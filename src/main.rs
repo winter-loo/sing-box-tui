@@ -17,10 +17,13 @@ use ratatui::{DefaultTerminal, Frame};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
+use serde_json::Value;
 use urlencoding::encode;
 
 const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:9090";
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
+const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+const DEFAULT_TEST_TIMEOUT_MS: u64 = 5_000;
 
 fn main() -> Result<()> {
     let controller = env::args()
@@ -31,8 +34,13 @@ fn main() -> Result<()> {
     let secret = env::var("SING_BOX_SECRET")
         .ok()
         .filter(|value| !value.is_empty());
+    let test_url = env::var("SING_BOX_TEST_URL").unwrap_or_else(|_| DEFAULT_TEST_URL.to_string());
+    let test_timeout_ms = env::var("SING_BOX_TEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TEST_TIMEOUT_MS);
 
-    let mut app = App::new(ApiClient::new(controller, secret)?)?;
+    let mut app = App::new(ApiClient::new(controller, secret)?, test_url, test_timeout_ms)?;
     let terminal = setup_terminal()?;
     let result = run_app(terminal, &mut app);
     restore_terminal()?;
@@ -167,6 +175,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" select  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
             Span::raw(" refresh  "),
+            Span::styled("t", Style::default().fg(Color::Cyan)),
+            Span::raw(" test  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(" quit"),
         ]),
@@ -276,10 +286,12 @@ struct App {
     focus: Focus,
     status: String,
     flash: Option<(String, Instant)>,
+    test_url: String,
+    test_timeout_ms: u64,
 }
 
 impl App {
-    fn new(client: ApiClient) -> Result<Self> {
+    fn new(client: ApiClient, test_url: String, test_timeout_ms: u64) -> Result<Self> {
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -288,6 +300,8 @@ impl App {
             focus: Focus::Groups,
             status: String::from("Loading proxy groups..."),
             flash: None,
+            test_url,
+            test_timeout_ms,
         };
         app.refresh()?;
         Ok(app)
@@ -320,10 +334,50 @@ impl App {
             KeyCode::Char('g') => self.move_first(),
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
+            KeyCode::Char('t') => self.test_selection(),
             KeyCode::Enter => self.activate_selection()?,
             _ => {}
         }
         Ok(true)
+    }
+
+    fn test_selection(&mut self) {
+        let Some(group) = self.selected_group() else {
+            self.status = String::from("No selector group available to test");
+            self.flash = Some((self.status.clone(), Instant::now()));
+            return;
+        };
+
+        let target = match self.focus {
+            Focus::Groups => group.current.clone().unwrap_or_else(|| group.name.clone()),
+            Focus::Members => group
+                .members
+                .get(self.member_index)
+                .cloned()
+                .or_else(|| group.current.clone())
+                .unwrap_or_else(|| group.name.clone()),
+        };
+
+        match self
+            .client
+            .probe_delay(&target, &self.test_url, self.test_timeout_ms)
+        {
+            Ok(delay_ms) => {
+                self.status = format!(
+                    "Test OK: {} responded in {} ms",
+                    sanitize_display_text(&target),
+                    delay_ms
+                );
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Test failed: {} ({})",
+                    sanitize_display_text(&target),
+                    error
+                );
+            }
+        }
+        self.flash = Some((self.status.clone(), Instant::now()));
     }
 
     fn move_next(&mut self) {
@@ -513,6 +567,43 @@ impl ApiClient {
             .with_context(|| format!("controller rejected switch request for {group}"))?;
         Ok(())
     }
+
+    fn probe_delay(&self, proxy: &str, test_url: &str, timeout_ms: u64) -> Result<u64> {
+        let encoded_proxy = encode(proxy);
+        let encoded_url = encode(test_url);
+        let response = self
+            .client
+            .get(format!(
+                "{}/proxies/{}/delay?timeout={}&url={}",
+                self.base_url, encoded_proxy, timeout_ms, encoded_url
+            ))
+            .send()
+            .with_context(|| format!("failed to test proxy {proxy}"))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            let message = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|json| {
+                    json.get("message")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| {
+                    if body.is_empty() {
+                        status.to_string()
+                    } else {
+                        body
+                    }
+                });
+            bail!("{message}");
+        }
+
+        let body = response.text().context("failed to read delay probe response")?;
+        parse_delay_ms(&body)
+    }
 }
 
 #[derive(Deserialize)]
@@ -536,9 +627,25 @@ struct SwitchProxyRequest {
     name: String,
 }
 
+fn parse_delay_ms(body: &str) -> Result<u64> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("empty delay response");
+    }
+    if let Ok(value) = trimmed.parse::<u64>() {
+        return Ok(value);
+    }
+
+    let json: Value = serde_json::from_str(trimmed).context("invalid delay response")?;
+    if let Some(delay) = json.get("delay").and_then(Value::as_u64) {
+        return Ok(delay);
+    }
+    bail!("delay missing from response");
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_display_text, truncate_for_width};
+    use super::{parse_delay_ms, sanitize_display_text, truncate_for_width};
 
     #[test]
     fn truncates_wide_strings_without_panicking() {
@@ -550,5 +657,10 @@ mod tests {
     #[test]
     fn strips_flag_emoji_for_terminal_safe_display() {
         assert_eq!(sanitize_display_text("🇺🇸美国光速1"), "美国光速1");
+    }
+
+    #[test]
+    fn parses_json_delay_response() {
+        assert_eq!(parse_delay_ms("{\"delay\":123}").unwrap(), 123);
     }
 }
