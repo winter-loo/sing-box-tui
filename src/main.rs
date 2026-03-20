@@ -345,6 +345,8 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
     let clash_api = clash_api_value
         .as_object_mut()
         .context("existing config experimental.clash_api must be an object")?;
+    clash_api.remove("external_ui_download_url");
+    clash_api.remove("external_ui_download_detour");
     clash_api
         .entry("external_controller")
         .or_insert_with(|| Value::String("127.0.0.1:9090".to_string()));
@@ -1288,6 +1290,13 @@ mod tests {
             }],
             "route": {
                 "final": "existing-node",
+            },
+            "experimental": {
+                "clash_api": {
+                    "external_controller": "127.0.0.1:9090",
+                    "external_ui_download_url": "https://example.com/ui.zip",
+                    "external_ui_download_detour": "direct"
+                }
             }
         });
 
@@ -1314,5 +1323,10 @@ mod tests {
         assert!(members.contains(&Value::String("node-a".to_string())));
         assert_eq!(config["route"]["final"], "existing-node");
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
+        let clash_api = config["experimental"]["clash_api"]
+            .as_object()
+            .expect("clash_api object");
+        assert!(!clash_api.contains_key("external_ui_download_url"));
+        assert!(!clash_api.contains_key("external_ui_download_detour"));
     }
 }
