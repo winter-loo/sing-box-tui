@@ -82,18 +82,21 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .groups
         .iter()
         .map(|group| {
-            let current = group
-                .current
-                .as_deref()
-                .map_or(String::from("unset"), ToString::to_string);
+            let current = group.current.as_deref().map_or("unset", |value| value);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    truncate_for_width(&group.name, groups_area.width.saturating_sub(10) as usize),
+                    truncate_for_width(
+                        &sanitize_display_text(&group.name),
+                        groups_area.width.saturating_sub(10) as usize,
+                    ),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!("[{}]", truncate_for_width(&current, 14)),
+                    format!(
+                        "[{}]",
+                        truncate_for_width(&sanitize_display_text(current), 14)
+                    ),
                     Style::default().fg(Color::Yellow),
                 ),
             ]))
@@ -119,6 +122,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .iter()
                 .map(|member| {
                     let is_current = group.current.as_deref() == Some(member.as_str());
+                    let display_member = sanitize_display_text(member);
                     let mut style = Style::default();
                     if is_current {
                         style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
@@ -126,7 +130,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             truncate_for_width(
-                                member,
+                                &display_member,
                                 members_area.width.saturating_sub(8) as usize,
                             ),
                             style,
@@ -140,7 +144,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let members_title = app
         .selected_group()
-        .map(|group| format!("Candidates for {}", group.name))
+        .map(|group| format!("Candidates for {}", sanitize_display_text(&group.name)))
         .unwrap_or_else(|| String::from("Candidates"));
     let members_block = Block::default()
         .title(members_title)
@@ -236,6 +240,26 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
     }
     output.push('…');
     output
+}
+
+fn sanitize_display_text(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|ch| !is_problematic_terminal_char(*ch))
+        .collect::<String>();
+    let compact = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        String::from("<unnamed>")
+    } else {
+        compact
+    }
+}
+
+fn is_problematic_terminal_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(ch, '\u{200d}' | '\u{fe0f}')
+        || ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch)
+        || ('\u{1f300}'..='\u{1faff}').contains(&ch)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -514,12 +538,17 @@ struct SwitchProxyRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_for_width;
+    use super::{sanitize_display_text, truncate_for_width};
 
     #[test]
     fn truncates_wide_strings_without_panicking() {
         let truncated = truncate_for_width("手动选择-自动选择-节点A", 8);
         assert!(truncated.ends_with('…'));
         assert!(!truncated.is_empty());
+    }
+
+    #[test]
+    fn strips_flag_emoji_for_terminal_safe_display() {
+        assert_eq!(sanitize_display_text("🇺🇸美国光速1"), "美国光速1");
     }
 }
