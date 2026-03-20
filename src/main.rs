@@ -190,7 +190,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(help, footer);
 
     if let Some(message) = app.flash_message() {
-        let area = centered_rect(60, 5, frame.area());
+        let popup_width = frame.area().width.saturating_sub(8).clamp(40, 96);
+        let popup_height = frame.area().height.saturating_sub(6).clamp(5, 8);
+        let area = centered_rect(popup_width, popup_height, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
@@ -250,6 +252,14 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
     }
     output.push('…');
     output
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 fn sanitize_display_text(value: &str) -> String {
@@ -373,7 +383,7 @@ impl App {
                 self.status = format!(
                     "Test failed: {} ({})",
                     sanitize_display_text(&target),
-                    error
+                    format_error_chain(&error)
                 );
             }
         }
