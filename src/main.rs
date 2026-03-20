@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
 use std::io::{self};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -16,18 +18,31 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use urlencoding::encode;
 
 const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:9090";
+const DEFAULT_CONFIG_PATH: &str = "/etc/sing-box/config.json";
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
 const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 const DEFAULT_TEST_TIMEOUT_MS: u64 = 5_000;
 
 fn main() -> Result<()> {
-    let controller = env::args()
-        .nth(1)
+    let options = CliOptions::parse(env::args().skip(1))?;
+
+    if let Some(source) = options.import_from.as_ref() {
+        run_import(
+            source,
+            options.import_output.as_ref(),
+            options.import_full_config,
+            &options.import_config_path,
+        )?;
+        return Ok(());
+    }
+
+    let controller = options
+        .controller
         .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
         .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
 
@@ -45,6 +60,561 @@ fn main() -> Result<()> {
     let result = run_app(terminal, &mut app);
     restore_terminal()?;
     result
+}
+
+#[derive(Default)]
+struct CliOptions {
+    controller: Option<String>,
+    import_from: Option<PathBuf>,
+    import_output: Option<PathBuf>,
+    import_full_config: bool,
+    import_config_path: PathBuf,
+}
+
+impl CliOptions {
+    fn parse<I>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut options = Self {
+            import_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            ..Self::default()
+        };
+        let mut iter = args.into_iter();
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--controller" => {
+                    let value = iter.next().context("--controller requires a value")?;
+                    options.controller = Some(value);
+                }
+                "--import-from" => {
+                    let value = iter.next().context("--import-from requires a file path")?;
+                    options.import_from = Some(PathBuf::from(value));
+                }
+                "--import-output" => {
+                    let value = iter
+                        .next()
+                        .context("--import-output requires a file path")?;
+                    options.import_output = Some(PathBuf::from(value));
+                }
+                "--import-full-config" => {
+                    options.import_full_config = true;
+                }
+                "--import-config-path" => {
+                    let value = iter
+                        .next()
+                        .context("--import-config-path requires a file path")?;
+                    options.import_config_path = PathBuf::from(value);
+                }
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => bail!("unknown flag: {value}"),
+                value => {
+                    if options.controller.is_none() {
+                        options.controller = Some(value.to_string());
+                    } else {
+                        bail!("unexpected positional argument: {value}");
+                    }
+                }
+            }
+        }
+
+        if options.import_output.is_some() && options.import_from.is_none() {
+            bail!("--import-output requires --import-from");
+        }
+
+        Ok(options)
+    }
+}
+
+fn print_usage() {
+    println!("sing-box-tui [--controller URL]");
+    println!(
+        "sing-box-tui --import-from <clash-proxies.yml> [--import-output <nodes.json|config.json>]"
+    );
+    println!("  --import-full-config [--import-config-path /etc/sing-box/config.json]");
+}
+
+fn run_import(
+    source: &PathBuf,
+    output: Option<&PathBuf>,
+    full_config: bool,
+    config_path: &PathBuf,
+) -> Result<()> {
+    let text = fs::read_to_string(source)
+        .with_context(|| format!("failed to read Clash proxy file {}", source.display()))?;
+    let config: ClashConfig =
+        serde_yaml::from_str(&text).context("failed to parse Clash YAML")?;
+
+    let converted = config
+        .proxies
+        .into_iter()
+        .filter(|entry| !is_metadata_entry(entry))
+        .map(convert_clash_proxy)
+        .collect::<Result<Vec<_>>>()?;
+
+    let output_value = if full_config {
+        build_full_config(config_path, converted)?
+    } else {
+        Value::Array(converted)
+    };
+
+    let json_text = serde_json::to_string_pretty(&output_value)
+        .context("failed to serialize sing-box import output")?;
+
+    if let Some(output) = output {
+        fs::write(output, format!("{json_text}\n"))
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!("{}", output.display());
+    } else {
+        println!("{json_text}");
+    }
+
+    Ok(())
+}
+
+fn build_full_config(config_path: &PathBuf, imported_nodes: Vec<Value>) -> Result<Value> {
+    if config_path.exists() {
+        let text = fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let mut config: Value = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        merge_into_existing_config(&mut config, imported_nodes)?;
+        Ok(config)
+    } else {
+        Ok(build_default_config(imported_nodes))
+    }
+}
+
+fn build_default_config(imported_nodes: Vec<Value>) -> Value {
+    let node_tags = collect_tags(&imported_nodes);
+    let select_members = with_auto_member(&node_tags);
+
+    let mut outbounds = Vec::with_capacity(imported_nodes.len() + 4);
+    outbounds.push(json!({
+        "type": "selector",
+        "tag": "select",
+        "outbounds": select_members,
+        "default": "auto",
+    }));
+    outbounds.push(json!({
+        "type": "urltest",
+        "tag": "auto",
+        "outbounds": node_tags,
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "10m",
+    }));
+    outbounds.extend(imported_nodes);
+    outbounds.push(json!({
+        "type": "direct",
+        "tag": "direct",
+    }));
+    outbounds.push(json!({
+        "type": "block",
+        "tag": "block",
+    }));
+
+    json!({
+        "log": {
+            "level": "info",
+        },
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 5780,
+            }
+        ],
+        "outbounds": outbounds,
+        "route": {
+            "final": "select",
+        },
+        "experimental": {
+            "cache_file": {
+                "enabled": true,
+            },
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": "",
+            }
+        }
+    })
+}
+
+fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds_value = root
+        .entry("outbounds")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let outbounds = outbounds_value
+        .as_array_mut()
+        .context("existing config outbounds must be an array")?;
+
+    upsert_special_outbound(
+        outbounds,
+        "direct",
+        || json!({ "type": "direct", "tag": "direct" }),
+        |_| {},
+    )?;
+    upsert_special_outbound(
+        outbounds,
+        "block",
+        || json!({ "type": "block", "tag": "block" }),
+        |_| {},
+    )?;
+
+    let node_tags = collect_tags(&imported_nodes);
+    let select_members = with_auto_member(&node_tags);
+
+    upsert_special_outbound(
+        outbounds,
+        "select",
+        || {
+            json!({
+                "type": "selector",
+                "tag": "select",
+                "outbounds": select_members,
+                "default": "auto",
+            })
+        },
+        |value| {
+            merge_outbound_members(value, &select_members);
+            ensure_string_field(value, "type", "selector");
+            ensure_string_field(value, "default", "auto");
+        },
+    )?;
+
+    upsert_special_outbound(
+        outbounds,
+        "auto",
+        || {
+            json!({
+                "type": "urltest",
+                "tag": "auto",
+                "outbounds": node_tags,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "10m",
+            })
+        },
+        |value| {
+            merge_outbound_members(value, &node_tags);
+            ensure_string_field(value, "type", "urltest");
+            ensure_string_field(value, "url", "https://www.gstatic.com/generate_204");
+            ensure_string_field(value, "interval", "10m");
+        },
+    )?;
+
+    for node in imported_nodes {
+        upsert_tagged_outbound(outbounds, node)?;
+    }
+
+    let route_value = root.entry("route").or_insert_with(|| json!({}));
+    let route = route_value
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    route
+        .entry("final")
+        .or_insert_with(|| Value::String("select".to_string()));
+
+    let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
+    let experimental = experimental_value
+        .as_object_mut()
+        .context("existing config experimental must be an object")?;
+    let cache_file_value = experimental
+        .entry("cache_file")
+        .or_insert_with(|| json!({ "enabled": true }));
+    let cache_file = cache_file_value
+        .as_object_mut()
+        .context("existing config experimental.cache_file must be an object")?;
+    cache_file
+        .entry("enabled")
+        .or_insert_with(|| Value::Bool(true));
+
+    let clash_api_value = experimental.entry("clash_api").or_insert_with(|| {
+        json!({
+            "external_controller": "127.0.0.1:9090",
+            "secret": "",
+        })
+    });
+    let clash_api = clash_api_value
+        .as_object_mut()
+        .context("existing config experimental.clash_api must be an object")?;
+    clash_api
+        .entry("external_controller")
+        .or_insert_with(|| Value::String("127.0.0.1:9090".to_string()));
+    clash_api
+        .entry("secret")
+        .or_insert_with(|| Value::String(String::new()));
+
+    Ok(())
+}
+
+fn upsert_special_outbound<F, G>(
+    outbounds: &mut Vec<Value>,
+    tag: &str,
+    build_default: F,
+    update: G,
+) -> Result<()>
+where
+    F: FnOnce() -> Value,
+    G: FnOnce(&mut Value),
+{
+    if let Some(existing) = find_outbound_by_tag_mut(outbounds, tag) {
+        update(existing);
+    } else {
+        outbounds.push(build_default());
+    }
+    Ok(())
+}
+
+fn upsert_tagged_outbound(outbounds: &mut Vec<Value>, outbound: Value) -> Result<()> {
+    let tag = outbound_tag(&outbound)?.to_string();
+    if let Some(existing) = find_outbound_by_tag_mut(outbounds, &tag) {
+        *existing = outbound;
+    } else {
+        outbounds.push(outbound);
+    }
+    Ok(())
+}
+
+fn find_outbound_by_tag_mut<'a>(outbounds: &'a mut [Value], tag: &str) -> Option<&'a mut Value> {
+    outbounds.iter_mut().find(|value| {
+        value
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|current| current == tag)
+    })
+}
+
+fn outbound_tag(outbound: &Value) -> Result<&str> {
+    outbound
+        .get("tag")
+        .and_then(Value::as_str)
+        .context("converted outbound is missing string tag")
+}
+
+fn collect_tags(outbounds: &[Value]) -> Vec<String> {
+    outbounds
+        .iter()
+        .filter_map(|value| value.get("tag").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn with_auto_member(tags: &[String]) -> Vec<String> {
+    let mut members = Vec::with_capacity(tags.len() + 1);
+    members.push("auto".to_string());
+    members.extend(tags.iter().cloned());
+    members
+}
+
+fn merge_outbound_members(outbound: &mut Value, new_members: &[String]) {
+    let Some(object) = outbound.as_object_mut() else {
+        return;
+    };
+
+    let mut merged = BTreeSet::new();
+    let entry = object
+        .entry("outbounds")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(existing) = entry.as_array_mut() else {
+        return;
+    };
+
+    let mut values = Vec::new();
+    for value in existing.iter() {
+        if let Some(member) = value.as_str() && merged.insert(member.to_string()) {
+            values.push(Value::String(member.to_string()));
+        }
+    }
+    for member in new_members {
+        if merged.insert(member.clone()) {
+            values.push(Value::String(member.clone()));
+        }
+    }
+    *existing = values;
+}
+
+fn ensure_string_field(outbound: &mut Value, key: &str, value: &str) {
+    let Some(object) = outbound.as_object_mut() else {
+        return;
+    };
+    object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::String(value.to_string()));
+}
+
+fn is_metadata_entry(entry: &ClashProxy) -> bool {
+    ["剩余流量", "距离下次重置剩余", "套餐到期"]
+        .iter()
+        .any(|marker| entry.name.contains(marker))
+}
+
+fn convert_clash_proxy(entry: ClashProxy) -> Result<Value> {
+    match entry.kind.as_str() {
+        "hysteria2" => {
+            let mut outbound = json!({
+                "type": "hysteria2",
+                "tag": entry.name,
+                "server": entry.server,
+                "password": entry.password,
+                "up_mbps": entry.up,
+                "down_mbps": entry.down,
+                "tls": build_tls(&entry),
+            });
+            if let Some(ports) = entry.ports.clone() {
+                outbound["server_ports"] = json!([ports.replace('-', ":")]);
+            } else {
+                outbound["server_port"] = json!(entry.port);
+            }
+            Ok(outbound)
+        }
+        "trojan" => Ok(json!({
+            "type": "trojan",
+            "tag": entry.name,
+            "server": entry.server,
+            "server_port": entry.port,
+            "password": entry.password,
+            "tls": build_tls(&entry),
+            "transport": build_transport(&entry),
+        })),
+        "vmess" => Ok(json!({
+            "type": "vmess",
+            "tag": entry.name,
+            "server": entry.server,
+            "server_port": entry.port,
+            "uuid": entry.uuid,
+            "security": entry.cipher.clone().unwrap_or_else(|| "auto".to_string()),
+            "alter_id": entry.alter_id.unwrap_or(0),
+            "tls": build_tls(&entry),
+            "transport": build_transport(&entry),
+        })),
+        "ss" => Ok(json!({
+            "type": "shadowsocks",
+            "tag": entry.name,
+            "server": entry.server,
+            "server_port": entry.port,
+            "method": entry.cipher,
+            "password": entry.password,
+        })),
+        other => bail!("unsupported Clash proxy type: {other}"),
+    }
+}
+
+fn build_tls(entry: &ClashProxy) -> Value {
+    let server_name = entry
+        .sni
+        .clone()
+        .or_else(|| entry.server_name.clone())
+        .unwrap_or_default();
+    let enabled = entry.tls.unwrap_or(false)
+        || !server_name.is_empty()
+        || entry.skip_cert_verify.unwrap_or(false);
+    if !enabled {
+        return Value::Null;
+    }
+
+    let mut value = json!({
+        "enabled": true,
+    });
+    if !server_name.is_empty() {
+        value["server_name"] = Value::String(server_name);
+    }
+    if entry.skip_cert_verify.unwrap_or(false) {
+        value["insecure"] = Value::Bool(true);
+    }
+    value
+}
+
+fn build_transport(entry: &ClashProxy) -> Value {
+    if entry.network.as_deref() != Some("ws") {
+        return Value::Null;
+    }
+
+    let mut headers = serde_json::Map::new();
+    if let Some(ws_opts) = entry.ws_opts.as_ref() {
+        for (key, value) in &ws_opts.headers {
+            headers.insert(key.clone(), Value::String(value.clone()));
+        }
+    }
+    for (key, value) in &entry.ws_headers {
+        headers.insert(key.clone(), Value::String(value.clone()));
+    }
+
+    let path = entry
+        .ws_opts
+        .as_ref()
+        .and_then(|opts| opts.path.clone())
+        .or_else(|| entry.ws_path.clone())
+        .unwrap_or_else(|| "/".to_string());
+
+    let mut transport = json!({
+        "type": "ws",
+        "path": path,
+    });
+    if !headers.is_empty() {
+        transport["headers"] = Value::Object(headers);
+    }
+    transport
+}
+
+#[derive(Deserialize)]
+struct ClashConfig {
+    #[serde(default)]
+    proxies: Vec<ClashProxy>,
+}
+
+#[derive(Deserialize)]
+struct ClashProxy {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    server: String,
+    port: u16,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    cipher: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(rename = "alterId", default)]
+    alter_id: Option<u32>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(rename = "skip-cert-verify", default)]
+    skip_cert_verify: Option<bool>,
+    #[serde(default)]
+    sni: Option<String>,
+    #[serde(rename = "servername", default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    up: Option<u32>,
+    #[serde(default)]
+    down: Option<u32>,
+    #[serde(default)]
+    ports: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(rename = "ws-opts", default)]
+    ws_opts: Option<ClashWsOpts>,
+    #[serde(rename = "ws-path", default)]
+    ws_path: Option<String>,
+    #[serde(rename = "ws-headers", default)]
+    ws_headers: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct ClashWsOpts {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 fn setup_terminal() -> Result<DefaultTerminal> {
@@ -632,7 +1202,7 @@ struct ProxyNode {
     all: Vec<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct SwitchProxyRequest {
     name: String,
 }
@@ -655,7 +1225,11 @@ fn parse_delay_ms(body: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_delay_ms, sanitize_display_text, truncate_for_width};
+    use super::{
+        build_default_config, merge_into_existing_config, parse_delay_ms, sanitize_display_text,
+        truncate_for_width,
+    };
+    use serde_json::{Value, json};
 
     #[test]
     fn truncates_wide_strings_without_panicking() {
@@ -672,5 +1246,73 @@ mod tests {
     #[test]
     fn parses_json_delay_response() {
         assert_eq!(parse_delay_ms("{\"delay\":123}").unwrap(), 123);
+    }
+
+    #[test]
+    fn default_full_config_contains_selector_and_imported_nodes() {
+        let config = build_default_config(vec![json!({
+            "type": "trojan",
+            "tag": "node-a",
+            "server": "example.com",
+            "server_port": 443,
+            "password": "secret",
+        })]);
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        assert!(outbounds.iter().any(|value| value["tag"] == "select"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "auto"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
+        assert_eq!(config["route"]["final"], "select");
+    }
+
+    #[test]
+    fn merge_preserves_existing_config_and_adds_imported_nodes() {
+        let mut config = json!({
+            "inbounds": [{
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 9000,
+            }],
+            "outbounds": [{
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["existing-node"],
+                "default": "existing-node",
+            }, {
+                "type": "trojan",
+                "tag": "existing-node",
+                "server": "old.example.com",
+                "server_port": 443,
+                "password": "secret",
+            }],
+            "route": {
+                "final": "existing-node",
+            }
+        });
+
+        merge_into_existing_config(
+            &mut config,
+            vec![json!({
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "example.com",
+                "server_port": 443,
+                "password": "secret",
+            })],
+        )
+        .expect("merge succeeds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        let select = outbounds
+            .iter()
+            .find(|value| value["tag"] == "select")
+            .expect("select outbound");
+        let members = select["outbounds"].as_array().expect("selector members");
+        assert!(members.contains(&Value::String("existing-node".to_string())));
+        assert!(members.contains(&Value::String("auto".to_string())));
+        assert!(members.contains(&Value::String("node-a".to_string())));
+        assert_eq!(config["route"]["final"], "existing-node");
+        assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
     }
 }
