@@ -342,17 +342,20 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
             "secret": "",
         })
     });
-    let clash_api = clash_api_value
-        .as_object_mut()
-        .context("existing config experimental.clash_api must be an object")?;
-    clash_api.remove("external_ui_download_url");
-    clash_api.remove("external_ui_download_detour");
-    clash_api
-        .entry("external_controller")
-        .or_insert_with(|| Value::String("127.0.0.1:9090".to_string()));
-    clash_api
-        .entry("secret")
-        .or_insert_with(|| Value::String(String::new()));
+    let existing_controller = clash_api_value
+        .get("external_controller")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+    let existing_secret = clash_api_value
+        .get("secret")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    *clash_api_value = json!({
+        "external_controller": existing_controller,
+        "secret": existing_secret,
+    });
 
     Ok(())
 }
@@ -1294,8 +1297,11 @@ mod tests {
             "experimental": {
                 "clash_api": {
                     "external_controller": "127.0.0.1:9090",
+                    "external_ui": "ui",
                     "external_ui_download_url": "https://example.com/ui.zip",
-                    "external_ui_download_detour": "direct"
+                    "external_ui_download_detour": "direct",
+                    "default_mode": "rule",
+                    "secret": "top-secret"
                 }
             }
         });
@@ -1326,7 +1332,17 @@ mod tests {
         let clash_api = config["experimental"]["clash_api"]
             .as_object()
             .expect("clash_api object");
+        assert_eq!(
+            clash_api.get("external_controller"),
+            Some(&Value::String("127.0.0.1:9090".to_string()))
+        );
+        assert_eq!(
+            clash_api.get("secret"),
+            Some(&Value::String("top-secret".to_string()))
+        );
+        assert!(!clash_api.contains_key("external_ui"));
         assert!(!clash_api.contains_key("external_ui_download_url"));
         assert!(!clash_api.contains_key("external_ui_download_detour"));
+        assert!(!clash_api.contains_key("default_mode"));
     }
 }
