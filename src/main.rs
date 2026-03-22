@@ -35,6 +35,17 @@ const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:9090";
 const DEFAULT_CONFIG_PATH: &str = "/etc/sing-box/config.json";
 const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 const DEFAULT_BENCHMARK_MAX_CONCURRENCY: usize = 16;
+const DEFAULT_SELECTOR_TAG: &str = "手动选择";
+const DEFAULT_AUTO_SELECTOR_TAG: &str = "自动选择";
+const DEFAULT_AD_BLOCK_SELECTOR_TAG: &str = "广告路由";
+const DEFAULT_DIRECT_TAG: &str = "国内直连";
+const DEFAULT_BLOCK_TAG: &str = "屏蔽";
+const DEFAULT_REMOTE_DNS_TAG: &str = "remote";
+const DEFAULT_LOCAL_DNS_TAG: &str = "local";
+const SELECTOR_TAG_ALIASES: &[&str] = &["手动选择", "select"];
+const AUTO_SELECTOR_TAG_ALIASES: &[&str] = &["自动选择", "auto"];
+const DIRECT_TAG_ALIASES: &[&str] = &["国内直连", "direct"];
+const BLOCK_TAG_ALIASES: &[&str] = &["屏蔽", "block"];
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
 const SINGLE_NODE_RETEST_DEBOUNCE: Duration = Duration::from_millis(800);
 
@@ -229,7 +240,7 @@ impl CliCommand {
 
     fn parse_benchmark(args: &[String]) -> Result<Self> {
         let mut controller = None;
-        let mut selector = String::from("select");
+        let mut selector = String::from(DEFAULT_SELECTOR_TAG);
         let mut pattern = String::new();
         let mut url = String::from(DEFAULT_DELAY_TEST_URL);
         let mut timeout_ms = 5000_u64;
@@ -368,7 +379,9 @@ fn print_benchmark_usage() {
     println!();
     println!("Options:");
     println!("      --controller <URL>        Clash controller base URL");
-    println!("      --selector <NAME>         Selector group to benchmark (default: select)");
+    println!(
+        "      --selector <NAME>         Selector group to benchmark (default: {DEFAULT_SELECTOR_TAG})"
+    );
     println!("      --match <TEXT>            Substring filter for candidate tags (default: empty)");
     println!("      --url <URL>               Delay test URL (default: {DEFAULT_DELAY_TEST_URL})");
     println!("      --timeout-ms <MS>         Delay probe timeout in ms (default: 5000)");
@@ -494,55 +507,231 @@ fn build_full_config(
 
 fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
-    let select_members = with_auto_member(&node_tags);
+    let select_members = with_leading_member(DEFAULT_AUTO_SELECTOR_TAG, &node_tags);
 
-    let mut outbounds = Vec::with_capacity(imported_nodes.len() + 4);
+    let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
     outbounds.push(json!({
         "type": "selector",
-        "tag": "select",
+        "tag": DEFAULT_SELECTOR_TAG,
         "outbounds": select_members,
-        "default": "auto",
+        "default": DEFAULT_AUTO_SELECTOR_TAG,
+        "interrupt_exist_connections": true,
     }));
     outbounds.push(json!({
         "type": "urltest",
-        "tag": "auto",
+        "tag": DEFAULT_AUTO_SELECTOR_TAG,
         "outbounds": node_tags,
-        "url": DEFAULT_DELAY_TEST_URL,
-        "interval": "10m",
+        "interrupt_exist_connections": true,
+    }));
+    outbounds.push(json!({
+        "type": "selector",
+        "tag": DEFAULT_AD_BLOCK_SELECTOR_TAG,
+        "outbounds": [DEFAULT_SELECTOR_TAG, DEFAULT_DIRECT_TAG, DEFAULT_BLOCK_TAG],
+        "default": DEFAULT_BLOCK_TAG,
+        "interrupt_exist_connections": true,
     }));
     outbounds.extend(imported_nodes);
     outbounds.push(json!({
         "type": "direct",
-        "tag": "direct",
+        "tag": DEFAULT_DIRECT_TAG,
     }));
     outbounds.push(json!({
         "type": "block",
-        "tag": "block",
+        "tag": DEFAULT_BLOCK_TAG,
     }));
 
     json!({
         "log": {
-            "level": "info",
+            "level": "error",
+            "output": "core.log",
+            "timestamp": true,
+        },
+        "dns": {
+            "servers": [
+                {
+                    "type": "tls",
+                    "tag": DEFAULT_REMOTE_DNS_TAG,
+                    "server": "8.8.8.8",
+                    "server_port": 853,
+                    "detour": DEFAULT_SELECTOR_TAG,
+                },
+                {
+                    "type": "tls",
+                    "tag": DEFAULT_LOCAL_DNS_TAG,
+                    "server": "223.5.5.5",
+                    "server_port": 853,
+                }
+            ],
+            "rules": [
+                {
+                    "clash_mode": "全局",
+                    "server": DEFAULT_REMOTE_DNS_TAG,
+                },
+                {
+                    "clash_mode": "直连",
+                    "server": DEFAULT_LOCAL_DNS_TAG,
+                },
+                {
+                    "rule_set": "geosite-cn",
+                    "server": DEFAULT_LOCAL_DNS_TAG,
+                },
+                {
+                    "rule_set": "geosite-geolocation-cn",
+                    "server": DEFAULT_LOCAL_DNS_TAG,
+                },
+                {
+                    "type": "logical",
+                    "mode": "and",
+                    "rules": [
+                        {
+                            "rule_set": "geosite-geolocation-!cn",
+                            "invert": true,
+                        },
+                        {
+                            "rule_set": "geoip-cn",
+                        }
+                    ],
+                    "server": DEFAULT_REMOTE_DNS_TAG,
+                    "client_subnet": "114.114.114.114/24",
+                },
+                {
+                    "clash_mode": "规则",
+                    "server": DEFAULT_REMOTE_DNS_TAG,
+                }
+            ],
+            "strategy": "ipv4_only",
+            "independent_cache": false,
         },
         "inbounds": [
             {
+                "type": "tun",
+                "mtu": 9000,
+                "address": [
+                    "172.19.0.1/30",
+                    "2001:0470:f9da:fdfa::1/64",
+                ],
+                "auto_route": true,
+                "auto_redirect": true,
+                "strict_route": true,
+                "stack": "mixed",
+                "sniff": true,
+                "endpoint_independent_nat": true,
+                "domain_strategy": "ipv4_only",
+            },
+            {
                 "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
+                "listen": "::",
                 "listen_port": 5780,
+                "sniff": true,
+                "domain_strategy": "ipv4_only",
+                "set_system_proxy": false,
             }
         ],
         "outbounds": outbounds,
         "route": {
-            "final": "select",
+            "default_domain_resolver": {
+                "server": DEFAULT_LOCAL_DNS_TAG,
+                "strategy": "ipv4_only",
+            },
+            "rules": [
+                {
+                    "type": "logical",
+                    "mode": "or",
+                    "rules": [
+                        {
+                            "protocol": "dns",
+                        },
+                        {
+                            "port": 53,
+                        }
+                    ],
+                    "action": "hijack-dns",
+                },
+                {
+                    "clash_mode": "直连",
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
+                    "clash_mode": "全局",
+                    "outbound": DEFAULT_SELECTOR_TAG,
+                },
+                {
+                    "ip_is_private": true,
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
+                    "rule_set": "geoip-cn",
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
+                    "rule_set": "geosite-cn",
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
+                    "rule_set": "geosite-geolocation-cn",
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
+                    "rule_set": "AdGuardSDNSFilter",
+                    "outbound": DEFAULT_AD_BLOCK_SELECTOR_TAG,
+                },
+                {
+                    "clash_mode": "规则",
+                    "outbound": DEFAULT_SELECTOR_TAG,
+                }
+            ],
+            "rule_set": [
+                {
+                    "type": "remote",
+                    "tag": "geoip-cn",
+                    "format": "binary",
+                    "url": "https://sjcdjf01.airapp.link/theme/rules/geoip-cn.srs",
+                    "download_detour": DEFAULT_DIRECT_TAG,
+                    "update_interval": "30d",
+                },
+                {
+                    "type": "remote",
+                    "tag": "geosite-cn",
+                    "format": "binary",
+                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-cn.srs",
+                    "download_detour": DEFAULT_DIRECT_TAG,
+                    "update_interval": "30d",
+                },
+                {
+                    "type": "remote",
+                    "tag": "geosite-geolocation-cn",
+                    "format": "binary",
+                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-geolocation-cn.srs",
+                    "download_detour": DEFAULT_DIRECT_TAG,
+                    "update_interval": "30d",
+                },
+                {
+                    "type": "remote",
+                    "tag": "geosite-geolocation-!cn",
+                    "format": "binary",
+                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-geolocation-!cn.srs",
+                    "download_detour": DEFAULT_DIRECT_TAG,
+                    "update_interval": "30d",
+                },
+                {
+                    "type": "remote",
+                    "tag": "AdGuardSDNSFilter",
+                    "format": "binary",
+                    "url": "https://sjcdjf01.airapp.link/theme/rules/AdGuardSDNSFilter.srs",
+                    "download_detour": DEFAULT_DIRECT_TAG,
+                    "update_interval": "30d",
+                }
+            ],
+            "auto_detect_interface": true,
         },
         "experimental": {
             "cache_file": {
                 "enabled": true,
+                "store_rdrc": true,
             },
             "clash_api": {
-                "external_controller": "127.0.0.1:9090",
-                "secret": "",
+                "external_controller": "0.0.0.0:9090",
+                "default_mode": "规则",
             }
         }
     })
@@ -563,16 +752,46 @@ fn merge_into_existing_config(
         .as_array_mut()
         .context("existing config outbounds must be an array")?;
 
+    let selector_tag = preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let prefers_legacy_tags = selector_tag == "select";
+    let auto_tag = preferred_existing_tag(
+        outbounds,
+        AUTO_SELECTOR_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "auto"
+        } else {
+            DEFAULT_AUTO_SELECTOR_TAG
+        },
+    );
+    let direct_tag = preferred_existing_tag(
+        outbounds,
+        DIRECT_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "direct"
+        } else {
+            DEFAULT_DIRECT_TAG
+        },
+    );
+    let block_tag = preferred_existing_tag(
+        outbounds,
+        BLOCK_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "block"
+        } else {
+            DEFAULT_BLOCK_TAG
+        },
+    );
+
     upsert_special_outbound(
         outbounds,
-        "direct",
-        || json!({ "type": "direct", "tag": "direct" }),
+        &direct_tag,
+        || json!({ "type": "direct", "tag": direct_tag }),
         |_| {},
     )?;
     upsert_special_outbound(
         outbounds,
-        "block",
-        || json!({ "type": "block", "tag": "block" }),
+        &block_tag,
+        || json!({ "type": "block", "tag": block_tag }),
         |_| {},
     )?;
 
@@ -581,17 +800,17 @@ fn merge_into_existing_config(
     }
 
     let node_tags = collect_tags(&imported_nodes);
-    let select_members = with_auto_member(&node_tags);
+    let select_members = with_leading_member(&auto_tag, &node_tags);
 
     upsert_special_outbound(
         outbounds,
-        "select",
+        &selector_tag,
         || {
             json!({
                 "type": "selector",
-                "tag": "select",
+                "tag": selector_tag,
                 "outbounds": select_members,
-                "default": "auto",
+                "default": auto_tag,
             })
         },
         |value| {
@@ -601,17 +820,17 @@ fn merge_into_existing_config(
                 merge_outbound_members(value, &select_members);
             }
             ensure_string_field(value, "type", "selector");
-            ensure_string_field(value, "default", "auto");
+            ensure_string_field(value, "default", &auto_tag);
         },
     )?;
 
     upsert_special_outbound(
         outbounds,
-        "auto",
+        &auto_tag,
         || {
             json!({
                 "type": "urltest",
-                "tag": "auto",
+                "tag": auto_tag,
                 "outbounds": node_tags,
                 "url": DEFAULT_DELAY_TEST_URL,
                 "interval": "10m",
@@ -639,7 +858,7 @@ fn merge_into_existing_config(
         .context("existing config route must be an object")?;
     route
         .entry("final")
-        .or_insert_with(|| Value::String("select".to_string()));
+        .or_insert_with(|| Value::String(selector_tag));
 
     let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
     let experimental = experimental_value
@@ -729,6 +948,15 @@ fn outbound_tag(outbound: &Value) -> Result<&str> {
         .context("converted outbound is missing string tag")
 }
 
+fn preferred_existing_tag(outbounds: &[Value], aliases: &[&str], preferred: &str) -> String {
+    outbounds
+        .iter()
+        .filter_map(|value| value.get("tag").and_then(Value::as_str))
+        .find(|tag| aliases.iter().any(|alias| alias == tag))
+        .unwrap_or(preferred)
+        .to_string()
+}
+
 fn collect_tags(outbounds: &[Value]) -> Vec<String> {
     outbounds
         .iter()
@@ -737,9 +965,9 @@ fn collect_tags(outbounds: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn with_auto_member(tags: &[String]) -> Vec<String> {
+fn with_leading_member(first: &str, tags: &[String]) -> Vec<String> {
     let mut members = Vec::with_capacity(tags.len() + 1);
-    members.push("auto".to_string());
+    members.push(first.to_string());
     members.extend(tags.iter().cloned());
     members
 }
@@ -1470,6 +1698,10 @@ impl App {
         self.flash = Some((self.status.clone(), Instant::now()));
     }
 
+    fn set_switch_status(&mut self, group: &str, member: &str) {
+        self.set_status_only(format!("Switched {} to {}", group, member));
+    }
+
     fn flash_message(&mut self) -> Option<String> {
         let (message, since) = self.flash.as_ref()?;
         if since.elapsed() > Duration::from_secs(2) {
@@ -1597,17 +1829,19 @@ impl App {
         let Some(group) = self.selected_group() else {
             bail!("no selector group available");
         };
+        let group_name = group.name.clone();
         let Some(member) = group.members.get(self.member_index).cloned() else {
             bail!("no proxy available in selected group");
         };
         self.client
-            .switch_proxy(&group.name, &member)
-            .with_context(|| format!("failed to switch {} to {}", group.name, member))?;
-        self.set_status_with_flash(format!("Switched {} to {}", group.name, member));
+            .switch_proxy(&group_name, &member)
+            .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
         if REFRESH_DEBOUNCE > Duration::ZERO {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
-        self.refresh()
+        self.refresh()?;
+        self.set_switch_status(&group_name, &member);
+        Ok(())
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -1916,7 +2150,7 @@ impl App {
         };
 
         match code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char(' ') => {
                 self.filter_input = None;
                 self.set_status_only("Benchmark filter edit canceled");
             }
@@ -2724,7 +2958,10 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        let client = AsyncClient::builder().build().expect("test HTTP client");
+        let client = AsyncClient::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
 
         App {
             client: ApiClient {
@@ -2773,10 +3010,14 @@ mod tests {
         })]);
 
         let outbounds = config["outbounds"].as_array().expect("outbounds array");
-        assert!(outbounds.iter().any(|value| value["tag"] == "select"));
-        assert!(outbounds.iter().any(|value| value["tag"] == "auto"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "手动选择"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "自动选择"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "广告路由"));
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
-        assert_eq!(config["route"]["final"], "select");
+        assert_eq!(config["dns"]["servers"][0]["type"], "tls");
+        assert_eq!(config["route"]["default_domain_resolver"]["server"], "local");
+        assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
+        assert!(config["route"].get("final").is_none());
     }
 
     #[test]
@@ -3167,6 +3408,29 @@ mod tests {
         assert_eq!(app.benchmark_filter, "美国");
         assert_eq!(app.filter_input, None);
         assert_eq!(app.status, "Benchmark filter edit canceled");
+    }
+
+    #[test]
+    fn filter_modal_space_cancels_without_changing_filter() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('/')).expect("open modal");
+        app.handle_key(KeyCode::Char('x')).expect("type");
+        app.handle_key(KeyCode::Char(' ')).expect("cancel");
+
+        assert_eq!(app.benchmark_filter, "美国");
+        assert_eq!(app.filter_input, None);
+        assert_eq!(app.status, "Benchmark filter edit canceled");
+    }
+
+    #[test]
+    fn switching_selection_updates_status_without_flash_popup() {
+        let mut app = test_app();
+        app.set_status_with_flash("old flash");
+        app.set_switch_status("select", "node-b");
+
+        assert_eq!(app.status, "Switched select to node-b");
+        assert!(app.flash.is_none());
     }
 
     #[test]
