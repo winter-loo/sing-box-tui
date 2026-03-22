@@ -3,7 +3,15 @@ use std::env;
 use std::fs;
 use std::io::{self};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use reqwest::Version;
+
+use tokio::process::Command as TokioCommand;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+use tokio::task::JoinSet;
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -16,126 +24,361 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use reqwest::blocking::Client;
+use reqwest::Client as AsyncClient;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use urlencoding::encode;
 
 const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:9090";
 const DEFAULT_CONFIG_PATH: &str = "/etc/sing-box/config.json";
+const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+const DEFAULT_BENCHMARK_MAX_CONCURRENCY: usize = 16;
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(200);
-const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
-const DEFAULT_TEST_TIMEOUT_MS: u64 = 5_000;
+const SINGLE_NODE_RETEST_DEBOUNCE: Duration = Duration::from_millis(800);
 
 fn main() -> Result<()> {
-    let options = CliOptions::parse(env::args().skip(1))?;
-
-    if let Some(source) = options.import_from.as_ref() {
-        run_import(
-            source,
-            options.import_output.as_ref(),
-            options.import_full_config,
-            &options.import_config_path,
-        )?;
-        return Ok(());
+    match CliCommand::parse(env::args().skip(1))? {
+        CliCommand::Run {
+            controller,
+            max_concurrency,
+        } => run_tui(controller, max_concurrency),
+        CliCommand::Import {
+            input,
+            output,
+            config_path,
+            replace_nodes,
+        } => run_import(&input, output.as_ref(), true, &config_path, replace_nodes),
+        CliCommand::Benchmark {
+            controller,
+            selector,
+            pattern,
+            url,
+            timeout_ms,
+            request_timeout,
+            max_concurrency,
+            switch,
+            verify,
+            verify_discord,
+        } => run_benchmark(BenchmarkOptions {
+            controller,
+            selector,
+            pattern,
+            url,
+            timeout_ms,
+            request_timeout,
+            max_concurrency,
+            switch,
+            verify,
+            verify_discord,
+        }),
     }
+}
 
-    let controller = options
-        .controller
+fn run_tui(controller: Option<String>, max_concurrency: Option<usize>) -> Result<()> {
+    let controller = controller
         .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
         .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
 
     let secret = env::var("SING_BOX_SECRET")
         .ok()
         .filter(|value| !value.is_empty());
-    let test_url = env::var("SING_BOX_TEST_URL").unwrap_or_else(|_| DEFAULT_TEST_URL.to_string());
-    let test_timeout_ms = env::var("SING_BOX_TEST_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TEST_TIMEOUT_MS);
 
-    let mut app = App::new(ApiClient::new(controller, secret)?, test_url, test_timeout_ms)?;
+    let mut app = App::new(
+        ApiClient::new(controller, secret)?,
+        max_concurrency.unwrap_or(DEFAULT_BENCHMARK_MAX_CONCURRENCY),
+    )?;
     let terminal = setup_terminal()?;
     let result = run_app(terminal, &mut app);
     restore_terminal()?;
     result
 }
 
-#[derive(Default)]
-struct CliOptions {
-    controller: Option<String>,
-    import_from: Option<PathBuf>,
-    import_output: Option<PathBuf>,
-    import_full_config: bool,
-    import_config_path: PathBuf,
+enum CliCommand {
+    Run {
+        controller: Option<String>,
+        max_concurrency: Option<usize>,
+    },
+    Import {
+        input: PathBuf,
+        output: Option<PathBuf>,
+        config_path: PathBuf,
+        replace_nodes: bool,
+    },
+    Benchmark {
+        controller: Option<String>,
+        selector: String,
+        pattern: String,
+        url: String,
+        timeout_ms: u64,
+        request_timeout: f64,
+        max_concurrency: usize,
+        switch: bool,
+        verify: bool,
+        verify_discord: bool,
+    },
 }
 
-impl CliOptions {
+impl CliCommand {
     fn parse<I>(args: I) -> Result<Self>
     where
         I: IntoIterator<Item = String>,
     {
-        let mut options = Self {
-            import_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
-            ..Self::default()
-        };
-        let mut iter = args.into_iter();
+        let args = args.into_iter().collect::<Vec<_>>();
+        if args.is_empty() {
+            return Ok(Self::Run {
+                controller: None,
+                max_concurrency: None,
+            });
+        }
 
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
+        match args[0].as_str() {
+            "run" => Self::parse_run(&args[1..]),
+            "import" => Self::parse_import(&args[1..]),
+            "benchmark" => Self::parse_benchmark(&args[1..]),
+            "--help" | "-h" | "help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            value if value.starts_with('-') => bail!("unknown flag: {value}"),
+            value => bail!("unknown command: {value}"),
+        }
+    }
+
+    fn parse_run(args: &[String]) -> Result<Self> {
+        let mut controller = None;
+        let mut max_concurrency = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
                 "--controller" => {
-                    let value = iter.next().context("--controller requires a value")?;
-                    options.controller = Some(value);
+                    i += 1;
+                    let value = args.get(i).context("--controller requires a value")?;
+                    controller = Some(value.clone());
                 }
-                "--import-from" => {
-                    let value = iter.next().context("--import-from requires a file path")?;
-                    options.import_from = Some(PathBuf::from(value));
-                }
-                "--import-output" => {
-                    let value = iter
-                        .next()
-                        .context("--import-output requires a file path")?;
-                    options.import_output = Some(PathBuf::from(value));
-                }
-                "--import-full-config" => {
-                    options.import_full_config = true;
-                }
-                "--import-config-path" => {
-                    let value = iter
-                        .next()
-                        .context("--import-config-path requires a file path")?;
-                    options.import_config_path = PathBuf::from(value);
+                "--max-concurrency" => {
+                    i += 1;
+                    max_concurrency =
+                        Some(parse_max_concurrency(args.get(i), "--max-concurrency")?);
                 }
                 "--help" | "-h" => {
-                    print_usage();
+                    print_run_usage();
                     std::process::exit(0);
                 }
-                value if value.starts_with('-') => bail!("unknown flag: {value}"),
+                value if value.starts_with('-') => bail!("unknown flag for run: {value}"),
+                value => bail!("unexpected positional argument for run: {value}"),
+            }
+            i += 1;
+        }
+        Ok(Self::Run {
+            controller,
+            max_concurrency,
+        })
+    }
+
+    fn parse_import(args: &[String]) -> Result<Self> {
+        let mut input = None;
+        let mut output = None;
+        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut replace_nodes = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-i" | "--input" => {
+                    i += 1;
+                    let value = args.get(i).context("-i/--input requires a file path")?;
+                    input = Some(PathBuf::from(value));
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    let value = args.get(i).context("-o/--output requires a file path")?;
+                    output = Some(PathBuf::from(value));
+                }
+                "--config" => {
+                    i += 1;
+                    let value = args.get(i).context("--config requires a file path")?;
+                    config_path = PathBuf::from(value);
+                }
+                "--replace-nodes" => {
+                    replace_nodes = true;
+                }
+                "--help" | "-h" => {
+                    print_import_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => bail!("unknown flag for import: {value}"),
                 value => {
-                    if options.controller.is_none() {
-                        options.controller = Some(value.to_string());
+                    if input.is_none() {
+                        input = Some(PathBuf::from(value));
                     } else {
-                        bail!("unexpected positional argument: {value}");
+                        bail!("unexpected positional argument for import: {value}");
                     }
                 }
             }
+            i += 1;
         }
 
-        if options.import_output.is_some() && options.import_from.is_none() {
-            bail!("--import-output requires --import-from");
+        Ok(Self::Import {
+            input: input.context("import requires an input Clash YAML file (use -i/--input)")?,
+            output,
+            config_path,
+            replace_nodes,
+        })
+    }
+
+    fn parse_benchmark(args: &[String]) -> Result<Self> {
+        let mut controller = None;
+        let mut selector = String::from("select");
+        let mut pattern = String::from("美国");
+        let mut url = String::from(DEFAULT_DELAY_TEST_URL);
+        let mut timeout_ms = 5000_u64;
+        let mut request_timeout = 12.0_f64;
+        let mut max_concurrency = DEFAULT_BENCHMARK_MAX_CONCURRENCY;
+        let mut switch = false;
+        let mut verify = false;
+        let mut verify_discord = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--controller" => {
+                    i += 1;
+                    let value = args.get(i).context("--controller requires a value")?;
+                    controller = Some(value.clone());
+                }
+                "--selector" => {
+                    i += 1;
+                    selector = args.get(i).context("--selector requires a value")?.clone();
+                }
+                "--match" | "--pattern" => {
+                    i += 1;
+                    pattern = args
+                        .get(i)
+                        .context("--match/--pattern requires a value")?
+                        .clone();
+                }
+                "--url" => {
+                    i += 1;
+                    url = args.get(i).context("--url requires a value")?.clone();
+                }
+                "--timeout-ms" => {
+                    i += 1;
+                    timeout_ms = args
+                        .get(i)
+                        .context("--timeout-ms requires a value")?
+                        .parse()
+                        .context("--timeout-ms must be an integer")?;
+                }
+                "--request-timeout" => {
+                    i += 1;
+                    request_timeout = args
+                        .get(i)
+                        .context("--request-timeout requires a value")?
+                        .parse()
+                        .context("--request-timeout must be a number")?;
+                }
+                "--max-concurrency" => {
+                    i += 1;
+                    max_concurrency = parse_max_concurrency(args.get(i), "--max-concurrency")?;
+                }
+                "--switch" => switch = true,
+                "--verify" => verify = true,
+                "--verify-discord" => verify_discord = true,
+                "--help" | "-h" => {
+                    print_benchmark_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => bail!("unknown flag for benchmark: {value}"),
+                value => bail!("unexpected positional argument for benchmark: {value}"),
+            }
+            i += 1;
         }
 
-        Ok(options)
+        Ok(Self::Benchmark {
+            controller,
+            selector,
+            pattern,
+            url,
+            timeout_ms,
+            request_timeout,
+            max_concurrency,
+            switch,
+            verify,
+            verify_discord,
+        })
     }
 }
 
+fn parse_max_concurrency(value: Option<&String>, flag: &str) -> Result<usize> {
+    let parsed = value
+        .with_context(|| format!("{flag} requires a value"))?
+        .parse::<usize>()
+        .with_context(|| format!("{flag} must be a positive integer"))?;
+    if parsed == 0 {
+        bail!("{flag} must be greater than 0");
+    }
+    Ok(parsed)
+}
+
 fn print_usage() {
-    println!("sing-box-tui [--controller URL]");
+    println!("sing-box-tui <command> [options]");
+    println!();
+    println!("Commands:");
+    println!("  run [--controller URL] [--max-concurrency N]    Start the TUI");
+    println!("  import -i <clash.yml> [-o <config.json>] [--config FILE] [--replace-nodes]");
     println!(
-        "sing-box-tui --import-from <clash-proxies.yml> [--import-output <nodes.json|config.json>]"
+        "                                                Import Clash YAML into a full sing-box config"
     );
-    println!("  --import-full-config [--import-config-path /etc/sing-box/config.json]");
+    println!(
+        "  benchmark [--selector NAME] [--match TEXT] [--max-concurrency N] [--switch] [--verify] [--verify-discord]"
+    );
+    println!(
+        "                                                Benchmark selector candidates and optionally switch"
+    );
+}
+
+fn print_run_usage() {
+    println!("sing-box-tui run [--controller URL] [--max-concurrency N]");
+    println!();
+    println!(
+        "      --max-concurrency <N>   Limit concurrent delay probes in TUI benchmarks (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
+    );
+}
+
+fn print_import_usage() {
+    println!(
+        "sing-box-tui import -i <clash.yml> [-o <config.json>] [--config FILE] [--replace-nodes]"
+    );
+    println!();
+    println!("Input options:");
+    println!("  -i, --input <FILE>        Input Clash YAML subscription/config file");
+    println!(
+        "      --config <FILE>       Existing sing-box config to merge into (default: /etc/sing-box/config.json)"
+    );
+    println!();
+    println!("Output options:");
+    println!("  -o, --output <FILE>       Output full sing-box config JSON");
+    println!();
+    println!("Behavior options:");
+    println!("      --replace-nodes       Replace existing node outbounds instead of merging");
+}
+
+fn print_benchmark_usage() {
+    println!("sing-box-tui benchmark [options]");
+    println!();
+    println!("Options:");
+    println!("      --controller <URL>        Clash controller base URL");
+    println!("      --selector <NAME>         Selector group to benchmark (default: select)");
+    println!("      --match <TEXT>            Substring filter for candidate tags (default: 美国)");
+    println!("      --url <URL>               Delay test URL (default: {DEFAULT_DELAY_TEST_URL})");
+    println!("      --timeout-ms <MS>         Delay probe timeout in ms (default: 5000)");
+    println!("      --request-timeout <SEC>   HTTP request timeout in seconds (default: 12)");
+    println!(
+        "      --max-concurrency <N>     Limit concurrent delay probes (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
+    );
+    println!("      --switch                  Switch selector to the best successful node");
+    println!("      --verify                  Run post-switch verification HTTP checks");
+    println!("      --verify-discord          Include Discord checks during verification");
 }
 
 fn run_import(
@@ -143,11 +386,11 @@ fn run_import(
     output: Option<&PathBuf>,
     full_config: bool,
     config_path: &PathBuf,
+    replace_nodes: bool,
 ) -> Result<()> {
     let text = fs::read_to_string(source)
         .with_context(|| format!("failed to read Clash proxy file {}", source.display()))?;
-    let config: ClashConfig =
-        serde_yaml::from_str(&text).context("failed to parse Clash YAML")?;
+    let config: ClashConfig = serde_yaml::from_str(&text).context("failed to parse Clash YAML")?;
 
     let converted = config
         .proxies
@@ -157,7 +400,7 @@ fn run_import(
         .collect::<Result<Vec<_>>>()?;
 
     let output_value = if full_config {
-        build_full_config(config_path, converted)?
+        build_full_config(config_path, converted, replace_nodes)?
     } else {
         Value::Array(converted)
     };
@@ -176,13 +419,73 @@ fn run_import(
     Ok(())
 }
 
-fn build_full_config(config_path: &PathBuf, imported_nodes: Vec<Value>) -> Result<Value> {
+fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
+    let controller = options
+        .controller
+        .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
+        .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
+    let secret = env::var("SING_BOX_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty());
+
+    let client = ApiClient::new(controller, secret)?;
+    let summary = client.benchmark_selector(&BenchmarkRequest {
+        selector: options.selector,
+        pattern: options.pattern,
+        url: options.url,
+        timeout_ms: options.timeout_ms,
+        request_timeout: options.request_timeout,
+        max_concurrency: options.max_concurrency,
+        nodes: None,
+    })?;
+
+    let mut final_node = summary.current.clone();
+    let mut switched = false;
+    if options.switch {
+        if let Some(best) = summary.best_success() {
+            client.switch_proxy(&summary.selector, &best.name)?;
+            final_node = Some(best.name.clone());
+            switched = true;
+        }
+    }
+
+    let verification = if options.verify {
+        Some(run_verification(options.verify_discord))
+    } else {
+        None
+    };
+    let best = summary.best_success().cloned();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&BenchmarkOutput {
+            selector: summary.selector,
+            current: summary.current,
+            pattern: summary.pattern,
+            test_url: summary.url,
+            timeout_ms: summary.timeout_ms,
+            max_concurrency: summary.max_concurrency,
+            results: summary.results,
+            best,
+            switched,
+            final_node,
+            verification,
+        })?
+    );
+    Ok(())
+}
+
+fn build_full_config(
+    config_path: &PathBuf,
+    imported_nodes: Vec<Value>,
+    replace_nodes: bool,
+) -> Result<Value> {
     if config_path.exists() {
         let text = fs::read_to_string(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
         let mut config: Value = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse {}", config_path.display()))?;
-        merge_into_existing_config(&mut config, imported_nodes)?;
+        merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
         Ok(config)
     } else {
         Ok(build_default_config(imported_nodes))
@@ -204,7 +507,7 @@ fn build_default_config(imported_nodes: Vec<Value>) -> Value {
         "type": "urltest",
         "tag": "auto",
         "outbounds": node_tags,
-        "url": "https://www.gstatic.com/generate_204",
+        "url": DEFAULT_DELAY_TEST_URL,
         "interval": "10m",
     }));
     outbounds.extend(imported_nodes);
@@ -245,7 +548,11 @@ fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     })
 }
 
-fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) -> Result<()> {
+fn merge_into_existing_config(
+    config: &mut Value,
+    imported_nodes: Vec<Value>,
+    replace_nodes: bool,
+) -> Result<()> {
     let root = config
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
@@ -269,6 +576,10 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
         |_| {},
     )?;
 
+    if replace_nodes {
+        outbounds.retain(|outbound| !is_replaceable_node_outbound(outbound));
+    }
+
     let node_tags = collect_tags(&imported_nodes);
     let select_members = with_auto_member(&node_tags);
 
@@ -284,7 +595,11 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
             })
         },
         |value| {
-            merge_outbound_members(value, &select_members);
+            if replace_nodes {
+                set_outbound_members(value, &select_members);
+            } else {
+                merge_outbound_members(value, &select_members);
+            }
             ensure_string_field(value, "type", "selector");
             ensure_string_field(value, "default", "auto");
         },
@@ -298,14 +613,18 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
                 "type": "urltest",
                 "tag": "auto",
                 "outbounds": node_tags,
-                "url": "https://www.gstatic.com/generate_204",
+                "url": DEFAULT_DELAY_TEST_URL,
                 "interval": "10m",
             })
         },
         |value| {
-            merge_outbound_members(value, &node_tags);
+            if replace_nodes {
+                set_outbound_members(value, &node_tags);
+            } else {
+                merge_outbound_members(value, &node_tags);
+            }
             ensure_string_field(value, "type", "urltest");
-            ensure_string_field(value, "url", "https://www.gstatic.com/generate_204");
+            ensure_string_field(value, "url", DEFAULT_DELAY_TEST_URL);
             ensure_string_field(value, "interval", "10m");
         },
     )?;
@@ -342,22 +661,28 @@ fn merge_into_existing_config(config: &mut Value, imported_nodes: Vec<Value>) ->
             "secret": "",
         })
     });
-    let existing_controller = clash_api_value
-        .get("external_controller")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
-    let existing_secret = clash_api_value
-        .get("secret")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    *clash_api_value = json!({
-        "external_controller": existing_controller,
-        "secret": existing_secret,
-    });
+    let clash_api = clash_api_value
+        .as_object_mut()
+        .context("existing config experimental.clash_api must be an object")?;
+    clash_api
+        .entry("external_controller")
+        .or_insert_with(|| Value::String("127.0.0.1:9090".to_string()));
+    clash_api
+        .entry("secret")
+        .or_insert_with(|| Value::String(String::new()));
 
     Ok(())
+}
+
+fn is_replaceable_node_outbound(outbound: &Value) -> bool {
+    let outbound_type = outbound
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !matches!(
+        outbound_type,
+        "selector" | "urltest" | "direct" | "block" | "dns"
+    )
 }
 
 fn upsert_special_outbound<F, G>(
@@ -419,6 +744,22 @@ fn with_auto_member(tags: &[String]) -> Vec<String> {
     members
 }
 
+fn set_outbound_members(outbound: &mut Value, members: &[String]) {
+    let Some(object) = outbound.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "outbounds".to_string(),
+        Value::Array(
+            members
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
+}
+
 fn merge_outbound_members(outbound: &mut Value, new_members: &[String]) {
     let Some(object) = outbound.as_object_mut() else {
         return;
@@ -434,8 +775,10 @@ fn merge_outbound_members(outbound: &mut Value, new_members: &[String]) {
 
     let mut values = Vec::new();
     for value in existing.iter() {
-        if let Some(member) = value.as_str() && merged.insert(member.to_string()) {
-            values.push(Value::String(member.to_string()));
+        if let Some(member) = value.as_str() {
+            if merged.insert(member.to_string()) {
+                values.push(Value::String(member.to_string()));
+            }
         }
     }
     for member in new_members {
@@ -508,6 +851,16 @@ fn convert_clash_proxy(entry: ClashProxy) -> Result<Value> {
             "method": entry.cipher,
             "password": entry.password,
         })),
+        "vless" => Ok(json!({
+            "type": "vless",
+            "tag": entry.name,
+            "server": entry.server,
+            "server_port": entry.port,
+            "uuid": entry.uuid,
+            "flow": entry.flow,
+            "tls": build_vless_tls(&entry),
+            "transport": build_transport(&entry),
+        })),
         other => bail!("unsupported Clash proxy type: {other}"),
     }
 }
@@ -535,6 +888,30 @@ fn build_tls(entry: &ClashProxy) -> Value {
         value["insecure"] = Value::Bool(true);
     }
     value
+}
+
+fn build_vless_tls(entry: &ClashProxy) -> Value {
+    let mut tls = build_tls(entry);
+    if tls.is_null() {
+        tls = json!({ "enabled": true });
+    }
+
+    if let Some(fingerprint) = entry.client_fingerprint.as_ref() {
+        tls["utls"] = json!({
+            "enabled": true,
+            "fingerprint": fingerprint,
+        });
+    }
+
+    if let Some(reality) = entry.reality_opts.as_ref() {
+        tls["reality"] = json!({
+            "enabled": true,
+            "public_key": reality.public_key,
+            "short_id": reality.short_id.clone().unwrap_or_default(),
+        });
+    }
+
+    tls
 }
 
 fn build_transport(entry: &ClashProxy) -> Value {
@@ -588,6 +965,8 @@ struct ClashProxy {
     cipher: Option<String>,
     #[serde(default)]
     uuid: Option<String>,
+    #[serde(default)]
+    flow: Option<String>,
     #[serde(rename = "alterId", default)]
     alter_id: Option<u32>,
     #[serde(default)]
@@ -612,6 +991,18 @@ struct ClashProxy {
     ws_path: Option<String>,
     #[serde(rename = "ws-headers", default)]
     ws_headers: BTreeMap<String, String>,
+    #[serde(rename = "reality-opts", default)]
+    reality_opts: Option<ClashRealityOpts>,
+    #[serde(rename = "client-fingerprint", default)]
+    client_fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClashRealityOpts {
+    #[serde(rename = "public-key", default)]
+    public_key: Option<String>,
+    #[serde(rename = "short-id", default)]
+    short_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -638,6 +1029,7 @@ fn restore_terminal() -> Result<()> {
 
 fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
+        app.poll_benchmark_updates()?;
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -656,30 +1048,31 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let [main, footer] =
-        Layout::vertical([Constraint::Min(8), Constraint::Length(4)]).areas(frame.area());
-    let [groups_area, members_area] =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(main);
+    let [main, status_area] =
+        Layout::vertical([Constraint::Min(10), Constraint::Length(6)]).areas(frame.area());
+    let [groups_area, members_area, benchmark_area] = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(40),
+        Constraint::Percentage(35),
+    ])
+    .areas(main);
 
     let groups = app
         .groups
         .iter()
         .map(|group| {
-            let current = group.current.as_deref().map_or("unset", |value| value);
+            let current = group
+                .current
+                .as_deref()
+                .map_or(String::from("unset"), ToString::to_string);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    truncate_for_width(
-                        &sanitize_display_text(&group.name),
-                        groups_area.width.saturating_sub(10) as usize,
-                    ),
+                    truncate_for_width(&group.name, groups_area.width.saturating_sub(10) as usize),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    format!(
-                        "[{}]",
-                        truncate_for_width(&sanitize_display_text(current), 14)
-                    ),
+                    format!("[{}]", truncate_for_width(&current, 14)),
                     Style::default().fg(Color::Yellow),
                 ),
             ]))
@@ -697,27 +1090,52 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let mut groups_state = ListState::default().with_selected(Some(app.group_index));
     frame.render_stateful_widget(groups_widget, groups_area, &mut groups_state);
 
+    let displayed_members = app.displayed_members();
     let members = app
         .selected_group()
         .map(|group| {
-            group
-                .members
+            displayed_members
                 .iter()
                 .map(|member| {
                     let is_current = group.current.as_deref() == Some(member.as_str());
-                    let display_member = sanitize_display_text(member);
+                    let bench = app
+                        .selected_benchmark()
+                        .and_then(|summary| summary.find_result(member));
                     let mut style = Style::default();
                     if is_current {
                         style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
                     }
+                    let (marker, marker_style, loading_suffix) = match bench {
+                        Some(result) if !result.completed => (
+                            result.display_delay(),
+                            Style::default()
+                                .fg(Color::LightYellow)
+                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                            "  ⟳",
+                        ),
+                        Some(result) if result.delay.is_some() => (
+                            result.display_delay(),
+                            Style::default().fg(Color::Magenta),
+                            "",
+                        ),
+                        Some(result) => (
+                            result.display_delay(),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            "",
+                        ),
+                        None => ("-".to_string(), Style::default().fg(Color::DarkGray), ""),
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             truncate_for_width(
-                                &display_member,
-                                members_area.width.saturating_sub(8) as usize,
+                                member,
+                                members_area.width.saturating_sub(16) as usize,
                             ),
                             style,
                         ),
+                        Span::raw("  "),
+                        Span::styled(marker, marker_style),
+                        Span::raw(loading_suffix),
                         Span::raw(if is_current { "  *" } else { "" }),
                     ]))
                 })
@@ -727,8 +1145,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let members_title = app
         .selected_group()
-        .map(|group| format!("Candidates for {}", sanitize_display_text(&group.name)))
-        .unwrap_or_else(|| String::from("Candidates"));
+        .map(|group| {
+            format!(
+                "Candidates for {} [{}]",
+                group.name,
+                benchmark_mode_badge(app.latency_sort_mode)
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Candidates [{}]",
+                benchmark_mode_badge(app.latency_sort_mode)
+            )
+        });
     let members_block = Block::default()
         .title(members_title)
         .borders(Borders::ALL)
@@ -737,8 +1166,108 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .block(members_block)
         .highlight_style(selected_style(app.focus == Focus::Members))
         .highlight_symbol("> ");
-    let mut members_state = ListState::default().with_selected(Some(app.member_index));
+    let mut members_state = ListState::default().with_selected(app.displayed_member_index());
     frame.render_stateful_widget(members_widget, members_area, &mut members_state);
+
+    let benchmark_items = app
+        .selected_benchmark()
+        .map(|summary| {
+            let ordered_results = summary.ordered_results(app.latency_sort_mode);
+            ordered_results
+                .iter()
+                .map(|result| {
+                    let is_best = summary
+                        .best_success()
+                        .is_some_and(|best| best.name == result.name);
+                    let (style, delay_style, suffix) = if !result.completed {
+                        (
+                            Style::default()
+                                .fg(Color::LightYellow)
+                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                            Style::default()
+                                .fg(Color::LightYellow)
+                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                            "  ⟳",
+                        )
+                    } else if is_best {
+                        (
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                            "",
+                        )
+                    } else if result.delay.is_none() {
+                        (
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            "",
+                        )
+                    } else {
+                        (Style::default(), Style::default().fg(Color::Yellow), "")
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            truncate_for_width(
+                                &result.name,
+                                benchmark_area.width.saturating_sub(18) as usize,
+                            ),
+                            style,
+                        ),
+                        Span::raw("  "),
+                        Span::styled(result.display_delay(), delay_style),
+                        Span::raw(suffix),
+                    ]))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            vec![ListItem::new(Line::from(
+                "Press b to benchmark selector or t to benchmark one node",
+            ))]
+        });
+
+    let benchmark_title = app.selected_benchmark().map_or_else(
+        || String::from("Benchmark"),
+        |summary| {
+            format!(
+                "Benchmark [{}] /{} [{}]",
+                summary.pattern,
+                summary.results.len(),
+                benchmark_mode_badge(app.latency_sort_mode)
+            )
+        },
+    );
+    let benchmark_widget = List::new(benchmark_items).block(
+        Block::default()
+            .title(benchmark_title)
+            .borders(Borders::ALL)
+            .border_style(border_style(app.focus == Focus::Benchmark)),
+    );
+    frame.render_widget(benchmark_widget, benchmark_area);
+
+    let benchmark_hint = app.selected_benchmark().map_or_else(
+        || {
+            format!(
+                "mode={}  b group benchmark  t node benchmark  s toggle view  / edit filter",
+                benchmark_mode_badge(app.latency_sort_mode)
+            )
+        },
+        |summary| {
+            let best = summary
+                .best_success()
+                .map(|item| format!("best={} {}", item.name, item.display_delay()))
+                .unwrap_or_else(|| "best=none".to_string());
+            format!(
+                "filter='{}'  mode={}  {}",
+                summary.pattern,
+                benchmark_mode_badge(app.latency_sort_mode),
+                truncate_for_width(&best, 30)
+            )
+        },
+    );
 
     let help = Paragraph::new(vec![
         Line::from(vec![
@@ -746,12 +1275,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" move  "),
             Span::styled("Tab/h/l", Style::default().fg(Color::Cyan)),
             Span::raw(" switch pane  "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::styled("Space", Style::default().fg(Color::Cyan)),
             Span::raw(" select  "),
+            Span::styled("b/t", Style::default().fg(Color::Cyan)),
+            Span::raw(" benchmark  "),
+            Span::styled("s", Style::default().fg(Color::Cyan)),
+            Span::raw(" view mode  "),
+            Span::styled("v/V", Style::default().fg(Color::Cyan)),
+            Span::raw(" verify  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" filter  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
             Span::raw(" refresh  "),
-            Span::styled("t", Style::default().fg(Color::Cyan)),
-            Span::raw(" test  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(" quit"),
         ]),
@@ -759,15 +1294,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("Controller: ", Style::default().fg(Color::DarkGray)),
             Span::raw(app.client.base_url.as_str()),
         ]),
+        Line::from(benchmark_hint),
         Line::from(app.status_line()),
     ])
     .block(Block::default().title("Status").borders(Borders::ALL));
-    frame.render_widget(help, footer);
+    frame.render_widget(help, status_area);
 
     if let Some(message) = app.flash_message() {
-        let popup_width = frame.area().width.saturating_sub(8).clamp(40, 96);
-        let popup_height = frame.area().height.saturating_sub(6).clamp(5, 8);
-        let area = centered_rect(popup_width, popup_height, frame.area());
+        let area = centered_rect(80, 7, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
@@ -794,6 +1328,14 @@ fn selected_style(active: bool) -> Style {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
+    }
+}
+
+fn benchmark_mode_badge(latency_sort_mode: bool) -> &'static str {
+    if latency_sort_mode {
+        "LATENCY SORT"
+    } else {
+        "FILTER VIEW"
     }
 }
 
@@ -829,38 +1371,11 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
     output
 }
 
-fn format_error_chain(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(" -> ")
-}
-
-fn sanitize_display_text(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .filter(|ch| !is_problematic_terminal_char(*ch))
-        .collect::<String>();
-    let compact = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() {
-        String::from("<unnamed>")
-    } else {
-        compact
-    }
-}
-
-fn is_problematic_terminal_char(ch: char) -> bool {
-    ch.is_control()
-        || matches!(ch, '\u{200d}' | '\u{fe0f}')
-        || ('\u{1f1e6}'..='\u{1f1ff}').contains(&ch)
-        || ('\u{1f300}'..='\u{1faff}').contains(&ch)
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Focus {
     Groups,
     Members,
+    Benchmark,
 }
 
 struct App {
@@ -871,12 +1386,19 @@ struct App {
     focus: Focus,
     status: String,
     flash: Option<(String, Instant)>,
-    test_url: String,
-    test_timeout_ms: u64,
+    benchmark_filter: String,
+    benchmark_url: String,
+    benchmark_timeout_ms: u64,
+    benchmark_request_timeout: f64,
+    benchmark_max_concurrency: usize,
+    benchmarks: BTreeMap<String, BenchmarkSummary>,
+    benchmark_jobs: Vec<BenchmarkJob>,
+    latency_sort_mode: bool,
+    last_single_node_benchmark: Option<(String, String, Instant)>,
 }
 
 impl App {
-    fn new(client: ApiClient, test_url: String, test_timeout_ms: u64) -> Result<Self> {
+    fn new(client: ApiClient, benchmark_max_concurrency: usize) -> Result<Self> {
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -885,8 +1407,15 @@ impl App {
             focus: Focus::Groups,
             status: String::from("Loading proxy groups..."),
             flash: None,
-            test_url,
-            test_timeout_ms,
+            benchmark_filter: String::from("美国"),
+            benchmark_url: String::from(DEFAULT_DELAY_TEST_URL),
+            benchmark_timeout_ms: 5000,
+            benchmark_request_timeout: 12.0,
+            benchmark_max_concurrency,
+            benchmarks: BTreeMap::new(),
+            benchmark_jobs: Vec::new(),
+            latency_sort_mode: false,
+            last_single_node_benchmark: None,
         };
         app.refresh()?;
         Ok(app)
@@ -894,6 +1423,56 @@ impl App {
 
     fn selected_group(&self) -> Option<&ProxyGroup> {
         self.groups.get(self.group_index)
+    }
+
+    fn selected_benchmark(&self) -> Option<&BenchmarkSummary> {
+        let group = self.selected_group()?;
+        self.benchmarks.get(&group.name)
+    }
+
+    fn displayed_members(&self) -> Vec<String> {
+        let Some(group) = self.selected_group() else {
+            return Vec::new();
+        };
+        let Some(summary) = self.selected_benchmark() else {
+            return group.members.clone();
+        };
+        if !self.latency_sort_mode {
+            return group.members.clone();
+        }
+
+        let mut successes = Vec::new();
+        let mut pending_or_untested = Vec::new();
+        for (index, member) in group.members.iter().enumerate() {
+            match summary.find_result(member) {
+                Some(result) if result.completed && result.delay.is_none() => {}
+                Some(result) if result.completed => {
+                    successes.push((result.delay.unwrap_or(u64::MAX), index, member.clone()))
+                }
+                _ => pending_or_untested.push((index, member.clone())),
+            }
+        }
+        successes.sort_by_key(|(delay, index, _)| (*delay, *index));
+        let mut out = successes
+            .into_iter()
+            .map(|(_, _, member)| member)
+            .collect::<Vec<_>>();
+        out.extend(pending_or_untested.into_iter().map(|(_, member)| member));
+        out
+    }
+
+    fn displayed_member_index(&self) -> Option<usize> {
+        let members = self.displayed_members();
+        let current = self.selected_group()?.members.get(self.member_index)?;
+        members.iter().position(|member| member == current)
+    }
+
+    fn sync_selection_to_member_name(&mut self, name: &str) {
+        if let Some(group) = self.selected_group() {
+            if let Some(index) = group.members.iter().position(|member| member == name) {
+                self.member_index = index;
+            }
+        }
     }
 
     fn status_line(&self) -> String {
@@ -912,57 +1491,36 @@ impl App {
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.focus = match self.focus {
+                    Focus::Groups => Focus::Members,
+                    Focus::Members => Focus::Benchmark,
+                    Focus::Benchmark => Focus::Groups,
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = match self.focus {
+                    Focus::Groups => Focus::Benchmark,
+                    Focus::Members => Focus::Groups,
+                    Focus::Benchmark => Focus::Members,
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_previous(),
             KeyCode::Char('g') => self.move_first(),
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
-            KeyCode::Char('t') => self.test_selection(),
-            KeyCode::Enter => self.activate_selection()?,
+            KeyCode::Char('b') => self.start_group_benchmark()?,
+            KeyCode::Char('t') => self.start_member_benchmark()?,
+            KeyCode::Char('s') => self.toggle_latency_sort_mode(),
+            KeyCode::Char('v') => self.run_verify(false)?,
+            KeyCode::Char('V') => self.run_verify(true)?,
+            KeyCode::Char('/') => self.prompt_benchmark_filter()?,
+            KeyCode::Char(' ') => self.activate_selection()?,
+            KeyCode::Enter => {}
             _ => {}
         }
         Ok(true)
-    }
-
-    fn test_selection(&mut self) {
-        let Some(group) = self.selected_group() else {
-            self.status = String::from("No selector group available to test");
-            self.flash = Some((self.status.clone(), Instant::now()));
-            return;
-        };
-
-        let target = match self.focus {
-            Focus::Groups => group.current.clone().unwrap_or_else(|| group.name.clone()),
-            Focus::Members => group
-                .members
-                .get(self.member_index)
-                .cloned()
-                .or_else(|| group.current.clone())
-                .unwrap_or_else(|| group.name.clone()),
-        };
-
-        match self
-            .client
-            .probe_delay(&target, &self.test_url, self.test_timeout_ms)
-        {
-            Ok(delay_ms) => {
-                self.status = format!(
-                    "Test OK: {} responded in {} ms",
-                    sanitize_display_text(&target),
-                    delay_ms
-                );
-            }
-            Err(error) => {
-                self.status = format!(
-                    "Test failed: {} ({})",
-                    sanitize_display_text(&target),
-                    format_error_chain(&error)
-                );
-            }
-        }
-        self.flash = Some((self.status.clone(), Instant::now()));
     }
 
     fn move_next(&mut self) {
@@ -974,12 +1532,16 @@ impl App {
                 }
             }
             Focus::Members => {
-                if let Some(group) = self.selected_group() {
-                    if self.member_index + 1 < group.members.len() {
-                        self.member_index += 1;
-                    }
+                let members = self.displayed_members();
+                if members.is_empty() {
+                    return;
+                }
+                let current_index = self.displayed_member_index().unwrap_or(0);
+                if current_index + 1 < members.len() {
+                    self.sync_selection_to_member_name(&members[current_index + 1]);
                 }
             }
+            Focus::Benchmark => {}
         }
     }
 
@@ -992,10 +1554,16 @@ impl App {
                 }
             }
             Focus::Members => {
-                if self.member_index > 0 {
-                    self.member_index -= 1;
+                let members = self.displayed_members();
+                if members.is_empty() {
+                    return;
+                }
+                let current_index = self.displayed_member_index().unwrap_or(0);
+                if current_index > 0 {
+                    self.sync_selection_to_member_name(&members[current_index - 1]);
                 }
             }
+            Focus::Benchmark => {}
         }
     }
 
@@ -1005,7 +1573,12 @@ impl App {
                 self.group_index = 0;
                 self.sync_member_selection_to_current();
             }
-            Focus::Members => self.member_index = 0,
+            Focus::Members => {
+                if let Some(first) = self.displayed_members().first().cloned() {
+                    self.sync_selection_to_member_name(&first);
+                }
+            }
+            Focus::Benchmark => {}
         }
     }
 
@@ -1018,12 +1591,11 @@ impl App {
                 }
             }
             Focus::Members => {
-                if let Some(group) = self.selected_group() {
-                    if !group.members.is_empty() {
-                        self.member_index = group.members.len() - 1;
-                    }
+                if let Some(last) = self.displayed_members().last().cloned() {
+                    self.sync_selection_to_member_name(&last);
                 }
             }
+            Focus::Benchmark => {}
         }
     }
 
@@ -1076,6 +1648,287 @@ impl App {
                 .unwrap_or(0);
         self.member_index = next_index;
     }
+
+    fn start_group_benchmark(&mut self) -> Result<()> {
+        let Some(group) = self.selected_group().cloned() else {
+            bail!("no selector group available");
+        };
+        if self
+            .benchmark_jobs
+            .iter()
+            .any(|job| job.group == group.name)
+        {
+            self.status = format!("Benchmark already running for {}", group.name);
+            self.flash = Some((self.status.clone(), Instant::now()));
+            return Ok(());
+        }
+        let request = BenchmarkRequest {
+            selector: group.name.clone(),
+            pattern: self.benchmark_filter.clone(),
+            url: self.benchmark_url.clone(),
+            timeout_ms: self.benchmark_timeout_ms,
+            request_timeout: self.benchmark_request_timeout,
+            max_concurrency: self.benchmark_max_concurrency,
+            nodes: None,
+        };
+        let candidate_names = self.client.fetch_benchmark_candidates(&request)?;
+        if candidate_names.is_empty() {
+            self.status = format!(
+                "No nodes in {} matched filter '{}'",
+                group.name, self.benchmark_filter
+            );
+            self.flash = Some((self.status.clone(), Instant::now()));
+            return Ok(());
+        }
+        self.prepare_group_benchmark(&group.name, candidate_names.clone());
+        self.spawn_benchmark_job(
+            group.name.clone(),
+            candidate_names,
+            request,
+            BenchmarkJobKind::Group,
+        );
+        self.focus = Focus::Benchmark;
+        self.status = format!(
+            "Benchmarking {} with filter '{}' in background (max {} concurrent)...",
+            group.name, self.benchmark_filter, self.benchmark_max_concurrency
+        );
+        Ok(())
+    }
+
+    fn start_member_benchmark(&mut self) -> Result<()> {
+        let Some(group) = self.selected_group().cloned() else {
+            bail!("no selector group available");
+        };
+        let Some(member) = group.members.get(self.member_index).cloned() else {
+            bail!("no proxy available in selected group");
+        };
+        if let Some((last_group, last_member, last_started)) = &self.last_single_node_benchmark {
+            if last_group == &group.name
+                && last_member == &member
+                && last_started.elapsed() < SINGLE_NODE_RETEST_DEBOUNCE
+            {
+                self.status = format!(
+                    "Ignoring repeated retest for {} / {} (debounced)",
+                    group.name, member
+                );
+                self.flash = Some((self.status.clone(), Instant::now()));
+                return Ok(());
+            }
+        }
+        if self
+            .benchmark_jobs
+            .iter()
+            .any(|job| job.group == group.name && job.nodes.iter().any(|node| node == &member))
+        {
+            self.status = format!("Benchmark already running for {} / {}", group.name, member);
+            self.flash = Some((self.status.clone(), Instant::now()));
+            return Ok(());
+        }
+        let request = BenchmarkRequest {
+            selector: group.name.clone(),
+            pattern: self.benchmark_filter.clone(),
+            url: self.benchmark_url.clone(),
+            timeout_ms: self.benchmark_timeout_ms,
+            request_timeout: self.benchmark_request_timeout,
+            max_concurrency: 1,
+            nodes: Some(vec![member.clone()]),
+        };
+        self.prepare_node_benchmark(&group.name, &member);
+        self.spawn_benchmark_job(
+            group.name.clone(),
+            vec![member.clone()],
+            request,
+            BenchmarkJobKind::SingleNode {
+                node: member.clone(),
+            },
+        );
+        self.last_single_node_benchmark =
+            Some((group.name.clone(), member.clone(), Instant::now()));
+        self.status = format!("Benchmarking {} / {} in background...", group.name, member);
+        Ok(())
+    }
+
+    fn prepare_group_benchmark(&mut self, group: &str, candidates: Vec<String>) {
+        let summary = self
+            .benchmarks
+            .entry(group.to_string())
+            .or_insert_with(|| BenchmarkSummary::empty(group.to_string()));
+        summary.selector = group.to_string();
+        summary.pattern = self.benchmark_filter.clone();
+        summary.url = self.benchmark_url.clone();
+        summary.timeout_ms = self.benchmark_timeout_ms;
+        summary.max_concurrency = self.benchmark_max_concurrency.max(1);
+        for name in candidates {
+            summary.upsert_pending(name);
+        }
+    }
+
+    fn prepare_node_benchmark(&mut self, group: &str, node: &str) {
+        let summary = self
+            .benchmarks
+            .entry(group.to_string())
+            .or_insert_with(|| BenchmarkSummary::empty(group.to_string()));
+        summary.selector = group.to_string();
+        summary.pattern = self.benchmark_filter.clone();
+        summary.url = self.benchmark_url.clone();
+        summary.timeout_ms = self.benchmark_timeout_ms;
+        summary.max_concurrency = 1;
+        summary.upsert_pending(node.to_string());
+    }
+
+    fn spawn_benchmark_job(
+        &mut self,
+        group: String,
+        nodes: Vec<String>,
+        request: BenchmarkRequest,
+        kind: BenchmarkJobKind,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_benchmark_worker(
+            self.client.base_url.clone(),
+            self.client.client.clone(),
+            request,
+            tx,
+        );
+        self.benchmark_jobs.push(BenchmarkJob {
+            group,
+            nodes,
+            kind,
+            receiver: rx,
+            worker,
+        });
+    }
+
+    fn toggle_latency_sort_mode(&mut self) {
+        self.latency_sort_mode = !self.latency_sort_mode;
+        self.status = if self.latency_sort_mode {
+            "View mode: LATENCY SORT (hide failed-tested nodes, sort successful nodes by delay)"
+                .to_string()
+        } else {
+            "View mode: FILTER VIEW (original selector order with current filter)".to_string()
+        };
+        self.flash = Some((self.status.clone(), Instant::now()));
+    }
+
+    fn poll_benchmark_updates(&mut self) -> Result<()> {
+        let mut finished_indexes = Vec::new();
+
+        for index in 0..self.benchmark_jobs.len() {
+            let mut finished = false;
+            loop {
+                match self.benchmark_jobs[index].receiver.try_recv() {
+                    Ok(BenchmarkEvent::Progress(result)) => {
+                        if let Some(summary) =
+                            self.benchmarks.get_mut(&self.benchmark_jobs[index].group)
+                        {
+                            summary.update_result(result);
+                            self.status = format!(
+                                "Benchmarking {}... best so far: {}",
+                                self.benchmark_jobs[index].group,
+                                summary.best_label()
+                            );
+                        }
+                    }
+                    Ok(BenchmarkEvent::Finished) => {
+                        finished = true;
+                        let group = self.benchmark_jobs[index].group.clone();
+                        let kind = self.benchmark_jobs[index].kind.clone();
+                        if let Some(summary) = self.benchmarks.get(&group) {
+                            match kind {
+                                BenchmarkJobKind::Group => {
+                                    if let Some(best) = summary.best_success() {
+                                        self.status = format!(
+                                            "Benchmarked {}: best is {} ({})",
+                                            group,
+                                            best.name,
+                                            best.display_delay()
+                                        );
+                                    } else {
+                                        self.status = format!(
+                                            "Benchmarked {} but no healthy node matched",
+                                            group
+                                        );
+                                    }
+                                }
+                                BenchmarkJobKind::SingleNode { node } => {
+                                    let result = summary.find_result(&node);
+                                    self.status = match result {
+                                        Some(result) if result.delay.is_some() => format!(
+                                            "Benchmarked {} / {}: {}",
+                                            group,
+                                            node,
+                                            result.display_delay()
+                                        ),
+                                        Some(_) => {
+                                            format!("Benchmarked {} / {}: failed", group, node)
+                                        }
+                                        None => {
+                                            format!("Benchmark finished for {} / {}", group, node)
+                                        }
+                                    };
+                                }
+                            }
+                            self.flash = Some((self.status.clone(), Instant::now()));
+                        }
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        self.status = format!(
+                            "Benchmark worker for {} disconnected",
+                            self.benchmark_jobs[index].group
+                        );
+                        self.flash = Some((self.status.clone(), Instant::now()));
+                        break;
+                    }
+                }
+            }
+            if finished {
+                finished_indexes.push(index);
+            }
+        }
+
+        for index in finished_indexes.into_iter().rev() {
+            let job = self.benchmark_jobs.swap_remove(index);
+            let _ = job.worker.join();
+        }
+
+        Ok(())
+    }
+
+    fn run_verify(&mut self, include_discord: bool) -> Result<()> {
+        self.status = if include_discord {
+            "Running verification (google/github/discord)...".to_string()
+        } else {
+            "Running verification (google/github)...".to_string()
+        };
+        let report = run_verification(include_discord);
+        let summary = report.summary_line();
+        self.status = summary.clone();
+        self.flash = Some((summary, Instant::now()));
+        Ok(())
+    }
+
+    fn prompt_benchmark_filter(&mut self) -> Result<()> {
+        restore_terminal()?;
+        println!(
+            "Enter benchmark substring filter (current: {}): ",
+            self.benchmark_filter
+        );
+        let mut buffer = String::new();
+        io::stdin()
+            .read_line(&mut buffer)
+            .context("failed to read benchmark filter from stdin")?;
+        let value = buffer.trim();
+        setup_terminal()?;
+        if !value.is_empty() {
+            self.benchmark_filter = value.to_string();
+            self.status = format!("Benchmark filter set to '{}'", self.benchmark_filter);
+            self.flash = Some((self.status.clone(), Instant::now()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1087,7 +1940,8 @@ struct ProxyGroup {
 
 struct ApiClient {
     base_url: String,
-    client: Client,
+    runtime: TokioRuntime,
+    client: AsyncClient,
 }
 
 impl ApiClient {
@@ -1100,28 +1954,37 @@ impl ApiClient {
                     .context("invalid SING_BOX_SECRET header value")?,
             );
         }
-        let client = Client::builder()
+        let runtime = TokioRuntimeBuilder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to build Tokio runtime for API client")?;
+        let client = AsyncClient::builder()
             .default_headers(headers)
             .build()
-            .context("failed to build HTTP client")?;
+            .context("failed to build async HTTP client")?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            runtime,
             client,
         })
     }
 
     fn fetch_selector_groups(&self) -> Result<Vec<ProxyGroup>> {
-        let response = self
+        self.runtime.block_on(self.fetch_selector_groups_async())
+    }
+
+    async fn fetch_selector_groups_async(&self) -> Result<Vec<ProxyGroup>> {
+        let payload: ProxiesResponse = self
             .client
             .get(format!("{}/proxies", self.base_url))
             .send()
+            .await
             .context("failed to query Clash API /proxies")?
             .error_for_status()
-            .context("Clash API /proxies returned an error")?;
-
-        let payload: ProxiesResponse = response
+            .context("Clash API /proxies returned an error")?
             .json()
+            .await
             .context("failed to decode Clash API /proxies response")?;
 
         let mut groups = payload
@@ -1139,7 +2002,119 @@ impl ApiClient {
         Ok(groups)
     }
 
+    async fn fetch_selector_async(&self, selector: &str) -> Result<ProxyNode> {
+        let encoded = encode(selector);
+        self.client
+            .get(format!("{}/proxies/{}", self.base_url, encoded))
+            .send()
+            .await
+            .with_context(|| format!("failed to query Clash API selector {selector}"))?
+            .error_for_status()
+            .with_context(|| format!("Clash API rejected selector read for {selector}"))?
+            .json()
+            .await
+            .context("failed to decode Clash API selector response")
+    }
+
+    fn benchmark_selector(&self, request: &BenchmarkRequest) -> Result<BenchmarkSummary> {
+        self.runtime
+            .block_on(self.benchmark_selector_async(request))
+    }
+
+    fn fetch_benchmark_candidates(&self, request: &BenchmarkRequest) -> Result<Vec<String>> {
+        self.runtime
+            .block_on(self.fetch_benchmark_candidates_async(request))
+    }
+
+    async fn fetch_benchmark_candidates_async(
+        &self,
+        request: &BenchmarkRequest,
+    ) -> Result<Vec<String>> {
+        let selector = self.fetch_selector_async(&request.selector).await?;
+        Ok(filter_benchmark_candidates(&selector.all, request))
+    }
+
+    async fn benchmark_selector_async(
+        &self,
+        request: &BenchmarkRequest,
+    ) -> Result<BenchmarkSummary> {
+        let selector = self.fetch_selector_async(&request.selector).await?;
+        let current = selector.now;
+        let candidates = filter_benchmark_candidates(&selector.all, request);
+
+        if candidates.is_empty() {
+            return Ok(BenchmarkSummary {
+                selector: request.selector.clone(),
+                current,
+                pattern: request.pattern.clone(),
+                url: request.url.clone(),
+                timeout_ms: request.timeout_ms,
+                max_concurrency: request.max_concurrency,
+                results: Vec::new(),
+            });
+        }
+
+        let base_url = self.base_url.clone();
+        let client = self.client.clone();
+        let url = request.url.clone();
+        let timeout_ms = request.timeout_ms;
+        let request_timeout = request.request_timeout;
+
+        let max_concurrency = request.max_concurrency.max(1);
+        let mut results = {
+            let mut tasks = JoinSet::new();
+            let mut pending = candidates.into_iter();
+
+            for _ in 0..max_concurrency {
+                let Some(name) = pending.next() else {
+                    break;
+                };
+                spawn_benchmark_task(
+                    &mut tasks,
+                    client.clone(),
+                    base_url.clone(),
+                    name,
+                    url.clone(),
+                    timeout_ms,
+                    request_timeout,
+                );
+            }
+
+            let mut results = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                results.push(result.expect("benchmark worker panicked"));
+                if let Some(name) = pending.next() {
+                    spawn_benchmark_task(
+                        &mut tasks,
+                        client.clone(),
+                        base_url.clone(),
+                        name,
+                        url.clone(),
+                        timeout_ms,
+                        request_timeout,
+                    );
+                }
+            }
+            results
+        };
+        results.sort_by_key(|item| (item.delay.is_none(), item.delay.unwrap_or(u64::MAX)));
+
+        Ok(BenchmarkSummary {
+            selector: request.selector.clone(),
+            current,
+            pattern: request.pattern.clone(),
+            url: request.url.clone(),
+            timeout_ms: request.timeout_ms,
+            max_concurrency,
+            results,
+        })
+    }
+
     fn switch_proxy(&self, group: &str, proxy: &str) -> Result<()> {
+        self.runtime.block_on(self.switch_proxy_async(group, proxy))
+    }
+
+    async fn switch_proxy_async(&self, group: &str, proxy: &str) -> Result<()> {
         let encoded_group = encode(group);
         self.client
             .put(format!("{}/proxies/{}", self.base_url, encoded_group))
@@ -1147,48 +2122,166 @@ impl ApiClient {
                 name: proxy.to_string(),
             })
             .send()
+            .await
             .with_context(|| format!("failed to send switch request for {group}"))?
             .error_for_status()
             .with_context(|| format!("controller rejected switch request for {group}"))?;
         Ok(())
     }
+}
 
-    fn probe_delay(&self, proxy: &str, test_url: &str, timeout_ms: u64) -> Result<u64> {
-        let encoded_proxy = encode(proxy);
-        let encoded_url = encode(test_url);
-        let response = self
-            .client
-            .get(format!(
-                "{}/proxies/{}/delay?timeout={}&url={}",
-                self.base_url, encoded_proxy, timeout_ms, encoded_url
-            ))
-            .send()
-            .with_context(|| format!("failed to test proxy {proxy}"))?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|json| {
-                    json.get("message")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| {
-                    if body.is_empty() {
-                        status.to_string()
-                    } else {
-                        body
-                    }
-                });
-            bail!("{message}");
-        }
-
-        let body = response.text().context("failed to read delay probe response")?;
-        parse_delay_ms(&body)
+fn filter_benchmark_candidates(all: &[String], request: &BenchmarkRequest) -> Vec<String> {
+    if let Some(nodes) = &request.nodes {
+        let wanted = nodes.iter().collect::<std::collections::BTreeSet<_>>();
+        all.iter()
+            .filter(|name| wanted.contains(name))
+            .cloned()
+            .collect()
+    } else {
+        all.iter()
+            .filter(|name| name.contains(&request.pattern))
+            .cloned()
+            .collect()
     }
+}
+
+fn spawn_benchmark_worker(
+    base_url: String,
+    client: AsyncClient,
+    request: BenchmarkRequest,
+    tx: Sender<BenchmarkEvent>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let runtime = match TokioRuntimeBuilder::new_multi_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = tx.send(BenchmarkEvent::Finished);
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let selector_name = request.selector.clone();
+            let selector =
+                match fetch_selector_for_benchmark(&client, &base_url, &selector_name).await {
+                    Ok(selector) => selector,
+                    Err(_) => {
+                        let _ = tx.send(BenchmarkEvent::Finished);
+                        return;
+                    }
+                };
+
+            let candidates = filter_benchmark_candidates(&selector.all, &request);
+
+            let max_concurrency = request.max_concurrency.max(1);
+            let mut tasks = JoinSet::new();
+            let mut pending = candidates.into_iter();
+
+            for _ in 0..max_concurrency {
+                let Some(name) = pending.next() else {
+                    break;
+                };
+                spawn_benchmark_task(
+                    &mut tasks,
+                    client.clone(),
+                    base_url.clone(),
+                    name,
+                    request.url.clone(),
+                    request.timeout_ms,
+                    request.request_timeout,
+                );
+            }
+
+            while let Some(result) = tasks.join_next().await {
+                if let Ok(result) = result {
+                    let _ = tx.send(BenchmarkEvent::Progress(result));
+                }
+                if let Some(name) = pending.next() {
+                    spawn_benchmark_task(
+                        &mut tasks,
+                        client.clone(),
+                        base_url.clone(),
+                        name,
+                        request.url.clone(),
+                        request.timeout_ms,
+                        request.request_timeout,
+                    );
+                }
+            }
+
+            let _ = tx.send(BenchmarkEvent::Finished);
+        });
+    })
+}
+
+async fn fetch_selector_for_benchmark(
+    client: &AsyncClient,
+    base_url: &str,
+    selector: &str,
+) -> Result<ProxyNode> {
+    let encoded = encode(selector);
+    client
+        .get(format!("{}/proxies/{}", base_url, encoded))
+        .send()
+        .await
+        .with_context(|| format!("failed to query Clash API selector {selector}"))?
+        .error_for_status()
+        .with_context(|| format!("Clash API rejected selector read for {selector}"))?
+        .json()
+        .await
+        .context("failed to decode Clash API selector response")
+}
+
+fn spawn_benchmark_task(
+    tasks: &mut JoinSet<BenchmarkResult>,
+    client: AsyncClient,
+    base_url: String,
+    name: String,
+    url: String,
+    timeout_ms: u64,
+    request_timeout: f64,
+) {
+    tasks.spawn(async move {
+        let delay = measure_delay(
+            client,
+            base_url,
+            name.clone(),
+            url,
+            timeout_ms,
+            request_timeout,
+        )
+        .await;
+        BenchmarkResult {
+            name,
+            delay,
+            completed: true,
+        }
+    });
+}
+
+async fn measure_delay(
+    client: AsyncClient,
+    base_url: String,
+    proxy_name: String,
+    url: String,
+    timeout_ms: u64,
+    request_timeout: f64,
+) -> Option<u64> {
+    let encoded_name = encode(&proxy_name);
+    let encoded_url = encode(&url);
+    let response = client
+        .get(format!(
+            "{}/proxies/{}/delay?timeout={}&url={}",
+            base_url, encoded_name, timeout_ms, encoded_url
+        ))
+        .timeout(Duration::from_secs_f64(request_timeout))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let payload: DelayResponse = response.json().await.ok()?;
+    payload.delay
 }
 
 #[derive(Deserialize)]
@@ -1207,31 +2300,414 @@ struct ProxyNode {
     all: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct DelayResponse {
+    #[serde(default)]
+    delay: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct SwitchProxyRequest {
     name: String,
 }
 
-fn parse_delay_ms(body: &str) -> Result<u64> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!("empty delay response");
+struct BenchmarkOptions {
+    controller: Option<String>,
+    selector: String,
+    pattern: String,
+    url: String,
+    timeout_ms: u64,
+    request_timeout: f64,
+    max_concurrency: usize,
+    switch: bool,
+    verify: bool,
+    verify_discord: bool,
+}
+
+struct BenchmarkRequest {
+    selector: String,
+    pattern: String,
+    url: String,
+    timeout_ms: u64,
+    request_timeout: f64,
+    max_concurrency: usize,
+    nodes: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BenchmarkResult {
+    name: String,
+    delay: Option<u64>,
+    #[serde(skip)]
+    completed: bool,
+}
+
+impl BenchmarkResult {
+    fn display_delay(&self) -> String {
+        match (self.delay, self.completed) {
+            (Some(delay), _) => format!("{delay}ms"),
+            (None, false) => "...".to_string(),
+            (None, true) => "fail".to_string(),
+        }
     }
-    if let Ok(value) = trimmed.parse::<u64>() {
-        return Ok(value);
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkSummary {
+    selector: String,
+    current: Option<String>,
+    pattern: String,
+    url: String,
+    timeout_ms: u64,
+    max_concurrency: usize,
+    results: Vec<BenchmarkResult>,
+}
+
+#[derive(Clone)]
+enum BenchmarkJobKind {
+    Group,
+    SingleNode { node: String },
+}
+
+struct BenchmarkJob {
+    group: String,
+    nodes: Vec<String>,
+    kind: BenchmarkJobKind,
+    receiver: Receiver<BenchmarkEvent>,
+    worker: JoinHandle<()>,
+}
+
+enum BenchmarkEvent {
+    Progress(BenchmarkResult),
+    Finished,
+}
+
+impl BenchmarkSummary {
+    fn empty(selector: String) -> Self {
+        Self {
+            selector,
+            current: None,
+            pattern: String::new(),
+            url: String::new(),
+            timeout_ms: 0,
+            max_concurrency: 1,
+            results: Vec::new(),
+        }
     }
 
-    let json: Value = serde_json::from_str(trimmed).context("invalid delay response")?;
-    if let Some(delay) = json.get("delay").and_then(Value::as_u64) {
-        return Ok(delay);
+    fn upsert_pending(&mut self, name: String) {
+        if let Some(existing) = self.results.iter_mut().find(|item| item.name == name) {
+            existing.delay = None;
+            existing.completed = false;
+        } else {
+            self.results.push(BenchmarkResult {
+                name,
+                delay: None,
+                completed: false,
+            });
+        }
     }
-    bail!("delay missing from response");
+
+    fn update_result(&mut self, result: BenchmarkResult) {
+        if let Some(existing) = self
+            .results
+            .iter_mut()
+            .find(|item| item.name == result.name)
+        {
+            *existing = result;
+        } else {
+            self.results.push(result);
+        }
+    }
+
+    fn best_label(&self) -> String {
+        self.best_success()
+            .map(|item| format!("{} ({})", item.name, item.display_delay()))
+            .unwrap_or_else(|| "pending".to_string())
+    }
+
+    fn best_success(&self) -> Option<&BenchmarkResult> {
+        self.results
+            .iter()
+            .filter(|item| item.completed)
+            .filter_map(|item| item.delay.map(|delay| (item, delay)))
+            .min_by_key(|(_, delay)| *delay)
+            .map(|(item, _)| item)
+    }
+
+    fn find_result(&self, name: &str) -> Option<&BenchmarkResult> {
+        self.results.iter().find(|item| item.name == name)
+    }
+    fn ordered_results(&self, latency_sort_mode: bool) -> Vec<&BenchmarkResult> {
+        let mut results = self.results.iter().collect::<Vec<_>>();
+        if latency_sort_mode {
+            results.retain(|item| !(item.completed && item.delay.is_none()));
+            results.sort_by_key(|item| {
+                if item.completed {
+                    (
+                        0_u8,
+                        item.delay.unwrap_or(u64::MAX),
+                        0_usize,
+                        item.name.as_str(),
+                    )
+                } else {
+                    (1_u8, u64::MAX, 0_usize, item.name.as_str())
+                }
+            });
+        }
+        results
+    }
+}
+
+#[derive(Serialize)]
+struct BenchmarkOutput {
+    selector: String,
+    current: Option<String>,
+    pattern: String,
+    test_url: String,
+    timeout_ms: u64,
+    max_concurrency: usize,
+    results: Vec<BenchmarkResult>,
+    best: Option<BenchmarkResult>,
+    switched: bool,
+    final_node: Option<String>,
+    verification: Option<VerificationReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ShellCheck {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl ShellCheck {
+    fn ok(&self) -> bool {
+        self.code == 0
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct VerificationReport {
+    google_v4: ShellCheck,
+    github: ShellCheck,
+    discord_gateway_rest: Option<ShellCheck>,
+    discord_gateway_logs: Option<ShellCheck>,
+}
+
+impl VerificationReport {
+    fn summary_line(&self) -> String {
+        let mut parts = vec![
+            format!("google={}", if self.google_v4.ok() { "ok" } else { "fail" }),
+            format!("github={}", if self.github.ok() { "ok" } else { "fail" }),
+        ];
+        if let Some(rest) = &self.discord_gateway_rest {
+            parts.push(format!(
+                "discord_rest={}",
+                if rest.ok() { "ok" } else { "fail" }
+            ));
+        }
+        if let Some(logs) = &self.discord_gateway_logs {
+            parts.push(format!(
+                "discord_logs={}",
+                if logs.ok() { "hits" } else { "clean/none" }
+            ));
+        }
+        format!("Verification: {}", parts.join("  "))
+    }
+}
+
+fn run_verification(include_discord: bool) -> VerificationReport {
+    let google_v4 =
+        run_http_verification("https://www.google.com", true, 5, Some(("accept", "*/*")));
+    let github = run_http_verification("https://github.com", false, 5, Some(("accept", "*/*")));
+    let discord_gateway_rest = include_discord.then(|| {
+        run_http_verification(
+            "https://discord.com/api/v10/gateway",
+            false,
+            8,
+            Some(("accept", "application/json")),
+        )
+    });
+    let discord_gateway_logs = include_discord.then(run_journalctl_verification);
+
+    VerificationReport {
+        google_v4,
+        github,
+        discord_gateway_rest,
+        discord_gateway_logs,
+    }
+}
+
+fn run_http_verification(
+    url: &str,
+    force_ipv4: bool,
+    max_lines: usize,
+    extra_header: Option<(&str, &str)>,
+) -> ShellCheck {
+    let runtime = match TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ShellCheck {
+                code: -1,
+                stdout: String::new(),
+                stderr: format!("failed to build Tokio runtime for verification: {error}"),
+            };
+        }
+    };
+
+    runtime.block_on(async move {
+        let mut builder = AsyncClient::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(12))
+            .user_agent("sing-box-tui/0.1 verification");
+        if force_ipv4 {
+            builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        }
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                return ShellCheck {
+                    code: -1,
+                    stdout: String::new(),
+                    stderr: format!("failed to build verification HTTP client: {error}"),
+                };
+            }
+        };
+
+        let mut request = client.head(url);
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
+
+        match request.send().await {
+            Ok(response) => ShellCheck {
+                code: if response.status().is_success() { 0 } else { 1 },
+                stdout: format_response_head(&response, max_lines),
+                stderr: String::new(),
+            },
+            Err(error) => ShellCheck {
+                code: 1,
+                stdout: String::new(),
+                stderr: error.to_string(),
+            },
+        }
+    })
+}
+
+fn format_response_head(response: &reqwest::Response, max_lines: usize) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} {} {}",
+        format_http_version(response.version()),
+        response.status().as_u16(),
+        response.status().canonical_reason().unwrap_or("")
+    ));
+    for (name, value) in response.headers() {
+        let value = value.to_str().unwrap_or("<binary>");
+        lines.push(format!("{}: {}", name.as_str(), value));
+    }
+    lines
+        .into_iter()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/?",
+    }
+}
+
+fn run_journalctl_verification() -> ShellCheck {
+    let runtime = match TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ShellCheck {
+                code: -1,
+                stdout: String::new(),
+                stderr: format!(
+                    "failed to build Tokio runtime for journalctl verification: {error}"
+                ),
+            };
+        }
+    };
+
+    runtime.block_on(async move {
+        match TokioCommand::new("journalctl")
+            .args([
+                "--user",
+                "-u",
+                "openclaw-gateway",
+                "--since",
+                "5 min ago",
+                "--no-pager",
+                "-l",
+            ])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if !output.status.success() {
+                    return ShellCheck {
+                        code: output.status.code().unwrap_or(-1),
+                        stdout: String::new(),
+                        stderr,
+                    };
+                }
+
+                let patterns = [
+                    "discord",
+                    "1006",
+                    "econnreset",
+                    "fetch failed",
+                    "gateway error",
+                ];
+                let lines = String::from_utf8_lossy(&output.stdout);
+                let matched = lines
+                    .lines()
+                    .filter(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        patterns.iter().any(|pattern| lower.contains(pattern))
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let start = matched.len().saturating_sub(40);
+
+                ShellCheck {
+                    code: if matched.is_empty() { 1 } else { 0 },
+                    stdout: matched[start..].join("\n"),
+                    stderr,
+                }
+            }
+            Err(error) => ShellCheck {
+                code: -1,
+                stdout: String::new(),
+                stderr: error.to_string(),
+            },
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_default_config, merge_into_existing_config, parse_delay_ms, sanitize_display_text,
+        BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, CliCommand,
+        DEFAULT_BENCHMARK_MAX_CONCURRENCY, build_default_config, merge_into_existing_config,
         truncate_for_width,
     };
     use serde_json::{Value, json};
@@ -1241,16 +2717,6 @@ mod tests {
         let truncated = truncate_for_width("手动选择-自动选择-节点A", 8);
         assert!(truncated.ends_with('…'));
         assert!(!truncated.is_empty());
-    }
-
-    #[test]
-    fn strips_flag_emoji_for_terminal_safe_display() {
-        assert_eq!(sanitize_display_text("🇺🇸美国光速1"), "美国光速1");
-    }
-
-    #[test]
-    fn parses_json_delay_response() {
-        assert_eq!(parse_delay_ms("{\"delay\":123}").unwrap(), 123);
     }
 
     #[test]
@@ -1293,16 +2759,6 @@ mod tests {
             }],
             "route": {
                 "final": "existing-node",
-            },
-            "experimental": {
-                "clash_api": {
-                    "external_controller": "127.0.0.1:9090",
-                    "external_ui": "ui",
-                    "external_ui_download_url": "https://example.com/ui.zip",
-                    "external_ui_download_detour": "direct",
-                    "default_mode": "rule",
-                    "secret": "top-secret"
-                }
             }
         });
 
@@ -1315,6 +2771,7 @@ mod tests {
                 "server_port": 443,
                 "password": "secret",
             })],
+            false,
         )
         .expect("merge succeeds");
 
@@ -1329,20 +2786,174 @@ mod tests {
         assert!(members.contains(&Value::String("node-a".to_string())));
         assert_eq!(config["route"]["final"], "existing-node");
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
-        let clash_api = config["experimental"]["clash_api"]
-            .as_object()
-            .expect("clash_api object");
-        assert_eq!(
-            clash_api.get("external_controller"),
-            Some(&Value::String("127.0.0.1:9090".to_string()))
-        );
-        assert_eq!(
-            clash_api.get("secret"),
-            Some(&Value::String("top-secret".to_string()))
-        );
-        assert!(!clash_api.contains_key("external_ui"));
-        assert!(!clash_api.contains_key("external_ui_download_url"));
-        assert!(!clash_api.contains_key("external_ui_download_detour"));
-        assert!(!clash_api.contains_key("default_mode"));
+    }
+
+    #[test]
+    fn replace_nodes_removes_existing_node_outbounds_but_keeps_special_ones() {
+        let mut config = json!({
+            "outbounds": [{
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["old-node"],
+                "default": "old-node"
+            }, {
+                "type": "urltest",
+                "tag": "auto",
+                "outbounds": ["old-node"],
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "10m"
+            }, {
+                "type": "trojan",
+                "tag": "old-node",
+                "server": "old.example.com",
+                "server_port": 443,
+                "password": "secret"
+            }, {
+                "type": "direct",
+                "tag": "direct"
+            }],
+            "route": {
+                "final": "select"
+            }
+        });
+
+        merge_into_existing_config(
+            &mut config,
+            vec![json!({
+                "type": "vless",
+                "tag": "new-node",
+                "server": "new.example.com",
+                "server_port": 443,
+                "uuid": "abc"
+            })],
+            true,
+        )
+        .expect("replace succeeds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        assert!(!outbounds.iter().any(|value| value["tag"] == "old-node"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "new-node"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "select"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "auto"));
+        assert!(outbounds.iter().any(|value| value["tag"] == "direct"));
+
+        let select = outbounds
+            .iter()
+            .find(|value| value["tag"] == "select")
+            .expect("select outbound");
+        let members = select["outbounds"].as_array().expect("selector members");
+        assert!(!members.contains(&Value::String("old-node".to_string())));
+        assert!(members.contains(&Value::String("auto".to_string())));
+        assert!(members.contains(&Value::String("new-node".to_string())));
+    }
+
+    #[test]
+    fn benchmark_summary_picks_lowest_successful_delay() {
+        let summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("node-b".to_string()),
+            pattern: "美国".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: DEFAULT_BENCHMARK_MAX_CONCURRENCY,
+            results: vec![
+                BenchmarkResult {
+                    name: "node-a".to_string(),
+                    delay: Some(100),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "node-b".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "node-c".to_string(),
+                    delay: None,
+                    completed: true,
+                },
+            ],
+        };
+
+        let best = summary.best_success().expect("best result");
+        assert_eq!(best.name, "node-b");
+        assert_eq!(best.delay, Some(80));
+    }
+
+    #[test]
+    fn benchmark_command_defaults_max_concurrency() {
+        let command = CliCommand::parse([
+            "benchmark".to_string(),
+            "--selector".to_string(),
+            "select".to_string(),
+        ])
+        .expect("benchmark command parses");
+
+        match command {
+            CliCommand::Benchmark {
+                max_concurrency, ..
+            } => {
+                assert_eq!(max_concurrency, DEFAULT_BENCHMARK_MAX_CONCURRENCY);
+            }
+            _ => panic!("expected benchmark command"),
+        }
+    }
+
+    #[test]
+    fn run_command_accepts_max_concurrency() {
+        let command = CliCommand::parse([
+            "run".to_string(),
+            "--max-concurrency".to_string(),
+            "7".to_string(),
+        ])
+        .expect("run command parses");
+
+        match command {
+            CliCommand::Run {
+                max_concurrency, ..
+            } => {
+                assert_eq!(max_concurrency, Some(7));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn benchmark_output_serializes_max_concurrency() {
+        let output = BenchmarkOutput {
+            selector: "select".to_string(),
+            current: Some("node-a".to_string()),
+            pattern: "美国".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 7,
+            results: vec![BenchmarkResult {
+                name: "node-a".to_string(),
+                delay: Some(42),
+                completed: true,
+            }],
+            best: None,
+            switched: false,
+            final_node: Some("node-a".to_string()),
+            verification: None,
+        };
+
+        let json = serde_json::to_value(output).expect("serialize benchmark output");
+        assert_eq!(json["max_concurrency"], 7);
+    }
+
+    #[test]
+    fn benchmark_request_carries_max_concurrency() {
+        let request = BenchmarkRequest {
+            selector: "select".to_string(),
+            pattern: "美国".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            request_timeout: 12.0,
+            max_concurrency: 3,
+            nodes: None,
+        };
+
+        assert_eq!(request.max_concurrency, 3);
     }
 }

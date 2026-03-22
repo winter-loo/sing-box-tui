@@ -27,13 +27,19 @@ Example config fragment:
 ## Run
 
 ```bash
-cargo run
+cargo run -- run
 ```
 
 Or point it at a different controller:
 
 ```bash
-SING_BOX_CONTROLLER=http://127.0.0.1:9090 cargo run
+cargo run -- run --controller http://127.0.0.1:9090
+```
+
+Environment variable still works too:
+
+```bash
+SING_BOX_CONTROLLER=http://127.0.0.1:9090 cargo run -- run
 ```
 
 If the controller has a secret:
@@ -44,16 +50,16 @@ SING_BOX_SECRET='your-secret' cargo run
 
 ## Import Clash Nodes
 
-Nodes-only JSON:
-
-```bash
-cargo run -- --import-from clash_proxies.txt --import-output imported_nodes.json
-```
-
 Full `config.json` output:
 
 ```bash
-cargo run -- --import-from clash_proxies.txt --import-full-config --import-output config.json
+cargo run -- import -i clash_proxies.txt -o config.json
+```
+
+Replace existing node outbounds instead of merging:
+
+```bash
+cargo run -- import -i clash_proxies.txt -o config.json --replace-nodes
 ```
 
 Full-config behavior:
@@ -65,14 +71,15 @@ Full-config behavior:
   - `direct` and `block`
   - `route.final = "select"`
   - `experimental.clash_api` on `127.0.0.1:9090`
-- If `/etc/sing-box/config.json` exists, the importer reads it and merges the imported nodes into that config instead of replacing it.
+- If `/etc/sing-box/config.json` exists, the importer reads it and merges the imported nodes into that config by default.
+- With `--import-replace-nodes`, the importer removes existing node outbounds first, then inserts the newly imported nodes.
 - Existing `select`, `auto`, `direct`, and `block` outbounds are reused when present.
 - Imported node tags replace same-tag outbounds and are appended otherwise.
 
 Use a different source config path if needed:
 
 ```bash
-cargo run -- --import-from clash_proxies.txt --import-full-config --import-config-path ./config.json --import-output merged-config.json
+cargo run -- import -i clash_proxies.txt --config ./config.json -o merged-config.json
 ```
 
 Validate the generated config:
@@ -81,10 +88,46 @@ Validate the generated config:
 sing-box check -c config.json
 ```
 
+## Benchmark Nodes
+
+The former Python skill script is now built into the Rust app.
+
+CLI examples:
+
+```bash
+cargo run -- benchmark --match 美国
+cargo run -- benchmark --match 美国 --max-concurrency 8
+cargo run -- benchmark --selector select --match 美国 --switch
+cargo run -- benchmark --match 美国 --switch --verify
+cargo run -- benchmark --match 美国 --switch --verify --verify-discord
+cargo run -- run --max-concurrency 8
+```
+
+If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
+
+JSON output includes:
+
+- current selector target
+- tested candidates
+- per-node delay values
+- best successful node
+- whether a switch was applied
+- final selected node
+- optional verification summary
+
 ## Keys
 
 - `Up` / `Down` or `j` / `k`: move
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
-- `Enter`: apply the selected proxy to the selected selector group
+- `Space`: apply/switch to the currently highlighted proxy in the current selector group
+- `Enter`: unused for selection
+- `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
+- `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
+- `s`: toggle the visible benchmark view mode between `FILTER VIEW` and `LATENCY SORT`; the active mode is shown in the pane titles/status, and latency sort hides failed-tested nodes while sorting successful tested nodes by ascending latency
+- `v`: run Google/GitHub verification checks
+- `V`: run Google/GitHub/Discord verification checks
+- `/`: change the benchmark substring filter
 - `r`: refresh groups
 - `q`: quit
+
+During async benchmarks, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.
