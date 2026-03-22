@@ -1190,6 +1190,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
         },
     );
 
+    let bottom_line = if let Some(input) = app.filter_input.as_deref() {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
+            Span::raw(input),
+            Span::styled("  Enter apply  Esc cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(app.status_line())
+    };
+
     let help = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Arrows/jk", Style::default().fg(Color::Cyan)),
@@ -1216,7 +1226,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(app.client.base_url.as_str()),
         ]),
         Line::from(benchmark_hint),
-        Line::from(app.status_line()),
+        bottom_line,
     ])
     .block(Block::default().title("Status").borders(Borders::ALL));
     frame.render_widget(help, status_area);
@@ -1228,6 +1238,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
             area,
         );
+    }
+    if let Some(input) = app.filter_input.as_deref() {
+        let cursor_x = status_area
+            .x
+            .saturating_add(1)
+            .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
+            .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
+        let cursor_y = status_area.y.saturating_add(4);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -1315,6 +1334,7 @@ struct App {
     benchmark_jobs: Vec<BenchmarkJob>,
     latency_sort_mode: bool,
     last_single_node_benchmark: Option<(String, String, Instant)>,
+    filter_input: Option<String>,
 }
 
 impl App {
@@ -1336,6 +1356,7 @@ impl App {
             benchmark_jobs: Vec::new(),
             latency_sort_mode: false,
             last_single_node_benchmark: None,
+            filter_input: None,
         };
         app.refresh()?;
         Ok(app)
@@ -1350,20 +1371,37 @@ impl App {
         self.benchmarks.get(&group.name)
     }
 
+    fn member_matches_filter(&self, member: &str) -> bool {
+        self.benchmark_filter.is_empty() || member.contains(&self.benchmark_filter)
+    }
+
     fn displayed_members(&self) -> Vec<String> {
         let Some(group) = self.selected_group() else {
             return Vec::new();
         };
         let Some(summary) = self.selected_benchmark() else {
-            return group.members.clone();
+            return group
+                .members
+                .iter()
+                .filter(|member| self.member_matches_filter(member))
+                .cloned()
+                .collect();
         };
         if !self.latency_sort_mode {
-            return group.members.clone();
+            return group
+                .members
+                .iter()
+                .filter(|member| self.member_matches_filter(member))
+                .cloned()
+                .collect();
         }
 
         let mut successes = Vec::new();
         let mut pending_or_untested = Vec::new();
         for (index, member) in group.members.iter().enumerate() {
+            if !self.member_matches_filter(member) {
+                continue;
+            }
             match summary.find_result(member) {
                 Some(result) if result.completed && result.delay.is_none() => {}
                 Some(result) if result.completed => {
@@ -1395,6 +1433,29 @@ impl App {
         }
     }
 
+    fn sync_selection_to_displayed_members(&mut self) {
+        let displayed = self.displayed_members();
+        if displayed.is_empty() {
+            return;
+        }
+
+        let current = self
+            .selected_group()
+            .and_then(|group| group.members.get(self.member_index))
+            .cloned();
+        if current
+            .as_ref()
+            .is_some_and(|member| displayed.iter().any(|item| item == member))
+        {
+            return;
+        }
+
+        if let Some(first) = displayed.first() {
+            let next = first.clone();
+            self.sync_selection_to_member_name(&next);
+        }
+    }
+
     fn status_line(&self) -> String {
         self.status.clone()
     }
@@ -1419,6 +1480,10 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.filter_input.is_some() {
+            return self.handle_filter_input_key(code);
+        }
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
@@ -1443,7 +1508,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
-            KeyCode::Char('/') => self.prompt_benchmark_filter()?,
+            KeyCode::Char('/') => self.open_benchmark_filter_modal(),
             KeyCode::Char(' ') => self.activate_selection()?,
             KeyCode::Enter => {}
             _ => {}
@@ -1570,6 +1635,7 @@ impl App {
                 })
                 .unwrap_or(0);
         self.member_index = next_index;
+        self.sync_selection_to_displayed_members();
     }
 
     fn start_group_benchmark(&mut self) -> Result<()> {
@@ -1839,26 +1905,48 @@ impl App {
         Ok(())
     }
 
-    fn prompt_benchmark_filter(&mut self) -> Result<()> {
-        restore_terminal()?;
-        println!(
-            "Enter benchmark substring filter (current: {}): ",
-            self.benchmark_filter
-        );
-        let mut buffer = String::new();
-        io::stdin()
-            .read_line(&mut buffer)
-            .context("failed to read benchmark filter from stdin")?;
-        let value = buffer.trim();
-        setup_terminal()?;
-        if !value.is_empty() {
-            self.benchmark_filter = value.to_string();
-            self.set_status_with_flash(format!(
+    fn open_benchmark_filter_modal(&mut self) {
+        self.filter_input = Some(self.benchmark_filter.clone());
+        self.flash = None;
+    }
+
+    fn handle_filter_input_key(&mut self, code: KeyCode) -> Result<bool> {
+        let Some(buffer) = self.filter_input.as_mut() else {
+            return Ok(true);
+        };
+
+        match code {
+            KeyCode::Esc => {
+                self.filter_input = None;
+                self.set_status_only("Benchmark filter edit canceled");
+            }
+            KeyCode::Enter => {
+                let value = buffer.trim().to_string();
+                self.filter_input = None;
+                self.apply_benchmark_filter(value);
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(ch) => {
+                buffer.push(ch);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn apply_benchmark_filter(&mut self, value: String) {
+        self.benchmark_filter = value;
+        self.sync_selection_to_displayed_members();
+        if self.benchmark_filter.is_empty() {
+            self.set_status_only("Benchmark filter cleared");
+        } else {
+            self.set_status_only(format!(
                 "Benchmark filter set to '{}'",
                 self.benchmark_filter
             ));
         }
-        Ok(())
     }
 }
 
@@ -2623,6 +2711,7 @@ mod tests {
         DEFAULT_BENCHMARK_MAX_CONCURRENCY, Focus, ProxyGroup, build_default_config,
         merge_into_existing_config, truncate_for_width,
     };
+    use crossterm::event::KeyCode;
     use reqwest::Client as AsyncClient;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -2662,6 +2751,7 @@ mod tests {
             benchmark_jobs: Vec::new(),
             latency_sort_mode: false,
             last_single_node_benchmark: None,
+            filter_input: None,
         }
     }
 
@@ -3024,5 +3114,92 @@ mod tests {
         assert_eq!(app.status, "Benchmarked select: best is node-a (42ms)");
         assert!(app.flash.is_none());
         assert!(app.benchmark_jobs.is_empty());
+    }
+
+    #[test]
+    fn slash_opens_filter_modal_with_current_value() {
+        let mut app = test_app();
+        app.benchmark_filter = "hk".to_string();
+
+        app.handle_key(KeyCode::Char('/')).expect("open modal");
+
+        assert_eq!(app.filter_input.as_deref(), Some("hk"));
+    }
+
+    #[test]
+    fn filter_modal_submit_updates_filter() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('/')).expect("open modal");
+        app.handle_key(KeyCode::Char('u')).expect("type");
+        app.handle_key(KeyCode::Char('s')).expect("type");
+        app.handle_key(KeyCode::Enter).expect("submit");
+
+        assert_eq!(app.benchmark_filter, "美国us");
+        assert_eq!(app.filter_input, None);
+        assert_eq!(app.status, "Benchmark filter set to '美国us'");
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn filter_modal_empty_submit_clears_filter() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('/')).expect("open modal");
+        app.handle_key(KeyCode::Backspace).expect("backspace");
+        app.handle_key(KeyCode::Backspace).expect("backspace");
+        app.handle_key(KeyCode::Enter).expect("submit");
+
+        assert!(app.benchmark_filter.is_empty());
+        assert_eq!(app.filter_input, None);
+        assert_eq!(app.status, "Benchmark filter cleared");
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn filter_modal_escape_cancels_without_changing_filter() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('/')).expect("open modal");
+        app.handle_key(KeyCode::Char('x')).expect("type");
+        app.handle_key(KeyCode::Esc).expect("cancel");
+
+        assert_eq!(app.benchmark_filter, "美国");
+        assert_eq!(app.filter_input, None);
+        assert_eq!(app.status, "Benchmark filter edit canceled");
+    }
+
+    #[test]
+    fn displayed_members_follow_active_filter() {
+        let mut app = test_app();
+        app.groups[0].members = vec![
+            "hk-1".to_string(),
+            "us-1".to_string(),
+            "hk-2".to_string(),
+        ];
+
+        app.apply_benchmark_filter("hk".to_string());
+
+        assert_eq!(
+            app.displayed_members(),
+            vec!["hk-1".to_string(), "hk-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn applying_filter_moves_selection_to_visible_member() {
+        let mut app = test_app();
+        app.groups[0].members = vec![
+            "hk-1".to_string(),
+            "us-1".to_string(),
+            "hk-2".to_string(),
+        ];
+        app.member_index = 1;
+
+        app.apply_benchmark_filter("hk".to_string());
+
+        assert_eq!(app.displayed_members(), vec!["hk-1".to_string(), "hk-2".to_string()]);
+        assert_eq!(app.member_index, 0);
+        assert_eq!(app.displayed_member_index(), Some(0));
     }
 }
