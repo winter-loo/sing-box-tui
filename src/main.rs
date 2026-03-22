@@ -1050,10 +1050,9 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(10), Constraint::Length(6)]).areas(frame.area());
-    let [groups_area, members_area, benchmark_area] = Layout::horizontal([
-        Constraint::Percentage(25),
-        Constraint::Percentage(40),
-        Constraint::Percentage(35),
+    let [groups_area, members_area] = Layout::horizontal([
+        Constraint::Percentage(28),
+        Constraint::Percentage(72),
     ])
     .areas(main);
 
@@ -1169,85 +1168,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let mut members_state = ListState::default().with_selected(app.displayed_member_index());
     frame.render_stateful_widget(members_widget, members_area, &mut members_state);
 
-    let benchmark_items = app
-        .selected_benchmark()
-        .map(|summary| {
-            let ordered_results = summary.ordered_results(app.latency_sort_mode);
-            ordered_results
-                .iter()
-                .map(|result| {
-                    let is_best = summary
-                        .best_success()
-                        .is_some_and(|best| best.name == result.name);
-                    let (style, delay_style, suffix) = if !result.completed {
-                        (
-                            Style::default()
-                                .fg(Color::LightYellow)
-                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                            Style::default()
-                                .fg(Color::LightYellow)
-                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                            "  ⟳",
-                        )
-                    } else if is_best {
-                        (
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                            "",
-                        )
-                    } else if result.delay.is_none() {
-                        (
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            "",
-                        )
-                    } else {
-                        (Style::default(), Style::default().fg(Color::Yellow), "")
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            truncate_for_width(
-                                &result.name,
-                                benchmark_area.width.saturating_sub(18) as usize,
-                            ),
-                            style,
-                        ),
-                        Span::raw("  "),
-                        Span::styled(result.display_delay(), delay_style),
-                        Span::raw(suffix),
-                    ]))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            vec![ListItem::new(Line::from(
-                "Press b to benchmark selector or t to benchmark one node",
-            ))]
-        });
-
-    let benchmark_title = app.selected_benchmark().map_or_else(
-        || String::from("Benchmark"),
-        |summary| {
-            format!(
-                "Benchmark [{}] /{} [{}]",
-                summary.pattern,
-                summary.results.len(),
-                benchmark_mode_badge(app.latency_sort_mode)
-            )
-        },
-    );
-    let benchmark_widget = List::new(benchmark_items).block(
-        Block::default()
-            .title(benchmark_title)
-            .borders(Borders::ALL)
-            .border_style(border_style(app.focus == Focus::Benchmark)),
-    );
-    frame.render_widget(benchmark_widget, benchmark_area);
-
     let benchmark_hint = app.selected_benchmark().map_or_else(
         || {
             format!(
@@ -1261,8 +1181,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .map(|item| format!("best={} {}", item.name, item.display_delay()))
                 .unwrap_or_else(|| "best=none".to_string());
             format!(
-                "filter='{}'  mode={}  {}",
+                "filter='{}'  tested={}  mode={}  {}",
                 summary.pattern,
+                summary.results.len(),
                 benchmark_mode_badge(app.latency_sort_mode),
                 truncate_for_width(&best, 30)
             )
@@ -1375,7 +1296,6 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
 enum Focus {
     Groups,
     Members,
-    Benchmark,
 }
 
 struct App {
@@ -1479,6 +1399,16 @@ impl App {
         self.status.clone()
     }
 
+    fn set_status_only(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.flash = None;
+    }
+
+    fn set_status_with_flash(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.flash = Some((self.status.clone(), Instant::now()));
+    }
+
     fn flash_message(&mut self) -> Option<String> {
         let (message, since) = self.flash.as_ref()?;
         if since.elapsed() > Duration::from_secs(2) {
@@ -1494,15 +1424,13 @@ impl App {
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.focus = match self.focus {
                     Focus::Groups => Focus::Members,
-                    Focus::Members => Focus::Benchmark,
-                    Focus::Benchmark => Focus::Groups,
+                    Focus::Members => Focus::Groups,
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = match self.focus {
-                    Focus::Groups => Focus::Benchmark,
+                    Focus::Groups => Focus::Members,
                     Focus::Members => Focus::Groups,
-                    Focus::Benchmark => Focus::Members,
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
@@ -1541,7 +1469,6 @@ impl App {
                     self.sync_selection_to_member_name(&members[current_index + 1]);
                 }
             }
-            Focus::Benchmark => {}
         }
     }
 
@@ -1563,7 +1490,6 @@ impl App {
                     self.sync_selection_to_member_name(&members[current_index - 1]);
                 }
             }
-            Focus::Benchmark => {}
         }
     }
 
@@ -1578,7 +1504,6 @@ impl App {
                     self.sync_selection_to_member_name(&first);
                 }
             }
-            Focus::Benchmark => {}
         }
     }
 
@@ -1595,7 +1520,6 @@ impl App {
                     self.sync_selection_to_member_name(&last);
                 }
             }
-            Focus::Benchmark => {}
         }
     }
 
@@ -1614,8 +1538,7 @@ impl App {
         self.client
             .switch_proxy(&group.name, &member)
             .with_context(|| format!("failed to switch {} to {}", group.name, member))?;
-        self.status = format!("Switched {} to {}", group.name, member);
-        self.flash = Some((self.status.clone(), Instant::now()));
+        self.set_status_with_flash(format!("Switched {} to {}", group.name, member));
         if REFRESH_DEBOUNCE > Duration::ZERO {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
@@ -1658,8 +1581,7 @@ impl App {
             .iter()
             .any(|job| job.group == group.name)
         {
-            self.status = format!("Benchmark already running for {}", group.name);
-            self.flash = Some((self.status.clone(), Instant::now()));
+            self.set_status_only(format!("Benchmark already running for {}", group.name));
             return Ok(());
         }
         let request = BenchmarkRequest {
@@ -1673,11 +1595,10 @@ impl App {
         };
         let candidate_names = self.client.fetch_benchmark_candidates(&request)?;
         if candidate_names.is_empty() {
-            self.status = format!(
+            self.set_status_only(format!(
                 "No nodes in {} matched filter '{}'",
                 group.name, self.benchmark_filter
-            );
-            self.flash = Some((self.status.clone(), Instant::now()));
+            ));
             return Ok(());
         }
         self.prepare_group_benchmark(&group.name, candidate_names.clone());
@@ -1687,11 +1608,10 @@ impl App {
             request,
             BenchmarkJobKind::Group,
         );
-        self.focus = Focus::Benchmark;
-        self.status = format!(
+        self.set_status_only(format!(
             "Benchmarking {} with filter '{}' in background (max {} concurrent)...",
             group.name, self.benchmark_filter, self.benchmark_max_concurrency
-        );
+        ));
         Ok(())
     }
 
@@ -1707,11 +1627,10 @@ impl App {
                 && last_member == &member
                 && last_started.elapsed() < SINGLE_NODE_RETEST_DEBOUNCE
             {
-                self.status = format!(
+                self.set_status_only(format!(
                     "Ignoring repeated retest for {} / {} (debounced)",
                     group.name, member
-                );
-                self.flash = Some((self.status.clone(), Instant::now()));
+                ));
                 return Ok(());
             }
         }
@@ -1720,8 +1639,10 @@ impl App {
             .iter()
             .any(|job| job.group == group.name && job.nodes.iter().any(|node| node == &member))
         {
-            self.status = format!("Benchmark already running for {} / {}", group.name, member);
-            self.flash = Some((self.status.clone(), Instant::now()));
+            self.set_status_only(format!(
+                "Benchmark already running for {} / {}",
+                group.name, member
+            ));
             return Ok(());
         }
         let request = BenchmarkRequest {
@@ -1744,7 +1665,10 @@ impl App {
         );
         self.last_single_node_benchmark =
             Some((group.name.clone(), member.clone(), Instant::now()));
-        self.status = format!("Benchmarking {} / {} in background...", group.name, member);
+        self.set_status_only(format!(
+            "Benchmarking {} / {} in background...",
+            group.name, member
+        ));
         Ok(())
     }
 
@@ -1801,13 +1725,13 @@ impl App {
 
     fn toggle_latency_sort_mode(&mut self) {
         self.latency_sort_mode = !self.latency_sort_mode;
-        self.status = if self.latency_sort_mode {
+        let status = if self.latency_sort_mode {
             "View mode: LATENCY SORT (hide failed-tested nodes, sort successful nodes by delay)"
                 .to_string()
         } else {
             "View mode: FILTER VIEW (original selector order with current filter)".to_string()
         };
-        self.flash = Some((self.status.clone(), Instant::now()));
+        self.set_status_only(status);
     }
 
     fn poll_benchmark_updates(&mut self) -> Result<()> {
@@ -1837,22 +1761,22 @@ impl App {
                             match kind {
                                 BenchmarkJobKind::Group => {
                                     if let Some(best) = summary.best_success() {
-                                        self.status = format!(
+                                        self.set_status_only(format!(
                                             "Benchmarked {}: best is {} ({})",
                                             group,
                                             best.name,
                                             best.display_delay()
-                                        );
+                                        ));
                                     } else {
-                                        self.status = format!(
+                                        self.set_status_only(format!(
                                             "Benchmarked {} but no healthy node matched",
                                             group
-                                        );
+                                        ));
                                     }
                                 }
                                 BenchmarkJobKind::SingleNode { node } => {
                                     let result = summary.find_result(&node);
-                                    self.status = match result {
+                                    let status = match result {
                                         Some(result) if result.delay.is_some() => format!(
                                             "Benchmarked {} / {}: {}",
                                             group,
@@ -1866,20 +1790,26 @@ impl App {
                                             format!("Benchmark finished for {} / {}", group, node)
                                         }
                                     };
+                                    self.set_status_only(status);
                                 }
                             }
-                            self.flash = Some((self.status.clone(), Instant::now()));
                         }
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         finished = true;
-                        self.status = format!(
-                            "Benchmark worker for {} disconnected",
-                            self.benchmark_jobs[index].group
-                        );
-                        self.flash = Some((self.status.clone(), Instant::now()));
+                        let group = self.benchmark_jobs[index].group.clone();
+                        match &self.benchmark_jobs[index].kind {
+                            BenchmarkJobKind::Group => self.set_status_only(format!(
+                                "Benchmark worker for {} disconnected",
+                                group
+                            )),
+                            BenchmarkJobKind::SingleNode { .. } => self.set_status_only(format!(
+                                "Benchmark worker for {} disconnected",
+                                group
+                            )),
+                        }
                         break;
                     }
                 }
@@ -1905,8 +1835,7 @@ impl App {
         };
         let report = run_verification(include_discord);
         let summary = report.summary_line();
-        self.status = summary.clone();
-        self.flash = Some((summary, Instant::now()));
+        self.set_status_with_flash(summary);
         Ok(())
     }
 
@@ -1924,8 +1853,10 @@ impl App {
         setup_terminal()?;
         if !value.is_empty() {
             self.benchmark_filter = value.to_string();
-            self.status = format!("Benchmark filter set to '{}'", self.benchmark_filter);
-            self.flash = Some((self.status.clone(), Instant::now()));
+            self.set_status_with_flash(format!(
+                "Benchmark filter set to '{}'",
+                self.benchmark_filter
+            ));
         }
         Ok(())
     }
@@ -2438,25 +2369,6 @@ impl BenchmarkSummary {
     fn find_result(&self, name: &str) -> Option<&BenchmarkResult> {
         self.results.iter().find(|item| item.name == name)
     }
-    fn ordered_results(&self, latency_sort_mode: bool) -> Vec<&BenchmarkResult> {
-        let mut results = self.results.iter().collect::<Vec<_>>();
-        if latency_sort_mode {
-            results.retain(|item| !(item.completed && item.delay.is_none()));
-            results.sort_by_key(|item| {
-                if item.completed {
-                    (
-                        0_u8,
-                        item.delay.unwrap_or(u64::MAX),
-                        0_usize,
-                        item.name.as_str(),
-                    )
-                } else {
-                    (1_u8, u64::MAX, 0_usize, item.name.as_str())
-                }
-            });
-        }
-        results
-    }
 }
 
 #[derive(Serialize)]
@@ -2706,11 +2618,52 @@ fn run_journalctl_verification() -> ShellCheck {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, CliCommand,
-        DEFAULT_BENCHMARK_MAX_CONCURRENCY, build_default_config, merge_into_existing_config,
-        truncate_for_width,
+        ApiClient, App, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkOutput,
+        BenchmarkRequest, BenchmarkResult, BenchmarkSummary, CliCommand,
+        DEFAULT_BENCHMARK_MAX_CONCURRENCY, Focus, ProxyGroup, build_default_config,
+        merge_into_existing_config, truncate_for_width,
     };
+    use reqwest::Client as AsyncClient;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+    use std::thread;
+    use tokio::runtime::Builder as TokioRuntimeBuilder;
+
+    fn test_app() -> App {
+        let runtime = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let client = AsyncClient::builder().build().expect("test HTTP client");
+
+        App {
+            client: ApiClient {
+                base_url: "http://127.0.0.1:9090".to_string(),
+                runtime,
+                client,
+            },
+            groups: vec![ProxyGroup {
+                name: "select".to_string(),
+                current: Some("node-a".to_string()),
+                members: vec!["node-a".to_string()],
+            }],
+            group_index: 0,
+            member_index: 0,
+            focus: Focus::Members,
+            status: String::new(),
+            flash: None,
+            benchmark_filter: "美国".to_string(),
+            benchmark_url: "https://www.gstatic.com/generate_204".to_string(),
+            benchmark_timeout_ms: 5000,
+            benchmark_request_timeout: 12.0,
+            benchmark_max_concurrency: DEFAULT_BENCHMARK_MAX_CONCURRENCY,
+            benchmarks: BTreeMap::new(),
+            benchmark_jobs: Vec::new(),
+            latency_sort_mode: false,
+            last_single_node_benchmark: None,
+        }
+    }
 
     #[test]
     fn truncates_wide_strings_without_panicking() {
@@ -2955,5 +2908,118 @@ mod tests {
         };
 
         assert_eq!(request.max_concurrency, 3);
+    }
+
+    #[test]
+    fn status_only_updates_clear_flash() {
+        let mut app = test_app();
+
+        app.set_status_with_flash("flash me");
+        assert!(app.flash.is_some());
+
+        app.set_status_only("status only");
+
+        assert_eq!(app.status, "status only");
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn single_node_benchmark_finish_does_not_flash() {
+        let mut app = test_app();
+        app.benchmarks.insert(
+            "select".to_string(),
+            BenchmarkSummary {
+                selector: "select".to_string(),
+                current: Some("node-a".to_string()),
+                pattern: "美国".to_string(),
+                url: "https://www.gstatic.com/generate_204".to_string(),
+                timeout_ms: 5000,
+                max_concurrency: 1,
+                results: vec![BenchmarkResult {
+                    name: "node-a".to_string(),
+                    delay: Some(42),
+                    completed: true,
+                }],
+            },
+        );
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(BenchmarkEvent::Finished).expect("send finish event");
+        let worker = thread::spawn(|| {});
+        app.benchmark_jobs.push(BenchmarkJob {
+            group: "select".to_string(),
+            nodes: vec!["node-a".to_string()],
+            kind: BenchmarkJobKind::SingleNode {
+                node: "node-a".to_string(),
+            },
+            receiver: rx,
+            worker,
+        });
+
+        app.poll_benchmark_updates().expect("poll succeeds");
+
+        assert_eq!(app.status, "Benchmarked select / node-a: 42ms");
+        assert!(app.flash.is_none());
+        assert!(app.benchmark_jobs.is_empty());
+    }
+
+    #[test]
+    fn toggling_latency_sort_mode_does_not_flash() {
+        let mut app = test_app();
+        app.set_status_with_flash("existing flash");
+
+        app.toggle_latency_sort_mode();
+
+        assert!(app.latency_sort_mode);
+        assert_eq!(
+            app.status,
+            "View mode: LATENCY SORT (hide failed-tested nodes, sort successful nodes by delay)"
+        );
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn group_benchmark_finish_does_not_flash() {
+        let mut app = test_app();
+        app.benchmarks.insert(
+            "select".to_string(),
+            BenchmarkSummary {
+                selector: "select".to_string(),
+                current: Some("node-a".to_string()),
+                pattern: "美国".to_string(),
+                url: "https://www.gstatic.com/generate_204".to_string(),
+                timeout_ms: 5000,
+                max_concurrency: 4,
+                results: vec![
+                    BenchmarkResult {
+                        name: "node-a".to_string(),
+                        delay: Some(42),
+                        completed: true,
+                    },
+                    BenchmarkResult {
+                        name: "node-b".to_string(),
+                        delay: Some(80),
+                        completed: true,
+                    },
+                ],
+            },
+        );
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(BenchmarkEvent::Finished).expect("send finish event");
+        let worker = thread::spawn(|| {});
+        app.benchmark_jobs.push(BenchmarkJob {
+            group: "select".to_string(),
+            nodes: vec!["node-a".to_string(), "node-b".to_string()],
+            kind: BenchmarkJobKind::Group,
+            receiver: rx,
+            worker,
+        });
+
+        app.poll_benchmark_updates().expect("poll succeeds");
+
+        assert_eq!(app.status, "Benchmarked select: best is node-a (42ms)");
+        assert!(app.flash.is_none());
+        assert!(app.benchmark_jobs.is_empty());
     }
 }
