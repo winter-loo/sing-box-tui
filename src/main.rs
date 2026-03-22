@@ -230,7 +230,7 @@ impl CliCommand {
     fn parse_benchmark(args: &[String]) -> Result<Self> {
         let mut controller = None;
         let mut selector = String::from("select");
-        let mut pattern = String::from("美国");
+        let mut pattern = String::new();
         let mut url = String::from(DEFAULT_DELAY_TEST_URL);
         let mut timeout_ms = 5000_u64;
         let mut request_timeout = 12.0_f64;
@@ -369,7 +369,7 @@ fn print_benchmark_usage() {
     println!("Options:");
     println!("      --controller <URL>        Clash controller base URL");
     println!("      --selector <NAME>         Selector group to benchmark (default: select)");
-    println!("      --match <TEXT>            Substring filter for candidate tags (default: 美国)");
+    println!("      --match <TEXT>            Substring filter for candidate tags (default: empty)");
     println!("      --url <URL>               Delay test URL (default: {DEFAULT_DELAY_TEST_URL})");
     println!("      --timeout-ms <MS>         Delay probe timeout in ms (default: 5000)");
     println!("      --request-timeout <SEC>   HTTP request timeout in seconds (default: 12)");
@@ -1327,7 +1327,7 @@ impl App {
             focus: Focus::Groups,
             status: String::from("Loading proxy groups..."),
             flash: None,
-            benchmark_filter: String::from("美国"),
+            benchmark_filter: String::new(),
             benchmark_url: String::from(DEFAULT_DELAY_TEST_URL),
             benchmark_timeout_ms: 5000,
             benchmark_request_timeout: 12.0,
@@ -2844,9 +2844,12 @@ mod tests {
 
         match command {
             CliCommand::Benchmark {
-                max_concurrency, ..
+                max_concurrency,
+                pattern,
+                ..
             } => {
                 assert_eq!(max_concurrency, DEFAULT_BENCHMARK_MAX_CONCURRENCY);
+                assert!(pattern.is_empty());
             }
             _ => panic!("expected benchmark command"),
         }
