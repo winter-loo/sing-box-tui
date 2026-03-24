@@ -1,5 +1,47 @@
 # sing-box-tui
 
+## Provider sync
+
+`sync` logs into a provider website, downloads the sing-box subscription JSON, and merges provider nodes into your local sing-box config.
+
+Example:
+
+```bash
+cargo run -- sync \
+  --provider https://3.airtcp.me \
+  --account-file ./provider-account.txt \
+  --config /etc/sing-box/config.json \
+  --subscription-output ./output/airtcp-singbox.json
+
+cargo run -- sync \
+  --provider https://3.airtcp.me \
+  --account-file ./provider-account.txt \
+  --config /etc/sing-box/config.json \
+  --output ./output/merged-config.json
+
+cargo run -- sync \
+  --provider https://3.airtcp.me \
+  --account-file ./provider-account.txt \
+  --config /etc/sing-box/config.json \
+  --write
+```
+
+`sync` is safe by default: it will not overwrite the live config unless you pass `--write`. Otherwise, use `--output` to write the merged config somewhere else.
+
+Account file formats:
+
+```text
+email=your-email@example.com
+password=your-password
+```
+
+or:
+
+```text
+your-email@example.com
+your-password
+```
+
 Small terminal UI for switching `sing-box` selector outbounds through the Clash-compatible controller API.
 
 ## Requirements
@@ -95,15 +137,15 @@ The former Python skill script is now built into the Rust app.
 CLI examples:
 
 ```bash
-cargo run -- benchmark --match 美国
-cargo run -- benchmark --match 美国 --max-concurrency 8
+cargo run -- benchmark
+cargo run -- benchmark --max-concurrency 8
 cargo run -- benchmark --selector select --match 美国 --switch
 cargo run -- benchmark --match 美国 --switch --verify
 cargo run -- benchmark --match 美国 --switch --verify --verify-discord
 cargo run -- run --max-concurrency 8
 ```
 
-If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
+If `--match` is omitted, benchmarking runs without a substring filter. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
 
 JSON output includes:
 
