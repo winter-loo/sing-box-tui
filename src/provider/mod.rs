@@ -1,16 +1,54 @@
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::Url;
-use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
-use urlencoding::encode;
 
 use crate::import::build_full_config_from_singbox_subscription;
+
+mod airtcp;
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+trait ProviderPlugin {
+    fn key(&self) -> &'static str;
+    fn matches(&self, provider_url: &Url) -> bool;
+    fn login<'a>(
+        &'a self,
+        client: &'a Client,
+        provider_url: &'a Url,
+        credentials: &'a ProviderCredentials,
+    ) -> BoxFuture<'a, String>;
+    fn fetch_subscription_url<'a>(
+        &'a self,
+        client: &'a Client,
+        provider_url: &'a Url,
+        cookies: &'a str,
+        format: SubscriptionFormat,
+    ) -> BoxFuture<'a, Url>;
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionFormat {
+    SingBox,
+    Clash,
+}
+
+impl SubscriptionFormat {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::SingBox => "singbox=1",
+            Self::Clash => "mihomo=1",
+        }
+    }
+}
 
 pub(crate) fn run_provider_sync(
     provider: String,
@@ -30,16 +68,21 @@ pub(crate) fn run_provider_sync(
     let runtime_provider_url = provider_url.clone();
 
     let result = runtime.block_on(async move {
-        let provider_kind = ProviderKind::detect(&runtime_provider_url)?;
+        let plugin = resolve_provider_plugin(&runtime_provider_url)?;
         let client = Client::builder()
             .build()
             .context("failed to build provider HTTP client")?;
 
-        let cookies = provider_kind
+        let cookies = plugin
             .login(&client, &runtime_provider_url, &credentials)
             .await?;
-        let subscription_url = provider_kind
-            .fetch_singbox_subscription_url(&client, &runtime_provider_url, &cookies)
+        let subscription_url = plugin
+            .fetch_subscription_url(
+                &client,
+                &runtime_provider_url,
+                &cookies,
+                SubscriptionFormat::SingBox,
+            )
             .await?;
         let subscription_json = client
             .get(subscription_url.clone())
@@ -52,10 +95,10 @@ pub(crate) fn run_provider_sync(
             .text()
             .await
             .context("failed to read sing-box subscription response")?;
-        Ok::<_, anyhow::Error>((subscription_url, subscription_json))
+        Ok::<_, anyhow::Error>((plugin.key(), subscription_url, subscription_json))
     })?;
 
-    let (subscription_url, subscription_json) = result;
+    let (plugin_key, subscription_url, subscription_json) = result;
     if let Some(path) = subscription_output {
         fs::write(path, format!("{subscription_json}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -89,6 +132,7 @@ pub(crate) fn run_provider_sync(
         "{}",
         serde_json::to_string_pretty(&json!(ProviderSyncOutput {
             provider: provider_url.to_string(),
+            provider_plugin: plugin_key.to_string(),
             singbox_subscription_url: subscription_url.to_string(),
             imported_nodes,
             merged_config_path: merged_path.display().to_string(),
@@ -102,6 +146,7 @@ pub(crate) fn run_provider_sync(
 #[derive(Serialize)]
 struct ProviderSyncOutput {
     provider: String,
+    provider_plugin: String,
     singbox_subscription_url: String,
     imported_nodes: usize,
     merged_config_path: String,
@@ -166,130 +211,17 @@ impl ProviderCredentials {
     }
 }
 
-enum ProviderKind {
-    AirTcp,
-}
-
-impl ProviderKind {
-    fn detect(provider_url: &Url) -> Result<Self> {
-        let host = provider_url
-            .host_str()
-            .context("provider URL is missing a host")?;
-        if host.contains("airtcp.") {
-            Ok(Self::AirTcp)
-        } else {
-            bail!("unsupported provider host: {host}")
-        }
-    }
-
-    async fn login(
-        &self,
-        client: &Client,
-        provider_url: &Url,
-        credentials: &ProviderCredentials,
-    ) -> Result<String> {
-        match self {
-            Self::AirTcp => login_airtcp(client, provider_url, credentials).await,
-        }
-    }
-
-    async fn fetch_singbox_subscription_url(
-        &self,
-        client: &Client,
-        provider_url: &Url,
-        cookies: &str,
-    ) -> Result<Url> {
-        match self {
-            Self::AirTcp => {
-                fetch_airtcp_singbox_subscription_url(client, provider_url, cookies).await
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct AirTcpLoginResponse {
-    ret: i32,
-    msg: String,
-}
-
-async fn login_airtcp(
-    client: &Client,
-    provider_url: &Url,
-    credentials: &ProviderCredentials,
-) -> Result<String> {
-    let login_url = provider_url
-        .join("/denglu")
-        .context("failed to build AirTCP login URL")?;
-    let body = format!(
-        "email={}&passwd={}&code=&remember_me=on",
-        encode(&credentials.username),
-        encode(&credentials.password),
-    );
-    let response = client
-        .post(login_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .context("failed to send provider login request")?;
-    let cookies = capture_cookie_header(response.headers())?;
-    let payload: AirTcpLoginResponse = response
-        .error_for_status()
-        .context("provider login request returned an error")?
-        .json()
-        .await
-        .context("failed to decode provider login response")?;
-    if payload.ret != 1 {
-        bail!("provider login failed: {}", payload.msg);
-    }
-    Ok(cookies)
-}
-
-async fn fetch_airtcp_singbox_subscription_url(
-    client: &Client,
-    provider_url: &Url,
-    cookies: &str,
-) -> Result<Url> {
-    let user_url = provider_url
-        .join("/user")
-        .context("failed to build provider user page URL")?;
-    let user_html = client
-        .get(user_url)
-        .header("Cookie", cookies)
-        .send()
-        .await
-        .context("failed to fetch provider user page")?
-        .error_for_status()
-        .context("provider user page returned an error")?
-        .text()
-        .await
-        .context("failed to read provider user page")?;
-
-    if let Some(url) = extract_subscription_url_from_text(provider_url, &user_html, "singbox=1")? {
-        return Ok(url);
-    }
-
-    for asset_url in extract_script_asset_urls(provider_url, &user_html)? {
-        let script = client
-            .get(asset_url)
-            .header("Cookie", cookies)
-            .send()
-            .await
-            .context("failed to fetch provider user asset")?
-            .error_for_status()
-            .context("provider user asset returned an error")?
-            .text()
-            .await
-            .context("failed to read provider user asset")?;
-        if let Some(url) =
-            extract_subscription_url_from_text(provider_url, &script, "singbox=1")?
-        {
-            return Ok(url);
-        }
-    }
-
-    bail!("failed to find a sing-box subscription URL in the authenticated provider page")
+fn resolve_provider_plugin(provider_url: &Url) -> Result<&'static dyn ProviderPlugin> {
+    let plugins: [&'static dyn ProviderPlugin; 1] = [&airtcp::AIRTCP_PLUGIN];
+    plugins
+        .into_iter()
+        .find(|plugin| plugin.matches(provider_url))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported provider host: {}",
+                provider_url.host_str().unwrap_or_default()
+            )
+        })
 }
 
 fn normalize_provider_url(value: &str) -> Result<Url> {
@@ -340,8 +272,9 @@ fn extract_script_asset_urls(base_url: &Url, html: &str) -> Result<Vec<Url>> {
 fn extract_subscription_url_from_text(
     base_url: &Url,
     text: &str,
-    marker: &str,
+    format: SubscriptionFormat,
 ) -> Result<Option<Url>> {
+    let marker = format.marker();
     let Some(index) = text.find(marker) else {
         return Ok(None);
     };
@@ -380,9 +313,17 @@ fn extract_subscription_url_from_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderCredentials, extract_script_asset_urls, extract_subscription_url_from_text,
-        normalize_provider_url,
+        ProviderCredentials, SubscriptionFormat, extract_script_asset_urls,
+        extract_subscription_url_from_text, normalize_provider_url, resolve_provider_plugin,
     };
+
+    #[test]
+    fn resolves_airtcp_plugin_from_host() {
+        let provider_url = normalize_provider_url("https://3.airtcp.me").expect("provider URL");
+        let plugin = resolve_provider_plugin(&provider_url).expect("plugin resolves");
+
+        assert_eq!(plugin.key(), "airtcp");
+    }
 
     #[test]
     fn parses_key_value_account_file() {
@@ -419,12 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn extracts_absolute_subscription_url_from_script() {
+    fn extracts_absolute_singbox_subscription_url_from_script() {
         let base = normalize_provider_url("https://3.airtcp.me").expect("base URL");
         let url = extract_subscription_url_from_text(
             &base,
             r#"const s="https://spring.mailrelay.us/link/abc?singbox=1";"#,
-            "singbox=1",
+            SubscriptionFormat::SingBox,
         )
         .expect("subscription extraction succeeds")
         .expect("subscription URL exists");
@@ -433,12 +374,26 @@ mod tests {
     }
 
     #[test]
+    fn extracts_absolute_clash_subscription_url_from_script() {
+        let base = normalize_provider_url("https://3.airtcp.me").expect("base URL");
+        let url = extract_subscription_url_from_text(
+            &base,
+            r#"const s="https://spring.mailrelay.us/link/abc?mihomo=1";"#,
+            SubscriptionFormat::Clash,
+        )
+        .expect("subscription extraction succeeds")
+        .expect("subscription URL exists");
+
+        assert_eq!(url.as_str(), "https://spring.mailrelay.us/link/abc?mihomo=1");
+    }
+
+    #[test]
     fn extracts_escaped_relative_subscription_url_from_script() {
         let base = normalize_provider_url("https://3.airtcp.me").expect("base URL");
         let url = extract_subscription_url_from_text(
             &base,
             r#"const s="\/api\/subscription?singbox=1";"#,
-            "singbox=1",
+            SubscriptionFormat::SingBox,
         )
         .expect("subscription extraction succeeds")
         .expect("subscription URL exists");
