@@ -87,7 +87,10 @@ fn is_mergeable_subscription_outbound(outbound: &Value) -> bool {
     let Some(tag) = outbound.get("tag").and_then(Value::as_str) else {
         return false;
     };
-    if matches!(tag, "手动选择" | "自动选择" | "广告路由" | "国内直连" | "屏蔽" | "dns-out") {
+    if matches!(
+        tag,
+        "手动选择" | "自动选择" | "广告路由" | "国内直连" | "屏蔽" | "dns-out"
+    ) {
         return false;
     }
     !tag.contains("如遇不可用请访问")
@@ -119,8 +122,10 @@ mod tests {
         assert_eq!(imported_count, 1);
         let outbounds = config["outbounds"].as_array().expect("outbounds array");
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
-        assert!(!outbounds
-            .iter()
-            .any(|value| value["tag"] == "如遇不可用请访问3.airtcp.us"));
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "如遇不可用请访问3.airtcp.us")
+        );
     }
 }

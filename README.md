@@ -78,6 +78,19 @@ Or point it at a different controller:
 cargo run -- run --controller http://127.0.0.1:9090
 ```
 
+List selector groups through the Clash API:
+
+```bash
+cargo run -- selectors
+cargo run -- selectors --selector select
+```
+
+Inspect live controller status, traffic, and active connections:
+
+```bash
+cargo run -- status
+```
+
 Environment variable still works too:
 
 ```bash
@@ -156,6 +169,13 @@ JSON output includes:
 - whether a switch was applied
 - final selected node
 - optional verification summary
+
+## Clash API Inspection
+
+Two read-only controller commands are available in addition to the TUI and benchmarking flow:
+
+- `selectors`: returns JSON for all selector groups, or one group with `--selector NAME`
+- `status`: returns controller version, current traffic counters, aggregate connection totals, and active connection metadata
 
 ## Keys
 

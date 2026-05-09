@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::defaults::{
-    AUTO_SELECTOR_TAG_ALIASES, BLOCK_TAG_ALIASES, DIRECT_TAG_ALIASES,
-    DEFAULT_AD_BLOCK_SELECTOR_TAG, DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG,
-    DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG, DEFAULT_LOCAL_DNS_TAG,
-    DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, SELECTOR_TAG_ALIASES,
+    AUTO_SELECTOR_TAG_ALIASES, BLOCK_TAG_ALIASES, DEFAULT_AD_BLOCK_SELECTOR_TAG,
+    DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG,
+    DEFAULT_LOCAL_DNS_TAG, DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES,
+    SELECTOR_TAG_ALIASES,
 };
 
 pub(crate) fn build_full_config(
@@ -276,7 +276,8 @@ pub(crate) fn merge_into_existing_config(
         .as_array_mut()
         .context("existing config outbounds must be an array")?;
 
-    let selector_tag = preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let selector_tag =
+        preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
     let prefers_legacy_tags = selector_tag == "select";
     let auto_tag = preferred_existing_tag(
         outbounds,
@@ -571,7 +572,10 @@ mod tests {
         assert!(outbounds.iter().any(|value| value["tag"] == "广告路由"));
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
         assert_eq!(config["dns"]["servers"][0]["type"], "tls");
-        assert_eq!(config["route"]["default_domain_resolver"]["server"], "local");
+        assert_eq!(
+            config["route"]["default_domain_resolver"]["server"],
+            "local"
+        );
         assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
         assert!(config["route"].get("final").is_none());
     }

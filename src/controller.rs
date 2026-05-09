@@ -4,11 +4,11 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use reqwest::Client as AsyncClient;
 use reqwest::Version;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
-use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
@@ -17,16 +17,38 @@ use urlencoding::encode;
 
 use crate::defaults::DEFAULT_CONTROLLER;
 
-pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
-    let controller = options
-        .controller
-        .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
-        .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
-    let secret = env::var("SING_BOX_SECRET")
-        .ok()
-        .filter(|value| !value.is_empty());
+pub(crate) fn run_selectors(options: SelectorsOptions) -> Result<()> {
+    let client = build_api_client(options.controller)?;
+    let groups = if let Some(selector) = options.selector {
+        vec![client.fetch_selector_group(&selector)?]
+    } else {
+        client.fetch_selector_groups()?
+    };
 
-    let client = ApiClient::new(controller, secret)?;
+    let output = SelectorsOutput {
+        groups: groups
+            .into_iter()
+            .map(|group| ProxyGroupOutput {
+                name: group.name,
+                current: group.current,
+                members: group.members,
+            })
+            .collect(),
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub(crate) fn run_status(options: StatusOptions) -> Result<()> {
+    let client = build_api_client(options.controller)?;
+    let status = client.fetch_status()?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
+
+pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
+    let client = build_api_client(options.controller)?;
     let summary = client.benchmark_selector(&BenchmarkRequest {
         selector: options.selector,
         pattern: options.pattern,
@@ -116,6 +138,11 @@ impl ApiClient {
         self.runtime.block_on(self.fetch_selector_groups_async())
     }
 
+    pub(crate) fn fetch_selector_group(&self, selector: &str) -> Result<ProxyGroup> {
+        self.runtime
+            .block_on(self.fetch_selector_group_async(selector))
+    }
+
     async fn fetch_selector_groups_async(&self) -> Result<Vec<ProxyGroup>> {
         let payload: ProxiesResponse = self
             .client
@@ -129,19 +156,12 @@ impl ApiClient {
             .await
             .context("failed to decode Clash API /proxies response")?;
 
-        let mut groups = payload
-            .proxies
-            .into_values()
-            .filter(|proxy| proxy.kind.eq_ignore_ascii_case("selector"))
-            .map(|proxy| ProxyGroup {
-                name: proxy.name,
-                current: proxy.now,
-                members: proxy.all,
-            })
-            .collect::<Vec<_>>();
+        Ok(selectors_from_payload(payload))
+    }
 
-        groups.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(groups)
+    async fn fetch_selector_group_async(&self, selector: &str) -> Result<ProxyGroup> {
+        let proxy = self.fetch_selector_async(selector).await?;
+        proxy_group_from_node(proxy).with_context(|| format!("{selector} is not a selector group"))
     }
 
     async fn fetch_selector_async(&self, selector: &str) -> Result<ProxyNode> {
@@ -158,12 +178,20 @@ impl ApiClient {
             .context("failed to decode Clash API selector response")
     }
 
-    pub(crate) fn benchmark_selector(&self, request: &BenchmarkRequest) -> Result<BenchmarkSummary> {
-        self.runtime.block_on(self.benchmark_selector_async(request))
+    pub(crate) fn benchmark_selector(
+        &self,
+        request: &BenchmarkRequest,
+    ) -> Result<BenchmarkSummary> {
+        self.runtime
+            .block_on(self.benchmark_selector_async(request))
     }
 
-    pub(crate) fn fetch_benchmark_candidates(&self, request: &BenchmarkRequest) -> Result<Vec<String>> {
-        self.runtime.block_on(self.fetch_benchmark_candidates_async(request))
+    pub(crate) fn fetch_benchmark_candidates(
+        &self,
+        request: &BenchmarkRequest,
+    ) -> Result<Vec<String>> {
+        self.runtime
+            .block_on(self.fetch_benchmark_candidates_async(request))
     }
 
     async fn fetch_benchmark_candidates_async(
@@ -254,6 +282,10 @@ impl ApiClient {
         self.runtime.block_on(self.switch_proxy_async(group, proxy))
     }
 
+    pub(crate) fn fetch_status(&self) -> Result<StatusOutput> {
+        self.runtime.block_on(self.fetch_status_async())
+    }
+
     async fn switch_proxy_async(&self, group: &str, proxy: &str) -> Result<()> {
         let encoded_group = encode(group);
         self.client
@@ -268,9 +300,99 @@ impl ApiClient {
             .with_context(|| format!("controller rejected switch request for {group}"))?;
         Ok(())
     }
+
+    async fn fetch_status_async(&self) -> Result<StatusOutput> {
+        let version: VersionResponse = self
+            .client
+            .get(format!("{}/version", self.base_url))
+            .send()
+            .await
+            .context("failed to query Clash API /version")?
+            .error_for_status()
+            .context("Clash API /version returned an error")?
+            .json()
+            .await
+            .context("failed to decode Clash API /version response")?;
+
+        let traffic: TrafficSnapshot = self
+            .client
+            .get(format!("{}/traffic", self.base_url))
+            .send()
+            .await
+            .context("failed to query Clash API /traffic")?
+            .error_for_status()
+            .context("Clash API /traffic returned an error")?
+            .json()
+            .await
+            .context("failed to decode Clash API /traffic response")?;
+
+        let connections: ConnectionsResponse = self
+            .client
+            .get(format!("{}/connections", self.base_url))
+            .send()
+            .await
+            .context("failed to query Clash API /connections")?
+            .error_for_status()
+            .context("Clash API /connections returned an error")?
+            .json()
+            .await
+            .context("failed to decode Clash API /connections response")?;
+
+        Ok(status_from_parts(version.version, traffic, connections))
+    }
 }
 
-pub(crate) fn filter_benchmark_candidates(all: &[String], request: &BenchmarkRequest) -> Vec<String> {
+fn build_api_client(controller: Option<String>) -> Result<ApiClient> {
+    let controller = controller
+        .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
+        .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
+    let secret = env::var("SING_BOX_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty());
+    ApiClient::new(controller, secret)
+}
+
+fn selectors_from_payload(payload: ProxiesResponse) -> Vec<ProxyGroup> {
+    let mut groups = payload
+        .proxies
+        .into_values()
+        .filter_map(|proxy| proxy_group_from_node(proxy).ok())
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.name.cmp(&right.name));
+    groups
+}
+
+fn proxy_group_from_node(proxy: ProxyNode) -> Result<ProxyGroup> {
+    if !proxy.kind.eq_ignore_ascii_case("selector") {
+        bail!("proxy is not a selector group");
+    }
+    Ok(ProxyGroup {
+        name: proxy.name,
+        current: proxy.now,
+        members: proxy.all,
+    })
+}
+
+fn status_from_parts(
+    version: String,
+    traffic: TrafficSnapshot,
+    connections: ConnectionsResponse,
+) -> StatusOutput {
+    StatusOutput {
+        version,
+        traffic,
+        upload_total: connections.upload_total,
+        download_total: connections.download_total,
+        memory: connections.memory,
+        connection_count: connections.connections.len(),
+        connections: connections.connections,
+    }
+}
+
+pub(crate) fn filter_benchmark_candidates(
+    all: &[String],
+    request: &BenchmarkRequest,
+) -> Vec<String> {
     if let Some(nodes) = &request.nodes {
         let wanted = nodes.iter().collect::<std::collections::BTreeSet<_>>();
         all.iter()
@@ -446,9 +568,82 @@ struct DelayResponse {
     delay: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct VersionResponse {
+    version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct TrafficSnapshot {
+    #[serde(rename = "up", alias = "upload")]
+    pub(crate) upload: u64,
+    #[serde(rename = "down", alias = "download")]
+    pub(crate) download: u64,
+}
+
+#[derive(Deserialize)]
+struct ConnectionsResponse {
+    #[serde(rename = "uploadTotal", default)]
+    upload_total: Option<u64>,
+    #[serde(rename = "downloadTotal", default)]
+    download_total: Option<u64>,
+    #[serde(default)]
+    memory: Option<u64>,
+    #[serde(default)]
+    connections: Vec<ConnectionInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ConnectionInfo {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) download: u64,
+    #[serde(default)]
+    pub(crate) upload: u64,
+    #[serde(default)]
+    pub(crate) start: Option<String>,
+    #[serde(default)]
+    pub(crate) chains: Vec<String>,
+    #[serde(default)]
+    pub(crate) rule: Option<String>,
+    #[serde(rename = "rulePayload", default)]
+    pub(crate) rule_payload: Option<String>,
+    #[serde(default)]
+    pub(crate) metadata: ConnectionMetadata,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ConnectionMetadata {
+    #[serde(default, rename = "network")]
+    pub(crate) network: Option<String>,
+    #[serde(default, rename = "type")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, rename = "sourceIP")]
+    pub(crate) source_ip: Option<String>,
+    #[serde(default, rename = "destinationIP")]
+    pub(crate) destination_ip: Option<String>,
+    #[serde(default)]
+    pub(crate) host: Option<String>,
+    #[serde(default, rename = "destinationPort")]
+    pub(crate) destination_port: Option<String>,
+    #[serde(default, rename = "sourcePort")]
+    pub(crate) source_port: Option<String>,
+    #[serde(default, rename = "processPath")]
+    pub(crate) process_path: Option<String>,
+}
+
 #[derive(Serialize)]
 struct SwitchProxyRequest {
     name: String,
+}
+
+pub(crate) struct SelectorsOptions {
+    pub(crate) controller: Option<String>,
+    pub(crate) selector: Option<String>,
+}
+
+pub(crate) struct StatusOptions {
+    pub(crate) controller: Option<String>,
 }
 
 pub(crate) struct BenchmarkOptions {
@@ -550,7 +745,11 @@ impl BenchmarkSummary {
     }
 
     pub(crate) fn update_result(&mut self, result: BenchmarkResult) {
-        if let Some(existing) = self.results.iter_mut().find(|item| item.name == result.name) {
+        if let Some(existing) = self
+            .results
+            .iter_mut()
+            .find(|item| item.name == result.name)
+        {
             *existing = result;
         } else {
             self.results.push(result);
@@ -590,6 +789,29 @@ pub(crate) struct BenchmarkOutput {
     pub(crate) switched: bool,
     pub(crate) final_node: Option<String>,
     pub(crate) verification: Option<VerificationReport>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SelectorsOutput {
+    pub(crate) groups: Vec<ProxyGroupOutput>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ProxyGroupOutput {
+    pub(crate) name: String,
+    pub(crate) current: Option<String>,
+    pub(crate) members: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct StatusOutput {
+    pub(crate) version: String,
+    pub(crate) traffic: TrafficSnapshot,
+    pub(crate) upload_total: Option<u64>,
+    pub(crate) download_total: Option<u64>,
+    pub(crate) memory: Option<u64>,
+    pub(crate) connection_count: usize,
+    pub(crate) connections: Vec<ConnectionInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -823,7 +1045,10 @@ fn run_journalctl_verification() -> ShellCheck {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary};
+    use super::{
+        BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
+        ProxiesResponse, TrafficSnapshot, selectors_from_payload, status_from_parts,
+    };
 
     #[test]
     fn benchmark_summary_picks_lowest_successful_delay() {
@@ -895,5 +1120,46 @@ mod tests {
         };
 
         assert_eq!(request.max_concurrency, 3);
+    }
+
+    #[test]
+    fn fetch_selector_groups_returns_sorted_selectors() {
+        let payload: ProxiesResponse = serde_json::from_str(
+            r#"{"proxies":{"DIRECT":{"name":"DIRECT","type":"Direct"},"auto":{"name":"auto","type":"Selector","now":"node-b","all":["node-a","node-b"]},"select":{"name":"select","type":"Selector","now":"node-a","all":["node-a","node-b"]}}}"#,
+        )
+        .expect("parse proxies payload");
+        let groups = selectors_from_payload(payload);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "auto");
+        assert_eq!(groups[0].current.as_deref(), Some("node-b"));
+        assert_eq!(groups[1].name, "select");
+        assert_eq!(groups[1].members, vec!["node-a", "node-b"]);
+    }
+
+    #[test]
+    fn fetch_status_combines_version_traffic_and_connections() {
+        let traffic: TrafficSnapshot =
+            serde_json::from_str(r#"{"up":123,"down":456}"#).expect("parse traffic payload");
+        let connections: ConnectionsResponse = serde_json::from_str(
+            r#"{"downloadTotal":4096,"uploadTotal":2048,"memory":512,"connections":[{"id":"conn-1","download":300,"upload":100,"chains":["select","node-a"],"rule":"MATCH","rulePayload":"","metadata":{"network":"tcp","type":"http","sourceIP":"127.0.0.1","destinationIP":"1.1.1.1","host":"example.com","destinationPort":"443"}}]}"#,
+        )
+        .expect("parse connections payload");
+        let status = status_from_parts("1.12.0".to_string(), traffic, connections);
+
+        assert_eq!(status.version, "1.12.0");
+        assert_eq!(status.traffic.upload, 123);
+        assert_eq!(status.traffic.download, 456);
+        assert_eq!(status.memory, Some(512));
+        assert_eq!(status.connection_count, 1);
+        assert_eq!(status.upload_total, Some(2048));
+        assert_eq!(status.download_total, Some(4096));
+        assert_eq!(status.connections.len(), 1);
+        assert_eq!(status.connections[0].id, "conn-1");
+        assert_eq!(status.connections[0].chains, vec!["select", "node-a"]);
+        assert_eq!(
+            status.connections[0].metadata.host.as_deref(),
+            Some("example.com")
+        );
     }
 }

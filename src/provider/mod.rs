@@ -136,8 +136,7 @@ pub(crate) fn run_provider_sync(
             singbox_subscription_url: subscription_url.to_string(),
             imported_nodes,
             merged_config_path: merged_path.display().to_string(),
-            subscription_output_path: subscription_output
-                .map(|path| path.display().to_string()),
+            subscription_output_path: subscription_output.map(|path| path.display().to_string()),
         }))?
     );
     Ok(())
@@ -187,9 +186,7 @@ impl ProviderCredentials {
                     "email" | "username" | "user" | "account" => {
                         username = Some(value.trim().to_string())
                     }
-                    "password" | "passwd" | "pass" => {
-                        password = Some(value.trim().to_string())
-                    }
+                    "password" | "passwd" | "pass" => password = Some(value.trim().to_string()),
                     _ => {}
                 }
             }
@@ -201,7 +198,9 @@ impl ProviderCredentials {
         }
 
         if lines.len() < 2 {
-            bail!("account file must contain username/email on the first line and password on the second line");
+            bail!(
+                "account file must contain username/email on the first line and password on the second line"
+            );
         }
 
         Ok(Self {
@@ -327,10 +326,9 @@ mod tests {
 
     #[test]
     fn parses_key_value_account_file() {
-        let credentials = ProviderCredentials::parse(
-            "email=your-email@example.com\npassword=your-password\n",
-        )
-        .expect("account file parses");
+        let credentials =
+            ProviderCredentials::parse("email=your-email@example.com\npassword=your-password\n")
+                .expect("account file parses");
 
         assert_eq!(credentials.username, "your-email@example.com");
         assert_eq!(credentials.password, "your-password");
@@ -370,7 +368,10 @@ mod tests {
         .expect("subscription extraction succeeds")
         .expect("subscription URL exists");
 
-        assert_eq!(url.as_str(), "https://spring.mailrelay.us/link/abc?singbox=1");
+        assert_eq!(
+            url.as_str(),
+            "https://spring.mailrelay.us/link/abc?singbox=1"
+        );
     }
 
     #[test]
@@ -384,7 +385,10 @@ mod tests {
         .expect("subscription extraction succeeds")
         .expect("subscription URL exists");
 
-        assert_eq!(url.as_str(), "https://spring.mailrelay.us/link/abc?mihomo=1");
+        assert_eq!(
+            url.as_str(),
+            "https://spring.mailrelay.us/link/abc?mihomo=1"
+        );
     }
 
     #[test]
@@ -398,6 +402,9 @@ mod tests {
         .expect("subscription extraction succeeds")
         .expect("subscription URL exists");
 
-        assert_eq!(url.as_str(), "https://3.airtcp.me/api/subscription?singbox=1");
+        assert_eq!(
+            url.as_str(),
+            "https://3.airtcp.me/api/subscription?singbox=1"
+        );
     }
 }

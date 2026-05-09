@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::controller::{
-    ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
-    BenchmarkSummary, ProxyGroup, run_verification, spawn_benchmark_worker,
+    ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
+    ProxyGroup, run_verification, spawn_benchmark_worker,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
@@ -81,11 +81,8 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(10), Constraint::Length(6)]).areas(frame.area());
-    let [groups_area, members_area] = Layout::horizontal([
-        Constraint::Percentage(28),
-        Constraint::Percentage(72),
-    ])
-    .areas(main);
+    let [groups_area, members_area] =
+        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(main);
 
     let groups = app
         .groups
@@ -225,7 +222,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
             Span::raw(input),
-            Span::styled("  Enter apply  Esc cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "  Enter apply  Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     } else {
         Line::from(app.status_line())
@@ -663,14 +663,14 @@ impl App {
     }
 
     fn sync_member_selection_to_current(&mut self) {
-        let next_index = self
-            .selected_group()
-            .and_then(|group| {
-                group.current
-                    .as_deref()
-                    .and_then(|current| group.members.iter().position(|member| member == current))
-            })
-            .unwrap_or(0);
+        let next_index =
+            self.selected_group()
+                .and_then(|group| {
+                    group.current.as_deref().and_then(|current| {
+                        group.members.iter().position(|member| member == current)
+                    })
+                })
+                .unwrap_or(0);
         self.member_index = next_index;
         self.sync_selection_to_displayed_members();
     }
@@ -679,7 +679,11 @@ impl App {
         let Some(group) = self.selected_group().cloned() else {
             bail!("no selector group available");
         };
-        if self.benchmark_jobs.iter().any(|job| job.group == group.name) {
+        if self
+            .benchmark_jobs
+            .iter()
+            .any(|job| job.group == group.name)
+        {
             self.set_status_only(format!("Benchmark already running for {}", group.name));
             return Ok(());
         }
@@ -898,7 +902,10 @@ impl App {
                     Err(TryRecvError::Disconnected) => {
                         finished = true;
                         let group = self.benchmark_jobs[index].group.clone();
-                        self.set_status_only(format!("Benchmark worker for {} disconnected", group));
+                        self.set_status_only(format!(
+                            "Benchmark worker for {} disconnected",
+                            group
+                        ));
                         break;
                     }
                 }
@@ -1067,7 +1074,8 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel();
-        tx.send(BenchmarkEvent::Finished).expect("send finish event");
+        tx.send(BenchmarkEvent::Finished)
+            .expect("send finish event");
         let worker = thread::spawn(|| {});
         app.benchmark_jobs.push(BenchmarkJob {
             group: "select".to_string(),
@@ -1129,7 +1137,8 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel();
-        tx.send(BenchmarkEvent::Finished).expect("send finish event");
+        tx.send(BenchmarkEvent::Finished)
+            .expect("send finish event");
         let worker = thread::spawn(|| {});
         app.benchmark_jobs.push(BenchmarkJob {
             group: "select".to_string(),
@@ -1225,11 +1234,7 @@ mod tests {
     #[test]
     fn displayed_members_follow_active_filter() {
         let mut app = test_app();
-        app.groups[0].members = vec![
-            "hk-1".to_string(),
-            "us-1".to_string(),
-            "hk-2".to_string(),
-        ];
+        app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
 
         app.apply_benchmark_filter("hk".to_string());
 
@@ -1242,11 +1247,7 @@ mod tests {
     #[test]
     fn applying_filter_moves_selection_to_visible_member() {
         let mut app = test_app();
-        app.groups[0].members = vec![
-            "hk-1".to_string(),
-            "us-1".to_string(),
-            "hk-2".to_string(),
-        ];
+        app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
         app.member_index = 1;
 
         app.apply_benchmark_filter("hk".to_string());

@@ -12,7 +12,9 @@ mod provider;
 mod tui;
 
 use cli::CliCommand;
-use controller::{BenchmarkOptions, run_benchmark};
+use controller::{
+    BenchmarkOptions, SelectorsOptions, StatusOptions, run_benchmark, run_selectors, run_status,
+};
 use import::run_import;
 use provider::run_provider_sync;
 use tui::run_tui;
@@ -23,6 +25,14 @@ fn main() -> Result<()> {
             controller,
             max_concurrency,
         } => run_tui(controller, max_concurrency),
+        CliCommand::Selectors {
+            controller,
+            selector,
+        } => run_selectors(SelectorsOptions {
+            controller,
+            selector,
+        }),
+        CliCommand::Status { controller } => run_status(StatusOptions { controller }),
         CliCommand::Import {
             input,
             output,
