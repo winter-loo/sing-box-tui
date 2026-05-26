@@ -266,6 +266,10 @@ impl ApiClient {
         self.runtime.block_on(self.switch_proxy_async(group, proxy))
     }
 
+    pub(crate) fn set_mode(&self, mode: &str) -> Result<()> {
+        self.runtime.block_on(self.set_mode_async(mode))
+    }
+
     pub(crate) fn fetch_status(&self) -> Result<StatusOutput> {
         self.runtime.block_on(self.fetch_status_async())
     }
@@ -282,6 +286,20 @@ impl ApiClient {
             .with_context(|| format!("failed to send switch request for {group}"))?
             .error_for_status()
             .with_context(|| format!("controller rejected switch request for {group}"))?;
+        Ok(())
+    }
+
+    async fn set_mode_async(&self, mode: &str) -> Result<()> {
+        self.client
+            .patch(format!("{}/configs", self.base_url))
+            .json(&UpdateConfigRequest {
+                mode: mode.to_string(),
+            })
+            .send()
+            .await
+            .context("failed to send Clash API mode update")?
+            .error_for_status()
+            .context("controller rejected Clash API mode update")?;
         Ok(())
     }
 
@@ -619,6 +637,11 @@ pub(crate) struct ConnectionMetadata {
 #[derive(Serialize)]
 struct SwitchProxyRequest {
     name: String,
+}
+
+#[derive(Serialize)]
+struct UpdateConfigRequest {
+    mode: String,
 }
 
 pub(crate) struct SelectorsOptions {
@@ -1032,7 +1055,8 @@ fn run_journalctl_verification() -> ShellCheck {
 mod tests {
     use super::{
         BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
-        ProxiesResponse, TrafficSnapshot, selectors_from_payload, status_from_parts,
+        ProxiesResponse, TrafficSnapshot, UpdateConfigRequest, selectors_from_payload,
+        status_from_parts,
     };
 
     #[test]
@@ -1105,6 +1129,16 @@ mod tests {
         };
 
         assert_eq!(request.max_concurrency, 3);
+    }
+
+    #[test]
+    fn update_config_request_serializes_mode() {
+        let json = serde_json::to_value(UpdateConfigRequest {
+            mode: "直连".to_string(),
+        })
+        .expect("serialize update config request");
+
+        assert_eq!(json["mode"], "直连");
     }
 
     #[test]

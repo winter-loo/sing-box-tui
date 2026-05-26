@@ -259,7 +259,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Up` / `Down` or `j` / `k`: move
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
-- `d`: switch the current selector group to `direct` / `国内直连`; this sends new connections direct while existing connections keep their current outbound until they close or fail
+- `d`: switch to direct; if the selected group contains `direct` / `国内直连`, the TUI switches that selector, otherwise it falls back to Clash mode `直连`
 - `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter

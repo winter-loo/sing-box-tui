@@ -41,6 +41,7 @@ const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const DIRECT_CLASH_MODE: &str = "直连";
 
 pub(crate) fn run_tui(controller: Option<String>, max_concurrency: Option<usize>) -> Result<()> {
     let controller = controller
@@ -549,6 +550,18 @@ fn benchmark_mode_badge(latency_sort_mode: bool) -> &'static str {
 
 fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
     if auto_select_enabled { "ON" } else { "OFF" }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DirectSwitchAction {
+    SelectorMember(String),
+    ClashModeDirect,
+}
+
+fn direct_switch_action(members: &[String]) -> DirectSwitchAction {
+    direct_member_name(members)
+        .map(DirectSwitchAction::SelectorMember)
+        .unwrap_or(DirectSwitchAction::ClashModeDirect)
 }
 
 fn direct_member_name(members: &[String]) -> Option<String> {
@@ -1105,25 +1118,31 @@ impl App {
             bail!("no selector group available");
         };
         let group_name = group.name.clone();
-        let Some(member) = direct_member_name(&group.members) else {
-            self.set_status_only(format!(
-                "Direct outbound is not available in {}",
-                group_name
-            ));
-            return Ok(());
-        };
-        self.client
-            .switch_proxy(&group_name, &member)
-            .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
-        if REFRESH_DEBOUNCE > Duration::ZERO {
-            std::thread::sleep(REFRESH_DEBOUNCE);
+        match direct_switch_action(&group.members) {
+            DirectSwitchAction::SelectorMember(member) => {
+                self.client
+                    .switch_proxy(&group_name, &member)
+                    .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
+                if REFRESH_DEBOUNCE > Duration::ZERO {
+                    std::thread::sleep(REFRESH_DEBOUNCE);
+                }
+                self.refresh()?;
+                self.save_runtime_state()?;
+                self.set_status_only(format!(
+                    "Switched {} to {} (new connections go direct)",
+                    group_name, member
+                ));
+            }
+            DirectSwitchAction::ClashModeDirect => {
+                self.client
+                    .set_mode(DIRECT_CLASH_MODE)
+                    .context("failed to switch Clash mode to direct")?;
+                self.set_status_only(format!(
+                    "Direct outbound is not in {}; switched Clash mode to {}",
+                    group_name, DIRECT_CLASH_MODE
+                ));
+            }
         }
-        self.refresh()?;
-        self.save_runtime_state()?;
-        self.set_status_only(format!(
-            "Switched {} to {} (new connections go direct)",
-            group_name, member
-        ));
         Ok(())
     }
 
@@ -1796,6 +1815,18 @@ mod tests {
             Some("direct".to_string())
         );
         assert_eq!(direct_member_name(&["node-a".to_string()]), None);
+    }
+
+    #[test]
+    fn direct_switch_action_falls_back_to_clash_direct_mode() {
+        assert_eq!(
+            super::direct_switch_action(&["node-a".to_string()]),
+            super::DirectSwitchAction::ClashModeDirect
+        );
+        assert_eq!(
+            super::direct_switch_action(&["node-a".to_string(), "direct".to_string()]),
+            super::DirectSwitchAction::SelectorMember("direct".to_string())
+        );
     }
 
     #[test]
