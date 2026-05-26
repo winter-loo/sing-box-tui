@@ -39,20 +39,20 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
         "tag": DEFAULT_SELECTOR_TAG,
         "outbounds": select_members,
         "default": DEFAULT_AUTO_SELECTOR_TAG,
-        "interrupt_exist_connections": true,
+        "interrupt_exist_connections": false,
     }));
     outbounds.push(json!({
         "type": "urltest",
         "tag": DEFAULT_AUTO_SELECTOR_TAG,
         "outbounds": node_tags,
-        "interrupt_exist_connections": true,
+        "interrupt_exist_connections": false,
     }));
     outbounds.push(json!({
         "type": "selector",
         "tag": DEFAULT_AD_BLOCK_SELECTOR_TAG,
         "outbounds": [DEFAULT_SELECTOR_TAG, DEFAULT_DIRECT_TAG, DEFAULT_BLOCK_TAG],
         "default": DEFAULT_BLOCK_TAG,
-        "interrupt_exist_connections": true,
+        "interrupt_exist_connections": false,
     }));
     outbounds.extend(imported_nodes);
     outbounds.push(json!({
@@ -346,6 +346,7 @@ pub(crate) fn merge_into_existing_config(
             }
             ensure_string_field(value, "type", "selector");
             ensure_string_field(value, "default", &auto_tag);
+            set_bool_field(value, "interrupt_exist_connections", false);
         },
     )?;
 
@@ -370,6 +371,7 @@ pub(crate) fn merge_into_existing_config(
             ensure_string_field(value, "type", "urltest");
             ensure_string_field(value, "url", DEFAULT_DELAY_TEST_URL);
             ensure_string_field(value, "interval", "10m");
+            set_bool_field(value, "interrupt_exist_connections", false);
         },
     )?;
 
@@ -551,6 +553,13 @@ fn ensure_string_field(outbound: &mut Value, key: &str, value: &str) {
         .or_insert_with(|| Value::String(value.to_string()));
 }
 
+fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
+    let Some(object) = outbound.as_object_mut() else {
+        return;
+    };
+    object.insert(key.to_string(), Value::Bool(value));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_default_config, merge_into_existing_config};
@@ -578,6 +587,80 @@ mod tests {
         );
         assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
         assert!(config["route"].get("final").is_none());
+    }
+
+    #[test]
+    fn default_config_preserves_existing_connections_on_selector_changes() {
+        let config = build_default_config(vec![json!({
+            "type": "trojan",
+            "tag": "node-a",
+            "server": "example.com",
+            "server_port": 443,
+            "password": "secret",
+        })]);
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        let selector = outbounds
+            .iter()
+            .find(|value| value["tag"] == "手动选择")
+            .expect("manual selector");
+        let auto = outbounds
+            .iter()
+            .find(|value| value["tag"] == "自动选择")
+            .expect("auto selector");
+        assert_eq!(selector["interrupt_exist_connections"], false);
+        assert_eq!(auto["interrupt_exist_connections"], false);
+    }
+
+    #[test]
+    fn merge_updates_existing_selectors_to_preserve_connections() {
+        let mut config = json!({
+            "outbounds": [{
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["old-node"],
+                "default": "old-node",
+                "interrupt_exist_connections": true
+            }, {
+                "type": "urltest",
+                "tag": "auto",
+                "outbounds": ["old-node"],
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "10m",
+                "interrupt_exist_connections": true
+            }, {
+                "type": "trojan",
+                "tag": "old-node",
+                "server": "old.example.com",
+                "server_port": 443,
+                "password": "secret"
+            }]
+        });
+
+        merge_into_existing_config(
+            &mut config,
+            vec![json!({
+                "type": "trojan",
+                "tag": "new-node",
+                "server": "new.example.com",
+                "server_port": 443,
+                "password": "secret",
+            })],
+            false,
+        )
+        .expect("merge succeeds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        let selector = outbounds
+            .iter()
+            .find(|value| value["tag"] == "select")
+            .expect("manual selector");
+        let auto = outbounds
+            .iter()
+            .find(|value| value["tag"] == "auto")
+            .expect("auto selector");
+        assert_eq!(selector["interrupt_exist_connections"], false);
+        assert_eq!(auto["interrupt_exist_connections"], false);
     }
 
     #[test]

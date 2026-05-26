@@ -78,6 +78,12 @@ Or point it at a different controller:
 cargo run -- run --controller http://127.0.0.1:9090
 ```
 
+Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Auto-pick benchmarks the filtered nodes every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
+
+TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and benchmark kind (`group`, `single`, or `auto`).
+
+Generated and merged configs set selector/urltest `interrupt_exist_connections` to `false`, so switching nodes does not tear down existing connections. Existing connections keep their original outbound until they close or fail; new/retried connections use the current selection.
+
 List selector groups through the Clash API:
 
 ```bash
@@ -127,7 +133,7 @@ Full-config behavior:
   - `route.final = "select"`
   - `experimental.clash_api` on `127.0.0.1:9090`
 - If `/etc/sing-box/config.json` exists, the importer reads it and merges the imported nodes into that config by default.
-- With `--import-replace-nodes`, the importer removes existing node outbounds first, then inserts the newly imported nodes.
+- With `--replace-nodes`, the importer removes existing node outbounds first, then inserts the newly imported nodes.
 - Existing `select`, `auto`, `direct`, and `block` outbounds are reused when present.
 - Imported node tags replace same-tag outbounds and are appended otherwise.
 
@@ -186,9 +192,12 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
 - `s`: toggle the visible benchmark view mode between `FILTER VIEW` and `LATENCY SORT`; the active mode is shown in the pane titles/status, and latency sort hides failed-tested nodes while sorting successful tested nodes by ascending latency
+- `a`: toggle runtime auto-pick using the current filter; it benchmarks every 30 seconds and switches only when current latency is above 600ms, failed, or outside the filter
+- `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
+- `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
 - `v`: run Google/GitHub verification checks
 - `V`: run Google/GitHub/Discord verification checks
-- `/`: change the benchmark substring filter
+- `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`
 - `r`: refresh groups
 - `q`: quit
 

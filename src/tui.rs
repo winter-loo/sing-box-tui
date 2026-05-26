@@ -12,8 +12,11 @@ use crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
+};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::controller::{
@@ -24,6 +27,16 @@ use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
     REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
 };
+use crate::storage::{
+    BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
+};
+
+const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
+const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
+const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
+const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
+const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn run_tui(controller: Option<String>, max_concurrency: Option<usize>) -> Result<()> {
     let controller = controller
@@ -61,6 +74,8 @@ fn restore_terminal() -> Result<()> {
 fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         app.poll_benchmark_updates()?;
+        app.maybe_start_auto_select_benchmark()?;
+        app.maybe_refresh_latency_chart()?;
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -199,8 +214,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let benchmark_hint = app.selected_benchmark().map_or_else(
         || {
             format!(
-                "mode={}  b group benchmark  t node benchmark  s toggle view  / edit filter",
-                benchmark_mode_badge(app.latency_sort_mode)
+                "mode={}  auto={}  b group benchmark  t node benchmark  a auto-pick  / filter",
+                benchmark_mode_badge(app.latency_sort_mode),
+                auto_select_badge(app.auto_select_enabled)
             )
         },
         |summary| {
@@ -209,10 +225,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .map(|item| format!("best={} {}", item.name, item.display_delay()))
                 .unwrap_or_else(|| "best=none".to_string());
             format!(
-                "filter='{}'  tested={}  mode={}  {}",
+                "filter='{}'  tested={}  mode={}  auto={}  {}",
                 summary.pattern,
                 summary.results.len(),
                 benchmark_mode_badge(app.latency_sort_mode),
+                auto_select_badge(app.auto_select_enabled),
                 truncate_for_width(&best, 30)
             )
         },
@@ -243,6 +260,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
             Span::raw(" view mode  "),
+            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::raw(" auto-pick  "),
+            Span::styled("i", Style::default().fg(Color::Cyan)),
+            Span::raw(" info  "),
             Span::styled("v/V", Style::default().fg(Color::Cyan)),
             Span::raw(" verify  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -270,6 +291,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
             area,
         );
     }
+    if let Some(chart) = app.latency_chart.as_ref() {
+        draw_latency_chart(frame, chart);
+    }
     if let Some(input) = app.filter_input.as_deref() {
         let cursor_x = status_area
             .x
@@ -279,6 +303,202 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let cursor_y = status_area.y.saturating_add(4);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
+    let area = centered_rect(90, 20, frame.area());
+    frame.render_widget(Clear, area);
+
+    let visible_samples = latency_chart_windowed_samples(&chart.samples, chart.window);
+    let segments = latency_chart_segments(&visible_samples);
+    let Some(start_ms) = latency_chart_window_start_ms(&chart.samples, chart.window) else {
+        frame.render_widget(
+            Paragraph::new("No latency history")
+                .block(Block::default().title("Latency").borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+    let time_unit = latency_chart_time_unit(chart.window);
+    let scale = match time_unit {
+        LatencyChartTimeUnit::Minutes => 60_000.0,
+        LatencyChartTimeUnit::Hours => 3_600_000.0,
+    };
+    let segment_data = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .iter()
+                .map(|point| {
+                    (
+                        point.0.saturating_sub(start_ms) as f64 / scale,
+                        point.1 as f64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    if segment_data.iter().all(Vec::is_empty) {
+        frame.render_widget(
+            Paragraph::new("No successful latency samples in this window")
+                .block(Block::default().title("Latency").borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+
+    let (min_y, max_y) = segment_data
+        .iter()
+        .flatten()
+        .fold((f64::MAX, f64::MIN), |(min_y, max_y), (_, y)| {
+            (min_y.min(*y), max_y.max(*y))
+        });
+    let x_max = chart.window.as_millis() as f64 / scale;
+    let x_bounds = [0.0, x_max.max(1.0)];
+    let y_bounds = latency_chart_y_bounds(min_y, max_y, AUTO_SELECT_THRESHOLD_MS);
+    let title = format!(
+        "Latency: {} / {} ({} samples, window {}, z/Z zoom)",
+        chart.selector,
+        truncate_for_width(&chart.node, 36),
+        visible_samples.len(),
+        latency_chart_window_label(chart.window)
+    );
+    let mut datasets = segment_data
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
+            Dataset::default()
+                .name(format!("latency-{index}"))
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Magenta))
+                .data(data)
+        })
+        .collect::<Vec<_>>();
+    let threshold_data = latency_chart_threshold_line(x_bounds[1], AUTO_SELECT_THRESHOLD_MS);
+    datasets.push(
+        Dataset::default()
+            .name(format!("{AUTO_SELECT_THRESHOLD_MS}ms limit"))
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Yellow))
+            .data(&threshold_data),
+    );
+    let chart_widget = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .x_axis(
+            Axis::default()
+                .title(match time_unit {
+                    LatencyChartTimeUnit::Minutes => "time (minutes)",
+                    LatencyChartTimeUnit::Hours => "time (hours)",
+                })
+                .style(Style::default().fg(Color::Gray))
+                .bounds(x_bounds)
+                .labels(vec![
+                    Span::raw(format!("{} ago", latency_chart_window_label(chart.window))),
+                    Span::raw("now"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("latency (ms)")
+                .style(Style::default().fg(Color::Gray))
+                .bounds(y_bounds)
+                .labels(vec![
+                    Span::raw(format!("{:.0}", y_bounds[0])),
+                    Span::raw(format!("{:.0}", y_bounds[1])),
+                ]),
+        );
+    frame.render_widget(chart_widget, area);
+}
+
+fn latency_chart_segments(samples: &[NodeLatencySample]) -> Vec<Vec<(u64, u64)>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for sample in samples {
+        if let Some(delay_ms) = sample.delay_ms {
+            current.push((sample.recorded_at_ms, delay_ms));
+        } else if !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn latency_chart_threshold_line(x_max: f64, threshold_ms: u64) -> Vec<(f64, f64)> {
+    vec![
+        (0.0, threshold_ms as f64),
+        (x_max.max(1.0), threshold_ms as f64),
+    ]
+}
+
+fn latency_chart_y_bounds(min_y: f64, max_y: f64, threshold_ms: u64) -> [f64; 2] {
+    let min_y = min_y.min(threshold_ms as f64);
+    let max_y = max_y.max(threshold_ms as f64);
+    let padding = ((max_y - min_y) * 0.05).max(10.0);
+    [0.0_f64.max(min_y - padding), max_y + padding]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LatencyChartTimeUnit {
+    Minutes,
+    Hours,
+}
+
+fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
+    if window >= Duration::from_secs(2 * 60 * 60) {
+        LatencyChartTimeUnit::Hours
+    } else {
+        LatencyChartTimeUnit::Minutes
+    }
+}
+
+fn latency_chart_window_label(window: Duration) -> String {
+    if window >= Duration::from_secs(60 * 60) {
+        format!("{}h", window.as_secs() / 3600)
+    } else {
+        format!("{}m", window.as_secs() / 60)
+    }
+}
+
+fn latency_chart_zoom_in(window: Duration) -> Duration {
+    (window / 2).max(LATENCY_CHART_MIN_WINDOW)
+}
+
+fn latency_chart_zoom_out(window: Duration) -> Duration {
+    (window * 2).min(LATENCY_CHART_MAX_WINDOW)
+}
+
+fn latency_chart_latest_ms(samples: &[NodeLatencySample]) -> Option<u64> {
+    samples.iter().map(|sample| sample.recorded_at_ms).max()
+}
+
+fn latency_chart_window_start_ms(samples: &[NodeLatencySample], window: Duration) -> Option<u64> {
+    let latest = latency_chart_latest_ms(samples)?;
+    Some(latest.saturating_sub(window.as_millis() as u64))
+}
+
+fn latency_chart_windowed_samples(
+    samples: &[NodeLatencySample],
+    window: Duration,
+) -> Vec<NodeLatencySample> {
+    let Some(start) = latency_chart_window_start_ms(samples, window) else {
+        return Vec::new();
+    };
+    samples
+        .iter()
+        .filter(|sample| sample.recorded_at_ms >= start)
+        .cloned()
+        .collect()
 }
 
 fn border_style(active: bool) -> Style {
@@ -307,6 +527,18 @@ fn benchmark_mode_badge(latency_sort_mode: bool) -> &'static str {
         "LATENCY SORT"
     } else {
         "FILTER VIEW"
+    }
+}
+
+fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
+    if auto_select_enabled { "ON" } else { "OFF" }
+}
+
+fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
+    match kind {
+        BenchmarkJobKind::Group => "group",
+        BenchmarkJobKind::AutoSelect => "auto",
+        BenchmarkJobKind::SingleNode { .. } => "single",
     }
 }
 
@@ -342,10 +574,34 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
     output
 }
 
+fn matches_filter(value: &str, filter: &str) -> bool {
+    let mut has_pattern = false;
+    for pattern in filter
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        has_pattern = true;
+        if value.contains(pattern) {
+            return true;
+        }
+    }
+    !has_pattern
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Focus {
     Groups,
     Members,
+}
+
+#[derive(Clone, Debug)]
+struct LatencyChartState {
+    selector: String,
+    node: String,
+    samples: Vec<NodeLatencySample>,
+    window: Duration,
+    last_refresh: Instant,
 }
 
 struct App {
@@ -366,6 +622,12 @@ struct App {
     latency_sort_mode: bool,
     last_single_node_benchmark: Option<(String, String, Instant)>,
     filter_input: Option<String>,
+    auto_select_enabled: bool,
+    auto_select_threshold_ms: u64,
+    auto_select_interval: Duration,
+    last_auto_select_benchmark: Option<Instant>,
+    benchmark_store: Option<BenchmarkStore>,
+    latency_chart: Option<LatencyChartState>,
 }
 
 impl App {
@@ -388,6 +650,12 @@ impl App {
             latency_sort_mode: false,
             last_single_node_benchmark: None,
             filter_input: None,
+            auto_select_enabled: false,
+            auto_select_threshold_ms: AUTO_SELECT_THRESHOLD_MS,
+            auto_select_interval: AUTO_SELECT_INTERVAL,
+            last_auto_select_benchmark: None,
+            benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
+            latency_chart: None,
         };
         app.refresh()?;
         Ok(app)
@@ -403,7 +671,16 @@ impl App {
     }
 
     fn member_matches_filter(&self, member: &str) -> bool {
-        self.benchmark_filter.is_empty() || member.contains(&self.benchmark_filter)
+        matches_filter(member, &self.benchmark_filter)
+    }
+
+    fn benchmark_candidates_for_group(&self, group: &ProxyGroup) -> Vec<String> {
+        group
+            .members
+            .iter()
+            .filter(|member| self.member_matches_filter(member))
+            .cloned()
+            .collect()
     }
 
     fn displayed_members(&self) -> Vec<String> {
@@ -518,6 +795,19 @@ impl App {
         if self.filter_input.is_some() {
             return self.handle_filter_input_key(code);
         }
+        if self.latency_chart.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+                    self.latency_chart = None;
+                    self.set_status_only("Latency chart closed");
+                }
+                KeyCode::Char('z') => self.zoom_latency_chart_in(),
+                KeyCode::Char('Z') => self.zoom_latency_chart_out(),
+                KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+            return Ok(true);
+        }
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
@@ -541,6 +831,8 @@ impl App {
             KeyCode::Char('b') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
+            KeyCode::Char('a') => self.toggle_auto_select(),
+            KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
@@ -549,6 +841,76 @@ impl App {
             _ => {}
         }
         Ok(true)
+    }
+
+    fn selected_member_name(&self) -> Option<String> {
+        self.selected_group()?
+            .members
+            .get(self.member_index)
+            .cloned()
+    }
+
+    fn open_latency_chart(&mut self) -> Result<()> {
+        let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
+            self.set_status_only("No selector group available for latency history");
+            return Ok(());
+        };
+        let Some(node) = self.selected_member_name() else {
+            self.set_status_only("No node selected for latency history");
+            return Ok(());
+        };
+        let Some(store) = &self.benchmark_store else {
+            self.set_status_only("SQLite benchmark history is unavailable");
+            return Ok(());
+        };
+        let samples = store.node_latency_history(&group_name, &node, 200)?;
+        if samples.iter().all(|sample| sample.delay_ms.is_none()) {
+            self.set_status_only(format!("No latency history for {}", node));
+            return Ok(());
+        }
+        let count = samples.len();
+        self.latency_chart = Some(LatencyChartState {
+            selector: group_name,
+            node: node.clone(),
+            samples,
+            window: LATENCY_CHART_DEFAULT_WINDOW,
+            last_refresh: Instant::now(),
+        });
+        self.set_status_only(format!("Showing {} latency samples for {}", count, node));
+        Ok(())
+    }
+
+    fn zoom_latency_chart_in(&mut self) {
+        let Some(chart) = self.latency_chart.as_mut() else {
+            return;
+        };
+        chart.window = latency_chart_zoom_in(chart.window);
+        let label = latency_chart_window_label(chart.window);
+        self.set_status_only(format!("Latency chart window: {label}"));
+    }
+
+    fn zoom_latency_chart_out(&mut self) {
+        let Some(chart) = self.latency_chart.as_mut() else {
+            return;
+        };
+        chart.window = latency_chart_zoom_out(chart.window);
+        let label = latency_chart_window_label(chart.window);
+        self.set_status_only(format!("Latency chart window: {label}"));
+    }
+
+    fn maybe_refresh_latency_chart(&mut self) -> Result<()> {
+        let Some(chart) = self.latency_chart.as_mut() else {
+            return Ok(());
+        };
+        if chart.last_refresh.elapsed() < LATENCY_CHART_REFRESH_INTERVAL {
+            return Ok(());
+        }
+        let Some(store) = &self.benchmark_store else {
+            return Ok(());
+        };
+        chart.samples = store.node_latency_history(&chart.selector, &chart.node, 200)?;
+        chart.last_refresh = Instant::now();
+        Ok(())
     }
 
     fn move_next(&mut self) {
@@ -687,6 +1049,7 @@ impl App {
             self.set_status_only(format!("Benchmark already running for {}", group.name));
             return Ok(());
         }
+        let candidate_names = self.benchmark_candidates_for_group(&group);
         let request = BenchmarkRequest {
             selector: group.name.clone(),
             pattern: self.benchmark_filter.clone(),
@@ -694,9 +1057,8 @@ impl App {
             timeout_ms: self.benchmark_timeout_ms,
             request_timeout: self.benchmark_request_timeout,
             max_concurrency: self.benchmark_max_concurrency,
-            nodes: None,
+            nodes: Some(candidate_names.clone()),
         };
-        let candidate_names = self.client.fetch_benchmark_candidates(&request)?;
         if candidate_names.is_empty() {
             self.set_status_only(format!(
                 "No nodes in {} matched filter '{}'",
@@ -836,6 +1198,164 @@ impl App {
         self.set_status_only(status);
     }
 
+    fn toggle_auto_select(&mut self) {
+        if self.auto_select_enabled {
+            self.auto_select_enabled = false;
+            self.set_status_only("Auto-pick disabled");
+            return;
+        }
+
+        if self.benchmark_filter.is_empty() {
+            self.set_status_only("Set a filter before enabling auto-pick");
+            return;
+        }
+
+        let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
+            self.set_status_only("No selector group available for auto-pick");
+            return;
+        };
+        self.auto_select_enabled = true;
+        self.last_auto_select_benchmark = None;
+        self.set_status_only(format!(
+            "Auto-pick enabled for {} with filter '{}' ({}ms threshold, every {}s)",
+            group_name,
+            self.benchmark_filter,
+            self.auto_select_threshold_ms,
+            self.auto_select_interval.as_secs()
+        ));
+    }
+
+    fn auto_select_benchmark_due(&self, now: Instant) -> bool {
+        if !self.auto_select_enabled || self.benchmark_filter.is_empty() {
+            return false;
+        }
+        self.last_auto_select_benchmark
+            .is_none_or(|last| now.duration_since(last) >= self.auto_select_interval)
+    }
+
+    fn maybe_start_auto_select_benchmark(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if !self.auto_select_benchmark_due(now) {
+            return Ok(());
+        }
+        let Some(group) = self.selected_group().cloned() else {
+            return Ok(());
+        };
+        if self
+            .benchmark_jobs
+            .iter()
+            .any(|job| job.group == group.name)
+        {
+            return Ok(());
+        }
+
+        let candidate_names = self.benchmark_candidates_for_group(&group);
+        let request = BenchmarkRequest {
+            selector: group.name.clone(),
+            pattern: self.benchmark_filter.clone(),
+            url: self.benchmark_url.clone(),
+            timeout_ms: self.benchmark_timeout_ms,
+            request_timeout: self.benchmark_request_timeout,
+            max_concurrency: self.benchmark_max_concurrency,
+            nodes: Some(candidate_names.clone()),
+        };
+        self.last_auto_select_benchmark = Some(now);
+        if candidate_names.is_empty() {
+            self.set_status_only(format!(
+                "Auto-pick found no nodes in {} matching '{}'",
+                group.name, self.benchmark_filter
+            ));
+            return Ok(());
+        }
+
+        self.prepare_group_benchmark(&group.name, candidate_names.clone());
+        self.spawn_benchmark_job(
+            group.name.clone(),
+            candidate_names,
+            request,
+            BenchmarkJobKind::AutoSelect,
+        );
+        self.set_status_only(format!(
+            "Auto-pick benchmarking {} with filter '{}'...",
+            group.name, self.benchmark_filter
+        ));
+        Ok(())
+    }
+
+    fn auto_select_target(&self, group: &ProxyGroup, summary: &BenchmarkSummary) -> Option<String> {
+        let best = summary.best_success()?;
+        let current = group.current.as_deref();
+        let current_result = current.and_then(|name| summary.find_result(name));
+        let current_is_acceptable = current_result
+            .and_then(|result| result.delay)
+            .is_some_and(|delay| delay <= self.auto_select_threshold_ms);
+        if current_is_acceptable {
+            return None;
+        }
+        if current == Some(best.name.as_str()) {
+            return None;
+        }
+        Some(best.name.clone())
+    }
+
+    fn finish_auto_select_benchmark(
+        &mut self,
+        group_name: &str,
+        summary: &BenchmarkSummary,
+    ) -> Result<()> {
+        let Some(group) = self
+            .groups
+            .iter()
+            .find(|group| group.name == group_name)
+            .cloned()
+        else {
+            self.set_status_only(format!(
+                "Auto-pick finished for missing group {}",
+                group_name
+            ));
+            return Ok(());
+        };
+
+        let Some(target) = self.auto_select_target(&group, summary) else {
+            let current = group.current.as_deref().unwrap_or("unset");
+            self.set_status_only(format!(
+                "Auto-pick kept {} on {} (threshold {}ms)",
+                group_name, current, self.auto_select_threshold_ms
+            ));
+            return Ok(());
+        };
+
+        self.client
+            .switch_proxy(group_name, &target)
+            .with_context(|| format!("auto-pick failed to switch {} to {}", group_name, target))?;
+        if REFRESH_DEBOUNCE > Duration::ZERO {
+            std::thread::sleep(REFRESH_DEBOUNCE);
+        }
+        self.refresh()?;
+        self.set_status_only(format!("Auto-pick switched {} to {}", group_name, target));
+        Ok(())
+    }
+
+    fn record_benchmark_result(
+        &self,
+        group: &str,
+        filter: &str,
+        job_kind: &BenchmarkJobKind,
+        result: &crate::controller::BenchmarkResult,
+    ) -> Result<()> {
+        let Some(store) = &self.benchmark_store else {
+            return Ok(());
+        };
+        store.record_benchmark(&BenchmarkRecord {
+            selector: group,
+            node: &result.name,
+            filter,
+            delay_ms: result.delay,
+            completed: result.completed,
+            job_kind: benchmark_job_kind_label(job_kind),
+        })
+    }
+
     fn poll_benchmark_updates(&mut self) -> Result<()> {
         let mut finished_indexes = Vec::new();
 
@@ -844,16 +1364,21 @@ impl App {
             loop {
                 match self.benchmark_jobs[index].receiver.try_recv() {
                     Ok(BenchmarkEvent::Progress(result)) => {
+                        let group = self.benchmark_jobs[index].group.clone();
+                        let kind = self.benchmark_jobs[index].kind.clone();
+                        let mut filter = self.benchmark_filter.clone();
                         if let Some(summary) =
                             self.benchmarks.get_mut(&self.benchmark_jobs[index].group)
                         {
-                            summary.update_result(result);
+                            filter = summary.pattern.clone();
+                            summary.update_result(result.clone());
                             self.status = format!(
                                 "Benchmarking {}... best so far: {}",
                                 self.benchmark_jobs[index].group,
                                 summary.best_label()
                             );
                         }
+                        self.record_benchmark_result(&group, &filter, &kind, &result)?;
                     }
                     Ok(BenchmarkEvent::Finished) => {
                         finished = true;
@@ -875,6 +1400,10 @@ impl App {
                                             group
                                         ));
                                     }
+                                }
+                                BenchmarkJobKind::AutoSelect => {
+                                    let summary = summary.clone();
+                                    self.finish_auto_select_benchmark(&group, &summary)?;
                                 }
                                 BenchmarkJobKind::SingleNode { node } => {
                                     let result = summary.find_result(&node);
@@ -968,7 +1497,9 @@ impl App {
     fn apply_benchmark_filter(&mut self, value: String) {
         self.benchmark_filter = value;
         self.sync_selection_to_displayed_members();
+        self.last_auto_select_benchmark = None;
         if self.benchmark_filter.is_empty() {
+            self.auto_select_enabled = false;
             self.set_status_only("Benchmark filter cleared");
         } else {
             self.set_status_only(format!(
@@ -981,7 +1512,12 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Focus, truncate_for_width};
+    use super::{
+        App, Focus, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
+        LatencyChartState, LatencyChartTimeUnit, latency_chart_segments,
+        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
+        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, truncate_for_width,
+    };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
         BenchmarkResult, BenchmarkSummary, ProxyGroup,
@@ -992,7 +1528,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::{Duration, Instant};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::runtime::Builder as TokioRuntimeBuilder;
+
+    use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
+
+    fn test_db_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-tui-test-{nanos}.sqlite3"))
+    }
 
     fn test_app() -> App {
         let runtime = TokioRuntimeBuilder::new_current_thread()
@@ -1030,6 +1578,12 @@ mod tests {
             latency_sort_mode: false,
             last_single_node_benchmark: None,
             filter_input: None,
+            auto_select_enabled: false,
+            auto_select_threshold_ms: 600,
+            auto_select_interval: Duration::from_secs(30),
+            last_auto_select_benchmark: None,
+            benchmark_store: None,
+            latency_chart: None,
         }
     }
 
@@ -1156,6 +1710,237 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_progress_is_recorded_to_sqlite() {
+        let path = test_db_path();
+        let mut app = test_app();
+        app.benchmark_store = Some(BenchmarkStore::open(&path).expect("open benchmark store"));
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(BenchmarkEvent::Progress(BenchmarkResult {
+            name: "美国-a".to_string(),
+            delay: Some(88),
+            completed: true,
+        }))
+        .expect("send progress event");
+        let worker = thread::spawn(|| {});
+        app.benchmark_jobs.push(BenchmarkJob {
+            group: "select".to_string(),
+            nodes: vec!["美国-a".to_string()],
+            kind: BenchmarkJobKind::AutoSelect,
+            receiver: rx,
+            worker,
+        });
+
+        app.poll_benchmark_updates().expect("poll succeeds");
+
+        let store = BenchmarkStore::open(&path).expect("reopen benchmark store");
+        let rows = store.recent_benchmarks(10).expect("read rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].selector, "select");
+        assert_eq!(rows[0].node, "美国-a");
+        assert_eq!(rows[0].filter, "美国");
+        assert_eq!(rows[0].delay_ms, Some(88));
+        assert!(rows[0].completed);
+        assert_eq!(rows[0].job_kind, "auto");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pressing_i_opens_latency_chart_for_selected_node() {
+        let path = test_db_path();
+        let mut app = test_app();
+        app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
+        app.member_index = 1;
+        let store = BenchmarkStore::open(&path).expect("open benchmark store");
+        store
+            .record_benchmark(&BenchmarkRecord {
+                selector: "select",
+                node: "node-b",
+                filter: "美国",
+                delay_ms: Some(93),
+                completed: true,
+                job_kind: "single",
+            })
+            .expect("record benchmark");
+        app.benchmark_store = Some(store);
+
+        app.handle_key(KeyCode::Char('i')).expect("open chart");
+
+        let chart = app.latency_chart.as_ref().expect("latency chart");
+        assert_eq!(chart.selector, "select");
+        assert_eq!(chart.node, "node-b");
+        assert_eq!(chart.samples.len(), 1);
+        assert_eq!(chart.samples[0].delay_ms, Some(93));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn latency_chart_segments_break_on_failed_samples() {
+        let samples = vec![
+            NodeLatencySample {
+                recorded_at_ms: 1_000,
+                delay_ms: Some(90),
+            },
+            NodeLatencySample {
+                recorded_at_ms: 2_000,
+                delay_ms: None,
+            },
+            NodeLatencySample {
+                recorded_at_ms: 3_000,
+                delay_ms: Some(120),
+            },
+        ];
+
+        assert_eq!(
+            latency_chart_segments(&samples),
+            vec![vec![(1_000, 90)], vec![(3_000, 120)]]
+        );
+    }
+
+    #[test]
+    fn latency_chart_uses_minutes_for_short_windows_and_hours_for_long_windows() {
+        assert_eq!(
+            latency_chart_time_unit(Duration::from_secs(30 * 60)),
+            LatencyChartTimeUnit::Minutes
+        );
+        assert_eq!(
+            latency_chart_time_unit(Duration::from_secs(3 * 60 * 60)),
+            LatencyChartTimeUnit::Hours
+        );
+    }
+
+    #[test]
+    fn latency_chart_zoom_adjusts_window() {
+        assert_eq!(
+            latency_chart_zoom_in(Duration::from_secs(60 * 60)),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            latency_chart_zoom_out(Duration::from_secs(60 * 60)),
+            Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn latency_chart_threshold_line_spans_the_visible_window() {
+        assert_eq!(
+            latency_chart_threshold_line(30.0, 600),
+            vec![(0.0, 600.0), (30.0, 600.0)]
+        );
+    }
+
+    #[test]
+    fn latency_chart_y_bounds_include_threshold() {
+        let low_latency_bounds = latency_chart_y_bounds(80.0, 120.0, 600);
+        assert!(low_latency_bounds[0] <= 80.0);
+        assert!(low_latency_bounds[1] > 600.0);
+
+        let high_latency_bounds = latency_chart_y_bounds(700.0, 900.0, 600);
+        assert!(high_latency_bounds[0] < 600.0);
+        assert!(high_latency_bounds[1] >= 900.0);
+    }
+
+    #[test]
+    fn latency_chart_window_keeps_recent_samples() {
+        let samples = vec![
+            NodeLatencySample {
+                recorded_at_ms: 0,
+                delay_ms: Some(90),
+            },
+            NodeLatencySample {
+                recorded_at_ms: 45 * 60 * 1000,
+                delay_ms: Some(120),
+            },
+            NodeLatencySample {
+                recorded_at_ms: 60 * 60 * 1000,
+                delay_ms: Some(80),
+            },
+        ];
+
+        let visible = latency_chart_windowed_samples(&samples, Duration::from_secs(30 * 60));
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].recorded_at_ms, 45 * 60 * 1000);
+        assert_eq!(visible[1].recorded_at_ms, 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn z_and_shift_z_zoom_latency_chart() {
+        let mut app = test_app();
+        app.latency_chart = Some(LatencyChartState {
+            selector: "select".to_string(),
+            node: "node-a".to_string(),
+            samples: vec![NodeLatencySample {
+                recorded_at_ms: 1_000,
+                delay_ms: Some(90),
+            }],
+            window: LATENCY_CHART_DEFAULT_WINDOW,
+            last_refresh: Instant::now(),
+        });
+
+        app.handle_key(KeyCode::Char('z')).expect("zoom in");
+        assert_eq!(
+            app.latency_chart.as_ref().expect("chart").window,
+            Duration::from_secs(30 * 60)
+        );
+
+        app.handle_key(KeyCode::Char('Z')).expect("zoom out");
+        assert_eq!(
+            app.latency_chart.as_ref().expect("chart").window,
+            LATENCY_CHART_DEFAULT_WINDOW
+        );
+    }
+
+    #[test]
+    fn latency_chart_refreshes_from_sqlite() {
+        let path = test_db_path();
+        let mut app = test_app();
+        let store = BenchmarkStore::open(&path).expect("open benchmark store");
+        store
+            .record_benchmark(&BenchmarkRecord {
+                selector: "select",
+                node: "node-a",
+                filter: "美国",
+                delay_ms: Some(77),
+                completed: true,
+                job_kind: "auto",
+            })
+            .expect("record benchmark");
+        app.benchmark_store = Some(store);
+        app.latency_chart = Some(LatencyChartState {
+            selector: "select".to_string(),
+            node: "node-a".to_string(),
+            samples: Vec::new(),
+            window: LATENCY_CHART_DEFAULT_WINDOW,
+            last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
+        });
+
+        app.maybe_refresh_latency_chart().expect("refresh chart");
+
+        let chart = app.latency_chart.as_ref().expect("chart");
+        assert_eq!(chart.samples.len(), 1);
+        assert_eq!(chart.samples[0].delay_ms, Some(77));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pressing_i_without_history_updates_status() {
+        let path = test_db_path();
+        let mut app = test_app();
+        app.benchmark_store = Some(BenchmarkStore::open(&path).expect("open benchmark store"));
+
+        app.handle_key(KeyCode::Char('i')).expect("open chart");
+
+        assert!(app.latency_chart.is_none());
+        assert_eq!(app.status, "No latency history for node-a");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn slash_opens_filter_modal_with_current_value() {
         let mut app = test_app();
         app.benchmark_filter = "hk".to_string();
@@ -1258,6 +2043,142 @@ mod tests {
         );
         assert_eq!(app.member_index, 0);
         assert_eq!(app.displayed_member_index(), Some(0));
+    }
+
+    #[test]
+    fn displayed_members_match_any_comma_separated_filter() {
+        let mut app = test_app();
+        app.groups[0].members = vec![
+            "美国-1".to_string(),
+            "香港-1".to_string(),
+            "日本-1".to_string(),
+        ];
+
+        app.apply_benchmark_filter("美国,香港".to_string());
+
+        assert_eq!(
+            app.displayed_members(),
+            vec!["美国-1".to_string(), "香港-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_select_keeps_current_when_latency_is_under_threshold() {
+        let app = test_app();
+        let group = ProxyGroup {
+            name: "select".to_string(),
+            current: Some("美国-a".to_string()),
+            members: vec!["美国-a".to_string(), "美国-b".to_string()],
+        };
+        let summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("美国-a".to_string()),
+            pattern: "美国".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![
+                BenchmarkResult {
+                    name: "美国-a".to_string(),
+                    delay: Some(500),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "美国-b".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+            ],
+        };
+
+        assert_eq!(app.auto_select_target(&group, &summary), None);
+    }
+
+    #[test]
+    fn auto_select_switches_to_best_when_current_latency_is_high() {
+        let app = test_app();
+        let group = ProxyGroup {
+            name: "select".to_string(),
+            current: Some("美国-a".to_string()),
+            members: vec!["美国-a".to_string(), "美国-b".to_string()],
+        };
+        let summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("美国-a".to_string()),
+            pattern: "美国".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![
+                BenchmarkResult {
+                    name: "美国-a".to_string(),
+                    delay: Some(650),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "美国-b".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            app.auto_select_target(&group, &summary),
+            Some("美国-b".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_select_switches_to_best_when_current_is_outside_filter() {
+        let app = test_app();
+        let group = ProxyGroup {
+            name: "select".to_string(),
+            current: Some("香港-a".to_string()),
+            members: vec!["香港-a".to_string(), "美国-b".to_string()],
+        };
+        let summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("香港-a".to_string()),
+            pattern: "美国".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![BenchmarkResult {
+                name: "美国-b".to_string(),
+                delay: Some(80),
+                completed: true,
+            }],
+        };
+
+        assert_eq!(
+            app.auto_select_target(&group, &summary),
+            Some("美国-b".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_select_benchmark_waits_for_interval() {
+        let mut app = test_app();
+        app.auto_select_enabled = true;
+        let now = Instant::now();
+        app.last_auto_select_benchmark = Some(now - Duration::from_secs(29));
+
+        assert!(!app.auto_select_benchmark_due(now));
+
+        app.last_auto_select_benchmark = Some(now - Duration::from_secs(30));
+        assert!(app.auto_select_benchmark_due(now));
+    }
+
+    #[test]
+    fn auto_select_toggle_requires_filter() {
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+
+        app.handle_key(KeyCode::Char('a')).expect("toggle handled");
+
+        assert!(!app.auto_select_enabled);
+        assert_eq!(app.status, "Set a filter before enabling auto-pick");
     }
 
     #[test]

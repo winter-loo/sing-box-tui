@@ -9,6 +9,7 @@ mod controller;
 mod defaults;
 mod import;
 mod provider;
+mod storage;
 mod tui;
 
 use cli::CliCommand;

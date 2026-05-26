@@ -186,22 +186,6 @@ impl ApiClient {
             .block_on(self.benchmark_selector_async(request))
     }
 
-    pub(crate) fn fetch_benchmark_candidates(
-        &self,
-        request: &BenchmarkRequest,
-    ) -> Result<Vec<String>> {
-        self.runtime
-            .block_on(self.fetch_benchmark_candidates_async(request))
-    }
-
-    async fn fetch_benchmark_candidates_async(
-        &self,
-        request: &BenchmarkRequest,
-    ) -> Result<Vec<String>> {
-        let selector = self.fetch_selector_async(&request.selector).await?;
-        Ok(filter_benchmark_candidates(&selector.all, request))
-    }
-
     async fn benchmark_selector_async(
         &self,
         request: &BenchmarkRequest,
@@ -702,6 +686,7 @@ pub(crate) struct BenchmarkSummary {
 #[derive(Clone)]
 pub(crate) enum BenchmarkJobKind {
     Group,
+    AutoSelect,
     SingleNode { node: String },
 }
 
