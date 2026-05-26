@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 use crate::defaults::{
     AUTO_SELECTOR_TAG_ALIASES, BLOCK_TAG_ALIASES, DEFAULT_AD_BLOCK_SELECTOR_TAG,
-    DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG,
-    DEFAULT_LOCAL_DNS_TAG, DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES,
-    SELECTOR_TAG_ALIASES,
+    DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_BYPASS_RULE_SET_PATH,
+    DEFAULT_BYPASS_RULE_SET_TAG, DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG, DEFAULT_LOCAL_DNS_TAG,
+    DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, SELECTOR_TAG_ALIASES,
 };
 
 pub(crate) fn build_full_config(
@@ -173,6 +173,10 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "action": "hijack-dns",
                 },
                 {
+                    "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
+                    "outbound": DEFAULT_DIRECT_TAG,
+                },
+                {
                     "clash_mode": "直连",
                     "outbound": DEFAULT_DIRECT_TAG,
                 },
@@ -206,6 +210,12 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                 }
             ],
             "rule_set": [
+                {
+                    "type": "local",
+                    "tag": DEFAULT_BYPASS_RULE_SET_TAG,
+                    "format": "source",
+                    "path": DEFAULT_BYPASS_RULE_SET_PATH,
+                },
                 {
                     "type": "remote",
                     "tag": "geoip-cn",
@@ -387,6 +397,7 @@ pub(crate) fn merge_into_existing_config(
     route
         .entry("final")
         .or_insert_with(|| Value::String(selector_tag));
+    ensure_bypass_route(route, &direct_tag)?;
 
     let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
     let experimental = experimental_value
@@ -419,6 +430,89 @@ pub(crate) fn merge_into_existing_config(
         .or_insert_with(|| Value::String(String::new()));
 
     Ok(())
+}
+
+fn ensure_bypass_route(route: &mut serde_json::Map<String, Value>, direct_tag: &str) -> Result<()> {
+    let rules_value = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rules = rules_value
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    if let Some(rule) = rules
+        .iter_mut()
+        .find(|rule| rule_references_rule_set(rule, DEFAULT_BYPASS_RULE_SET_TAG))
+    {
+        set_rule_outbound(rule, direct_tag);
+    } else {
+        let index = if rules.first().is_some_and(is_dns_hijack_rule) {
+            1
+        } else {
+            0
+        };
+        rules.insert(
+            index,
+            json!({
+                "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
+                "outbound": direct_tag,
+            }),
+        );
+    }
+
+    let rule_sets_value = route
+        .entry("rule_set")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rule_sets = rule_sets_value
+        .as_array_mut()
+        .context("existing config route.rule_set must be an array")?;
+    if let Some(rule_set) = rule_sets.iter_mut().find(|value| {
+        value
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| tag == DEFAULT_BYPASS_RULE_SET_TAG)
+    }) {
+        if let Some(object) = rule_set.as_object_mut() {
+            object.insert("type".to_string(), Value::String("local".to_string()));
+            object.insert("format".to_string(), Value::String("source".to_string()));
+            object.insert(
+                "path".to_string(),
+                Value::String(DEFAULT_BYPASS_RULE_SET_PATH.to_string()),
+            );
+        }
+    } else {
+        rule_sets.insert(
+            0,
+            json!({
+                "type": "local",
+                "tag": DEFAULT_BYPASS_RULE_SET_TAG,
+                "format": "source",
+                "path": DEFAULT_BYPASS_RULE_SET_PATH,
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn rule_references_rule_set(rule: &Value, tag: &str) -> bool {
+    match rule.get("rule_set") {
+        Some(Value::String(value)) => value == tag,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(tag)),
+        _ => false,
+    }
+}
+
+fn set_rule_outbound(rule: &mut Value, direct_tag: &str) {
+    let Some(object) = rule.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "outbound".to_string(),
+        Value::String(direct_tag.to_string()),
+    );
+}
+
+fn is_dns_hijack_rule(rule: &Value) -> bool {
+    rule.get("action").and_then(Value::as_str) == Some("hijack-dns")
 }
 
 fn is_replaceable_node_outbound(outbound: &Value) -> bool {
@@ -602,6 +696,19 @@ mod tests {
             "local"
         );
         assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
+        assert!(
+            config["route"]["rules"].as_array().expect("route rules")[1]["rule_set"]
+                == "sing-box-tui-bypass"
+        );
+        assert!(
+            config["route"]["rule_set"]
+                .as_array()
+                .expect("rule sets")
+                .iter()
+                .any(|value| value["tag"] == "sing-box-tui-bypass"
+                    && value["type"] == "local"
+                    && value["format"] == "source")
+        );
         assert!(config["route"].get("final").is_none());
     }
 
@@ -729,6 +836,22 @@ mod tests {
         assert!(members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("node-a".to_string())));
         assert_eq!(config["route"]["final"], "existing-node");
+        assert!(
+            config["route"]["rules"]
+                .as_array()
+                .expect("route rules")
+                .iter()
+                .any(|value| value["rule_set"] == "sing-box-tui-bypass"
+                    && value["outbound"] == "direct")
+        );
+        assert!(
+            config["route"]["rule_set"]
+                .as_array()
+                .expect("rule sets")
+                .iter()
+                .any(|value| value["tag"] == "sing-box-tui-bypass"
+                    && value["path"] == "sing-box-tui-bypass.json")
+        );
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
     }
 

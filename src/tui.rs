@@ -30,7 +30,10 @@ use crate::defaults::{
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
-use crate::tui_state::{TuiRuntimeState, TuiStateStore, default_tui_state_path};
+use crate::tui_state::{
+    BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
+    default_tui_state_path, parse_bypass_entries,
+};
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
@@ -245,6 +248,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ])
+    } else if let Some(input) = app.bypass_input.as_deref() {
+        Line::from(vec![
+            Span::styled("Bypass: ", Style::default().fg(Color::Cyan)),
+            Span::raw(input),
+            Span::styled(
+                "  domains/IPs/CIDRs comma-separated  Enter save  Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
         Line::from(app.status_line())
     };
@@ -259,6 +271,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" select  "),
             Span::styled("d", Style::default().fg(Color::Cyan)),
             Span::raw(" direct  "),
+            Span::styled("B", Style::default().fg(Color::Cyan)),
+            Span::raw(" bypass  "),
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
@@ -634,12 +648,15 @@ struct App {
     latency_sort_mode: bool,
     last_single_node_benchmark: Option<(String, String, Instant)>,
     filter_input: Option<String>,
+    bypass_input: Option<String>,
+    bypass_entries: Vec<String>,
     auto_select_enabled: bool,
     auto_select_threshold_ms: u64,
     auto_select_interval: Duration,
     last_auto_select_benchmark: Option<Instant>,
     benchmark_store: Option<BenchmarkStore>,
     state_store: Option<TuiStateStore>,
+    bypass_rule_set_store: Option<BypassRuleSetStore>,
     latency_chart: Option<LatencyChartState>,
 }
 
@@ -665,23 +682,28 @@ impl App {
             latency_sort_mode: false,
             last_single_node_benchmark: None,
             filter_input: None,
+            bypass_input: None,
+            bypass_entries: Vec::new(),
             auto_select_enabled: false,
             auto_select_threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             auto_select_interval: AUTO_SELECT_INTERVAL,
             last_auto_select_benchmark: None,
             benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
             state_store: Some(state_store),
+            bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
             latency_chart: None,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
         app.apply_runtime_state(runtime_state);
+        app.save_bypass_rule_set()?;
         Ok(app)
     }
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) {
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled && !self.benchmark_filter.is_empty();
+        self.bypass_entries = state.bypass_entries;
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
             && let Some(node) = state.current_selected_nodes.get(&group.name)
@@ -706,6 +728,7 @@ impl App {
                         .map(|current| (group.name.clone(), current.clone()))
                 })
                 .collect(),
+            bypass_entries: self.bypass_entries.clone(),
         }
     }
 
@@ -714,6 +737,13 @@ impl App {
             return Ok(());
         };
         store.save(&self.runtime_state())
+    }
+
+    fn save_bypass_rule_set(&self) -> Result<()> {
+        let Some(store) = &self.bypass_rule_set_store else {
+            return Ok(());
+        };
+        store.save(&self.bypass_entries)
     }
 
     fn selected_group(&self) -> Option<&ProxyGroup> {
@@ -850,6 +880,9 @@ impl App {
         if self.filter_input.is_some() {
             return self.handle_filter_input_key(code);
         }
+        if self.bypass_input.is_some() {
+            return self.handle_bypass_input_key(code);
+        }
         if self.latency_chart.is_some() {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
@@ -888,6 +921,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('d') => self.switch_to_direct()?,
+            KeyCode::Char('B') => self.open_bypass_modal(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
@@ -1556,6 +1590,11 @@ impl App {
         self.flash = None;
     }
 
+    fn open_bypass_modal(&mut self) {
+        self.bypass_input = Some(self.bypass_entries.join(","));
+        self.flash = None;
+    }
+
     fn handle_filter_input_key(&mut self, code: KeyCode) -> Result<bool> {
         let Some(buffer) = self.filter_input.as_mut() else {
             return Ok(true);
@@ -1582,6 +1621,32 @@ impl App {
         Ok(true)
     }
 
+    fn handle_bypass_input_key(&mut self, code: KeyCode) -> Result<bool> {
+        let Some(buffer) = self.bypass_input.as_mut() else {
+            return Ok(true);
+        };
+
+        match code {
+            KeyCode::Esc | KeyCode::Char(' ') => {
+                self.bypass_input = None;
+                self.set_status_only("Bypass edit canceled");
+            }
+            KeyCode::Enter => {
+                let value = buffer.clone();
+                self.bypass_input = None;
+                self.apply_bypass_entries(parse_bypass_entries(&value))?;
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(ch) => {
+                buffer.push(ch);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
     fn apply_benchmark_filter(&mut self, value: String) -> Result<()> {
         self.benchmark_filter = value;
         self.sync_selection_to_displayed_members();
@@ -1596,6 +1661,21 @@ impl App {
             ));
         }
         self.save_runtime_state()?;
+        Ok(())
+    }
+
+    fn apply_bypass_entries(&mut self, entries: Vec<String>) -> Result<()> {
+        self.bypass_entries = entries;
+        self.save_runtime_state()?;
+        self.save_bypass_rule_set()?;
+        if self.bypass_entries.is_empty() {
+            self.set_status_only("Bypass list cleared");
+        } else {
+            self.set_status_only(format!(
+                "Bypass list saved ({} entries)",
+                self.bypass_entries.len()
+            ));
+        }
         Ok(())
     }
 }
@@ -1641,6 +1721,14 @@ mod tests {
         std::env::temp_dir().join(format!("sing-box-tui-state-test-{nanos}.json"))
     }
 
+    fn test_bypass_rule_set_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-bypass-test-{nanos}.json"))
+    }
+
     fn test_app() -> App {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
@@ -1677,12 +1765,15 @@ mod tests {
             latency_sort_mode: false,
             last_single_node_benchmark: None,
             filter_input: None,
+            bypass_input: None,
+            bypass_entries: Vec::new(),
             auto_select_enabled: false,
             auto_select_threshold_ms: 600,
             auto_select_interval: Duration::from_secs(30),
             last_auto_select_benchmark: None,
             benchmark_store: None,
             state_store: None,
+            bypass_rule_set_store: None,
             latency_chart: None,
         }
     }
@@ -1714,6 +1805,7 @@ mod tests {
         let mut state = TuiRuntimeState {
             benchmark_filter: "美国,香港".to_string(),
             auto_pick_enabled: true,
+            bypass_entries: vec!["example.com".to_string(), "10.0.0.0/8".to_string()],
             ..TuiRuntimeState::default()
         };
         state
@@ -1724,6 +1816,36 @@ mod tests {
         let loaded = store.load().expect("load state");
 
         assert_eq!(loaded, state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bypass_rule_set_store_writes_domains_and_ip_cidrs() {
+        let path = test_bypass_rule_set_path();
+        let store = crate::tui_state::BypassRuleSetStore::new(&path);
+
+        store
+            .save(&[
+                "example.com".to_string(),
+                "*.github.com".to_string(),
+                "1.1.1.1".to_string(),
+                "10.0.0.0/8".to_string(),
+            ])
+            .expect("save rule set");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read rule set"))
+                .expect("parse rule set");
+        assert_eq!(value["version"], 1);
+        assert_eq!(
+            value["rules"][0]["domain_suffix"],
+            serde_json::json!(["example.com", "github.com"])
+        );
+        assert_eq!(
+            value["rules"][1]["ip_cidr"],
+            serde_json::json!(["1.1.1.1", "10.0.0.0/8"])
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -1772,6 +1894,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bypass_modal_updates_state_and_rule_set_file() {
+        let path = test_state_path();
+        let rule_set_path = test_bypass_rule_set_path();
+        let mut app = test_app();
+        app.state_store = Some(TuiStateStore::new(&path));
+        app.bypass_rule_set_store = Some(crate::tui_state::BypassRuleSetStore::new(&rule_set_path));
+
+        app.handle_key(KeyCode::Char('B'))
+            .expect("open bypass modal");
+        for ch in "example.com,10.0.0.0/8".chars() {
+            app.handle_key(KeyCode::Char(ch)).expect("type bypass");
+        }
+        app.handle_key(KeyCode::Enter).expect("save bypass");
+
+        let state = TuiStateStore::new(&path).load().expect("load state");
+        assert_eq!(
+            state.bypass_entries,
+            vec!["example.com".to_string(), "10.0.0.0/8".to_string()]
+        );
+        let rule_set: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&rule_set_path).expect("read rule set"))
+                .expect("parse rule set");
+        assert_eq!(
+            rule_set["rules"][0]["domain_suffix"],
+            serde_json::json!(["example.com"])
+        );
+        assert_eq!(
+            rule_set["rules"][1]["ip_cidr"],
+            serde_json::json!(["10.0.0.0/8"])
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(rule_set_path);
     }
 
     #[test]

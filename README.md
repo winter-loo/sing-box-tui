@@ -84,6 +84,8 @@ TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. S
 
 TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last benchmark filter, whether auto-pick is enabled, and the current selected node for each selector group.
 
+TUI bypass entries are stored in that same state file and written to a sing-box source rule-set at `./sing-box-tui-bypass.json` by default. Set `SING_BOX_TUI_BYPASS_RULE_SET=/path/to/sing-box-tui-bypass.json` to use a different file. Generated and merged configs reference this local rule-set near the top of `route.rules`, routing matched domains/IPs/CIDRs to `direct` / `国内直连`. If an older live config does not yet reference the rule-set, regenerate/merge the config and restart or reload sing-box once; after that, the local rule-set file can be edited by the TUI and sing-box will reload it.
+
 Generated and merged configs set selector/urltest `interrupt_exist_connections` to `false`, so switching nodes does not tear down existing connections. Existing connections keep their original outbound until they close or fail; new/retried connections use the current selection.
 
 List selector groups through the Clash API:
@@ -151,6 +153,73 @@ Validate the generated config:
 sing-box check -c config.json
 ```
 
+## Manual Bypass Migration
+
+Use this when you want to update an older `sing-box` config by hand so the TUI can manage direct-bypass domains, IPs, and CIDRs.
+
+Add this local source rule-set to `route.rule_set`:
+
+```json
+{
+  "type": "local",
+  "tag": "sing-box-tui-bypass",
+  "format": "source",
+  "path": "sing-box-tui-bypass.json"
+}
+```
+
+Add this route rule near the top of `route.rules`, after any DNS hijack rule and before normal proxy/direct rules:
+
+```json
+{
+  "rule_set": "sing-box-tui-bypass",
+  "outbound": "direct"
+}
+```
+
+If your direct outbound tag is `国内直连`, use that instead:
+
+```json
+{
+  "rule_set": "sing-box-tui-bypass",
+  "outbound": "国内直连"
+}
+```
+
+Create the rule-set file at the configured `path`:
+
+```json
+{
+  "version": 1,
+  "rules": []
+}
+```
+
+Example with entries:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "domain_suffix": ["example.com", "github.com"]
+    },
+    {
+      "ip_cidr": ["1.1.1.1", "10.0.0.0/8"]
+    }
+  ]
+}
+```
+
+Validate and restart once:
+
+```bash
+sing-box check -c /etc/sing-box/config.json
+sudo systemctl restart sing-box
+```
+
+After the config references the local rule-set, press `B` in the TUI to edit bypass entries. The TUI writes `sing-box-tui-bypass.json`; new or retried connections use the updated direct-bypass rules.
+
 ## Benchmark Nodes
 
 The former Python skill script is now built into the Rust app.
@@ -191,6 +260,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `d`: switch the current selector group to `direct` / `国内直连`; this sends new connections direct while existing connections keep their current outbound until they close or fail
+- `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
