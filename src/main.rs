@@ -11,6 +11,7 @@ mod import;
 mod provider;
 mod storage;
 mod tui;
+mod tui_state;
 
 use cli::CliCommand;
 use controller::{

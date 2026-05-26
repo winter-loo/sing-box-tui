@@ -31,7 +31,8 @@ pub(crate) fn build_full_config(
 
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
-    let select_members = with_leading_member(DEFAULT_AUTO_SELECTOR_TAG, &node_tags);
+    let select_members =
+        with_leading_members(&[DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_DIRECT_TAG], &node_tags);
 
     let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
     outbounds.push(json!({
@@ -325,7 +326,7 @@ pub(crate) fn merge_into_existing_config(
     }
 
     let node_tags = collect_tags(&imported_nodes);
-    let select_members = with_leading_member(&auto_tag, &node_tags);
+    let select_members = with_leading_members(&[&auto_tag, &direct_tag], &node_tags);
 
     upsert_special_outbound(
         outbounds,
@@ -492,10 +493,19 @@ fn collect_tags(outbounds: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn with_leading_member(first: &str, tags: &[String]) -> Vec<String> {
-    let mut members = Vec::with_capacity(tags.len() + 1);
-    members.push(first.to_string());
-    members.extend(tags.iter().cloned());
+fn with_leading_members(first_members: &[&str], tags: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut members = Vec::with_capacity(tags.len() + first_members.len());
+    for member in first_members {
+        if seen.insert((*member).to_string()) {
+            members.push((*member).to_string());
+        }
+    }
+    for tag in tags {
+        if seen.insert(tag.clone()) {
+            members.push(tag.clone());
+        }
+    }
     members
 }
 
@@ -580,6 +590,12 @@ mod tests {
         assert!(outbounds.iter().any(|value| value["tag"] == "自动选择"));
         assert!(outbounds.iter().any(|value| value["tag"] == "广告路由"));
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
+        let select = outbounds
+            .iter()
+            .find(|value| value["tag"] == "手动选择")
+            .expect("manual selector");
+        let members = select["outbounds"].as_array().expect("selector members");
+        assert!(members.contains(&Value::String("国内直连".to_string())));
         assert_eq!(config["dns"]["servers"][0]["type"], "tls");
         assert_eq!(
             config["route"]["default_domain_resolver"]["server"],
@@ -710,6 +726,7 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(members.contains(&Value::String("existing-node".to_string())));
         assert!(members.contains(&Value::String("auto".to_string())));
+        assert!(members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("node-a".to_string())));
         assert_eq!(config["route"]["final"], "existing-node");
         assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
@@ -771,6 +788,7 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(!members.contains(&Value::String("old-node".to_string())));
         assert!(members.contains(&Value::String("auto".to_string())));
+        assert!(members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("new-node".to_string())));
     }
 }

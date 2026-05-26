@@ -82,6 +82,8 @@ Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,�
 
 TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and benchmark kind (`group`, `single`, or `auto`).
 
+TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last benchmark filter, whether auto-pick is enabled, and the current selected node for each selector group.
+
 Generated and merged configs set selector/urltest `interrupt_exist_connections` to `false`, so switching nodes does not tear down existing connections. Existing connections keep their original outbound until they close or fail; new/retried connections use the current selection.
 
 List selector groups through the Clash API:
@@ -188,6 +190,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Up` / `Down` or `j` / `k`: move
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
+- `d`: switch the current selector group to `direct` / `国内直连`; this sends new connections direct while existing connections keep their current outbound until they close or fail
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)

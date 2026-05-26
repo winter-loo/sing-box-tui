@@ -25,11 +25,12 @@ use crate::controller::{
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
-    REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
+    DEFAULT_DIRECT_TAG, DIRECT_TAG_ALIASES, REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
 };
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
+use crate::tui_state::{TuiRuntimeState, TuiStateStore, default_tui_state_path};
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
@@ -256,6 +257,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" switch pane  "),
             Span::styled("Space", Style::default().fg(Color::Cyan)),
             Span::raw(" select  "),
+            Span::styled("d", Style::default().fg(Color::Cyan)),
+            Span::raw(" direct  "),
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
@@ -534,6 +537,15 @@ fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
     if auto_select_enabled { "ON" } else { "OFF" }
 }
 
+fn direct_member_name(members: &[String]) -> Option<String> {
+    members
+        .iter()
+        .find(|member| {
+            member.as_str() == DEFAULT_DIRECT_TAG || DIRECT_TAG_ALIASES.contains(&member.as_str())
+        })
+        .cloned()
+}
+
 fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
     match kind {
         BenchmarkJobKind::Group => "group",
@@ -627,11 +639,14 @@ struct App {
     auto_select_interval: Duration,
     last_auto_select_benchmark: Option<Instant>,
     benchmark_store: Option<BenchmarkStore>,
+    state_store: Option<TuiStateStore>,
     latency_chart: Option<LatencyChartState>,
 }
 
 impl App {
     fn new(client: ApiClient, benchmark_max_concurrency: usize) -> Result<Self> {
+        let state_store = TuiStateStore::new(default_tui_state_path());
+        let runtime_state = state_store.load()?;
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -655,10 +670,50 @@ impl App {
             auto_select_interval: AUTO_SELECT_INTERVAL,
             last_auto_select_benchmark: None,
             benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
+            state_store: Some(state_store),
             latency_chart: None,
         };
+        app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
+        app.apply_runtime_state(runtime_state);
         Ok(app)
+    }
+
+    fn apply_runtime_state(&mut self, state: TuiRuntimeState) {
+        self.benchmark_filter = state.benchmark_filter;
+        self.auto_select_enabled = state.auto_pick_enabled && !self.benchmark_filter.is_empty();
+        self.last_auto_select_benchmark = None;
+        if let Some(group) = self.selected_group()
+            && let Some(node) = state.current_selected_nodes.get(&group.name)
+        {
+            let node = node.clone();
+            self.sync_selection_to_member_name(&node);
+        }
+        self.sync_selection_to_displayed_members();
+    }
+
+    fn runtime_state(&self) -> TuiRuntimeState {
+        TuiRuntimeState {
+            benchmark_filter: self.benchmark_filter.clone(),
+            auto_pick_enabled: self.auto_select_enabled,
+            current_selected_nodes: self
+                .groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .current
+                        .as_ref()
+                        .map(|current| (group.name.clone(), current.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    fn save_runtime_state(&self) -> Result<()> {
+        let Some(store) = &self.state_store else {
+            return Ok(());
+        };
+        store.save(&self.runtime_state())
     }
 
     fn selected_group(&self) -> Option<&ProxyGroup> {
@@ -831,7 +886,8 @@ impl App {
             KeyCode::Char('b') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
-            KeyCode::Char('a') => self.toggle_auto_select(),
+            KeyCode::Char('a') => self.toggle_auto_select()?,
+            KeyCode::Char('d') => self.switch_to_direct()?,
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
@@ -1005,7 +1061,35 @@ impl App {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
         self.refresh()?;
+        self.save_runtime_state()?;
         self.set_switch_status(&group_name, &member);
+        Ok(())
+    }
+
+    fn switch_to_direct(&mut self) -> Result<()> {
+        let Some(group) = self.selected_group() else {
+            bail!("no selector group available");
+        };
+        let group_name = group.name.clone();
+        let Some(member) = direct_member_name(&group.members) else {
+            self.set_status_only(format!(
+                "Direct outbound is not available in {}",
+                group_name
+            ));
+            return Ok(());
+        };
+        self.client
+            .switch_proxy(&group_name, &member)
+            .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
+        if REFRESH_DEBOUNCE > Duration::ZERO {
+            std::thread::sleep(REFRESH_DEBOUNCE);
+        }
+        self.refresh()?;
+        self.save_runtime_state()?;
+        self.set_status_only(format!(
+            "Switched {} to {} (new connections go direct)",
+            group_name, member
+        ));
         Ok(())
     }
 
@@ -1198,21 +1282,22 @@ impl App {
         self.set_status_only(status);
     }
 
-    fn toggle_auto_select(&mut self) {
+    fn toggle_auto_select(&mut self) -> Result<()> {
         if self.auto_select_enabled {
             self.auto_select_enabled = false;
             self.set_status_only("Auto-pick disabled");
-            return;
+            self.save_runtime_state()?;
+            return Ok(());
         }
 
         if self.benchmark_filter.is_empty() {
             self.set_status_only("Set a filter before enabling auto-pick");
-            return;
+            return Ok(());
         }
 
         let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
             self.set_status_only("No selector group available for auto-pick");
-            return;
+            return Ok(());
         };
         self.auto_select_enabled = true;
         self.last_auto_select_benchmark = None;
@@ -1223,6 +1308,8 @@ impl App {
             self.auto_select_threshold_ms,
             self.auto_select_interval.as_secs()
         ));
+        self.save_runtime_state()?;
+        Ok(())
     }
 
     fn auto_select_benchmark_due(&self, now: Instant) -> bool {
@@ -1332,6 +1419,7 @@ impl App {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
         self.refresh()?;
+        self.save_runtime_state()?;
         self.set_status_only(format!("Auto-pick switched {} to {}", group_name, target));
         Ok(())
     }
@@ -1481,7 +1569,7 @@ impl App {
             KeyCode::Enter => {
                 let value = buffer.trim().to_string();
                 self.filter_input = None;
-                self.apply_benchmark_filter(value);
+                self.apply_benchmark_filter(value)?;
             }
             KeyCode::Backspace => {
                 buffer.pop();
@@ -1494,7 +1582,7 @@ impl App {
         Ok(true)
     }
 
-    fn apply_benchmark_filter(&mut self, value: String) {
+    fn apply_benchmark_filter(&mut self, value: String) -> Result<()> {
         self.benchmark_filter = value;
         self.sync_selection_to_displayed_members();
         self.last_auto_select_benchmark = None;
@@ -1507,6 +1595,8 @@ impl App {
                 self.benchmark_filter
             ));
         }
+        self.save_runtime_state()?;
+        Ok(())
     }
 }
 
@@ -1514,7 +1604,7 @@ impl App {
 mod tests {
     use super::{
         App, Focus, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LatencyChartTimeUnit, latency_chart_segments,
+        LatencyChartState, LatencyChartTimeUnit, direct_member_name, latency_chart_segments,
         latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
         latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, truncate_for_width,
     };
@@ -1523,6 +1613,7 @@ mod tests {
         BenchmarkResult, BenchmarkSummary, ProxyGroup,
     };
     use crate::defaults::DEFAULT_BENCHMARK_MAX_CONCURRENCY;
+    use crate::tui_state::{TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
     use reqwest::Client as AsyncClient;
     use std::collections::BTreeMap;
@@ -1540,6 +1631,14 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("sing-box-tui-tui-test-{nanos}.sqlite3"))
+    }
+
+    fn test_state_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-state-test-{nanos}.json"))
     }
 
     fn test_app() -> App {
@@ -1583,6 +1682,7 @@ mod tests {
             auto_select_interval: Duration::from_secs(30),
             last_auto_select_benchmark: None,
             benchmark_store: None,
+            state_store: None,
             latency_chart: None,
         }
     }
@@ -1592,6 +1692,86 @@ mod tests {
         let truncated = truncate_for_width("手动选择-自动选择-节点A", 8);
         assert!(truncated.ends_with('…'));
         assert!(!truncated.is_empty());
+    }
+
+    #[test]
+    fn direct_member_name_accepts_default_and_legacy_tags() {
+        assert_eq!(
+            direct_member_name(&["node-a".to_string(), "国内直连".to_string()]),
+            Some("国内直连".to_string())
+        );
+        assert_eq!(
+            direct_member_name(&["node-a".to_string(), "direct".to_string()]),
+            Some("direct".to_string())
+        );
+        assert_eq!(direct_member_name(&["node-a".to_string()]), None);
+    }
+
+    #[test]
+    fn tui_state_store_round_trips_filter_auto_pick_and_current_nodes() {
+        let path = test_state_path();
+        let store = TuiStateStore::new(&path);
+        let mut state = TuiRuntimeState {
+            benchmark_filter: "美国,香港".to_string(),
+            auto_pick_enabled: true,
+            ..TuiRuntimeState::default()
+        };
+        state
+            .current_selected_nodes
+            .insert("select".to_string(), "node-a".to_string());
+
+        store.save(&state).expect("save state");
+        let loaded = store.load().expect("load state");
+
+        assert_eq!(loaded, state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn app_applies_persisted_filter_auto_pick_and_selected_node() {
+        let mut app = test_app();
+        app.groups[0].members = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ];
+        app.member_index = 0;
+        let mut state = TuiRuntimeState {
+            benchmark_filter: "node-b,node-c".to_string(),
+            auto_pick_enabled: true,
+            ..TuiRuntimeState::default()
+        };
+        state
+            .current_selected_nodes
+            .insert("select".to_string(), "node-c".to_string());
+
+        app.apply_runtime_state(state);
+
+        assert_eq!(app.benchmark_filter, "node-b,node-c");
+        assert!(app.auto_select_enabled);
+        assert_eq!(app.member_index, 2);
+    }
+
+    #[test]
+    fn filter_and_auto_pick_changes_are_saved_to_tui_state() {
+        let path = test_state_path();
+        let mut app = test_app();
+        app.state_store = Some(TuiStateStore::new(&path));
+
+        app.apply_benchmark_filter("香港".to_string())
+            .expect("apply filter");
+        app.handle_key(KeyCode::Char('a'))
+            .expect("toggle auto-pick");
+
+        let state = TuiStateStore::new(&path).load().expect("load state");
+        assert_eq!(state.benchmark_filter, "香港");
+        assert!(state.auto_pick_enabled);
+        assert_eq!(
+            state.current_selected_nodes.get("select"),
+            Some(&"node-a".to_string())
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2021,7 +2201,8 @@ mod tests {
         let mut app = test_app();
         app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
 
-        app.apply_benchmark_filter("hk".to_string());
+        app.apply_benchmark_filter("hk".to_string())
+            .expect("apply filter");
 
         assert_eq!(
             app.displayed_members(),
@@ -2035,7 +2216,8 @@ mod tests {
         app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
         app.member_index = 1;
 
-        app.apply_benchmark_filter("hk".to_string());
+        app.apply_benchmark_filter("hk".to_string())
+            .expect("apply filter");
 
         assert_eq!(
             app.displayed_members(),
@@ -2054,7 +2236,8 @@ mod tests {
             "日本-1".to_string(),
         ];
 
-        app.apply_benchmark_filter("美国,香港".to_string());
+        app.apply_benchmark_filter("美国,香港".to_string())
+            .expect("apply filter");
 
         assert_eq!(
             app.displayed_members(),
