@@ -1,11 +1,16 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use reqwest::Url;
+use reqwest::header::USER_AGENT;
+use serde::Serialize;
 use serde_json::Value;
+use serde_json::json;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use crate::clash::{ClashConfig, convert_clash_proxy, is_metadata_entry};
-use crate::config::build_full_config;
+use crate::config::{build_full_config, build_full_config_with_provider_groups};
 
 pub(crate) fn run_import(
     source: &PathBuf,
@@ -45,6 +50,92 @@ pub(crate) fn run_import(
     Ok(())
 }
 
+pub(crate) fn run_subscribe_import(
+    subscription_url: String,
+    output: Option<&PathBuf>,
+    config_path: &PathBuf,
+    subscription_output: Option<&PathBuf>,
+    replace_nodes: bool,
+    provider_name: Option<&str>,
+    existing_provider_name: Option<&str>,
+) -> Result<()> {
+    let parsed_url = Url::parse(&subscription_url).with_context(|| {
+        format!(
+            "invalid subscription URL: {}",
+            redact_url(&subscription_url)
+        )
+    })?;
+    let runtime = TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build Tokio runtime for subscription import")?;
+    let subscription_json = runtime.block_on(async {
+        reqwest::Client::builder()
+            .build()
+            .context("failed to build subscription HTTP client")?
+            .get(parsed_url)
+            .header(USER_AGENT, "sing-box")
+            .send()
+            .await
+            .context("failed to fetch sing-box subscription URL")?
+            .error_for_status()
+            .context("subscription server rejected request")?
+            .text()
+            .await
+            .context("failed to read sing-box subscription response")
+    })?;
+
+    if subscription_json.trim().is_empty() {
+        bail!("subscription response was empty");
+    }
+
+    if let Some(path) = subscription_output {
+        fs::write(path, format!("{subscription_json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    let (config, imported_nodes) = if let Some(provider_name) = provider_name {
+        build_full_config_from_singbox_subscription_with_provider_groups(
+            config_path,
+            &subscription_json,
+            replace_nodes,
+            provider_name,
+            existing_provider_name,
+        )?
+    } else {
+        build_full_config_from_singbox_subscription(config_path, &subscription_json, replace_nodes)?
+    };
+    let config_text =
+        serde_json::to_string_pretty(&config).context("failed to serialize merged config")?;
+
+    if let Some(output) = output {
+        fs::write(output, format!("{config_text}\n"))
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!(SubscriptionImportOutput {
+                subscription_url: redact_url(&subscription_url),
+                imported_nodes,
+                merged_config_path: output.display().to_string(),
+                subscription_output_path: subscription_output
+                    .map(|path| path.display().to_string()),
+            }))?
+        );
+    } else {
+        println!("{config_text}");
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SubscriptionImportOutput {
+    subscription_url: String,
+    imported_nodes: usize,
+    merged_config_path: String,
+    subscription_output_path: Option<String>,
+}
+
 pub(crate) fn build_full_config_from_singbox_subscription(
     config_path: &PathBuf,
     subscription_json: &str,
@@ -53,6 +144,25 @@ pub(crate) fn build_full_config_from_singbox_subscription(
     let imported_nodes = extract_mergeable_outbounds_from_singbox_subscription(subscription_json)?;
     let node_count = imported_nodes.len();
     let config = build_full_config(config_path, imported_nodes, replace_nodes)?;
+    Ok((config, node_count))
+}
+
+pub(crate) fn build_full_config_from_singbox_subscription_with_provider_groups(
+    config_path: &PathBuf,
+    subscription_json: &str,
+    replace_nodes: bool,
+    provider_name: &str,
+    existing_provider_name: Option<&str>,
+) -> Result<(Value, usize)> {
+    let imported_nodes = extract_mergeable_outbounds_from_singbox_subscription(subscription_json)?;
+    let node_count = imported_nodes.len();
+    let config = build_full_config_with_provider_groups(
+        config_path,
+        imported_nodes,
+        replace_nodes,
+        provider_name,
+        existing_provider_name,
+    )?;
     Ok((config, node_count))
 }
 
@@ -87,6 +197,9 @@ fn is_mergeable_subscription_outbound(outbound: &Value) -> bool {
     let Some(tag) = outbound.get("tag").and_then(Value::as_str) else {
         return false;
     };
+    if is_subscription_metadata_tag(tag) {
+        return false;
+    }
     if matches!(
         tag,
         "手动选择" | "自动选择" | "广告路由" | "国内直连" | "屏蔽" | "dns-out"
@@ -94,6 +207,44 @@ fn is_mergeable_subscription_outbound(outbound: &Value) -> bool {
         return false;
     }
     !tag.contains("如遇不可用请访问")
+}
+
+fn is_subscription_metadata_tag(tag: &str) -> bool {
+    tag.starts_with("剩余流量")
+        || tag.starts_with("套餐到期")
+        || tag.contains("官网")
+        || tag.contains("刷新订阅")
+        || tag.contains("请更换客户端")
+        || tag.contains("直连地址")
+        || tag.contains("TG群")
+        || tag.contains("邀请好友")
+}
+
+fn redact_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return value.to_string();
+    };
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            if key.eq_ignore_ascii_case("token") {
+                (key.into_owned(), "REDACTED".to_string())
+            } else {
+                (key.into_owned(), value.into_owned())
+            }
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return url.to_string();
+    }
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in pairs {
+            query.append_pair(&key, &value);
+        }
+    }
+    url.to_string()
 }
 
 #[cfg(test)]
@@ -108,6 +259,8 @@ mod tests {
             {"type":"urltest","tag":"自动选择","outbounds":["node-a"]},
             {"type":"shadowsocks","tag":"node-a","server":"example.com","server_port":443,"method":"aes-128-gcm","password":"secret"},
             {"type":"vmess","tag":"如遇不可用请访问3.airtcp.us","server":"notice.example.com","server_port":10086,"uuid":"abc"},
+            {"type":"vless","tag":"剩余流量：599.96 GB","server":"notice.example.com","server_port":443,"uuid":"abc"},
+            {"type":"vmess","tag":"TG群：https://t.me/example","server":"notice.example.com","server_port":10086,"uuid":"abc"},
             {"type":"direct","tag":"国内直连"}
           ]
         }"#;
@@ -126,6 +279,16 @@ mod tests {
             !outbounds
                 .iter()
                 .any(|value| value["tag"] == "如遇不可用请访问3.airtcp.us")
+        );
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "剩余流量：599.96 GB")
+        );
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "TG群：https://t.me/example")
         );
     }
 }

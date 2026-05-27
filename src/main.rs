@@ -17,7 +17,7 @@ use cli::CliCommand;
 use controller::{
     BenchmarkOptions, SelectorsOptions, StatusOptions, run_benchmark, run_selectors, run_status,
 };
-use import::run_import;
+use import::{run_import, run_subscribe_import};
 use provider::run_provider_sync;
 use tui::run_tui;
 
@@ -41,6 +41,23 @@ fn main() -> Result<()> {
             config_path,
             replace_nodes,
         } => run_import(&input, output.as_ref(), true, &config_path, replace_nodes),
+        CliCommand::Subscribe {
+            url,
+            output,
+            config_path,
+            subscription_output,
+            replace_nodes,
+            provider_name,
+            existing_provider_name,
+        } => run_subscribe_import(
+            url,
+            output.as_ref(),
+            &config_path,
+            subscription_output.as_ref(),
+            replace_nodes,
+            provider_name.as_deref(),
+            existing_provider_name.as_deref(),
+        ),
         CliCommand::Benchmark {
             controller,
             selector,

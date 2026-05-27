@@ -30,6 +30,7 @@ pub(crate) fn run_selectors(options: SelectorsOptions) -> Result<()> {
             .into_iter()
             .map(|group| ProxyGroupOutput {
                 name: group.name,
+                kind: group.kind,
                 current: group.current,
                 members: group.members,
             })
@@ -98,6 +99,7 @@ pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
 #[derive(Clone, Debug)]
 pub(crate) struct ProxyGroup {
     pub(crate) name: String,
+    pub(crate) kind: String,
     pub(crate) current: Option<String>,
     pub(crate) members: Vec<String>,
 }
@@ -365,11 +367,12 @@ fn selectors_from_payload(payload: ProxiesResponse) -> Vec<ProxyGroup> {
 }
 
 fn proxy_group_from_node(proxy: ProxyNode) -> Result<ProxyGroup> {
-    if !proxy.kind.eq_ignore_ascii_case("selector") {
-        bail!("proxy is not a selector group");
+    if !proxy.kind.eq_ignore_ascii_case("selector") && !proxy.kind.eq_ignore_ascii_case("urltest") {
+        bail!("proxy is not a selector/urltest group");
     }
     Ok(ProxyGroup {
         name: proxy.name,
+        kind: proxy.kind,
         current: proxy.now,
         members: proxy.all,
     })
@@ -807,6 +810,7 @@ pub(crate) struct SelectorsOutput {
 #[derive(Serialize)]
 pub(crate) struct ProxyGroupOutput {
     pub(crate) name: String,
+    pub(crate) kind: String,
     pub(crate) current: Option<String>,
     pub(crate) members: Vec<String>,
 }

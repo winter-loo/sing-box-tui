@@ -29,6 +29,48 @@ pub(crate) fn build_full_config(
     }
 }
 
+pub(crate) fn build_full_config_with_provider_groups(
+    config_path: &PathBuf,
+    imported_nodes: Vec<Value>,
+    replace_nodes: bool,
+    provider_name: &str,
+    existing_provider_name: Option<&str>,
+) -> Result<Value> {
+    let imported_node_tags = collect_tags(&imported_nodes);
+    let mut existing_node_tags = Vec::new();
+
+    let mut config = if config_path.exists() {
+        let text = fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let mut config: Value = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        if let Some(outbounds) = config.get("outbounds").and_then(Value::as_array)
+            && !replace_nodes
+        {
+            existing_node_tags = outbounds
+                .iter()
+                .filter(|outbound| is_replaceable_node_outbound(outbound))
+                .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+                .filter(|tag| !is_metadata_node_tag(tag))
+                .map(ToString::to_string)
+                .collect();
+        }
+        merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
+        config
+    } else {
+        build_default_config(imported_nodes)
+    };
+
+    add_provider_groups(
+        &mut config,
+        provider_name,
+        &imported_node_tags,
+        existing_provider_name,
+        &existing_node_tags,
+    )?;
+    Ok(config)
+}
+
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
     let select_members =
@@ -139,16 +181,12 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                 "auto_redirect": true,
                 "strict_route": true,
                 "stack": "mixed",
-                "sniff": true,
                 "endpoint_independent_nat": true,
-                "domain_strategy": "ipv4_only",
             },
             {
                 "type": "mixed",
                 "listen": "::",
                 "listen_port": 5780,
-                "sniff": true,
-                "domain_strategy": "ipv4_only",
                 "set_system_proxy": false,
             }
         ],
@@ -280,6 +318,7 @@ pub(crate) fn merge_into_existing_config(
     let root = config
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
+    migrate_legacy_inbound_fields(root)?;
     let outbounds_value = root
         .entry("outbounds")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -432,6 +471,207 @@ pub(crate) fn merge_into_existing_config(
     Ok(())
 }
 
+fn add_provider_groups(
+    config: &mut Value,
+    provider_name: &str,
+    provider_node_tags: &[String],
+    existing_provider_name: Option<&str>,
+    existing_node_tags: &[String],
+) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .context("existing config outbounds must be an array")?;
+    outbounds.retain(|outbound| {
+        !is_replaceable_node_outbound(outbound)
+            || outbound
+                .get("tag")
+                .and_then(Value::as_str)
+                .is_some_and(|tag| !is_metadata_node_tag(tag))
+    });
+
+    let selector_tag =
+        preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let prefers_legacy_tags = selector_tag == "select";
+    let auto_tag = preferred_existing_tag(
+        outbounds,
+        AUTO_SELECTOR_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "auto"
+        } else {
+            DEFAULT_AUTO_SELECTOR_TAG
+        },
+    );
+    let direct_tag = preferred_existing_tag(
+        outbounds,
+        DIRECT_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "direct"
+        } else {
+            DEFAULT_DIRECT_TAG
+        },
+    );
+
+    let mut provider_tags = Vec::new();
+    if let Some(existing_provider_name) = existing_provider_name
+        && !existing_node_tags.is_empty()
+    {
+        upsert_provider_selector(outbounds, existing_provider_name, existing_node_tags)?;
+        provider_tags.push(existing_provider_name.to_string());
+    }
+    if !provider_node_tags.is_empty() {
+        upsert_provider_selector(outbounds, provider_name, provider_node_tags)?;
+        provider_tags.push(provider_name.to_string());
+    }
+    if provider_tags.len() < 2 {
+        return Ok(());
+    }
+
+    let select_members =
+        with_leading_members(&[auto_tag.as_str(), direct_tag.as_str()], &provider_tags);
+    if let Some(selector) = find_outbound_by_tag_mut(outbounds, &selector_tag) {
+        set_outbound_members(selector, &select_members);
+        ensure_string_field(selector, "type", "selector");
+        ensure_string_field(selector, "default", &auto_tag);
+    }
+
+    let all_node_tags = collect_tags(
+        &outbounds
+            .iter()
+            .filter(|outbound| is_replaceable_node_outbound(outbound))
+            .filter(|outbound| {
+                outbound
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| !is_metadata_node_tag(tag))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if let Some(auto) = find_outbound_by_tag_mut(outbounds, &auto_tag) {
+        set_outbound_members(auto, &all_node_tags);
+        ensure_string_field(auto, "type", "urltest");
+        ensure_string_field(auto, "url", DEFAULT_DELAY_TEST_URL);
+        ensure_string_field(auto, "interval", "10m");
+    }
+
+    Ok(())
+}
+
+fn upsert_provider_selector(
+    outbounds: &mut Vec<Value>,
+    provider_name: &str,
+    node_tags: &[String],
+) -> Result<()> {
+    upsert_special_outbound(
+        outbounds,
+        provider_name,
+        || {
+            json!({
+                "type": "selector",
+                "tag": provider_name,
+                "outbounds": node_tags,
+                "default": node_tags.first().cloned().unwrap_or_default(),
+                "interrupt_exist_connections": true,
+            })
+        },
+        |value| {
+            set_outbound_members(value, node_tags);
+            ensure_string_field(value, "type", "selector");
+            if let Some(first) = node_tags.first() {
+                ensure_string_field(value, "default", first);
+            }
+        },
+    )
+}
+
+fn migrate_legacy_inbound_fields(root: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let Some(inbounds_value) = root.get_mut("inbounds") else {
+        return Ok(());
+    };
+    let inbounds = inbounds_value
+        .as_array_mut()
+        .context("existing config inbounds must be an array")?;
+
+    let mut sniff = false;
+    let mut sniff_timeout = None;
+    let mut strategy = None;
+
+    for inbound in inbounds {
+        let Some(object) = inbound.as_object_mut() else {
+            continue;
+        };
+
+        if object
+            .remove("sniff")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            sniff = true;
+        }
+        if let Some(value) = object.remove("sniff_timeout").and_then(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }) {
+            sniff_timeout.get_or_insert(value);
+        }
+        if let Some(value) = object.remove("domain_strategy").and_then(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }) {
+            strategy.get_or_insert(value);
+        }
+        object.remove("sniff_override_destination");
+        object.remove("udp_disable_domain_unmapping");
+    }
+
+    let mut rules_to_prepend = Vec::new();
+    if let Some(strategy) = strategy {
+        rules_to_prepend.push(json!({
+            "action": "resolve",
+            "strategy": strategy,
+        }));
+    }
+    if sniff {
+        let mut rule = json!({ "action": "sniff" });
+        if let Some(timeout) = sniff_timeout {
+            rule.as_object_mut()
+                .expect("sniff rule is an object")
+                .insert("timeout".to_string(), Value::String(timeout));
+        }
+        rules_to_prepend.push(rule);
+    }
+    if rules_to_prepend.is_empty() {
+        return Ok(());
+    }
+
+    let route_value = root.entry("route").or_insert_with(|| json!({}));
+    let route = route_value
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    let rules_value = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rules = rules_value
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+
+    for rule in rules_to_prepend.into_iter().rev() {
+        if !rules.iter().any(|existing| existing == &rule) {
+            rules.insert(0, rule);
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_bypass_route(route: &mut serde_json::Map<String, Value>, direct_tag: &str) -> Result<()> {
     let rules_value = route
         .entry("rules")
@@ -524,6 +764,19 @@ fn is_replaceable_node_outbound(outbound: &Value) -> bool {
         outbound_type,
         "selector" | "urltest" | "direct" | "block" | "dns"
     )
+}
+
+fn is_metadata_node_tag(tag: &str) -> bool {
+    tag.starts_with("剩余流量")
+        || tag.starts_with("距离下次重置剩余")
+        || tag.starts_with("套餐到期")
+        || tag.contains("官网")
+        || tag.contains("刷新订阅")
+        || tag.contains("如遇不可用请访问")
+        || tag.contains("请更换客户端")
+        || tag.contains("直连地址")
+        || tag.contains("TG群")
+        || tag.contains("邀请好友")
 }
 
 fn upsert_special_outbound<F, G>(
@@ -913,5 +1166,34 @@ mod tests {
         assert!(members.contains(&Value::String("auto".to_string())));
         assert!(members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("new-node".to_string())));
+    }
+
+    #[test]
+    fn merge_migrates_legacy_inbound_fields_to_route_actions() {
+        let mut config = json!({
+            "inbounds": [{
+                "type": "mixed",
+                "listen": "127.0.0.1",
+                "listen_port": 5780,
+                "sniff": true,
+                "sniff_timeout": "1s",
+                "domain_strategy": "ipv4_only"
+            }],
+            "outbounds": []
+        });
+
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("merge succeeds");
+
+        assert!(config["inbounds"][0].get("sniff").is_none());
+        assert!(config["inbounds"][0].get("domain_strategy").is_none());
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.contains(&json!({
+            "action": "resolve",
+            "strategy": "ipv4_only"
+        })));
+        assert!(rules.contains(&json!({
+            "action": "sniff",
+            "timeout": "1s"
+        })));
     }
 }

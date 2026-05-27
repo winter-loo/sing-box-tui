@@ -25,7 +25,8 @@ use crate::controller::{
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
-    DEFAULT_DIRECT_TAG, DIRECT_TAG_ALIASES, REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
+    DEFAULT_DIRECT_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, REFRESH_DEBOUNCE,
+    SINGLE_NODE_RETEST_DEBOUNCE,
 };
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
@@ -101,45 +102,64 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
         Layout::vertical([Constraint::Min(10), Constraint::Length(6)]).areas(frame.area());
+    let implicit_root_mode = app.implicit_root_mode();
     let [groups_area, members_area] =
-        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(main);
+        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
 
     let groups = app
-        .groups
+        .displayed_group_names()
         .iter()
-        .map(|group| {
+        .map(|group_name| {
+            let group = app.group_by_name(group_name);
             let current = group
-                .current
-                .as_deref()
+                .and_then(|group| group.current.as_deref())
                 .map_or(String::from("unset"), ToString::to_string);
+            let is_current = app
+                .implicit_root_group()
+                .and_then(|root| root.current.as_deref())
+                == Some(group_name.as_str());
+            let mut style = Style::default().fg(Color::Cyan);
+            if implicit_root_mode && is_current {
+                style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
+            }
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    truncate_for_width(&group.name, groups_area.width.saturating_sub(10) as usize),
-                    Style::default().fg(Color::Cyan),
+                    truncate_for_width(group_name, groups_area.width.saturating_sub(18) as usize),
+                    style,
                 ),
                 Span::raw(" "),
                 Span::styled(
                     format!("[{}]", truncate_for_width(&current, 14)),
                     Style::default().fg(Color::Yellow),
                 ),
+                Span::raw(if implicit_root_mode && is_current {
+                    "  *"
+                } else {
+                    ""
+                }),
             ]))
         })
         .collect::<Vec<_>>();
 
+    let groups_title = if implicit_root_mode {
+        "Choices"
+    } else {
+        "Selector Groups"
+    };
     let groups_block = Block::default()
-        .title("Selector Groups")
+        .title(groups_title)
         .borders(Borders::ALL)
         .border_style(border_style(app.focus == Focus::Groups));
     let groups_widget = List::new(groups)
         .block(groups_block)
         .highlight_style(selected_style(app.focus == Focus::Groups))
         .highlight_symbol("> ");
-    let mut groups_state = ListState::default().with_selected(Some(app.group_index));
+    let mut groups_state = ListState::default().with_selected(Some(app.displayed_group_index()));
     frame.render_stateful_widget(groups_widget, groups_area, &mut groups_state);
 
     let displayed_members = app.displayed_members();
     let members = app
-        .selected_group()
+        .selected_member_panel_group()
         .map(|group| {
             displayed_members
                 .iter()
@@ -191,7 +211,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .unwrap_or_default();
 
     let members_title = app
-        .selected_group()
+        .selected_member_panel_group()
         .map(|group| {
             format!(
                 "Candidates for {} [{}]",
@@ -647,6 +667,7 @@ struct App {
     client: ApiClient,
     groups: Vec<ProxyGroup>,
     group_index: usize,
+    provider_index: usize,
     member_index: usize,
     focus: Focus,
     status: String,
@@ -681,6 +702,7 @@ impl App {
             client,
             groups: Vec::new(),
             group_index: 0,
+            provider_index: 0,
             member_index: 0,
             focus: Focus::Groups,
             status: String::from("Loading proxy groups..."),
@@ -760,11 +782,81 @@ impl App {
     }
 
     fn selected_group(&self) -> Option<&ProxyGroup> {
+        if self.implicit_root_mode() {
+            return self
+                .selected_root_choice_name()
+                .and_then(|name| self.group_by_name(&name));
+        }
         self.groups.get(self.group_index)
     }
 
+    fn group_by_name(&self, name: &str) -> Option<&ProxyGroup> {
+        self.groups.iter().find(|group| group.name == name)
+    }
+
+    fn implicit_root_group(&self) -> Option<&ProxyGroup> {
+        let root = self.group_by_name(DEFAULT_SELECTOR_TAG)?;
+        let child_group_count = root
+            .members
+            .iter()
+            .filter(|member| self.group_by_name(member).is_some())
+            .count();
+        if child_group_count > 1 {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    fn implicit_root_mode(&self) -> bool {
+        self.implicit_root_group().is_some()
+    }
+
+    fn displayed_group_names(&self) -> Vec<String> {
+        if let Some(root) = self.implicit_root_group() {
+            return root
+                .members
+                .iter()
+                .filter(|member| self.group_by_name(member).is_some())
+                .cloned()
+                .collect();
+        }
+        self.groups.iter().map(|group| group.name.clone()).collect()
+    }
+
+    fn displayed_group_index(&self) -> usize {
+        if self.implicit_root_mode() {
+            self.provider_index
+        } else {
+            self.group_index
+        }
+    }
+
+    fn selected_root_choice_name(&self) -> Option<String> {
+        self.implicit_root_group().and_then(|root| {
+            root.members
+                .iter()
+                .filter(|member| self.group_by_name(member).is_some())
+                .nth(self.provider_index)
+                .cloned()
+        })
+    }
+
+    fn selected_member_panel_group(&self) -> Option<&ProxyGroup> {
+        if self.implicit_root_mode() {
+            let choice = self.selected_root_choice_name()?;
+            return self.group_by_name(&choice);
+        }
+        self.selected_group()
+    }
+
+    fn selected_member_panel_is_manual_selector(&self) -> bool {
+        self.selected_member_panel_group()
+            .is_some_and(|group| group.kind.eq_ignore_ascii_case("selector"))
+    }
+
     fn selected_benchmark(&self) -> Option<&BenchmarkSummary> {
-        let group = self.selected_group()?;
+        let group = self.selected_member_panel_group()?;
         self.benchmarks.get(&group.name)
     }
 
@@ -785,6 +877,7 @@ impl App {
         let Some(group) = self.selected_group() else {
             return Vec::new();
         };
+        let group = self.selected_member_panel_group().unwrap_or(group);
         let Some(summary) = self.selected_benchmark() else {
             return group
                 .members
@@ -827,12 +920,15 @@ impl App {
 
     fn displayed_member_index(&self) -> Option<usize> {
         let members = self.displayed_members();
-        let current = self.selected_group()?.members.get(self.member_index)?;
+        let current = self
+            .selected_member_panel_group()?
+            .members
+            .get(self.member_index)?;
         members.iter().position(|member| member == current)
     }
 
     fn sync_selection_to_member_name(&mut self, name: &str) {
-        if let Some(group) = self.selected_group()
+        if let Some(group) = self.selected_member_panel_group()
             && let Some(index) = group.members.iter().position(|member| member == name)
         {
             self.member_index = index;
@@ -846,7 +942,7 @@ impl App {
         }
 
         let current = self
-            .selected_group()
+            .selected_member_panel_group()
             .and_then(|group| group.members.get(self.member_index))
             .cloned();
         if current
@@ -916,13 +1012,13 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Groups => Focus::Members,
                     Focus::Members => Focus::Groups,
-                }
+                };
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = match self.focus {
                     Focus::Groups => Focus::Members,
                     Focus::Members => Focus::Groups,
-                }
+                };
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_previous(),
@@ -1019,7 +1115,12 @@ impl App {
     fn move_next(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if self.group_index + 1 < self.groups.len() {
+                if self.implicit_root_mode() {
+                    if self.provider_index + 1 < self.displayed_group_names().len() {
+                        self.provider_index += 1;
+                        self.sync_member_selection_to_current();
+                    }
+                } else if self.group_index + 1 < self.groups.len() {
                     self.group_index += 1;
                     self.sync_member_selection_to_current();
                 }
@@ -1040,7 +1141,12 @@ impl App {
     fn move_previous(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if self.group_index > 0 {
+                if self.implicit_root_mode() {
+                    if self.provider_index > 0 {
+                        self.provider_index -= 1;
+                        self.sync_member_selection_to_current();
+                    }
+                } else if self.group_index > 0 {
                     self.group_index -= 1;
                     self.sync_member_selection_to_current();
                 }
@@ -1061,7 +1167,11 @@ impl App {
     fn move_first(&mut self) {
         match self.focus {
             Focus::Groups => {
-                self.group_index = 0;
+                if self.implicit_root_mode() {
+                    self.provider_index = 0;
+                } else {
+                    self.group_index = 0;
+                }
                 self.sync_member_selection_to_current();
             }
             Focus::Members => {
@@ -1075,7 +1185,13 @@ impl App {
     fn move_last(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if !self.groups.is_empty() {
+                if self.implicit_root_mode() {
+                    let groups = self.displayed_group_names();
+                    if !groups.is_empty() {
+                        self.provider_index = groups.len() - 1;
+                        self.sync_member_selection_to_current();
+                    }
+                } else if !self.groups.is_empty() {
                     self.group_index = self.groups.len() - 1;
                     self.sync_member_selection_to_current();
                 }
@@ -1089,21 +1205,42 @@ impl App {
     }
 
     fn activate_selection(&mut self) -> Result<()> {
-        if self.focus != Focus::Members {
-            self.focus = Focus::Members;
+        if self.focus == Focus::Groups {
+            if self.implicit_root_mode() {
+                self.activate_root_choice()?;
+            } else {
+                self.focus = Focus::Members;
+            }
             return Ok(());
         }
 
-        let Some(group) = self.selected_group() else {
+        let Some(group) = self.selected_member_panel_group() else {
             bail!("no selector group available");
         };
         let group_name = group.name.clone();
+        if self.implicit_root_mode() && !self.selected_member_panel_is_manual_selector() {
+            self.activate_root_choice()?;
+            return Ok(());
+        }
         let Some(member) = group.members.get(self.member_index).cloned() else {
             bail!("no proxy available in selected group");
+        };
+        let parent_switch = if self.implicit_root_mode() {
+            self.selected_root_choice_name().and_then(|choice| {
+                self.implicit_root_group()
+                    .map(|root| (root.name.clone(), choice))
+            })
+        } else {
+            None
         };
         self.client
             .switch_proxy(&group_name, &member)
             .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
+        if let Some((parent, provider)) = parent_switch {
+            self.client
+                .switch_proxy(&parent, &provider)
+                .with_context(|| format!("failed to switch {} to {}", parent, provider))?;
+        }
         if REFRESH_DEBOUNCE > Duration::ZERO {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
@@ -1114,7 +1251,7 @@ impl App {
     }
 
     fn switch_to_direct(&mut self) -> Result<()> {
-        let Some(group) = self.selected_group() else {
+        let Some(group) = self.implicit_root_group().or_else(|| self.selected_group()) else {
             bail!("no selector group available");
         };
         let group_name = group.name.clone();
@@ -1146,16 +1283,51 @@ impl App {
         Ok(())
     }
 
+    fn activate_root_choice(&mut self) -> Result<()> {
+        let Some(root) = self.implicit_root_group() else {
+            bail!("no implicit root selector available");
+        };
+        let root_name = root.name.clone();
+        let Some(choice) = self.selected_root_choice_name() else {
+            bail!("no selectable choice available");
+        };
+        self.client
+            .switch_proxy(&root_name, &choice)
+            .with_context(|| format!("failed to switch {} to {}", root_name, choice))?;
+        if REFRESH_DEBOUNCE > Duration::ZERO {
+            std::thread::sleep(REFRESH_DEBOUNCE);
+        }
+        self.refresh()?;
+        self.save_runtime_state()?;
+        self.set_switch_status(&root_name, &choice);
+        Ok(())
+    }
+
     fn refresh(&mut self) -> Result<()> {
         let previous_group_name = self.selected_group().map(|group| group.name.clone());
+        let previous_choice_name = self.selected_root_choice_name();
         let groups = self.client.fetch_selector_groups()?;
         if groups.is_empty() {
             bail!("no selector groups returned by controller");
         }
         self.groups = groups;
-        self.group_index = previous_group_name
-            .and_then(|name| self.groups.iter().position(|group| group.name == name))
-            .unwrap_or(0);
+        if self.implicit_root_mode() {
+            let choices = self.displayed_group_names();
+            self.provider_index = previous_choice_name
+                .as_ref()
+                .and_then(|name| choices.iter().position(|choice| choice == name))
+                .or_else(|| {
+                    self.implicit_root_group()
+                        .and_then(|root| root.current.as_deref())
+                        .and_then(|current| choices.iter().position(|choice| choice == current))
+                })
+                .unwrap_or(0);
+        } else {
+            self.group_index = previous_group_name
+                .and_then(|name| self.groups.iter().position(|group| group.name == name))
+                .unwrap_or(0);
+            self.provider_index = 0;
+        }
         self.sync_member_selection_to_current();
         self.status = format!("Loaded {} selector groups", self.groups.len());
         Ok(())
@@ -1163,7 +1335,7 @@ impl App {
 
     fn sync_member_selection_to_current(&mut self) {
         let next_index =
-            self.selected_group()
+            self.selected_member_panel_group()
                 .and_then(|group| {
                     group.current.as_deref().and_then(|current| {
                         group.members.iter().position(|member| member == current)
@@ -1175,7 +1347,7 @@ impl App {
     }
 
     fn start_group_benchmark(&mut self) -> Result<()> {
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
         if self
@@ -1218,7 +1390,7 @@ impl App {
     }
 
     fn start_member_benchmark(&mut self) -> Result<()> {
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
         let Some(member) = group.members.get(self.member_index).cloned() else {
@@ -1766,10 +1938,12 @@ mod tests {
             },
             groups: vec![ProxyGroup {
                 name: "select".to_string(),
+                kind: "Selector".to_string(),
                 current: Some("node-a".to_string()),
                 members: vec!["node-a".to_string()],
             }],
             group_index: 0,
+            provider_index: 0,
             member_index: 0,
             focus: Focus::Members,
             status: String::new(),
@@ -1795,6 +1969,49 @@ mod tests {
             bypass_rule_set_store: None,
             latency_chart: None,
         }
+    }
+
+    fn provider_app() -> App {
+        let mut app = test_app();
+        app.groups = vec![
+            ProxyGroup {
+                name: "手动选择".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("宝贝云".to_string()),
+                members: vec![
+                    "自动选择".to_string(),
+                    "AirTCP".to_string(),
+                    "宝贝云".to_string(),
+                ],
+            },
+            ProxyGroup {
+                name: "自动选择".to_string(),
+                kind: "URLTest".to_string(),
+                current: Some("auto-node".to_string()),
+                members: vec![
+                    "auto-node".to_string(),
+                    "air-1".to_string(),
+                    "bby-1".to_string(),
+                ],
+            },
+            ProxyGroup {
+                name: "AirTCP".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("air-1".to_string()),
+                members: vec!["air-1".to_string(), "air-2".to_string()],
+            },
+            ProxyGroup {
+                name: "宝贝云".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("bby-2".to_string()),
+                members: vec!["bby-1".to_string(), "bby-2".to_string()],
+            },
+        ];
+        app.group_index = 0;
+        app.provider_index = 2;
+        app.member_index = 1;
+        app.benchmark_filter.clear();
+        app
     }
 
     #[test]
@@ -2400,6 +2617,96 @@ mod tests {
     }
 
     #[test]
+    fn implicit_root_mode_displays_root_choices_as_left_column() {
+        let mut app = provider_app();
+
+        assert!(app.implicit_root_mode());
+        assert_eq!(
+            app.displayed_group_names(),
+            vec![
+                "自动选择".to_string(),
+                "AirTCP".to_string(),
+                "宝贝云".to_string()
+            ]
+        );
+
+        app.groups[0].members = vec!["宝贝云".to_string()];
+
+        assert!(!app.implicit_root_mode());
+    }
+
+    #[test]
+    fn implicit_root_members_follow_selected_choice() {
+        let mut app = provider_app();
+
+        assert_eq!(app.selected_root_choice_name().as_deref(), Some("宝贝云"));
+        assert_eq!(
+            app.displayed_members(),
+            vec!["bby-1".to_string(), "bby-2".to_string()]
+        );
+
+        app.provider_index = 1;
+        app.sync_member_selection_to_current();
+
+        assert_eq!(app.selected_root_choice_name().as_deref(), Some("AirTCP"));
+        assert_eq!(
+            app.displayed_members(),
+            vec!["air-1".to_string(), "air-2".to_string()]
+        );
+        assert_eq!(app.member_index, 0);
+    }
+
+    #[test]
+    fn implicit_root_includes_urltest_auto_choice() {
+        let mut app = provider_app();
+        app.provider_index = 0;
+        app.sync_member_selection_to_current();
+
+        assert_eq!(app.selected_root_choice_name().as_deref(), Some("自动选择"));
+        assert_eq!(
+            app.displayed_members(),
+            vec![
+                "auto-node".to_string(),
+                "air-1".to_string(),
+                "bby-1".to_string()
+            ]
+        );
+        assert!(!app.selected_member_panel_is_manual_selector());
+    }
+
+    #[test]
+    fn implicit_root_benchmark_summary_is_scoped_to_selected_choice() {
+        let mut app = provider_app();
+        app.benchmarks.insert(
+            "宝贝云".to_string(),
+            BenchmarkSummary {
+                selector: "宝贝云".to_string(),
+                current: Some("bby-2".to_string()),
+                pattern: String::new(),
+                url: "https://www.gstatic.com/generate_204".to_string(),
+                timeout_ms: 5000,
+                max_concurrency: 4,
+                results: vec![BenchmarkResult {
+                    name: "bby-1".to_string(),
+                    delay: Some(88),
+                    completed: true,
+                }],
+            },
+        );
+
+        assert_eq!(
+            app.selected_benchmark()
+                .map(|summary| summary.selector.as_str()),
+            Some("宝贝云")
+        );
+        assert!(
+            app.selected_benchmark()
+                .and_then(|summary| summary.find_result("bby-1"))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn applying_filter_moves_selection_to_visible_member() {
         let mut app = test_app();
         app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
@@ -2439,6 +2746,7 @@ mod tests {
         let app = test_app();
         let group = ProxyGroup {
             name: "select".to_string(),
+            kind: "Selector".to_string(),
             current: Some("美国-a".to_string()),
             members: vec!["美国-a".to_string(), "美国-b".to_string()],
         };
@@ -2471,6 +2779,7 @@ mod tests {
         let app = test_app();
         let group = ProxyGroup {
             name: "select".to_string(),
+            kind: "Selector".to_string(),
             current: Some("美国-a".to_string()),
             members: vec!["美国-a".to_string(), "美国-b".to_string()],
         };
@@ -2506,6 +2815,7 @@ mod tests {
         let app = test_app();
         let group = ProxyGroup {
             name: "select".to_string(),
+            kind: "Selector".to_string(),
             current: Some("香港-a".to_string()),
             members: vec!["香港-a".to_string(), "美国-b".to_string()],
         };

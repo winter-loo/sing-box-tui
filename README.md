@@ -28,6 +28,18 @@ cargo run -- sync \
 
 `sync` is safe by default: it will not overwrite the live config unless you pass `--write`. Otherwise, use `--output` to write the merged config somewhere else.
 
+If you already have a direct sing-box subscription URL, use `subscribe` instead of `sync`:
+
+```bash
+cargo run -- subscribe \
+  --url 'https://h.bbydy.org/api/bby/client/subscribe?token=REDACTED' \
+  --config ./config.json \
+  --output ./output/merged-config.json \
+  --replace-nodes
+```
+
+`subscribe` fetches the URL with a `sing-box` user agent, extracts real node outbounds from the subscription JSON, filters provider metadata entries, and merges the nodes into the selector/urltest groups from the template config.
+
 Account file formats:
 
 ```text
@@ -43,6 +55,14 @@ your-password
 ```
 
 Small terminal UI for switching `sing-box` selector outbounds through the Clash-compatible controller API.
+
+The TUI keeps the original two-column layout when the selected selector has zero or one nested provider selector. When the selected selector contains multiple child selector groups, it switches to a three-column layout:
+
+```text
+Selector Groups | Providers | Nodes
+```
+
+Selecting a node inside a provider group updates that provider selector and then points the parent selector at the provider. This supports configs shaped like `手动选择 -> 宝贝云 -> node`.
 
 ## Requirements
 
@@ -223,6 +243,8 @@ After the config references the local rule-set, press `B` in the TUI to edit byp
 ## Benchmark Nodes
 
 The former Python skill script is now built into the Rust app.
+
+For a manual provider-subscription workflow, including fetching a sing-box subscription JSON, converting legacy config syntax for local testing, benchmarking every node through the Clash API, and verifying real traffic, see [docs/subscription-benchmark.md](docs/subscription-benchmark.md).
 
 CLI examples:
 

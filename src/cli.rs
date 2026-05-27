@@ -26,6 +26,15 @@ pub(crate) enum CliCommand {
         config_path: PathBuf,
         replace_nodes: bool,
     },
+    Subscribe {
+        url: String,
+        output: Option<PathBuf>,
+        config_path: PathBuf,
+        subscription_output: Option<PathBuf>,
+        replace_nodes: bool,
+        provider_name: Option<String>,
+        existing_provider_name: Option<String>,
+    },
     SyncProvider {
         provider: String,
         account_file: PathBuf,
@@ -67,6 +76,7 @@ impl CliCommand {
             "selectors" => Self::parse_selectors(&args[1..]),
             "status" => Self::parse_status(&args[1..]),
             "import" => Self::parse_import(&args[1..]),
+            "subscribe" => Self::parse_subscribe(&args[1..]),
             "sync" => Self::parse_sync_provider(&args[1..]),
             "benchmark" => Self::parse_benchmark(&args[1..]),
             "--help" | "-h" | "help" => {
@@ -209,6 +219,85 @@ impl CliCommand {
             output,
             config_path,
             replace_nodes,
+        })
+    }
+
+    fn parse_subscribe(args: &[String]) -> Result<Self> {
+        let mut url = None;
+        let mut output = None;
+        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut subscription_output = None;
+        let mut replace_nodes = false;
+        let mut provider_name = None;
+        let mut existing_provider_name = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--url" => {
+                    i += 1;
+                    url = Some(args.get(i).context("--url requires a value")?.clone());
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    output = Some(PathBuf::from(
+                        args.get(i).context("-o/--output requires a file path")?,
+                    ));
+                }
+                "--config" => {
+                    i += 1;
+                    config_path =
+                        PathBuf::from(args.get(i).context("--config requires a file path")?);
+                }
+                "--subscription-output" => {
+                    i += 1;
+                    subscription_output = Some(PathBuf::from(
+                        args.get(i)
+                            .context("--subscription-output requires a file path")?,
+                    ));
+                }
+                "--provider-name" => {
+                    i += 1;
+                    provider_name = Some(
+                        args.get(i)
+                            .context("--provider-name requires a value")?
+                            .clone(),
+                    );
+                }
+                "--existing-provider-name" => {
+                    i += 1;
+                    existing_provider_name = Some(
+                        args.get(i)
+                            .context("--existing-provider-name requires a value")?
+                            .clone(),
+                    );
+                }
+                "--replace-nodes" => {
+                    replace_nodes = true;
+                }
+                "--help" | "-h" => {
+                    print_subscribe_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => bail!("unknown flag for subscribe: {value}"),
+                value => {
+                    if url.is_none() {
+                        url = Some(value.to_string());
+                    } else {
+                        bail!("unexpected positional argument for subscribe: {value}");
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        Ok(Self::Subscribe {
+            url: url.context("subscribe requires --url <URL>")?,
+            output,
+            config_path,
+            subscription_output,
+            replace_nodes,
+            provider_name,
+            existing_provider_name,
         })
     }
 
@@ -396,6 +485,10 @@ fn print_usage() {
     println!(
         "                                                Import Clash YAML into a full sing-box config"
     );
+    println!("  subscribe --url URL [-o <config.json>] [--config FILE] [--replace-nodes]");
+    println!(
+        "                                                Fetch a sing-box subscription URL and merge nodes"
+    );
     println!("  sync --provider URL --account-file FILE [--config FILE] [-o FILE]");
     println!(
         "                                                Log into a provider site, fetch the sing-box subscription, and merge it"
@@ -447,6 +540,31 @@ fn print_import_usage() {
     println!();
     println!("Behavior options:");
     println!("      --replace-nodes       Replace existing node outbounds instead of merging");
+}
+
+fn print_subscribe_usage() {
+    println!(
+        "sing-box-tui subscribe --url URL [-o <config.json>] [--config FILE] [--replace-nodes]"
+    );
+    println!();
+    println!("Input options:");
+    println!("      --url <URL>                  sing-box subscription URL");
+    println!(
+        "      --config <FILE>              Existing sing-box config to merge into (default: /etc/sing-box/config.json)"
+    );
+    println!();
+    println!("Output options:");
+    println!("  -o, --output <FILE>              Output merged config path");
+    println!("      --subscription-output <FILE> Save downloaded sing-box JSON for debugging");
+    println!("      --provider-name <NAME>       Wrap imported nodes in a provider selector");
+    println!(
+        "      --existing-provider-name <NAME> Wrap existing template nodes in a provider selector"
+    );
+    println!();
+    println!("Behavior options:");
+    println!(
+        "      --replace-nodes              Replace existing node outbounds instead of merging"
+    );
 }
 
 fn print_sync_provider_usage() {
@@ -570,6 +688,41 @@ mod tests {
                 assert!(!write);
             }
             _ => panic!("expected sync-provider command"),
+        }
+    }
+
+    #[test]
+    fn subscribe_command_parses_url_and_output() {
+        let command = CliCommand::parse([
+            "subscribe".to_string(),
+            "--url".to_string(),
+            "https://example.com/sub?token=secret".to_string(),
+            "--config".to_string(),
+            "config.json".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+            "--replace-nodes".to_string(),
+        ])
+        .expect("subscribe command parses");
+
+        match command {
+            CliCommand::Subscribe {
+                url,
+                config_path,
+                output,
+                replace_nodes,
+                provider_name,
+                existing_provider_name,
+                ..
+            } => {
+                assert_eq!(url, "https://example.com/sub?token=secret");
+                assert_eq!(config_path, PathBuf::from("config.json"));
+                assert_eq!(output, Some(PathBuf::from("merged.json")));
+                assert!(replace_nodes);
+                assert!(provider_name.is_none());
+                assert!(existing_provider_name.is_none());
+            }
+            _ => panic!("expected subscribe command"),
         }
     }
 

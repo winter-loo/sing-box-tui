@@ -1,2 +1,11 @@
 /target
 /dist
+
+# Local runtime/subscription artifacts.
+/cache.db
+/config.json
+/clash_proxies.txt
+/imported_nodes.json
+/sing_box_nodes.json
+/*_sing_box_config.json
+/*_sing_box_nodes.json
