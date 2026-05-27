@@ -125,6 +125,7 @@ impl ApiClient {
             .build()
             .context("failed to build Tokio runtime for API client")?;
         let client = AsyncClient::builder()
+            .no_proxy()
             .default_headers(headers)
             .build()
             .context("failed to build async HTTP client")?;
