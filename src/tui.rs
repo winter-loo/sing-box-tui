@@ -25,8 +25,7 @@ use crate::controller::{
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
-    DEFAULT_DIRECT_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, REFRESH_DEBOUNCE,
-    SINGLE_NODE_RETEST_DEBOUNCE,
+    DEFAULT_SELECTOR_TAG, REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
 };
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
@@ -43,6 +42,8 @@ const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const DIRECT_CLASH_MODE: &str = "直连";
+const RULE_CLASH_MODE: &str = "规则";
+const GLOBAL_CLASH_MODE: &str = "全局";
 
 pub(crate) fn run_tui(controller: Option<String>, max_concurrency: Option<usize>) -> Result<()> {
     let controller = controller
@@ -142,7 +143,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .collect::<Vec<_>>();
 
     let groups_title = if implicit_root_mode {
-        "Choices"
+        "Providers"
     } else {
         "Selector Groups"
     };
@@ -239,7 +240,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let benchmark_hint = app.selected_benchmark().map_or_else(
         || {
             format!(
-                "mode={}  auto={}  b group benchmark  t node benchmark  a auto-pick  / filter",
+                "clash={}  view={}  auto={}  b group benchmark  t node benchmark  a auto-pick  / filter",
+                app.clash_mode_label(),
                 benchmark_mode_badge(app.latency_sort_mode),
                 auto_select_badge(app.auto_select_enabled)
             )
@@ -250,9 +252,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .map(|item| format!("best={} {}", item.name, item.display_delay()))
                 .unwrap_or_else(|| "best=none".to_string());
             format!(
-                "filter='{}'  tested={}  mode={}  auto={}  {}",
+                "filter='{}'  tested={}  clash={}  view={}  auto={}  {}",
                 summary.pattern,
                 summary.results.len(),
+                app.clash_mode_label(),
                 benchmark_mode_badge(app.latency_sort_mode),
                 auto_select_badge(app.auto_select_enabled),
                 truncate_for_width(&best, 30)
@@ -290,8 +293,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" switch pane  "),
             Span::styled("Space", Style::default().fg(Color::Cyan)),
             Span::raw(" select  "),
-            Span::styled("d", Style::default().fg(Color::Cyan)),
-            Span::raw(" direct  "),
+            Span::styled("m", Style::default().fg(Color::Cyan)),
+            Span::raw(" clash mode  "),
             Span::styled("B", Style::default().fg(Color::Cyan)),
             Span::raw(" bypass  "),
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
@@ -572,27 +575,6 @@ fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
     if auto_select_enabled { "ON" } else { "OFF" }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum DirectSwitchAction {
-    SelectorMember(String),
-    ClashModeDirect,
-}
-
-fn direct_switch_action(members: &[String]) -> DirectSwitchAction {
-    direct_member_name(members)
-        .map(DirectSwitchAction::SelectorMember)
-        .unwrap_or(DirectSwitchAction::ClashModeDirect)
-}
-
-fn direct_member_name(members: &[String]) -> Option<String> {
-    members
-        .iter()
-        .find(|member| {
-            member.as_str() == DEFAULT_DIRECT_TAG || DIRECT_TAG_ALIASES.contains(&member.as_str())
-        })
-        .cloned()
-}
-
 fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
     match kind {
         BenchmarkJobKind::Group => "group",
@@ -648,6 +630,22 @@ fn matches_filter(value: &str, filter: &str) -> bool {
     !has_pattern
 }
 
+fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
+    let modes = if mode_list.is_empty() {
+        [GLOBAL_CLASH_MODE, DIRECT_CLASH_MODE, RULE_CLASH_MODE]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        mode_list.to_vec()
+    };
+    let current_index = current.and_then(|value| modes.iter().position(|mode| mode == value));
+    modes
+        .get(current_index.map_or(0, |index| (index + 1) % modes.len()))
+        .cloned()
+        .unwrap_or_else(|| RULE_CLASH_MODE.to_string())
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Focus {
     Groups,
@@ -692,6 +690,8 @@ struct App {
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
     latency_chart: Option<LatencyChartState>,
+    clash_mode: Option<String>,
+    clash_modes: Vec<String>,
 }
 
 impl App {
@@ -727,6 +727,8 @@ impl App {
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
             latency_chart: None,
+            clash_mode: None,
+            clash_modes: Vec::new(),
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -796,12 +798,12 @@ impl App {
 
     fn implicit_root_group(&self) -> Option<&ProxyGroup> {
         let root = self.group_by_name(DEFAULT_SELECTOR_TAG)?;
-        let child_group_count = root
+        let provider_group_count = root
             .members
             .iter()
-            .filter(|member| self.group_by_name(member).is_some())
+            .filter(|member| self.is_provider_child_group(member))
             .count();
-        if child_group_count > 1 {
+        if provider_group_count > 1 {
             Some(root)
         } else {
             None
@@ -814,12 +816,7 @@ impl App {
 
     fn displayed_group_names(&self) -> Vec<String> {
         if let Some(root) = self.implicit_root_group() {
-            return root
-                .members
-                .iter()
-                .filter(|member| self.group_by_name(member).is_some())
-                .cloned()
-                .collect();
+            return self.provider_child_group_names(root);
         }
         self.groups.iter().map(|group| group.name.clone()).collect()
     }
@@ -834,12 +831,23 @@ impl App {
 
     fn selected_root_choice_name(&self) -> Option<String> {
         self.implicit_root_group().and_then(|root| {
-            root.members
-                .iter()
-                .filter(|member| self.group_by_name(member).is_some())
+            self.provider_child_group_names(root)
+                .into_iter()
                 .nth(self.provider_index)
-                .cloned()
         })
+    }
+
+    fn provider_child_group_names(&self, root: &ProxyGroup) -> Vec<String> {
+        root.members
+            .iter()
+            .filter(|member| self.is_provider_child_group(member))
+            .cloned()
+            .collect()
+    }
+
+    fn is_provider_child_group(&self, member: &str) -> bool {
+        self.group_by_name(member)
+            .is_some_and(|group| group.kind.eq_ignore_ascii_case("selector"))
     }
 
     fn selected_member_panel_group(&self) -> Option<&ProxyGroup> {
@@ -976,6 +984,10 @@ impl App {
         self.set_status_only(format!("Switched {} to {}", group, member));
     }
 
+    fn clash_mode_label(&self) -> &str {
+        self.clash_mode.as_deref().unwrap_or("unknown")
+    }
+
     fn flash_message(&mut self) -> Option<String> {
         let (message, since) = self.flash.as_ref()?;
         if since.elapsed() > Duration::from_secs(2) {
@@ -1029,7 +1041,7 @@ impl App {
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
             KeyCode::Char('a') => self.toggle_auto_select()?,
-            KeyCode::Char('d') => self.switch_to_direct()?,
+            KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('B') => self.open_bypass_modal(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('v') => self.run_verify(false)?,
@@ -1250,36 +1262,14 @@ impl App {
         Ok(())
     }
 
-    fn switch_to_direct(&mut self) -> Result<()> {
-        let Some(group) = self.implicit_root_group().or_else(|| self.selected_group()) else {
-            bail!("no selector group available");
-        };
-        let group_name = group.name.clone();
-        match direct_switch_action(&group.members) {
-            DirectSwitchAction::SelectorMember(member) => {
-                self.client
-                    .switch_proxy(&group_name, &member)
-                    .with_context(|| format!("failed to switch {} to {}", group_name, member))?;
-                if REFRESH_DEBOUNCE > Duration::ZERO {
-                    std::thread::sleep(REFRESH_DEBOUNCE);
-                }
-                self.refresh()?;
-                self.save_runtime_state()?;
-                self.set_status_only(format!(
-                    "Switched {} to {} (new connections go direct)",
-                    group_name, member
-                ));
-            }
-            DirectSwitchAction::ClashModeDirect => {
-                self.client
-                    .set_mode(DIRECT_CLASH_MODE)
-                    .context("failed to switch Clash mode to direct")?;
-                self.set_status_only(format!(
-                    "Direct outbound is not in {}; switched Clash mode to {}",
-                    group_name, DIRECT_CLASH_MODE
-                ));
-            }
-        }
+    fn cycle_clash_mode(&mut self) -> Result<()> {
+        let current = self.clash_mode.as_deref();
+        let next = next_clash_mode(current, &self.clash_modes);
+        self.client
+            .set_mode(&next)
+            .with_context(|| format!("failed to switch Clash mode to {next}"))?;
+        self.clash_mode = Some(next.clone());
+        self.set_status_only(format!("Switched Clash mode to {next}"));
         Ok(())
     }
 
@@ -1306,10 +1296,13 @@ impl App {
     fn refresh(&mut self) -> Result<()> {
         let previous_group_name = self.selected_group().map(|group| group.name.clone());
         let previous_choice_name = self.selected_root_choice_name();
+        let config = self.client.fetch_config()?;
         let groups = self.client.fetch_selector_groups()?;
         if groups.is_empty() {
             bail!("no selector groups returned by controller");
         }
+        self.clash_mode = config.mode;
+        self.clash_modes = config.mode_list;
         self.groups = groups;
         if self.implicit_root_mode() {
             let choices = self.displayed_group_names();
@@ -1874,10 +1867,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Focus, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LatencyChartTimeUnit, direct_member_name, latency_chart_segments,
-        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
-        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, truncate_for_width,
+        App, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE, LATENCY_CHART_DEFAULT_WINDOW,
+        LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE,
+        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
+        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
+        latency_chart_zoom_out, next_clash_mode, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -1968,6 +1962,12 @@ mod tests {
             state_store: None,
             bypass_rule_set_store: None,
             latency_chart: None,
+            clash_mode: Some(RULE_CLASH_MODE.to_string()),
+            clash_modes: vec![
+                GLOBAL_CLASH_MODE.to_string(),
+                DIRECT_CLASH_MODE.to_string(),
+                RULE_CLASH_MODE.to_string(),
+            ],
         }
     }
 
@@ -2008,7 +2008,7 @@ mod tests {
             },
         ];
         app.group_index = 0;
-        app.provider_index = 2;
+        app.provider_index = 1;
         app.member_index = 1;
         app.benchmark_filter.clear();
         app
@@ -2022,27 +2022,32 @@ mod tests {
     }
 
     #[test]
-    fn direct_member_name_accepts_default_and_legacy_tags() {
+    fn next_clash_mode_cycles_controller_mode_list() {
+        let modes = vec![
+            GLOBAL_CLASH_MODE.to_string(),
+            DIRECT_CLASH_MODE.to_string(),
+            RULE_CLASH_MODE.to_string(),
+        ];
+
         assert_eq!(
-            direct_member_name(&["node-a".to_string(), "国内直连".to_string()]),
-            Some("国内直连".to_string())
+            next_clash_mode(Some(DIRECT_CLASH_MODE), &modes),
+            RULE_CLASH_MODE
         );
         assert_eq!(
-            direct_member_name(&["node-a".to_string(), "direct".to_string()]),
-            Some("direct".to_string())
+            next_clash_mode(Some(RULE_CLASH_MODE), &modes),
+            GLOBAL_CLASH_MODE
         );
-        assert_eq!(direct_member_name(&["node-a".to_string()]), None);
+        assert_eq!(
+            next_clash_mode(Some(GLOBAL_CLASH_MODE), &modes),
+            DIRECT_CLASH_MODE
+        );
     }
 
     #[test]
-    fn direct_switch_action_falls_back_to_clash_direct_mode() {
+    fn next_clash_mode_defaults_to_rule_after_direct() {
         assert_eq!(
-            super::direct_switch_action(&["node-a".to_string()]),
-            super::DirectSwitchAction::ClashModeDirect
-        );
-        assert_eq!(
-            super::direct_switch_action(&["node-a".to_string(), "direct".to_string()]),
-            super::DirectSwitchAction::SelectorMember("direct".to_string())
+            next_clash_mode(Some(DIRECT_CLASH_MODE), &[]),
+            RULE_CLASH_MODE
         );
     }
 
@@ -2623,11 +2628,7 @@ mod tests {
         assert!(app.implicit_root_mode());
         assert_eq!(
             app.displayed_group_names(),
-            vec![
-                "自动选择".to_string(),
-                "AirTCP".to_string(),
-                "宝贝云".to_string()
-            ]
+            vec!["AirTCP".to_string(), "宝贝云".to_string()]
         );
 
         app.groups[0].members = vec!["宝贝云".to_string()];
@@ -2645,7 +2646,7 @@ mod tests {
             vec!["bby-1".to_string(), "bby-2".to_string()]
         );
 
-        app.provider_index = 1;
+        app.provider_index = 0;
         app.sync_member_selection_to_current();
 
         assert_eq!(app.selected_root_choice_name().as_deref(), Some("AirTCP"));
@@ -2657,21 +2658,17 @@ mod tests {
     }
 
     #[test]
-    fn implicit_root_includes_urltest_auto_choice() {
+    fn implicit_root_excludes_urltest_auto_choice() {
         let mut app = provider_app();
         app.provider_index = 0;
         app.sync_member_selection_to_current();
 
-        assert_eq!(app.selected_root_choice_name().as_deref(), Some("自动选择"));
+        assert_eq!(app.selected_root_choice_name().as_deref(), Some("AirTCP"));
         assert_eq!(
             app.displayed_members(),
-            vec![
-                "auto-node".to_string(),
-                "air-1".to_string(),
-                "bby-1".to_string()
-            ]
+            vec!["air-1".to_string(), "air-2".to_string()]
         );
-        assert!(!app.selected_member_panel_is_manual_selector());
+        assert!(app.selected_member_panel_is_manual_selector());
     }
 
     #[test]

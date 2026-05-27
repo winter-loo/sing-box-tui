@@ -7,5 +7,10 @@
 /clash_proxies.txt
 /imported_nodes.json
 /sing_box_nodes.json
+/merged-config.json
+/sing-box-tui-bypass.json
+/sing-box-tui.json
+/singbox.sqlite3
+/.suburl
 /*_sing_box_config.json
 /*_sing_box_nodes.json

@@ -273,6 +273,10 @@ impl ApiClient {
         self.runtime.block_on(self.set_mode_async(mode))
     }
 
+    pub(crate) fn fetch_config(&self) -> Result<ControllerConfig> {
+        self.runtime.block_on(self.fetch_config_async())
+    }
+
     pub(crate) fn fetch_status(&self) -> Result<StatusOutput> {
         self.runtime.block_on(self.fetch_status_async())
     }
@@ -304,6 +308,19 @@ impl ApiClient {
             .error_for_status()
             .context("controller rejected Clash API mode update")?;
         Ok(())
+    }
+
+    async fn fetch_config_async(&self) -> Result<ControllerConfig> {
+        self.client
+            .get(format!("{}/configs", self.base_url))
+            .send()
+            .await
+            .context("failed to query Clash API /configs")?
+            .error_for_status()
+            .context("Clash API /configs returned an error")?
+            .json()
+            .await
+            .context("failed to decode Clash API /configs response")
     }
 
     async fn fetch_status_async(&self) -> Result<StatusOutput> {
@@ -646,6 +663,14 @@ struct SwitchProxyRequest {
 #[derive(Serialize)]
 struct UpdateConfigRequest {
     mode: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ControllerConfig {
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    #[serde(default, rename = "mode-list")]
+    pub(crate) mode_list: Vec<String>,
 }
 
 pub(crate) struct SelectorsOptions {
