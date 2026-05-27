@@ -286,7 +286,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
-- `s`: toggle the visible benchmark view mode between `FILTER VIEW` and `LATENCY SORT`; the active mode is shown in the pane titles/status, and latency sort hides failed-tested nodes while sorting successful tested nodes by ascending latency
+- `s`: toggle node sort order between `SELECTOR ORDER` and `LATENCY ORDER`; latency order hides failed-tested nodes and sorts successful tested nodes by ascending latency
 - `a`: toggle runtime auto-pick using the current filter; it benchmarks every 30 seconds and switches only when current latency is above 600ms, failed, or outside the filter
 - `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
 - `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values

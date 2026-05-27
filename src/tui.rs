@@ -217,15 +217,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
             format!(
                 "Candidates for {} [{}]",
                 group.name,
-                benchmark_mode_badge(app.latency_sort_mode)
+                node_order_badge(app.latency_sort_mode)
             )
         })
-        .unwrap_or_else(|| {
-            format!(
-                "Candidates [{}]",
-                benchmark_mode_badge(app.latency_sort_mode)
-            )
-        });
+        .unwrap_or_else(|| format!("Candidates [{}]", node_order_badge(app.latency_sort_mode)));
     let members_block = Block::default()
         .title(members_title)
         .borders(Borders::ALL)
@@ -240,9 +235,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let benchmark_hint = app.selected_benchmark().map_or_else(
         || {
             format!(
-                "clash={}  view={}  auto={}  b group benchmark  t node benchmark  a auto-pick  / filter",
+                "clash={}  order={}  auto={}  b group benchmark  t node benchmark  a auto-pick  / filter",
                 app.clash_mode_label(),
-                benchmark_mode_badge(app.latency_sort_mode),
+                node_order_badge(app.latency_sort_mode),
                 auto_select_badge(app.auto_select_enabled)
             )
         },
@@ -252,11 +247,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .map(|item| format!("best={} {}", item.name, item.display_delay()))
                 .unwrap_or_else(|| "best=none".to_string());
             format!(
-                "filter='{}'  tested={}  clash={}  view={}  auto={}  {}",
+                "filter='{}'  tested={}  clash={}  order={}  auto={}  {}",
                 summary.pattern,
                 summary.results.len(),
                 app.clash_mode_label(),
-                benchmark_mode_badge(app.latency_sort_mode),
+                node_order_badge(app.latency_sort_mode),
                 auto_select_badge(app.auto_select_enabled),
                 truncate_for_width(&best, 30)
             )
@@ -300,7 +295,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
-            Span::raw(" view mode  "),
+            Span::raw(" sort order  "),
             Span::styled("a", Style::default().fg(Color::Cyan)),
             Span::raw(" auto-pick  "),
             Span::styled("i", Style::default().fg(Color::Cyan)),
@@ -563,11 +558,11 @@ fn selected_style(active: bool) -> Style {
     }
 }
 
-fn benchmark_mode_badge(latency_sort_mode: bool) -> &'static str {
+fn node_order_badge(latency_sort_mode: bool) -> &'static str {
     if latency_sort_mode {
-        "LATENCY SORT"
+        "LATENCY ORDER"
     } else {
-        "FILTER VIEW"
+        "SELECTOR ORDER"
     }
 }
 
@@ -1492,10 +1487,10 @@ impl App {
     fn toggle_latency_sort_mode(&mut self) {
         self.latency_sort_mode = !self.latency_sort_mode;
         let status = if self.latency_sort_mode {
-            "View mode: LATENCY SORT (hide failed-tested nodes, sort successful nodes by delay)"
+            "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
                 .to_string()
         } else {
-            "View mode: FILTER VIEW (original selector order with current filter)".to_string()
+            "Sort order: SELECTOR ORDER (original selector order with current filter)".to_string()
         };
         self.set_status_only(status);
     }
@@ -2249,7 +2244,7 @@ mod tests {
         assert!(app.latency_sort_mode);
         assert_eq!(
             app.status,
-            "View mode: LATENCY SORT (hide failed-tested nodes, sort successful nodes by delay)"
+            "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
         );
         assert!(app.flash.is_none());
     }
