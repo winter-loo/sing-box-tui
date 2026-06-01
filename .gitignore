@@ -12,5 +12,6 @@
 /sing-box-tui.json
 /singbox.sqlite3
 /.suburl
+/.suburl.*
 /*_sing_box_config.json
 /*_sing_box_nodes.json
