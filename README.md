@@ -121,6 +121,8 @@ Inspect live controller status, traffic, and active connections:
 cargo run -- status
 ```
 
+The TUI also shows active sing-box connection totals in the status area. Press `c` to open a live connection details panel showing the inbound type, target host/IP, outbound chain, and matched rule.
+
 Environment variable still works too:
 
 ```bash
@@ -281,7 +283,6 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Up` / `Down` or `j` / `k`: move
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
-- `d`: switch to direct; if the selected group contains `direct` / `国内直连`, the TUI switches that selector, otherwise it falls back to Clash mode `直连`
 - `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
@@ -290,6 +291,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `a`: toggle runtime auto-pick using the current filter; it benchmarks every 30 seconds and switches only when current latency is above 600ms, failed, or outside the filter
 - `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
 - `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
+- `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
 - `v`: run Google/GitHub verification checks
 - `V`: run Google/GitHub/Discord verification checks
 - `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`

@@ -21,7 +21,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
-    ProxyGroup, run_verification, spawn_benchmark_worker,
+    ConnectionInfo, ConnectionsSnapshot, ProxyGroup, run_verification, spawn_benchmark_worker,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
@@ -37,6 +37,7 @@ use crate::tui_state::{
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
+const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -83,6 +84,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_benchmark_updates()?;
         app.maybe_start_auto_select_benchmark()?;
         app.maybe_refresh_latency_chart()?;
+        app.maybe_refresh_connections();
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -102,7 +104,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(6)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(10), Constraint::Length(7)]).areas(frame.area());
     let implicit_root_mode = app.implicit_root_mode();
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
@@ -300,6 +302,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" auto-pick  "),
             Span::styled("i", Style::default().fg(Color::Cyan)),
             Span::raw(" info  "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(" connections  "),
             Span::styled("v/V", Style::default().fg(Color::Cyan)),
             Span::raw(" verify  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -314,6 +318,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(app.client.base_url.as_str()),
         ]),
         Line::from(benchmark_hint),
+        Line::from(app.connections_summary_line()),
         bottom_line,
     ])
     .block(Block::default().title("Status").borders(Borders::ALL));
@@ -330,15 +335,68 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(chart) = app.latency_chart.as_ref() {
         draw_latency_chart(frame, chart);
     }
+    if app.show_connections {
+        draw_connections_panel(frame, app);
+    }
     if let Some(input) = app.filter_input.as_deref() {
         let cursor_x = status_area
             .x
             .saturating_add(1)
             .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
             .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
-        let cursor_y = status_area.y.saturating_add(4);
+        let cursor_y = status_area.y.saturating_add(5);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn draw_connections_panel(frame: &mut Frame, app: &App) {
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(4).min(120);
+    let height = frame_area.height.saturating_sub(4).min(24);
+    let area = centered_rect(width.max(20), height.max(8), frame_area);
+    frame.render_widget(Clear, area);
+
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let max_rows = area.height.saturating_sub(6) as usize;
+    let mut lines = vec![
+        Line::from(app.connections_summary_line()),
+        Line::from(vec![
+            Span::styled("Source", Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled("Target", Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled("Chain", Style::default().fg(Color::Cyan)),
+        ]),
+    ];
+
+    if let Some(error) = &app.connection_error {
+        lines.push(Line::from(format!(
+            "error: {}",
+            truncate_for_width(error, inner_width.saturating_sub(7))
+        )));
+    } else if app.connections.connections.is_empty() {
+        lines.push(Line::from("No active connections"));
+    } else {
+        lines.extend(
+            app.connections
+                .connections
+                .iter()
+                .take(max_rows)
+                .map(|connection| Line::from(format_connection_line(connection, inner_width))),
+        );
+        let hidden = app.connections.connections.len().saturating_sub(max_rows);
+        if hidden > 0 {
+            lines.push(Line::from(format!("... {hidden} more connections")));
+        }
+    }
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title("Active Connections (c/Esc close, r refresh)")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(widget, area);
 }
 
 fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
@@ -570,6 +628,71 @@ fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
     if auto_select_enabled { "ON" } else { "OFF" }
 }
 
+fn format_connection_line(connection: &ConnectionInfo, max_width: usize) -> String {
+    let source = format_connection_source(connection);
+    let target = format_connection_target(connection);
+    let chain = if connection.chains.is_empty() {
+        "-".to_string()
+    } else {
+        connection.chains.join(" -> ")
+    };
+    let rule = connection.rule.as_deref().unwrap_or("-");
+    truncate_for_width(
+        &format!("{source:<14} {target:<28} {chain}  {rule}"),
+        max_width,
+    )
+}
+
+fn format_connection_source(connection: &ConnectionInfo) -> String {
+    let kind = connection.metadata.kind.as_deref().unwrap_or("-");
+    let network = connection.metadata.network.as_deref().unwrap_or("-");
+    format!("{kind}/{network}")
+}
+
+fn format_connection_target(connection: &ConnectionInfo) -> String {
+    let target = connection
+        .metadata
+        .host
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or(connection.metadata.destination_ip.as_deref())
+        .unwrap_or("-");
+    match connection.metadata.destination_port.as_deref() {
+        Some(port) if !port.is_empty() => format!("{target}:{port}"),
+        _ => target.to_string(),
+    }
+}
+
+fn connection_is_direct(connection: &ConnectionInfo) -> bool {
+    connection
+        .chains
+        .iter()
+        .any(|chain| is_direct_chain_name(chain))
+}
+
+fn is_direct_chain_name(value: &str) -> bool {
+    value.eq_ignore_ascii_case("direct") || value == "国内直连"
+}
+
+fn format_bytes_opt(bytes: Option<u64>) -> String {
+    bytes.map(format_bytes).unwrap_or_else(|| "-".to_string())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit_index])
+    }
+}
+
 fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
     match kind {
         BenchmarkJobKind::Group => "group",
@@ -687,6 +810,10 @@ struct App {
     latency_chart: Option<LatencyChartState>,
     clash_mode: Option<String>,
     clash_modes: Vec<String>,
+    connections: ConnectionsSnapshot,
+    connection_error: Option<String>,
+    last_connection_refresh: Instant,
+    show_connections: bool,
 }
 
 impl App {
@@ -724,6 +851,10 @@ impl App {
             latency_chart: None,
             clash_mode: None,
             clash_modes: Vec::new(),
+            connections: ConnectionsSnapshot::default(),
+            connection_error: None,
+            last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+            show_connections: false,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -965,6 +1096,45 @@ impl App {
         self.status.clone()
     }
 
+    fn connections_summary_line(&self) -> String {
+        if let Some(error) = &self.connection_error {
+            return format!("connections unavailable: {}", truncate_for_width(error, 80));
+        }
+
+        let direct_count = self
+            .connections
+            .connections
+            .iter()
+            .filter(|connection| connection_is_direct(connection))
+            .count();
+        let active_count = self.connections.connections.len();
+        let proxied_count = active_count.saturating_sub(direct_count);
+        format!(
+            "connections active={} proxy={} direct={} up={} down={}  c details",
+            active_count,
+            proxied_count,
+            direct_count,
+            format_bytes_opt(self.connections.upload_total),
+            format_bytes_opt(self.connections.download_total)
+        )
+    }
+
+    fn maybe_refresh_connections(&mut self) {
+        if self.last_connection_refresh.elapsed() < CONNECTION_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_connection_refresh = Instant::now();
+        match self.client.fetch_connections() {
+            Ok(connections) => {
+                self.connections = connections;
+                self.connection_error = None;
+            }
+            Err(error) => {
+                self.connection_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn set_status_only(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.flash = None;
@@ -998,6 +1168,22 @@ impl App {
         }
         if self.bypass_input.is_some() {
             return self.handle_bypass_input_key(code);
+        }
+        if self.show_connections {
+            match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') => {
+                    self.show_connections = false;
+                    self.set_status_only("Connection details closed");
+                }
+                KeyCode::Char('r') => {
+                    self.last_connection_refresh = Instant::now() - CONNECTION_REFRESH_INTERVAL;
+                    self.maybe_refresh_connections();
+                    self.set_status_only("Connection details refreshed");
+                }
+                KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+            return Ok(true);
         }
         if self.latency_chart.is_some() {
             match code {
@@ -1039,6 +1225,7 @@ impl App {
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('B') => self.open_bypass_modal(),
             KeyCode::Char('i') => self.open_latency_chart()?,
+            KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
@@ -1054,6 +1241,11 @@ impl App {
             .members
             .get(self.member_index)
             .cloned()
+    }
+
+    fn open_connections_panel(&mut self) {
+        self.show_connections = true;
+        self.set_status_only("Showing active connections");
     }
 
     fn open_latency_chart(&mut self) -> Result<()> {
@@ -1862,15 +2054,17 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE, LATENCY_CHART_DEFAULT_WINDOW,
-        LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE,
-        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
-        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
-        latency_chart_zoom_out, next_clash_mode, truncate_for_width,
+        App, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
+        LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState,
+        LatencyChartTimeUnit, RULE_CLASH_MODE, connection_is_direct, format_bytes,
+        format_connection_line, latency_chart_segments, latency_chart_threshold_line,
+        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
+        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
-        BenchmarkResult, BenchmarkSummary, ProxyGroup,
+        BenchmarkResult, BenchmarkSummary, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
+        ProxyGroup,
     };
     use crate::defaults::DEFAULT_BENCHMARK_MAX_CONCURRENCY;
     use crate::tui_state::{TuiRuntimeState, TuiStateStore};
@@ -1963,6 +2157,10 @@ mod tests {
                 DIRECT_CLASH_MODE.to_string(),
                 RULE_CLASH_MODE.to_string(),
             ],
+            connections: ConnectionsSnapshot::default(),
+            connection_error: None,
+            last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+            show_connections: false,
         }
     }
 
@@ -2014,6 +2212,71 @@ mod tests {
         let truncated = truncate_for_width("手动选择-自动选择-节点A", 8);
         assert!(truncated.ends_with('…'));
         assert!(!truncated.is_empty());
+    }
+
+    fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
+        ConnectionInfo {
+            id: "conn-1".to_string(),
+            download: 0,
+            upload: 0,
+            start: None,
+            chains: chains.into_iter().map(ToString::to_string).collect(),
+            rule: Some("clash_mode=规则 => route(手动选择)".to_string()),
+            rule_payload: None,
+            metadata: ConnectionMetadata {
+                network: Some("tcp".to_string()),
+                kind: Some("tun/tun-in".to_string()),
+                source_ip: Some("172.19.0.1".to_string()),
+                destination_ip: Some("1.1.1.1".to_string()),
+                host: Some(host.to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: None,
+                process_path: None,
+            },
+        }
+    }
+
+    #[test]
+    fn formats_connection_summary_counts_proxy_and_direct() {
+        let mut app = test_app();
+        app.connections = ConnectionsSnapshot {
+            upload_total: Some(1536),
+            download_total: Some(2 * 1024 * 1024),
+            memory: None,
+            connections: vec![
+                test_connection("www.google.com", vec!["node-a", "airtcp", "手动选择"]),
+                test_connection("example.cn", vec!["国内直连"]),
+            ],
+        };
+
+        assert_eq!(
+            app.connections_summary_line(),
+            "connections active=2 proxy=1 direct=1 up=1.5KiB down=2.0MiB  c details"
+        );
+    }
+
+    #[test]
+    fn connection_helpers_format_active_rows() {
+        let direct = test_connection("example.cn", vec!["国内直连"]);
+        let proxied = test_connection("www.google.com", vec!["node-a", "airtcp", "手动选择"]);
+
+        assert!(connection_is_direct(&direct));
+        assert!(!connection_is_direct(&proxied));
+        assert_eq!(format_bytes(512), "512B");
+        assert_eq!(format_bytes(2048), "2.0KiB");
+        assert!(format_connection_line(&proxied, 120).contains("www.google.com:443"));
+        assert!(format_connection_line(&proxied, 120).contains("node-a -> airtcp"));
+    }
+
+    #[test]
+    fn pressing_c_opens_connection_details() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('c'))
+            .expect("open connection panel");
+
+        assert!(app.show_connections);
+        assert_eq!(app.status, "Showing active connections");
     }
 
     #[test]

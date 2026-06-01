@@ -281,6 +281,10 @@ impl ApiClient {
         self.runtime.block_on(self.fetch_status_async())
     }
 
+    pub(crate) fn fetch_connections(&self) -> Result<ConnectionsSnapshot> {
+        self.runtime.block_on(self.fetch_connections_async())
+    }
+
     async fn switch_proxy_async(&self, group: &str, proxy: &str) -> Result<()> {
         let encoded_group = encode(group);
         self.client
@@ -348,9 +352,21 @@ impl ApiClient {
             .await
             .context("failed to decode Clash API /traffic response")?;
 
-        let connections: ConnectionsResponse = self
-            .client
+        let connections = self.fetch_connections_response_async().await?;
+
+        Ok(status_from_parts(version.version, traffic, connections))
+    }
+
+    async fn fetch_connections_async(&self) -> Result<ConnectionsSnapshot> {
+        self.fetch_connections_response_async()
+            .await
+            .map(connections_from_response)
+    }
+
+    async fn fetch_connections_response_async(&self) -> Result<ConnectionsResponse> {
+        self.client
             .get(format!("{}/connections", self.base_url))
+            .timeout(Duration::from_secs(3))
             .send()
             .await
             .context("failed to query Clash API /connections")?
@@ -358,9 +374,7 @@ impl ApiClient {
             .context("Clash API /connections returned an error")?
             .json()
             .await
-            .context("failed to decode Clash API /connections response")?;
-
-        Ok(status_from_parts(version.version, traffic, connections))
+            .context("failed to decode Clash API /connections response")
     }
 }
 
@@ -401,6 +415,7 @@ fn status_from_parts(
     traffic: TrafficSnapshot,
     connections: ConnectionsResponse,
 ) -> StatusOutput {
+    let connections = connections_from_response(connections);
     StatusOutput {
         version,
         traffic,
@@ -408,6 +423,15 @@ fn status_from_parts(
         download_total: connections.download_total,
         memory: connections.memory,
         connection_count: connections.connections.len(),
+        connections: connections.connections,
+    }
+}
+
+fn connections_from_response(connections: ConnectionsResponse) -> ConnectionsSnapshot {
+    ConnectionsSnapshot {
+        upload_total: connections.upload_total,
+        download_total: connections.download_total,
+        memory: connections.memory,
         connections: connections.connections,
     }
 }
@@ -614,6 +638,14 @@ struct ConnectionsResponse {
     memory: Option<u64>,
     #[serde(default)]
     connections: Vec<ConnectionInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct ConnectionsSnapshot {
+    pub(crate) upload_total: Option<u64>,
+    pub(crate) download_total: Option<u64>,
+    pub(crate) memory: Option<u64>,
+    pub(crate) connections: Vec<ConnectionInfo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
