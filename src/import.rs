@@ -69,8 +69,13 @@ pub(crate) fn run_subscribe_import(
         .enable_all()
         .build()
         .context("failed to build Tokio runtime for subscription import")?;
+    let use_direct_fetch = subscription_url_requires_direct_fetch(&parsed_url);
     let subscription_json = runtime.block_on(async {
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        if use_direct_fetch {
+            builder = builder.no_proxy();
+        }
+        builder
             .build()
             .context("failed to build subscription HTTP client")?
             .get(parsed_url)
@@ -166,7 +171,7 @@ pub(crate) fn build_full_config_from_singbox_subscription_with_provider_groups(
     Ok((config, node_count))
 }
 
-fn extract_mergeable_outbounds_from_singbox_subscription(
+pub(crate) fn extract_mergeable_outbounds_from_singbox_subscription(
     subscription_json: &str,
 ) -> Result<Vec<Value>> {
     let payload: Value =
@@ -181,6 +186,11 @@ fn extract_mergeable_outbounds_from_singbox_subscription(
         .filter(|outbound| is_mergeable_subscription_outbound(outbound))
         .cloned()
         .collect())
+}
+
+fn subscription_url_requires_direct_fetch(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    host.contains("airtcp") || host.contains("mailrelay")
 }
 
 fn is_mergeable_subscription_outbound(outbound: &Value) -> bool {

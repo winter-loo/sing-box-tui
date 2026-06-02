@@ -10,6 +10,7 @@ mod defaults;
 mod import;
 mod provider;
 mod storage;
+mod subscriptions;
 mod tui;
 mod tui_state;
 
@@ -19,14 +20,32 @@ use controller::{
 };
 use import::{run_import, run_subscribe_import};
 use provider::run_provider_sync;
-use tui::run_tui;
+use subscriptions::run_subscription_refresh;
+use tui::{TuiSubscriptionRefreshOptions, run_tui};
 
 fn main() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
         CliCommand::Run {
             controller,
             max_concurrency,
-        } => run_tui(controller, max_concurrency),
+            subscription_input,
+            subscription_cache,
+            subscription_config_path,
+            subscription_refresh_disabled,
+            force_subscription_refresh,
+            subscription_interval_days,
+        } => run_tui(
+            controller,
+            max_concurrency,
+            TuiSubscriptionRefreshOptions {
+                input: subscription_input,
+                cache_path: subscription_cache,
+                config_path: subscription_config_path,
+                disabled: subscription_refresh_disabled,
+                force: force_subscription_refresh,
+                interval_days: subscription_interval_days,
+            },
+        ),
         CliCommand::Selectors {
             controller,
             selector,
@@ -57,6 +76,25 @@ fn main() -> Result<()> {
             replace_nodes,
             provider_name.as_deref(),
             existing_provider_name.as_deref(),
+        ),
+        CliCommand::Subscriptions {
+            input,
+            cache,
+            output,
+            config_path,
+            replace_nodes,
+            write,
+            force,
+            interval_days,
+        } => run_subscription_refresh(
+            &input,
+            &cache,
+            &config_path,
+            output.as_ref(),
+            replace_nodes,
+            write,
+            force,
+            interval_days,
         ),
         CliCommand::Benchmark {
             controller,

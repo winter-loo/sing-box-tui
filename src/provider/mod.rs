@@ -70,8 +70,9 @@ pub(crate) fn run_provider_sync(
     let result = runtime.block_on(async move {
         let plugin = resolve_provider_plugin(&runtime_provider_url)?;
         let client = Client::builder()
+            .no_proxy()
             .build()
-            .context("failed to build provider HTTP client")?;
+            .context("failed to build direct provider HTTP client")?;
 
         let cookies = plugin
             .login(&client, &runtime_provider_url, &credentials)

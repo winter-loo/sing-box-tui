@@ -71,6 +71,42 @@ pub(crate) fn build_full_config_with_provider_groups(
     Ok(config)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderNodeSet {
+    pub(crate) provider_name: String,
+    pub(crate) nodes: Vec<Value>,
+}
+
+pub(crate) fn build_full_config_with_provider_node_sets(
+    config_path: &PathBuf,
+    provider_node_sets: Vec<ProviderNodeSet>,
+    replace_nodes: bool,
+) -> Result<Value> {
+    let provider_node_tags = provider_node_sets
+        .iter()
+        .map(|set| (set.provider_name.clone(), collect_tags(&set.nodes)))
+        .collect::<Vec<_>>();
+    let imported_nodes = provider_node_sets
+        .into_iter()
+        .flat_map(|set| set.nodes)
+        .collect::<Vec<_>>();
+
+    let mut config = if config_path.exists() {
+        let text = fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let mut config: Value = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        remove_provider_managed_nodes(&mut config, &provider_node_tags)?;
+        merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
+        config
+    } else {
+        build_default_config(imported_nodes)
+    };
+
+    add_multiple_provider_groups(&mut config, &provider_node_tags)?;
+    Ok(config)
+}
+
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
     let select_members =
@@ -209,6 +245,15 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                         }
                     ],
                     "action": "hijack-dns",
+                },
+                {
+                    "domain_suffix": [
+                        "airtcp.me",
+                        "airtcp.com",
+                        "airapp.link",
+                        "mailrelay.us"
+                    ],
+                    "outbound": DEFAULT_DIRECT_TAG,
                 },
                 {
                     "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
@@ -436,6 +481,7 @@ pub(crate) fn merge_into_existing_config(
     route
         .entry("final")
         .or_insert_with(|| Value::String(selector_tag));
+    ensure_subscription_direct_route(route, &direct_tag)?;
     ensure_bypass_route(route, &direct_tag)?;
 
     let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
@@ -561,6 +607,103 @@ fn add_provider_groups(
     Ok(())
 }
 
+fn add_multiple_provider_groups(
+    config: &mut Value,
+    provider_node_tags: &[(String, Vec<String>)],
+) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .context("existing config outbounds must be an array")?;
+    outbounds.retain(|outbound| {
+        !is_replaceable_node_outbound(outbound)
+            || outbound
+                .get("tag")
+                .and_then(Value::as_str)
+                .is_some_and(|tag| !is_metadata_node_tag(tag))
+    });
+
+    let mut provider_tags = Vec::new();
+    let mut grouped_node_tags = BTreeSet::new();
+    for (provider_name, node_tags) in provider_node_tags {
+        if node_tags.is_empty() {
+            continue;
+        }
+        upsert_provider_selector(outbounds, provider_name, node_tags)?;
+        provider_tags.push(provider_name.clone());
+        grouped_node_tags.extend(node_tags.iter().cloned());
+    }
+    if provider_node_tags.is_empty() {
+        return Ok(());
+    }
+
+    let selector_tag =
+        preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let prefers_legacy_tags = selector_tag == "select";
+    let auto_tag = preferred_existing_tag(
+        outbounds,
+        AUTO_SELECTOR_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "auto"
+        } else {
+            DEFAULT_AUTO_SELECTOR_TAG
+        },
+    );
+    let direct_tag = preferred_existing_tag(
+        outbounds,
+        DIRECT_TAG_ALIASES,
+        if prefers_legacy_tags {
+            "direct"
+        } else {
+            DEFAULT_DIRECT_TAG
+        },
+    );
+
+    let all_node_tags = collect_tags(
+        &outbounds
+            .iter()
+            .filter(|outbound| is_replaceable_node_outbound(outbound))
+            .filter(|outbound| {
+                outbound
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| !is_metadata_node_tag(tag))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let ungrouped_node_tags = all_node_tags
+        .iter()
+        .filter(|tag| !grouped_node_tags.contains(*tag))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut select_members =
+        with_leading_members(&[auto_tag.as_str(), direct_tag.as_str()], &provider_tags);
+    for tag in ungrouped_node_tags {
+        if !select_members.contains(&tag) {
+            select_members.push(tag);
+        }
+    }
+    if let Some(selector) = find_outbound_by_tag_mut(outbounds, &selector_tag) {
+        set_outbound_members(selector, &select_members);
+        ensure_string_field(selector, "type", "selector");
+        ensure_string_field(selector, "default", &auto_tag);
+    }
+
+    if let Some(auto) = find_outbound_by_tag_mut(outbounds, &auto_tag) {
+        set_outbound_members(auto, &all_node_tags);
+        ensure_string_field(auto, "type", "urltest");
+        ensure_string_field(auto, "url", DEFAULT_DELAY_TEST_URL);
+        ensure_string_field(auto, "interval", "10m");
+    }
+
+    Ok(())
+}
+
 fn upsert_provider_selector(
     outbounds: &mut Vec<Value>,
     provider_name: &str,
@@ -669,6 +812,89 @@ fn migrate_legacy_inbound_fields(root: &mut serde_json::Map<String, Value>) -> R
         }
     }
 
+    Ok(())
+}
+
+fn remove_provider_managed_nodes(
+    config: &mut Value,
+    provider_node_tags: &[(String, Vec<String>)],
+) -> Result<()> {
+    let provider_names = provider_node_tags
+        .iter()
+        .map(|(provider_name, _)| provider_name.as_str())
+        .collect::<BTreeSet<_>>();
+    if provider_names.is_empty() {
+        return Ok(());
+    }
+
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let Some(outbounds) = root.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    let stale_node_tags = outbounds
+        .iter()
+        .filter(|outbound| {
+            outbound
+                .get("tag")
+                .and_then(Value::as_str)
+                .is_some_and(|tag| provider_names.contains(tag))
+        })
+        .filter_map(|outbound| outbound.get("outbounds").and_then(Value::as_array))
+        .flat_map(|members| members.iter().filter_map(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+
+    outbounds.retain(|outbound| {
+        !is_managed_provider_selector(outbound, &provider_names)
+            && (!is_replaceable_node_outbound(outbound)
+                || outbound
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .is_none_or(|tag| !stale_node_tags.contains(tag)))
+    });
+    Ok(())
+}
+
+fn is_managed_provider_selector(outbound: &Value, provider_names: &BTreeSet<&str>) -> bool {
+    let outbound_type = outbound
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    outbound_type.eq_ignore_ascii_case("selector")
+        && outbound
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| provider_names.contains(tag))
+}
+
+fn ensure_subscription_direct_route(
+    route: &mut serde_json::Map<String, Value>,
+    direct_tag: &str,
+) -> Result<()> {
+    let rule = json!({
+        "domain_suffix": [
+            "airtcp.me",
+            "airtcp.com",
+            "airapp.link",
+            "mailrelay.us"
+        ],
+        "outbound": direct_tag,
+    });
+    let rules_value = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rules = rules_value
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    rules.retain(|existing| existing != &rule);
+    let index = rules
+        .iter()
+        .rposition(|existing| existing.get("action").is_some())
+        .map_or(0, |index| index + 1);
+    rules.insert(index, rule);
     Ok(())
 }
 
@@ -919,8 +1145,13 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_default_config, merge_into_existing_config};
+    use super::{
+        ProviderNodeSet, build_default_config, build_full_config_with_provider_node_sets,
+        merge_into_existing_config,
+    };
     use serde_json::{Value, json};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn default_full_config_contains_selector_and_imported_nodes() {
@@ -949,8 +1180,12 @@ mod tests {
             "local"
         );
         assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
+        assert_eq!(
+            config["route"]["rules"].as_array().expect("route rules")[1]["domain_suffix"],
+            json!(["airtcp.me", "airtcp.com", "airapp.link", "mailrelay.us"])
+        );
         assert!(
-            config["route"]["rules"].as_array().expect("route rules")[1]["rule_set"]
+            config["route"]["rules"].as_array().expect("route rules")[2]["rule_set"]
                 == "sing-box-tui-bypass"
         );
         assert!(
@@ -1169,6 +1404,159 @@ mod tests {
     }
 
     #[test]
+    fn provider_node_sets_replace_stale_provider_nodes() {
+        let path = temp_config_path("provider-refresh");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&json!({
+                    "outbounds": [{
+                        "type": "selector",
+                        "tag": "select",
+                        "outbounds": ["auto", "direct", "airtcp", "other-provider"]
+                    }, {
+                        "type": "urltest",
+                        "tag": "auto",
+                        "outbounds": ["old-airtcp-node", "other-node"]
+                    }, {
+                        "type": "selector",
+                        "tag": "airtcp",
+                        "outbounds": ["old-airtcp-node"]
+                    }, {
+                        "type": "selector",
+                        "tag": "other-provider",
+                        "outbounds": ["other-node"]
+                    }, {
+                        "type": "trojan",
+                        "tag": "old-airtcp-node",
+                        "server": "old.example.com",
+                        "server_port": 443,
+                        "password": "secret"
+                    }, {
+                        "type": "trojan",
+                        "tag": "other-node",
+                        "server": "other.example.com",
+                        "server_port": 443,
+                        "password": "secret"
+                    }]
+                }))
+                .expect("config serializes")
+            ),
+        )
+        .expect("temp config writes");
+
+        let config = build_full_config_with_provider_node_sets(
+            &path,
+            vec![ProviderNodeSet {
+                provider_name: "airtcp".to_string(),
+                nodes: vec![json!({
+                    "type": "trojan",
+                    "tag": "new-airtcp-node",
+                    "server": "new.example.com",
+                    "server_port": 443,
+                    "password": "secret"
+                })],
+            }],
+            false,
+        )
+        .expect("provider refresh config builds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "old-airtcp-node")
+        );
+        assert!(
+            outbounds
+                .iter()
+                .any(|value| value["tag"] == "new-airtcp-node")
+        );
+        assert!(outbounds.iter().any(|value| value["tag"] == "other-node"));
+
+        let provider = outbounds
+            .iter()
+            .find(|value| value["tag"] == "airtcp")
+            .expect("airtcp selector");
+        assert_eq!(
+            provider["outbounds"],
+            Value::Array(vec![Value::String("new-airtcp-node".to_string())])
+        );
+
+        let selector = outbounds
+            .iter()
+            .find(|value| value["tag"] == "select")
+            .expect("root selector");
+        let members = selector["outbounds"].as_array().expect("selector members");
+        assert!(members.contains(&Value::String("airtcp".to_string())));
+        assert!(members.contains(&Value::String("other-node".to_string())));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_provider_node_set_removes_stale_provider_selector() {
+        let path = temp_config_path("empty-provider-refresh");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&json!({
+                    "outbounds": [{
+                        "type": "selector",
+                        "tag": "select",
+                        "outbounds": ["auto", "direct", "airtcp"]
+                    }, {
+                        "type": "urltest",
+                        "tag": "auto",
+                        "outbounds": ["old-airtcp-node"]
+                    }, {
+                        "type": "selector",
+                        "tag": "airtcp",
+                        "outbounds": ["old-airtcp-node"]
+                    }, {
+                        "type": "trojan",
+                        "tag": "old-airtcp-node",
+                        "server": "old.example.com",
+                        "server_port": 443,
+                        "password": "secret"
+                    }]
+                }))
+                .expect("config serializes")
+            ),
+        )
+        .expect("temp config writes");
+
+        let config = build_full_config_with_provider_node_sets(
+            &path,
+            vec![ProviderNodeSet {
+                provider_name: "airtcp".to_string(),
+                nodes: Vec::new(),
+            }],
+            false,
+        )
+        .expect("provider refresh config builds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        assert!(!outbounds.iter().any(|value| value["tag"] == "airtcp"));
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "old-airtcp-node")
+        );
+
+        let selector = outbounds
+            .iter()
+            .find(|value| value["tag"] == "select")
+            .expect("root selector");
+        let members = selector["outbounds"].as_array().expect("selector members");
+        assert!(!members.contains(&Value::String("airtcp".to_string())));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn merge_migrates_legacy_inbound_fields_to_route_actions() {
         let mut config = json!({
             "inbounds": [{
@@ -1195,5 +1583,13 @@ mod tests {
             "action": "sniff",
             "timeout": "1s"
         })));
+    }
+
+    fn temp_config_path(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-{label}-{nanos}.json"))
     }
 }

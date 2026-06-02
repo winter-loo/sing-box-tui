@@ -40,6 +40,37 @@ cargo run -- subscribe \
 
 `subscribe` fetches the URL with a `sing-box` user agent, extracts real node outbounds from the subscription JSON, filters provider metadata entries, and merges the nodes into the selector/urltest groups from the template config.
 
+For multiple saved subscription URLs, keep a local `.suburl` file in provider-name format:
+
+```text
+baobeiyun = https://example.com/api/subscribe?token=REDACTED
+airtcp = https://spring.mailrelay.us/link/REDACTED?singbox=1
+```
+
+Refresh all providers at most once per day and write a merged config:
+
+```bash
+cargo run -- subscriptions \
+  --input .suburl \
+  --cache .suburl.cache.json \
+  --config /usr/local/etc/sing-box/config.json \
+  --output ./output/merged-config.json
+```
+
+Use `--write` instead of `--output` to overwrite `--config` in place, and `--force` to fetch even when the cached subscription payload is still fresh. The command stores downloaded subscription JSON in `.suburl.cache.json` so skipped daily runs can still rebuild the config from cached nodes.
+
+When the TUI is running, it also starts a background subscription refresh worker if `.suburl` exists. The worker runs once on startup, then checks again every day. It writes the merged config to the configured sing-box config path and keeps the TUI responsive while network fetches are running:
+
+```bash
+cargo run -- run --config /usr/local/etc/sing-box/config.json
+```
+
+Set `SING_BOX_CONFIG=/path/to/config.json` or pass `--config` to control the write target. Use `--no-subscription-refresh` to disable the TUI worker and `--force-subscription-refresh` to fetch on startup even when the cache is fresh. After the worker writes a new config, restart or reload sing-box for the new nodes to become active in the running service.
+
+Press `u` in the TUI to manually force-refresh subscription contents immediately. If a refresh is already running, the TUI keeps the existing worker and reports that the refresh is in progress.
+
+Before overwriting the sing-box config, subscription refresh writes one fixed backup next to it: `<config filename>.sing-box-tui-subscription-backup`. Each refresh replaces that same backup file, so only one subscription-refresh backup is kept on disk.
+
 Account file formats:
 
 ```text

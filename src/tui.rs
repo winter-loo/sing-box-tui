@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +32,9 @@ use crate::defaults::{
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
+use crate::subscriptions::{
+    SubscriptionRefreshOutput, SubscriptionRefreshRequest, refresh_subscriptions,
+};
 use crate::tui_state::{
     BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
     default_tui_state_path, parse_bypass_entries,
@@ -39,6 +44,7 @@ const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
@@ -46,7 +52,21 @@ const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
 
-pub(crate) fn run_tui(controller: Option<String>, max_concurrency: Option<usize>) -> Result<()> {
+#[derive(Clone, Debug)]
+pub(crate) struct TuiSubscriptionRefreshOptions {
+    pub(crate) input: PathBuf,
+    pub(crate) cache_path: PathBuf,
+    pub(crate) config_path: PathBuf,
+    pub(crate) disabled: bool,
+    pub(crate) force: bool,
+    pub(crate) interval_days: u64,
+}
+
+pub(crate) fn run_tui(
+    controller: Option<String>,
+    max_concurrency: Option<usize>,
+    subscription_refresh: TuiSubscriptionRefreshOptions,
+) -> Result<()> {
     let controller = controller
         .or_else(|| env::var("SING_BOX_CONTROLLER").ok())
         .unwrap_or_else(|| DEFAULT_CONTROLLER.to_string());
@@ -58,6 +78,7 @@ pub(crate) fn run_tui(controller: Option<String>, max_concurrency: Option<usize>
     let mut app = App::new(
         ApiClient::new(controller, secret)?,
         max_concurrency.unwrap_or(DEFAULT_BENCHMARK_MAX_CONCURRENCY),
+        subscription_refresh,
     )?;
     let terminal = setup_terminal()?;
     let result = run_app(terminal, &mut app);
@@ -82,6 +103,8 @@ fn restore_terminal() -> Result<()> {
 fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         app.poll_benchmark_updates()?;
+        app.poll_subscription_refresh_updates()?;
+        app.maybe_start_subscription_refresh();
         app.maybe_start_auto_select_benchmark()?;
         app.maybe_refresh_latency_chart()?;
         app.maybe_refresh_connections();
@@ -104,7 +127,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(7)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(10), Constraint::Length(8)]).areas(frame.area());
     let implicit_root_mode = app.implicit_root_mode();
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
@@ -310,6 +333,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" filter  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
             Span::raw(" refresh  "),
+            Span::styled("u", Style::default().fg(Color::Cyan)),
+            Span::raw(" update subs  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(" quit"),
         ]),
@@ -319,6 +344,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(benchmark_hint),
         Line::from(app.connections_summary_line()),
+        Line::from(app.subscription_summary_line()),
         bottom_line,
     ])
     .block(Block::default().title("Status").borders(Borders::ALL));
@@ -344,7 +370,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .saturating_add(1)
             .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
             .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
-        let cursor_y = status_area.y.saturating_add(5);
+        let cursor_y = status_area.y.saturating_add(6);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -693,6 +719,50 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn subscription_report_badge(report: &SubscriptionRefreshOutput) -> String {
+    report
+        .providers
+        .iter()
+        .map(|provider| {
+            let warning = provider
+                .warning
+                .as_ref()
+                .map(|warning| format!(" {}", truncate_for_width(warning, 24)))
+                .unwrap_or_default();
+            format!(
+                "{}:{}:{} nodes{}",
+                provider.provider, provider.status, provider.imported_nodes, warning
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_duration_badge(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 24 * 60 * 60 {
+        let days = secs / (24 * 60 * 60);
+        let hours = (secs % (24 * 60 * 60)) / 3600;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d{hours}h")
+        }
+    } else if secs >= 3600 {
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes}m")
+        }
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
     match kind {
         BenchmarkJobKind::Group => "group",
@@ -814,12 +884,71 @@ struct App {
     connection_error: Option<String>,
     last_connection_refresh: Instant,
     show_connections: bool,
+    subscription_refresh: Option<SubscriptionRefreshState>,
+}
+
+struct SubscriptionRefreshState {
+    request: SubscriptionRefreshRequest,
+    interval: Duration,
+    next_run: Instant,
+    job: Option<SubscriptionRefreshJob>,
+    last_report: Option<SubscriptionRefreshOutput>,
+    last_error: Option<String>,
+}
+
+struct SubscriptionRefreshJob {
+    receiver: mpsc::Receiver<SubscriptionRefreshEvent>,
+    worker: JoinHandle<()>,
+}
+
+enum SubscriptionRefreshEvent {
+    Finished(Result<SubscriptionRefreshOutput, String>),
+}
+
+impl SubscriptionRefreshState {
+    fn from_options(options: TuiSubscriptionRefreshOptions) -> Result<Option<Self>> {
+        if options.disabled || !options.input.exists() {
+            return Ok(None);
+        }
+        if options.interval_days == 0 {
+            bail!("--subscription-interval-days must be greater than 0");
+        }
+        let interval = Duration::from_secs(options.interval_days.saturating_mul(24 * 60 * 60));
+        Ok(Some(Self {
+            request: SubscriptionRefreshRequest {
+                input: options.input,
+                cache_path: options.cache_path,
+                config_path: options.config_path.clone(),
+                merged_path: options.config_path,
+                replace_nodes: false,
+                force: options.force,
+                interval_days: options.interval_days,
+            },
+            interval,
+            next_run: Instant::now(),
+            job: None,
+            last_report: None,
+            last_error: None,
+        }))
+    }
+
+    fn schedule_after(&mut self, delay: Duration) {
+        self.next_run = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+    }
 }
 
 impl App {
-    fn new(client: ApiClient, benchmark_max_concurrency: usize) -> Result<Self> {
+    fn new(
+        client: ApiClient,
+        benchmark_max_concurrency: usize,
+        subscription_refresh_options: TuiSubscriptionRefreshOptions,
+    ) -> Result<Self> {
         let state_store = TuiStateStore::new(default_tui_state_path());
         let runtime_state = state_store.load()?;
+        let subscription_refresh =
+            SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -855,6 +984,7 @@ impl App {
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
+            subscription_refresh,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -1119,6 +1249,128 @@ impl App {
         )
     }
 
+    fn subscription_summary_line(&self) -> String {
+        let Some(state) = &self.subscription_refresh else {
+            return "subscriptions: disabled or no .suburl".to_string();
+        };
+        if state.job.is_some() {
+            return format!(
+                "subscriptions: refreshing {} -> {}",
+                state.request.input.display(),
+                state.request.merged_path.display()
+            );
+        }
+        if let Some(error) = &state.last_error {
+            return format!(
+                "subscriptions: error: {}  retry in {}",
+                truncate_for_width(error, 72),
+                format_duration_badge(state.next_run.saturating_duration_since(Instant::now()))
+            );
+        }
+        if let Some(report) = &state.last_report {
+            return format!(
+                "subscriptions: {}  next in {}  reload sing-box to apply",
+                subscription_report_badge(report),
+                format_duration_badge(state.next_run.saturating_duration_since(Instant::now()))
+            );
+        }
+        format!(
+            "subscriptions: pending first refresh from {}",
+            state.request.input.display()
+        )
+    }
+
+    fn maybe_start_subscription_refresh(&mut self) {
+        let Some(state) = self.subscription_refresh.as_mut() else {
+            return;
+        };
+        if state.job.is_some() || Instant::now() < state.next_run {
+            return;
+        }
+
+        self.start_subscription_refresh_job(false, "Refreshing subscriptions in background...");
+    }
+
+    fn start_manual_subscription_refresh(&mut self) {
+        if self.subscription_refresh.is_none() {
+            self.set_status_only("Subscription refresh is disabled or .suburl was not found");
+            return;
+        }
+        let started = self.start_subscription_refresh_job(
+            true,
+            "Manually refreshing subscriptions in background...",
+        );
+        if !started {
+            self.set_status_only("Subscription refresh is already running");
+        }
+    }
+
+    fn start_subscription_refresh_job(&mut self, force: bool, status: &str) -> bool {
+        let Some(state) = self.subscription_refresh.as_mut() else {
+            return false;
+        };
+        if state.job.is_some() {
+            return false;
+        }
+
+        let mut request = state.request.clone();
+        request.force = force || state.request.force;
+        state.request.force = false;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = refresh_subscriptions(&request).map_err(|error| error.to_string());
+            let _ = tx.send(SubscriptionRefreshEvent::Finished(result));
+        });
+        state.job = Some(SubscriptionRefreshJob {
+            receiver: rx,
+            worker,
+        });
+        state.last_error = None;
+        self.set_status_only(status);
+        true
+    }
+
+    fn poll_subscription_refresh_updates(&mut self) -> Result<()> {
+        let Some(state) = self.subscription_refresh.as_mut() else {
+            return Ok(());
+        };
+        let Some(job) = state.job.as_ref() else {
+            return Ok(());
+        };
+
+        let event = match job.receiver.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => SubscriptionRefreshEvent::Finished(Err(
+                "subscription refresh worker disconnected".to_string(),
+            )),
+        };
+
+        let job = state.job.take().expect("subscription refresh job exists");
+        let _ = job.worker.join();
+        match event {
+            SubscriptionRefreshEvent::Finished(Ok(report)) => {
+                state.schedule_after(state.interval);
+                state.last_error = None;
+                state.last_report = Some(report.clone());
+                self.set_status_only(format!(
+                    "Subscription refresh updated config: {}; reload/restart sing-box to apply",
+                    subscription_report_badge(&report)
+                ));
+            }
+            SubscriptionRefreshEvent::Finished(Err(error)) => {
+                state.schedule_after(SUBSCRIPTION_REFRESH_RETRY_INTERVAL);
+                state.last_error = Some(error.clone());
+                self.set_status_only(format!(
+                    "Subscription refresh failed: {}; retry in {}",
+                    truncate_for_width(&error, 80),
+                    format_duration_badge(SUBSCRIPTION_REFRESH_RETRY_INTERVAL)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn maybe_refresh_connections(&mut self) {
         if self.last_connection_refresh.elapsed() < CONNECTION_REFRESH_INTERVAL {
             return;
@@ -1218,6 +1470,7 @@ impl App {
             KeyCode::Char('g') => self.move_first(),
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
+            KeyCode::Char('u') => self.start_manual_subscription_refresh(),
             KeyCode::Char('b') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
@@ -2057,9 +2310,10 @@ mod tests {
         App, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
         LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState,
         LatencyChartTimeUnit, RULE_CLASH_MODE, connection_is_direct, format_bytes,
-        format_connection_line, latency_chart_segments, latency_chart_threshold_line,
-        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
-        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode, truncate_for_width,
+        format_connection_line, format_duration_badge, latency_chart_segments,
+        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
+        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        subscription_report_badge, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -2067,6 +2321,7 @@ mod tests {
         ProxyGroup,
     };
     use crate::defaults::DEFAULT_BENCHMARK_MAX_CONCURRENCY;
+    use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
     use reqwest::Client as AsyncClient;
@@ -2161,6 +2416,7 @@ mod tests {
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
+            subscription_refresh: None,
         }
     }
 
@@ -2269,6 +2525,57 @@ mod tests {
     }
 
     #[test]
+    fn subscription_report_badge_summarizes_provider_counts() {
+        let report = SubscriptionRefreshOutput {
+            input_path: ".suburl".to_string(),
+            cache_path: ".suburl.cache.json".to_string(),
+            interval_days: 1,
+            merged_config_path: "/usr/local/etc/sing-box/config.json".to_string(),
+            backup_config_path: Some(
+                "/usr/local/etc/sing-box/config.json.sing-box-tui-subscription-backup".to_string(),
+            ),
+            providers: vec![
+                ProviderRefreshSummary {
+                    provider: "宝贝云".to_string(),
+                    subscription_url: "https://example.com?token=REDACTED".to_string(),
+                    status: "fetched".to_string(),
+                    imported_nodes: 67,
+                    fetched_at_unix: 10,
+                    warning: None,
+                },
+                ProviderRefreshSummary {
+                    provider: "airtcp".to_string(),
+                    subscription_url: "https://example.com/link/REDACTED".to_string(),
+                    status: "cached".to_string(),
+                    imported_nodes: 0,
+                    fetched_at_unix: 10,
+                    warning: Some("no mergeable nodes found".to_string()),
+                },
+            ],
+        };
+
+        let badge = subscription_report_badge(&report);
+
+        assert!(badge.contains("宝贝云:fetched:67 nodes"));
+        assert!(badge.contains("airtcp:cached:0 nodes"));
+        assert!(badge.contains("no mergeable nodes found"));
+    }
+
+    #[test]
+    fn duration_badge_uses_day_hour_minute_units() {
+        assert_eq!(format_duration_badge(Duration::from_secs(42)), "42s");
+        assert_eq!(format_duration_badge(Duration::from_secs(5 * 60)), "5m");
+        assert_eq!(
+            format_duration_badge(Duration::from_secs(2 * 3600 + 30 * 60)),
+            "2h30m"
+        );
+        assert_eq!(
+            format_duration_badge(Duration::from_secs(24 * 3600 + 3600)),
+            "1d1h"
+        );
+    }
+
+    #[test]
     fn pressing_c_opens_connection_details() {
         let mut app = test_app();
 
@@ -2277,6 +2584,19 @@ mod tests {
 
         assert!(app.show_connections);
         assert_eq!(app.status, "Showing active connections");
+    }
+
+    #[test]
+    fn pressing_u_without_subscription_state_updates_status() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('u'))
+            .expect("manual subscription refresh handled");
+
+        assert_eq!(
+            app.status,
+            "Subscription refresh is disabled or .suburl was not found"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -6,12 +7,22 @@ use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_DELAY_TEST_URL,
     DEFAULT_SELECTOR_TAG,
 };
+use crate::subscriptions::{
+    DEFAULT_SUBSCRIPTION_CACHE_PATH, DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
+    DEFAULT_SUBSCRIPTION_SOURCE_PATH,
+};
 
 #[derive(Debug)]
 pub(crate) enum CliCommand {
     Run {
         controller: Option<String>,
         max_concurrency: Option<usize>,
+        subscription_input: PathBuf,
+        subscription_cache: PathBuf,
+        subscription_config_path: PathBuf,
+        subscription_refresh_disabled: bool,
+        force_subscription_refresh: bool,
+        subscription_interval_days: u64,
     },
     Selectors {
         controller: Option<String>,
@@ -34,6 +45,16 @@ pub(crate) enum CliCommand {
         replace_nodes: bool,
         provider_name: Option<String>,
         existing_provider_name: Option<String>,
+    },
+    Subscriptions {
+        input: PathBuf,
+        cache: PathBuf,
+        output: Option<PathBuf>,
+        config_path: PathBuf,
+        replace_nodes: bool,
+        write: bool,
+        force: bool,
+        interval_days: u64,
     },
     SyncProvider {
         provider: String,
@@ -68,6 +89,12 @@ impl CliCommand {
             return Ok(Self::Run {
                 controller: None,
                 max_concurrency: None,
+                subscription_input: PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH),
+                subscription_cache: PathBuf::from(DEFAULT_SUBSCRIPTION_CACHE_PATH),
+                subscription_config_path: default_subscription_config_path(),
+                subscription_refresh_disabled: false,
+                force_subscription_refresh: false,
+                subscription_interval_days: DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
             });
         }
 
@@ -77,6 +104,7 @@ impl CliCommand {
             "status" => Self::parse_status(&args[1..]),
             "import" => Self::parse_import(&args[1..]),
             "subscribe" => Self::parse_subscribe(&args[1..]),
+            "subscriptions" | "refresh-subscriptions" => Self::parse_subscriptions(&args[1..]),
             "sync" => Self::parse_sync_provider(&args[1..]),
             "benchmark" => Self::parse_benchmark(&args[1..]),
             "--help" | "-h" | "help" => {
@@ -91,6 +119,12 @@ impl CliCommand {
     fn parse_run(args: &[String]) -> Result<Self> {
         let mut controller = None;
         let mut max_concurrency = None;
+        let mut subscription_input = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
+        let mut subscription_cache = PathBuf::from(DEFAULT_SUBSCRIPTION_CACHE_PATH);
+        let mut subscription_config_path = default_subscription_config_path();
+        let mut subscription_refresh_disabled = false;
+        let mut force_subscription_refresh = false;
+        let mut subscription_interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -104,6 +138,44 @@ impl CliCommand {
                     max_concurrency =
                         Some(parse_max_concurrency(args.get(i), "--max-concurrency")?);
                 }
+                "--config" | "--subscription-config" => {
+                    i += 1;
+                    subscription_config_path = PathBuf::from(
+                        args.get(i)
+                            .context("--config/--subscription-config requires a file path")?,
+                    );
+                }
+                "--subscription-input" => {
+                    i += 1;
+                    subscription_input = PathBuf::from(
+                        args.get(i)
+                            .context("--subscription-input requires a file path")?,
+                    );
+                }
+                "--subscription-cache" => {
+                    i += 1;
+                    subscription_cache = PathBuf::from(
+                        args.get(i)
+                            .context("--subscription-cache requires a file path")?,
+                    );
+                }
+                "--subscription-interval-days" => {
+                    i += 1;
+                    subscription_interval_days = args
+                        .get(i)
+                        .context("--subscription-interval-days requires a value")?
+                        .parse()
+                        .context("--subscription-interval-days must be a positive integer")?;
+                    if subscription_interval_days == 0 {
+                        bail!("--subscription-interval-days must be greater than 0");
+                    }
+                }
+                "--force-subscription-refresh" => {
+                    force_subscription_refresh = true;
+                }
+                "--no-subscription-refresh" => {
+                    subscription_refresh_disabled = true;
+                }
                 "--help" | "-h" => {
                     print_run_usage();
                     std::process::exit(0);
@@ -116,6 +188,12 @@ impl CliCommand {
         Ok(Self::Run {
             controller,
             max_concurrency,
+            subscription_input,
+            subscription_cache,
+            subscription_config_path,
+            subscription_refresh_disabled,
+            force_subscription_refresh,
+            subscription_interval_days,
         })
     }
 
@@ -301,6 +379,85 @@ impl CliCommand {
         })
     }
 
+    fn parse_subscriptions(args: &[String]) -> Result<Self> {
+        let mut input = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
+        let mut cache = PathBuf::from(DEFAULT_SUBSCRIPTION_CACHE_PATH);
+        let mut output = None;
+        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut replace_nodes = false;
+        let mut write = false;
+        let mut force = false;
+        let mut interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-i" | "--input" => {
+                    i += 1;
+                    input = PathBuf::from(args.get(i).context("-i/--input requires a file path")?);
+                }
+                "--cache" => {
+                    i += 1;
+                    cache = PathBuf::from(args.get(i).context("--cache requires a file path")?);
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    output = Some(PathBuf::from(
+                        args.get(i).context("-o/--output requires a file path")?,
+                    ));
+                }
+                "--config" => {
+                    i += 1;
+                    config_path =
+                        PathBuf::from(args.get(i).context("--config requires a file path")?);
+                }
+                "--replace-nodes" => {
+                    replace_nodes = true;
+                }
+                "--write" => {
+                    write = true;
+                }
+                "--force" => {
+                    force = true;
+                }
+                "--interval-days" => {
+                    i += 1;
+                    interval_days = args
+                        .get(i)
+                        .context("--interval-days requires a value")?
+                        .parse()
+                        .context("--interval-days must be a positive integer")?;
+                    if interval_days == 0 {
+                        bail!("--interval-days must be greater than 0");
+                    }
+                }
+                "--help" | "-h" => {
+                    print_subscriptions_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for subscriptions: {value}")
+                }
+                value => bail!("unexpected positional argument for subscriptions: {value}"),
+            }
+            i += 1;
+        }
+
+        if !write && output.is_none() {
+            bail!("subscriptions requires either --output <FILE> or --write");
+        }
+
+        Ok(Self::Subscriptions {
+            input,
+            cache,
+            output,
+            config_path,
+            replace_nodes,
+            write,
+            force,
+            interval_days,
+        })
+    }
+
     fn parse_sync_provider(args: &[String]) -> Result<Self> {
         let mut provider = None;
         let mut account_file = None;
@@ -474,6 +631,22 @@ fn parse_max_concurrency(value: Option<&String>, flag: &str) -> Result<usize> {
     Ok(parsed)
 }
 
+fn default_subscription_config_path() -> PathBuf {
+    if let Ok(path) = env::var("SING_BOX_CONFIG") {
+        return PathBuf::from(path);
+    }
+    for path in [
+        "/usr/local/etc/sing-box/config.json",
+        "/opt/homebrew/etc/sing-box/config.json",
+    ] {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(DEFAULT_CONFIG_PATH)
+}
+
 fn print_usage() {
     println!("sing-box-tui <command> [options]");
     println!();
@@ -489,6 +662,10 @@ fn print_usage() {
     println!(
         "                                                Fetch a sing-box subscription URL and merge nodes"
     );
+    println!("  subscriptions [-i .suburl] [--config FILE] [-o FILE|--write]");
+    println!(
+        "                                                Refresh provider subscription URLs once per day"
+    );
     println!("  sync --provider URL --account-file FILE [--config FILE] [-o FILE]");
     println!(
         "                                                Log into a provider site, fetch the sing-box subscription, and merge it"
@@ -502,11 +679,23 @@ fn print_usage() {
 }
 
 fn print_run_usage() {
-    println!("sing-box-tui run [--controller URL] [--max-concurrency N]");
+    println!("sing-box-tui run [--controller URL] [--max-concurrency N] [--config FILE]");
     println!();
     println!(
         "      --max-concurrency <N>   Limit concurrent delay probes in TUI benchmarks (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
     );
+    println!("      --config <FILE>         sing-box config path for TUI subscription refresh");
+    println!(
+        "      --subscription-input <FILE>   Provider URL file (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
+    );
+    println!(
+        "      --subscription-cache <FILE>   Subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
+    );
+    println!(
+        "      --subscription-interval-days <N> Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
+    );
+    println!("      --force-subscription-refresh  Fetch on startup even if cache is fresh");
+    println!("      --no-subscription-refresh     Disable TUI background subscription refresh");
 }
 
 fn print_selectors_usage() {
@@ -565,6 +754,32 @@ fn print_subscribe_usage() {
     println!(
         "      --replace-nodes              Replace existing node outbounds instead of merging"
     );
+}
+
+fn print_subscriptions_usage() {
+    println!("sing-box-tui subscriptions [-i .suburl] [--config FILE] [-o FILE|--write]");
+    println!();
+    println!("Input options:");
+    println!(
+        "  -i, --input <FILE>         Provider URL file in '<provider> = <url>' format (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
+    );
+    println!(
+        "      --config <FILE>        Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
+    );
+    println!(
+        "      --cache <FILE>         Local subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
+    );
+    println!();
+    println!("Output options:");
+    println!("  -o, --output <FILE>        Output merged config path");
+    println!("      --write                Overwrite the --config file in place");
+    println!();
+    println!("Behavior options:");
+    println!(
+        "      --interval-days <N>    Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
+    );
+    println!("      --force                Fetch every provider even when cache is fresh");
+    println!("      --replace-nodes        Replace all existing node outbounds before merging");
 }
 
 fn print_sync_provider_usage() {
@@ -644,6 +859,15 @@ mod tests {
             "run".to_string(),
             "--max-concurrency".to_string(),
             "7".to_string(),
+            "--config".to_string(),
+            "/usr/local/etc/sing-box/config.json".to_string(),
+            "--subscription-input".to_string(),
+            ".suburl".to_string(),
+            "--subscription-cache".to_string(),
+            ".suburl.cache.json".to_string(),
+            "--subscription-interval-days".to_string(),
+            "2".to_string(),
+            "--force-subscription-refresh".to_string(),
         ])
         .expect("run command parses");
 
@@ -653,6 +877,61 @@ mod tests {
             } => {
                 assert_eq!(max_concurrency, Some(7));
             }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_command_parses_subscription_refresh_options() {
+        let command = CliCommand::parse([
+            "run".to_string(),
+            "--config".to_string(),
+            "/usr/local/etc/sing-box/config.json".to_string(),
+            "--subscription-input".to_string(),
+            "urls.txt".to_string(),
+            "--subscription-cache".to_string(),
+            "cache.json".to_string(),
+            "--subscription-interval-days".to_string(),
+            "3".to_string(),
+            "--force-subscription-refresh".to_string(),
+        ])
+        .expect("run command parses");
+
+        match command {
+            CliCommand::Run {
+                subscription_config_path,
+                subscription_input,
+                subscription_cache,
+                subscription_interval_days,
+                force_subscription_refresh,
+                subscription_refresh_disabled,
+                ..
+            } => {
+                assert_eq!(
+                    subscription_config_path,
+                    PathBuf::from("/usr/local/etc/sing-box/config.json")
+                );
+                assert_eq!(subscription_input, PathBuf::from("urls.txt"));
+                assert_eq!(subscription_cache, PathBuf::from("cache.json"));
+                assert_eq!(subscription_interval_days, 3);
+                assert!(force_subscription_refresh);
+                assert!(!subscription_refresh_disabled);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_command_can_disable_subscription_refresh() {
+        let command =
+            CliCommand::parse(["run".to_string(), "--no-subscription-refresh".to_string()])
+                .expect("run command parses");
+
+        match command {
+            CliCommand::Run {
+                subscription_refresh_disabled,
+                ..
+            } => assert!(subscription_refresh_disabled),
             _ => panic!("expected run command"),
         }
     }
@@ -724,6 +1003,59 @@ mod tests {
             }
             _ => panic!("expected subscribe command"),
         }
+    }
+
+    #[test]
+    fn subscriptions_command_parses_refresh_options() {
+        let command = CliCommand::parse([
+            "subscriptions".to_string(),
+            "--input".to_string(),
+            ".suburl".to_string(),
+            "--cache".to_string(),
+            ".suburl.cache.json".to_string(),
+            "--config".to_string(),
+            "config.json".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+            "--interval-days".to_string(),
+            "1".to_string(),
+            "--force".to_string(),
+        ])
+        .expect("subscriptions command parses");
+
+        match command {
+            CliCommand::Subscriptions {
+                input,
+                cache,
+                output,
+                config_path,
+                force,
+                interval_days,
+                write,
+                ..
+            } => {
+                assert_eq!(input, PathBuf::from(".suburl"));
+                assert_eq!(cache, PathBuf::from(".suburl.cache.json"));
+                assert_eq!(config_path, PathBuf::from("config.json"));
+                assert_eq!(output, Some(PathBuf::from("merged.json")));
+                assert!(force);
+                assert_eq!(interval_days, 1);
+                assert!(!write);
+            }
+            _ => panic!("expected subscriptions command"),
+        }
+    }
+
+    #[test]
+    fn subscriptions_command_requires_output_or_write() {
+        let error = CliCommand::parse(["subscriptions".to_string()])
+            .expect_err("subscriptions without write target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("subscriptions requires either --output <FILE> or --write")
+        );
     }
 
     #[test]
