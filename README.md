@@ -47,6 +47,49 @@ baobeiyun = https://example.com/api/subscribe?token=REDACTED
 airtcp = https://spring.mailrelay.us/link/REDACTED?singbox=1
 ```
 
+Provider helper scripts under `scripts/` can extract subscription URLs from an
+already-authenticated Chrome tab through CDP. When Chrome runs on Windows and
+the script runs inside WSL, start a separate Windows Chrome profile with CDP
+enabled:
+
+```powershell
+& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
+  --user-data-dir="$env:TEMP\chrome-cdp-profile-9229" `
+  --remote-debugging-port=9229 `
+  --remote-allow-origins=* `
+  --new-window "https://5.airtcp.me/user"
+```
+
+On WSL2, current Chrome builds may still bind CDP to Windows `127.0.0.1` only.
+Use `--cdp-windows-relay` to start a temporary PowerShell TCP relay from the
+WSL-visible Windows host to that loopback CDP port:
+
+```bash
+python3 scripts/get-airtcp-singbox-url.py --cdp-windows-relay --list-pages-only
+python3 scripts/get-airtcp-singbox-url.py --cdp-windows-relay
+python3 scripts/get-baipiao-singbox-url.py --cdp-windows-relay
+python3 scripts/get-baobeiyun-singbox-url.py --cdp-windows-relay
+```
+
+If Chrome is already listening on a WSL-reachable Windows address, use
+`--cdp-windows` without the relay. Both modes resolve the Windows host IP from
+WSL, rewrite loopback debugger WebSocket URLs when needed, and bypass shell
+proxy variables for CDP HTTP calls. If WSL chooses the wrong host, pass it
+explicitly:
+
+```bash
+python3 scripts/get-airtcp-singbox-url.py \
+  --cdp-windows-relay \
+  --windows-host "$(ip route show default | awk '{ print $3; exit }')"
+```
+
+You can also set `SING_BOX_TUI_CDP_URL` to change the default CDP endpoint. Keep
+the CDP browser profile temporary and close that Chrome instance after use; a
+reachable CDP port can control the attached browser profile.
+
+Set `WSL_CDP_LOG=1` to print CDP helper diagnostics such as host resolution,
+URL rewrites, and relay start/stop events.
+
 Refresh all providers at most once per day and write a merged config:
 
 ```bash

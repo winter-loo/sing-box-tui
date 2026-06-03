@@ -37,10 +37,17 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
+from cdp_wsl import (
+    CDP_URL_ENV,
+    WINDOWS_RELAY_ENV,
+    WINDOWS_HOST_ENV,
+    rewrite_loopback_websocket_url,
+    wsl_windows_cdp_url,
+)
 
-DEFAULT_CDP_URL = "http://127.0.0.1:9229"
+DEFAULT_CDP_URL = os.environ.get(CDP_URL_ENV, "http://127.0.0.1:9229")
 DEFAULT_USER_URL = "https://5.airtcp.me/user"
 DEFAULT_PROVIDER_NAME = "airtcp"
 
@@ -247,23 +254,33 @@ class CdpConnection:
 def main() -> int:
     args = parse_args()
     try:
-        targets = list_targets(args.cdp_url)
-        if args.list_pages:
-            print_targets(targets, file=sys.stderr)
+        relay = args.cdp_windows_relay or os.environ.get(WINDOWS_RELAY_ENV) == "1"
+        with wsl_windows_cdp_url(
+            args.cdp_url,
+            enabled=args.cdp_windows,
+            windows_host=args.windows_host,
+            relay=relay,
+        ) as cdp_url:
+            targets = list_targets(cdp_url)
+            if args.list_pages or args.list_pages_only:
+                print_targets(targets, file=sys.stderr)
+            if args.list_pages_only:
+                return 0
 
-        target = find_airtcp_target(targets, args.tab_url_contains)
-        if target is None:
-            target = open_user_target(args.cdp_url, args.url)
+            target = find_airtcp_target(targets, args.tab_url_contains)
+            if target is None:
+                target = open_user_target(cdp_url, args.url)
 
-        websocket_url = target.get("webSocketDebuggerUrl")
-        if not websocket_url:
-            raise ExtractionError("selected AirTCP target has no webSocketDebuggerUrl")
+            websocket_url = target.get("webSocketDebuggerUrl")
+            if not websocket_url:
+                raise ExtractionError("selected AirTCP target has no webSocketDebuggerUrl")
+            websocket_url = rewrite_loopback_websocket_url(websocket_url, cdp_url)
 
-        with CdpConnection(websocket_url) as cdp:
-            cdp.call("Page.enable")
-            cdp.call("Runtime.enable")
-            cdp.call("Page.bringToFront")
-            subscription_url = capture_subscription_url(cdp, args.timeout_ms)
+            with CdpConnection(websocket_url) as cdp:
+                cdp.call("Page.enable")
+                cdp.call("Runtime.enable")
+                cdp.call("Page.bringToFront")
+                subscription_url = capture_subscription_url(cdp, args.timeout_ms)
 
         if args.import_url:
             output = build_singbox_import_url(subscription_url)
@@ -298,7 +315,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cdp-url",
         default=DEFAULT_CDP_URL,
-        help=f"Chrome DevTools endpoint. Default: {DEFAULT_CDP_URL}",
+        help=(
+            f"Chrome DevTools endpoint. Default: {DEFAULT_CDP_URL}. "
+            f"Can also be set with ${CDP_URL_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--cdp-windows",
+        action="store_true",
+        help=(
+            "Treat a loopback --cdp-url as a Windows-hosted CDP endpoint from WSL. "
+            "The script resolves the Windows host IP and rewrites loopback debugger "
+            "WebSocket URLs returned by Chrome."
+        ),
+    )
+    parser.add_argument(
+        "--windows-host",
+        help=(
+            "Windows host/IP to use with --cdp-windows. "
+            f"Default: ${WINDOWS_HOST_ENV}, then WSL default gateway."
+        ),
+    )
+    parser.add_argument(
+        "--cdp-windows-relay",
+        action="store_true",
+        help=(
+            "Start a temporary Windows PowerShell TCP relay from the WSL-visible "
+            "Windows host to Windows 127.0.0.1. Use this when Windows Chrome's "
+            "CDP port is loopback-only. Can also be enabled with "
+            f"{WINDOWS_RELAY_ENV}=1."
+        ),
     )
     parser.add_argument(
         "--url",
@@ -320,6 +366,11 @@ def parse_args() -> argparse.Namespace:
         "--list-pages",
         action="store_true",
         help="Print CDP page targets to stderr before extracting.",
+    )
+    parser.add_argument(
+        "--list-pages-only",
+        action="store_true",
+        help="Print CDP page targets to stderr, then exit without extracting.",
     )
     parser.add_argument(
         "--import-url",
@@ -359,7 +410,8 @@ def parse_args() -> argparse.Namespace:
 def cdp_http_json(cdp_url: str, path: str, method: str = "GET") -> Any:
     url = f"{cdp_url.rstrip('/')}{path}"
     request = Request(url, method=method)
-    with urlopen(request, timeout=10) as response:
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

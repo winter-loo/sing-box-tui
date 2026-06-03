@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>scripts/cdp_wsl.py Walkthrough</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --surface-2: #eef3f7;
+      --ink: #18202a;
+      --muted: #5a6675;
+      --line: #d8e0e8;
+      --accent: #0f6f8f;
+      --accent-2: #126445;
+      --warn: #8a5200;
+      --code-bg: #101820;
+      --code-ink: #edf5fb;
+      --shadow: 0 12px 30px rgba(16, 24, 32, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .wrap {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 44px 0 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent-2);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.18;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      max-width: 820px;
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 3.3rem);
+    }
+
+    .lead {
+      max-width: 760px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 28px;
+      padding: 28px 0 56px;
+      align-items: start;
+    }
+
+    nav {
+      position: sticky;
+      top: 16px;
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    nav h2 {
+      margin: 0 0 12px;
+      font-size: 0.95rem;
+    }
+
+    nav a {
+      display: block;
+      padding: 7px 0;
+      color: var(--muted);
+      font-size: 0.94rem;
+      text-decoration: none;
+    }
+
+    nav a:hover,
+    nav a:focus {
+      color: var(--accent);
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    section {
+      margin: 0 0 24px;
+      padding: 24px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    section h2 {
+      margin: 0 0 14px;
+      font-size: 1.45rem;
+    }
+
+    section h3 {
+      margin: 22px 0 10px;
+      font-size: 1.04rem;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    ul,
+    ol {
+      margin: 0 0 16px 1.25rem;
+      padding: 0;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    code {
+      padding: 0.14rem 0.32rem;
+      background: var(--surface-2);
+      border-radius: 4px;
+      color: #143247;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 14px 0 0;
+      padding: 16px;
+      overflow-x: auto;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border-radius: 8px;
+      font-size: 0.9rem;
+      line-height: 1.48;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0 0;
+    }
+
+    .flow-step,
+    .note,
+    .function-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+    }
+
+    .flow-step {
+      padding: 14px;
+      min-height: 126px;
+    }
+
+    .flow-step strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
+    }
+
+    .note {
+      margin: 16px 0 0;
+      padding: 14px 16px;
+    }
+
+    .note strong {
+      color: var(--warn);
+    }
+
+    .function-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .function-card {
+      padding: 16px;
+    }
+
+    .function-card h3 {
+      margin-top: 0;
+      color: var(--accent);
+    }
+
+    .function-card p:last-child {
+      margin-bottom: 0;
+    }
+
+    .source-map {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .source-card {
+      padding: 16px;
+      background: #fbfcfd;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .source-card h3 {
+      margin-top: 0;
+      color: var(--accent);
+      overflow-wrap: anywhere;
+    }
+
+    .tour-list {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .tour-step {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: 12px;
+      padding: 16px;
+      background: #fbfcfd;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .step-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 50%;
+      font-weight: 700;
+    }
+
+    .tour-step h3 {
+      margin: 0 0 8px;
+      color: var(--accent);
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0 0;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--surface-2);
+      font-size: 0.92rem;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    footer {
+      padding: 26px 0;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+      font-size: 0.92rem;
+    }
+
+    @media (max-width: 860px) {
+      .layout,
+      .flow,
+      .function-grid,
+      .source-map,
+      .tour-step {
+        grid-template-columns: 1fr;
+      }
+
+      nav {
+        position: static;
+      }
+
+      section {
+        padding: 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap hero">
+      <p class="eyebrow">Walkthrough</p>
+      <h1>Codebase tour for the WSL-to-Windows Chrome CDP workflow</h1>
+      <p class="lead">
+        Start in a provider script, follow the command-line flags into
+        <code>scripts/cdp_wsl.py</code>, then continue through CDP HTTP,
+        WebSocket setup, page evaluation, provider-specific extraction, and
+        cleanup.
+      </p>
+    </div>
+  </header>
+
+  <div class="wrap layout">
+    <nav aria-label="Walkthrough sections">
+      <h2>Contents</h2>
+      <a href="#problem">Problem</a>
+      <a href="#codebase-map">Codebase Map</a>
+      <a href="#guided-tour">Guided Tour</a>
+      <a href="#big-picture">Big Picture</a>
+      <a href="#public-api">Public API</a>
+      <a href="#host-resolution">Host Resolution</a>
+      <a href="#relay">Relay Path</a>
+      <a href="#url-rewrites">URL Rewrites</a>
+      <a href="#failure-cases">Failure Cases</a>
+      <a href="#usage">Usage</a>
+    </nav>
+
+    <main>
+      <section id="problem">
+        <h2>The Problem It Solves</h2>
+        <p>
+          The provider scripts talk to Chrome through Chrome DevTools Protocol
+          endpoints such as <code>http://127.0.0.1:9229/json/list</code> and
+          <code>ws://127.0.0.1:9229/devtools/page/...</code>. That works when
+          Chrome and Python run in the same network namespace.
+        </p>
+        <p>
+          In WSL2, Python runs inside Linux while Chrome may run on Windows.
+          Windows <code>127.0.0.1</code> is not the same as WSL
+          <code>127.0.0.1</code>. Chrome also commonly reports debugger
+          WebSocket URLs with loopback hosts, even when WSL needs to connect
+          through the Windows-side WSL gateway.
+        </p>
+        <div class="note">
+          <strong>Key idea:</strong> keep the provider scripts simple. They ask
+          this helper for an effective CDP URL, then use that same effective URL
+          to fix any loopback WebSocket URL returned by Chrome.
+        </div>
+      </section>
+
+      <section id="codebase-map">
+        <h2>Codebase Map</h2>
+        <p>
+          Read these files in this order. The provider scripts are the entry
+          points; <code>scripts/cdp_wsl.py</code> is infrastructure; the
+          provider-specific extraction functions are the final business logic.
+        </p>
+
+        <div class="source-map">
+          <article class="source-card">
+            <h3><code>scripts/get-airtcp-singbox-url.py</code></h3>
+            <p>
+              The easiest provider script to trace. Its <code>main()</code>
+              shows the whole workflow from CLI flags to subscription URL
+              output.
+            </p>
+            <p>
+              Key functions: <code>parse_args()</code>, <code>main()</code>,
+              <code>list_targets()</code>, <code>CdpConnection</code>,
+              <code>capture_subscription_url()</code>.
+            </p>
+          </article>
+
+          <article class="source-card">
+            <h3><code>scripts/cdp_wsl.py</code></h3>
+            <p>
+              Shared WSL/Windows CDP transport helper. It decides what host WSL
+              should dial, optionally starts the PowerShell relay, and rewrites
+              Chrome's loopback WebSocket URLs.
+            </p>
+            <p>
+              Key functions: <code>wsl_windows_cdp_url()</code>,
+              <code>find_windows_host()</code>,
+              <code>start_windows_cdp_relay()</code>.
+            </p>
+          </article>
+
+          <article class="source-card">
+            <h3>Other provider scripts</h3>
+            <p>
+              <code>get-baipiao-singbox-url.py</code> and
+              <code>get-baobeiyun-singbox-url.py</code> use the same transport
+              workflow, then diverge in provider-specific page logic.
+            </p>
+            <p>
+              Compare their <code>capture_...</code> functions after you
+              understand the AirTCP path.
+            </p>
+          </article>
+        </div>
+
+        <div class="note">
+          <strong>Best reading path:</strong> start with AirTCP
+          <code>main()</code>, jump into <code>wsl_windows_cdp_url()</code>,
+          return to <code>list_targets()</code>, then follow
+          <code>CdpConnection.call("Runtime.evaluate", ...)</code> into the
+          provider extraction function.
+        </div>
+      </section>
+
+      <section id="guided-tour">
+        <h2>Guided Tour Through The Workflow</h2>
+        <p>
+          This is the actual runtime path when you run a command such as
+          <code>python3 scripts/get-airtcp-singbox-url.py --cdp-windows-relay</code>.
+        </p>
+
+        <div class="tour-list">
+          <article class="tour-step">
+            <span class="step-number">1</span>
+            <div>
+              <h3>The command enters a provider script</h3>
+              <p>
+                Start at <code>scripts/get-airtcp-singbox-url.py</code>.
+                <code>parse_args()</code> defines the transport flags:
+                <code>--cdp-url</code>, <code>--cdp-windows</code>,
+                <code>--windows-host</code>, and
+                <code>--cdp-windows-relay</code>.
+              </p>
+              <pre><code>python3 scripts/get-airtcp-singbox-url.py --cdp-windows-relay</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">2</span>
+            <div>
+              <h3><code>main()</code> decides whether relay mode is active</h3>
+              <p>
+                The provider script sets <code>relay</code> from the CLI flag
+                or <code>WSL_CDP_WINDOWS_RELAY=1</code>. That variable decides
+                whether <code>cdp_wsl.py</code> only rewrites hosts or also
+                starts a Windows-side TCP relay.
+              </p>
+              <pre><code>relay = args.cdp_windows_relay or os.environ.get(WINDOWS_RELAY_ENV) == "1"</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">3</span>
+            <div>
+              <h3>The provider script enters <code>wsl_windows_cdp_url()</code></h3>
+              <p>
+                This is the handoff from provider code to transport code. The
+                context manager yields an effective CDP URL and guarantees relay
+                cleanup later.
+              </p>
+              <pre><code>with wsl_windows_cdp_url(
+    args.cdp_url,
+    enabled=args.cdp_windows,
+    windows_host=args.windows_host,
+    relay=relay,
+) as cdp_url:</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">4</span>
+            <div>
+              <h3><code>cdp_wsl.py</code> resolves the reachable Windows host</h3>
+              <p>
+                <code>resolve_wsl_windows_cdp_url()</code> rewrites
+                <code>http://127.0.0.1:9229</code> only when Windows mode or
+                relay mode is enabled. It asks <code>find_windows_host()</code>
+                for the host, preferring <code>WSL_WINDOWS_HOST</code>, then the
+                WSL default gateway, then <code>/etc/resolv.conf</code>.
+              </p>
+              <pre><code>http://127.0.0.1:9229
+http://172.28.192.1:9229</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">5</span>
+            <div>
+              <h3>Relay mode starts a temporary PowerShell bridge</h3>
+              <p>
+                If Chrome is only listening on Windows loopback,
+                <code>start_windows_cdp_relay()</code> launches PowerShell. The
+                relay listens on the WSL-visible host and forwards raw TCP bytes
+                to Windows <code>127.0.0.1:&lt;port&gt;</code>.
+              </p>
+              <pre><code>WSL -> 172.28.192.1:9229 -> PowerShell relay -> 127.0.0.1:9229 -> Chrome</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">6</span>
+            <div>
+              <h3>The provider script calls Chrome's HTTP CDP API</h3>
+              <p>
+                Back in the provider script, <code>list_targets(cdp_url)</code>
+                calls <code>cdp_http_json(cdp_url, "/json/list")</code>. The
+                HTTP opener uses <code>ProxyHandler({})</code> so proxy
+                environment variables do not hijack local CDP traffic.
+              </p>
+              <pre><code>targets = list_targets(cdp_url)</code></pre>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">7</span>
+            <div>
+              <h3>The provider script chooses or opens the right browser tab</h3>
+              <p>
+                The AirTCP path calls <code>find_airtcp_target()</code>. If no
+                matching page target exists, <code>open_user_target()</code>
+                asks Chrome to create a new tab through <code>/json/new</code>.
+                BaiPiao and Baobeiyun use the same pattern with provider-specific
+                target matching.
+              </p>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">8</span>
+            <div>
+              <h3>The WebSocket URL is made reachable from WSL</h3>
+              <p>
+                Chrome's target contains <code>webSocketDebuggerUrl</code>. If
+                Chrome reports <code>ws://127.0.0.1:...</code>,
+                <code>rewrite_loopback_websocket_url()</code> replaces that host
+                with the same effective CDP host used for HTTP.
+              </p>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">9</span>
+            <div>
+              <h3><code>CdpConnection</code> opens the raw CDP WebSocket</h3>
+              <p>
+                The provider script's <code>CdpConnection.connect()</code>
+                manually performs the WebSocket handshake, then
+                <code>CdpConnection.call()</code> sends CDP JSON messages such
+                as <code>Page.enable</code>, <code>Runtime.enable</code>, and
+                <code>Runtime.evaluate</code>.
+              </p>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">10</span>
+            <div>
+              <h3>Provider-specific extraction runs inside the tab</h3>
+              <p>
+                AirTCP calls <code>capture_subscription_url()</code>, which uses
+                <code>evaluate()</code> to inspect page JavaScript and DOM text.
+                If needed, it clicks the Sing-box import button and watches CDP
+                navigation events for a <code>sing-box://...</code> URL.
+              </p>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">11</span>
+            <div>
+              <h3>The result is decoded and printed</h3>
+              <p>
+                The provider script returns either the direct HTTPS subscription
+                URL or the <code>sing-box://</code> import URL depending on
+                flags. It writes to stdout or to <code>--output</code>.
+              </p>
+            </div>
+          </article>
+
+          <article class="tour-step">
+            <span class="step-number">12</span>
+            <div>
+              <h3>Context cleanup closes the relay</h3>
+              <p>
+                When the <code>with</code> block exits, control returns to
+                <code>wsl_windows_cdp_url()</code>. Its <code>finally</code>
+                block calls <code>stop_windows_cdp_relay()</code>, so relay
+                cleanup happens even if extraction fails.
+              </p>
+            </div>
+          </article>
+        </div>
+
+        <div class="note">
+          <strong>How to follow this live:</strong> run with
+          <code>WSL_CDP_LOG=1</code>. The log lines correspond to steps 3, 4, 5,
+          8, and 12.
+        </div>
+      </section>
+
+      <section id="big-picture">
+        <h2>Big Picture Flow</h2>
+        <p>
+          The provider scripts call <code>wsl_windows_cdp_url(...)</code> around
+          their CDP work. The context manager optionally starts a relay, yields
+          a reachable URL, then cleans up the relay afterward.
+        </p>
+
+        <div class="flow" aria-label="Execution flow">
+          <div class="flow-step">
+            <strong>1. Input</strong>
+            A script starts with a URL such as
+            <code>http://127.0.0.1:9229</code>.
+          </div>
+          <div class="flow-step">
+            <strong>2. Resolve</strong>
+            If Windows mode is enabled, loopback is replaced with the Windows
+            host visible from WSL.
+          </div>
+          <div class="flow-step">
+            <strong>3. Relay</strong>
+            If relay mode is enabled, PowerShell listens on the WSL-visible
+            host and forwards bytes to Windows <code>127.0.0.1</code>.
+          </div>
+          <div class="flow-step">
+            <strong>4. Cleanup</strong>
+            The yielded URL is used for CDP. When the context exits, the relay
+            process is terminated.
+          </div>
+        </div>
+
+        <pre><code>with wsl_windows_cdp_url(
+    "http://127.0.0.1:9229",
+    enabled=args.cdp_windows,
+    windows_host=args.windows_host,
+    relay=args.cdp_windows_relay,
+) as cdp_url:
+    targets = list_targets(cdp_url)</code></pre>
+      </section>
+
+      <section id="public-api">
+        <h2>Public API</h2>
+        <p>
+          These are the functions and constants intended for the provider
+          scripts to import.
+        </p>
+
+        <div class="function-grid">
+          <article class="function-card">
+            <h3><code>wsl_windows_cdp_url</code></h3>
+            <p>
+              Main entry point. It resolves the effective CDP URL and optionally
+              starts a temporary relay. It is a context manager so cleanup is
+              tied to the lifetime of the provider script operation.
+            </p>
+          </article>
+
+          <article class="function-card">
+            <h3><code>resolve_wsl_windows_cdp_url</code></h3>
+            <p>
+              Converts loopback URLs into Windows-host URLs when Windows mode
+              is enabled. Non-loopback URLs are already explicit, so they are
+              returned unchanged.
+            </p>
+          </article>
+
+          <article class="function-card">
+            <h3><code>rewrite_loopback_websocket_url</code></h3>
+            <p>
+              Fixes Chrome's returned <code>ws://127.0.0.1:port/...</code>
+              debugger URLs by replacing the host with the already chosen CDP
+              host.
+            </p>
+          </article>
+
+          <article class="function-card">
+            <h3>Environment constants</h3>
+            <p>
+              <code>SING_BOX_TUI_CDP_URL</code>, <code>WSL_WINDOWS_HOST</code>,
+              and <code>WSL_CDP_WINDOWS_RELAY</code> are shared names used by
+              the provider scripts and help text.
+            </p>
+          </article>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Constant</th>
+              <th>Meaning</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>CDP_URL_ENV</code></td>
+              <td>Environment variable that can override the default CDP URL.</td>
+            </tr>
+            <tr>
+              <td><code>WINDOWS_HOST_ENV</code></td>
+              <td>Environment variable for explicitly setting the Windows host visible from WSL.</td>
+            </tr>
+            <tr>
+              <td><code>WINDOWS_RELAY_ENV</code></td>
+              <td>Environment variable that enables relay mode when set by the caller.</td>
+            </tr>
+            <tr>
+              <td><code>CDP_LOG_ENV</code></td>
+              <td>Environment variable that enables helper diagnostics when set to <code>1</code>, <code>true</code>, <code>yes</code>, or <code>on</code>.</td>
+            </tr>
+            <tr>
+              <td><code>LOOPBACK_HOSTS</code></td>
+              <td>Hostnames treated as local-only: <code>127.0.0.1</code>, <code>localhost</code>, and <code>::1</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="host-resolution">
+        <h2>Host Resolution</h2>
+        <p>
+          <code>find_windows_host()</code> chooses the Windows-side address in a
+          deliberate order.
+        </p>
+
+        <ol>
+          <li>
+            Use <code>WSL_WINDOWS_HOST</code> if the user supplied it. This is
+            the escape hatch for unusual network setups.
+          </li>
+          <li>
+            Use the default gateway from <code>ip route show default</code>.
+            In WSL2, this is usually the Windows virtual network interface.
+          </li>
+          <li>
+            Fall back to the first <code>nameserver</code> in
+            <code>/etc/resolv.conf</code>. This is a secondary fallback because
+            it can point at a resolver that is not useful for CDP.
+          </li>
+        </ol>
+
+        <pre><code>def find_windows_host() -&gt; str | None:
+    host = os.environ.get(WINDOWS_HOST_ENV)
+    if host:
+        return host
+
+    host = _default_gateway()
+    if host:
+        return host
+
+    host = _nameserver_from_resolv_conf()
+    if host:
+        return host
+
+    return None</code></pre>
+
+        <div class="note">
+          <strong>Why gateway first?</strong> During testing, the resolver IP
+          accepted TCP but did not behave like a reachable Windows Chrome CDP
+          endpoint. The WSL default gateway was the correct Windows-side
+          interface for the relay.
+        </div>
+      </section>
+
+      <section id="relay">
+        <h2>The Relay Path</h2>
+        <p>
+          Chrome may ignore attempts to bind CDP to a non-loopback address and
+          still listen only on Windows <code>127.0.0.1</code>. In that case, WSL
+          cannot connect directly. Relay mode starts a small PowerShell process
+          on Windows:
+        </p>
+
+        <ul>
+          <li>It listens on the Windows host address that WSL can reach.</li>
+          <li>It connects onward to Windows <code>127.0.0.1:&lt;cdp-port&gt;</code>.</li>
+          <li>It copies bytes both directions until either side closes.</li>
+        </ul>
+
+        <pre><code>process = subprocess.Popen(
+    [powershell, "-NoProfile", "-Command", script],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)</code></pre>
+
+        <p>
+          The context manager stores that process and always calls
+          <code>stop_windows_cdp_relay()</code> in the <code>finally</code>
+          block. Normal exits and exceptions both take the cleanup path.
+        </p>
+
+        <div class="note">
+          <strong>Security note:</strong> a reachable CDP endpoint can control
+          the browser profile attached to it. Use a temporary Chrome profile and
+          close it after extracting the subscription URL.
+        </div>
+      </section>
+
+      <section id="url-rewrites">
+        <h2>URL Rewrites</h2>
+        <p>
+          Two related rewrites happen in this file.
+        </p>
+
+        <h3>HTTP CDP URL rewrite</h3>
+        <p>
+          <code>resolve_wsl_windows_cdp_url()</code> rewrites only loopback
+          hosts, and only when Windows mode or relay mode is enabled.
+        </p>
+
+        <pre><code>http://127.0.0.1:9229
+http://172.28.192.1:9229</code></pre>
+
+        <h3>WebSocket debugger URL rewrite</h3>
+        <p>
+          Chrome's <code>/json/list</code> response may contain a WebSocket URL
+          with a loopback host. <code>rewrite_loopback_websocket_url()</code>
+          reuses the effective CDP host so the HTTP and WebSocket connections go
+          to the same reachable endpoint.
+        </p>
+
+        <pre><code>ws://127.0.0.1:9229/devtools/page/abc
+ws://172.28.192.1:9229/devtools/page/abc</code></pre>
+
+        <p>
+          <code>replace_url_host()</code> does the shared mechanical work. It
+          parses the URL, preserves the original port, formats IPv6 hosts with
+          brackets, and rebuilds the URL with <code>urlunparse()</code>.
+        </p>
+      </section>
+
+      <section id="failure-cases">
+        <h2>Failure Cases To Know</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Failure</th>
+              <th>Where it is handled</th>
+              <th>What to do</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>No Windows host can be found.</td>
+              <td><code>resolve_wsl_windows_cdp_url()</code></td>
+              <td>Pass <code>--windows-host</code> or set <code>WSL_WINDOWS_HOST</code>.</td>
+            </tr>
+            <tr>
+              <td>Relay requested for a loopback-only effective URL.</td>
+              <td><code>start_windows_cdp_relay()</code></td>
+              <td>Use a non-loopback Windows host. The helper normally resolves one automatically.</td>
+            </tr>
+            <tr>
+              <td>Port cannot be inferred.</td>
+              <td><code>_default_port()</code> and relay validation</td>
+              <td>Use an explicit URL such as <code>http://127.0.0.1:9229</code>.</td>
+            </tr>
+            <tr>
+              <td>PowerShell is unavailable.</td>
+              <td><code>_powershell_path()</code></td>
+              <td>Run from WSL on Windows, or avoid relay mode and provide a reachable CDP URL.</td>
+            </tr>
+            <tr>
+              <td>The relay process exits immediately.</td>
+              <td><code>start_windows_cdp_relay()</code></td>
+              <td>Check whether the port is already in use or Windows firewall is blocking the listener.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="usage">
+        <h2>How The Provider Scripts Use It</h2>
+        <p>
+          The provider scripts expose this helper through command-line flags:
+        </p>
+
+        <div class="pill-row" aria-label="Relevant command-line flags">
+          <span class="pill"><code>--cdp-windows</code></span>
+          <span class="pill"><code>--cdp-windows-relay</code></span>
+          <span class="pill"><code>--windows-host</code></span>
+          <span class="pill"><code>--list-pages-only</code></span>
+        </div>
+
+        <pre><code>python3 scripts/get-airtcp-singbox-url.py --cdp-windows-relay --list-pages-only
+python3 scripts/get-baipiao-singbox-url.py --cdp-windows-relay
+python3 scripts/get-baobeiyun-singbox-url.py --cdp-windows-relay</code></pre>
+
+        <p>
+          The first command is a low-risk smoke test. It only asks Chrome for
+          page targets and exits before attempting provider-specific extraction.
+          Once that lists a page, the WebSocket path should use the same
+          reachable host.
+        </p>
+
+        <p>
+          For helper diagnostics, prefix a command with <code>WSL_CDP_LOG=1</code>.
+          The logs show host resolution, URL rewrites, PowerShell relay startup,
+          and relay cleanup without changing the extracted URL output format.
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="wrap">
+      Generated for <code>scripts/cdp_wsl.py</code>. Open this file directly in
+      a browser; it has no external assets or network dependencies.
+    </div>
+  </footer>
+</body>
+</html>
