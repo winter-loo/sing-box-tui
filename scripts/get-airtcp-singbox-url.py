@@ -290,7 +290,6 @@ def main() -> int:
         write_or_print(
             output,
             args.output,
-            args.append,
             provider_name=args.provider_name,
             raw=args.raw,
         )
@@ -391,12 +390,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Write the extracted URL to this file instead of stdout.",
-    )
-    parser.add_argument(
-        "--append",
-        action="store_true",
-        help="Append to --output instead of replacing it.",
+        help="Append the extracted URL to this file instead of printing to stdout.",
     )
     parser.add_argument(
         "-v",
@@ -681,7 +675,6 @@ def decode_singbox_import_url(import_url: str) -> tuple[str, str]:
 def write_or_print(
     value: str,
     output: Path | None,
-    append: bool,
     provider_name: str,
     raw: bool,
 ) -> None:
@@ -690,8 +683,7 @@ def write_or_print(
         return
 
     line = value if raw else f"{provider_name} = {value}"
-    mode = "a" if append else "w"
-    with output.open(mode, encoding="utf-8") as handle:
+    with output.open("a", encoding="utf-8") as handle:
         handle.write(line)
         handle.write("\n")
 

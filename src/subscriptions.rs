@@ -10,7 +10,10 @@ use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
-use crate::config::{ProviderNodeSet, build_full_config_with_provider_node_sets};
+use crate::config::{
+    ProviderNodeSet, build_full_config_with_provider_node_sets,
+    ensure_bypass_rule_set_file_for_config,
+};
 use crate::import::extract_mergeable_outbounds_from_singbox_subscription;
 
 pub(crate) const DEFAULT_SUBSCRIPTION_SOURCE_PATH: &str = ".suburl";
@@ -159,6 +162,7 @@ pub(crate) fn refresh_subscriptions(
         ),
     )
     .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
+    ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
 
     Ok(SubscriptionRefreshOutput {
         input_path: request.input.display().to_string(),

@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
+use crate::config::ensure_bypass_rule_set_file_for_config;
 use crate::import::build_full_config_from_singbox_subscription;
 
 mod airtcp;
@@ -128,6 +129,7 @@ pub(crate) fn run_provider_sync(
         ),
     )
     .with_context(|| format!("failed to write {}", merged_path.display()))?;
+    ensure_bypass_rule_set_file_for_config(&merged_path)?;
 
     println!(
         "{}",

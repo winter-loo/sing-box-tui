@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -27,6 +27,28 @@ pub(crate) fn build_full_config(
     } else {
         Ok(build_default_config(imported_nodes))
     }
+}
+
+pub(crate) fn ensure_bypass_rule_set_file_for_config(
+    config_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let config_dir = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let bypass_path = config_dir.join(DEFAULT_BYPASS_RULE_SET_PATH);
+    if bypass_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = serde_json::to_string_pretty(&json!({
+        "version": 1,
+        "rules": [],
+    }))
+    .context("failed to serialize default bypass rule-set")?;
+    fs::write(&bypass_path, format!("{contents}\n"))
+        .with_context(|| format!("failed to write {}", bypass_path.display()))?;
+    Ok(Some(bypass_path))
 }
 
 pub(crate) fn build_full_config_with_provider_groups(
@@ -109,8 +131,16 @@ pub(crate) fn build_full_config_with_provider_node_sets(
 
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
-    let select_members =
-        with_leading_members(&[DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_DIRECT_TAG], &node_tags);
+    let select_members = with_leading_members(&[DEFAULT_AUTO_SELECTOR_TAG], &node_tags);
+    let inbounds = vec![
+        build_default_tun_inbound(),
+        json!({
+            "type": "mixed",
+            "listen": "::",
+            "listen_port": 5780,
+            "set_system_proxy": false,
+        }),
+    ];
 
     let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
     outbounds.push(json!({
@@ -205,27 +235,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
             "strategy": "ipv4_only",
             "independent_cache": false,
         },
-        "inbounds": [
-            {
-                "type": "tun",
-                "mtu": 9000,
-                "address": [
-                    "172.19.0.1/30",
-                    "2001:0470:f9da:fdfa::1/64",
-                ],
-                "auto_route": true,
-                "auto_redirect": true,
-                "strict_route": true,
-                "stack": "mixed",
-                "endpoint_independent_nat": true,
-            },
-            {
-                "type": "mixed",
-                "listen": "::",
-                "listen_port": 5780,
-                "set_system_proxy": false,
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
             "default_domain_resolver": {
@@ -303,7 +313,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "type": "remote",
                     "tag": "geoip-cn",
                     "format": "binary",
-                    "url": "https://sjcdjf01.airapp.link/theme/rules/geoip-cn.srs",
+                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
                     "download_detour": DEFAULT_DIRECT_TAG,
                     "update_interval": "30d",
                 },
@@ -311,7 +321,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "type": "remote",
                     "tag": "geosite-cn",
                     "format": "binary",
-                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-cn.srs",
+                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
                     "download_detour": DEFAULT_DIRECT_TAG,
                     "update_interval": "30d",
                 },
@@ -319,7 +329,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "type": "remote",
                     "tag": "geosite-geolocation-cn",
                     "format": "binary",
-                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-geolocation-cn.srs",
+                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-cn.srs",
                     "download_detour": DEFAULT_DIRECT_TAG,
                     "update_interval": "30d",
                 },
@@ -327,7 +337,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "type": "remote",
                     "tag": "geosite-geolocation-!cn",
                     "format": "binary",
-                    "url": "https://sjcdjf01.airapp.link/theme/rules/geosite-geolocation-!cn.srs",
+                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
                     "download_detour": DEFAULT_DIRECT_TAG,
                     "update_interval": "30d",
                 },
@@ -335,7 +345,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "type": "remote",
                     "tag": "AdGuardSDNSFilter",
                     "format": "binary",
-                    "url": "https://sjcdjf01.airapp.link/theme/rules/AdGuardSDNSFilter.srs",
+                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
                     "download_detour": DEFAULT_DIRECT_TAG,
                     "update_interval": "30d",
                 }
@@ -353,6 +363,28 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
             }
         }
     })
+}
+
+fn build_default_tun_inbound() -> Value {
+    let mut inbound = json!({
+        "type": "tun",
+        "mtu": 9000,
+        "address": [
+            "172.19.0.1/30",
+            "2001:0470:f9da:fdfa::1/64",
+        ],
+        "auto_route": true,
+        "strict_route": true,
+        "stack": "mixed",
+        "endpoint_independent_nat": true,
+    });
+    if cfg!(target_os = "linux") {
+        inbound
+            .as_object_mut()
+            .expect("TUN inbound is an object")
+            .insert("auto_redirect".to_string(), Value::Bool(true));
+    }
+    inbound
 }
 
 pub(crate) fn merge_into_existing_config(
@@ -420,7 +452,7 @@ pub(crate) fn merge_into_existing_config(
     }
 
     let node_tags = collect_tags(&imported_nodes);
-    let select_members = with_leading_members(&[&auto_tag, &direct_tag], &node_tags);
+    let select_members = with_leading_members(&[&auto_tag], &node_tags);
 
     upsert_special_outbound(
         outbounds,
@@ -551,16 +583,6 @@ fn add_provider_groups(
             DEFAULT_AUTO_SELECTOR_TAG
         },
     );
-    let direct_tag = preferred_existing_tag(
-        outbounds,
-        DIRECT_TAG_ALIASES,
-        if prefers_legacy_tags {
-            "direct"
-        } else {
-            DEFAULT_DIRECT_TAG
-        },
-    );
-
     let mut provider_tags = Vec::new();
     if let Some(existing_provider_name) = existing_provider_name
         && !existing_node_tags.is_empty()
@@ -576,8 +598,7 @@ fn add_provider_groups(
         return Ok(());
     }
 
-    let select_members =
-        with_leading_members(&[auto_tag.as_str(), direct_tag.as_str()], &provider_tags);
+    let select_members = with_leading_members(&[auto_tag.as_str()], &provider_tags);
     if let Some(selector) = find_outbound_by_tag_mut(outbounds, &selector_tag) {
         set_outbound_members(selector, &select_members);
         ensure_string_field(selector, "type", "selector");
@@ -652,16 +673,6 @@ fn add_multiple_provider_groups(
             DEFAULT_AUTO_SELECTOR_TAG
         },
     );
-    let direct_tag = preferred_existing_tag(
-        outbounds,
-        DIRECT_TAG_ALIASES,
-        if prefers_legacy_tags {
-            "direct"
-        } else {
-            DEFAULT_DIRECT_TAG
-        },
-    );
-
     let all_node_tags = collect_tags(
         &outbounds
             .iter()
@@ -681,8 +692,7 @@ fn add_multiple_provider_groups(
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut select_members =
-        with_leading_members(&[auto_tag.as_str(), direct_tag.as_str()], &provider_tags);
+    let mut select_members = with_leading_members(&[auto_tag.as_str()], &provider_tags);
     for tag in ungrouped_node_tags {
         if !select_members.contains(&tag) {
             select_members.push(tag);
@@ -738,6 +748,9 @@ fn migrate_legacy_inbound_fields(root: &mut serde_json::Map<String, Value>) -> R
     let inbounds = inbounds_value
         .as_array_mut()
         .context("existing config inbounds must be an array")?;
+    if !cfg!(target_os = "linux") {
+        inbounds.retain(|inbound| !is_default_auto_redirect_tun_inbound(inbound));
+    }
 
     let mut sniff = false;
     let mut sniff_timeout = None;
@@ -813,6 +826,25 @@ fn migrate_legacy_inbound_fields(root: &mut serde_json::Map<String, Value>) -> R
     }
 
     Ok(())
+}
+
+fn is_default_auto_redirect_tun_inbound(inbound: &Value) -> bool {
+    inbound.as_object().is_some_and(|object| {
+        object.get("type").and_then(Value::as_str) == Some("tun")
+            && object
+                .get("auto_redirect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && object
+                .get("auto_route")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && object
+                .get("strict_route")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && object.get("stack").and_then(Value::as_str) == Some("mixed")
+    })
 }
 
 fn remove_provider_managed_nodes(
@@ -1147,8 +1179,9 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 mod tests {
     use super::{
         ProviderNodeSet, build_default_config, build_full_config_with_provider_node_sets,
-        merge_into_existing_config,
+        ensure_bypass_rule_set_file_for_config, merge_into_existing_config,
     };
+    use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
     use serde_json::{Value, json};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1164,6 +1197,16 @@ mod tests {
         })]);
 
         let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        let inbounds = config["inbounds"].as_array().expect("inbounds array");
+        let tun = inbounds
+            .iter()
+            .find(|value| value["type"] == "tun")
+            .expect("default TUN inbound");
+        assert_eq!(
+            tun.get("auto_redirect").and_then(Value::as_bool),
+            cfg!(target_os = "linux").then_some(true)
+        );
+        assert!(inbounds.iter().any(|value| value["type"] == "mixed"));
         assert!(outbounds.iter().any(|value| value["tag"] == "手动选择"));
         assert!(outbounds.iter().any(|value| value["tag"] == "自动选择"));
         assert!(outbounds.iter().any(|value| value["tag"] == "广告路由"));
@@ -1173,7 +1216,7 @@ mod tests {
             .find(|value| value["tag"] == "手动选择")
             .expect("manual selector");
         let members = select["outbounds"].as_array().expect("selector members");
-        assert!(members.contains(&Value::String("国内直连".to_string())));
+        assert!(!members.contains(&Value::String("国内直连".to_string())));
         assert_eq!(config["dns"]["servers"][0]["type"], "tls");
         assert_eq!(
             config["route"]["default_domain_resolver"]["server"],
@@ -1221,6 +1264,64 @@ mod tests {
             .expect("auto selector");
         assert_eq!(selector["interrupt_exist_connections"], false);
         assert_eq!(auto["interrupt_exist_connections"], false);
+    }
+
+    #[test]
+    fn creates_missing_bypass_rule_set_next_to_config() {
+        let config_path = temp_config_path("bypass-rule-set");
+        let bypass_path = config_path.with_file_name(DEFAULT_BYPASS_RULE_SET_PATH);
+        let _ = fs::remove_file(&bypass_path);
+
+        let created = ensure_bypass_rule_set_file_for_config(&config_path)
+            .expect("bypass rule-set creation succeeds");
+
+        assert_eq!(created, Some(bypass_path.clone()));
+        let text = fs::read_to_string(&bypass_path).expect("read bypass rule-set");
+        let value: Value = serde_json::from_str(&text).expect("parse bypass rule-set");
+        assert_eq!(value["version"], Value::from(1));
+        assert_eq!(value["rules"], Value::Array(Vec::new()));
+
+        let second = ensure_bypass_rule_set_file_for_config(&config_path)
+            .expect("existing bypass rule-set is preserved");
+        assert_eq!(second, None);
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(bypass_path);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn merge_removes_old_default_auto_redirect_tun_inbound() {
+        let mut config = json!({
+            "inbounds": [{
+                "type": "tun",
+                "mtu": 9000,
+                "address": [
+                    "172.19.0.1/30",
+                    "2001:0470:f9da:fdfa::1/64"
+                ],
+                "auto_route": true,
+                "auto_redirect": true,
+                "strict_route": true,
+                "stack": "mixed",
+                "endpoint_independent_nat": true
+            }, {
+                "type": "mixed",
+                "listen": "::",
+                "listen_port": 5780
+            }],
+            "outbounds": [{
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["old-node"]
+            }]
+        });
+
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("merge succeeds");
+
+        let inbounds = config["inbounds"].as_array().expect("inbounds array");
+        assert!(!inbounds.iter().any(|value| value["type"] == "tun"));
+        assert!(inbounds.iter().any(|value| value["type"] == "mixed"));
     }
 
     #[test]
@@ -1321,7 +1422,7 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(members.contains(&Value::String("existing-node".to_string())));
         assert!(members.contains(&Value::String("auto".to_string())));
-        assert!(members.contains(&Value::String("direct".to_string())));
+        assert!(!members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("node-a".to_string())));
         assert_eq!(config["route"]["final"], "existing-node");
         assert!(
@@ -1399,7 +1500,7 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(!members.contains(&Value::String("old-node".to_string())));
         assert!(members.contains(&Value::String("auto".to_string())));
-        assert!(members.contains(&Value::String("direct".to_string())));
+        assert!(!members.contains(&Value::String("direct".to_string())));
         assert!(members.contains(&Value::String("new-node".to_string())));
     }
 

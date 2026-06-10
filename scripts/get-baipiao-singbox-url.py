@@ -36,6 +36,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -291,7 +292,6 @@ def main() -> int:
         write_or_print(
             output,
             args.output,
-            args.append,
             provider_name=args.provider_name,
             raw=args.raw,
         )
@@ -392,12 +392,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Write the extracted URL to this file instead of stdout.",
-    )
-    parser.add_argument(
-        "--append",
-        action="store_true",
-        help="Append to --output instead of replacing it.",
+        help="Append the extracted URL to this file instead of printing to stdout.",
     )
     parser.add_argument(
         "-v",
@@ -412,8 +407,36 @@ def cdp_http_json(cdp_url: str, path: str, method: str = "GET") -> Any:
     url = f"{cdp_url.rstrip('/')}{path}"
     request = Request(url, method=method)
     opener = build_opener(ProxyHandler({}))
-    with opener.open(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with opener.open(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise ExtractionError(
+            f"Chrome DevTools returned HTTP {error.code} for {url}. "
+            f"Check that --cdp-url points to a Chrome remote debugging endpoint."
+        ) from error
+    except URLError as error:
+        raise ExtractionError(format_cdp_connection_error(cdp_url, path, error.reason)) from error
+    except OSError as error:
+        raise ExtractionError(format_cdp_connection_error(cdp_url, path, error)) from error
+
+
+def format_cdp_connection_error(cdp_url: str, path: str, reason: object) -> str:
+    endpoint = f"{cdp_url.rstrip('/')}{path}"
+    return (
+        f"Cannot connect to Chrome DevTools at {endpoint}.\n"
+        f"Chrome is probably not running with remote debugging enabled on this port.\n"
+        f"Start Chrome with CDP enabled, then log in to BaiPiao:\n"
+        f"  Start-Process chrome -ArgumentList "
+        f"'--remote-debugging-address=127.0.0.1', "
+        f"'--remote-debugging-port=9229', "
+        f"'--remote-allow-origins=*', "
+        f"'--new-window', "
+        f"'{DEFAULT_CONSOLE_URL}'\n"
+        f"If Chrome uses another port, pass it with --cdp-url, for example "
+        f"--cdp-url http://127.0.0.1:9230.\n"
+        f"Original error: {reason}"
+    )
 
 
 def list_targets(cdp_url: str) -> list[dict[str, Any]]:
@@ -845,7 +868,6 @@ def decode_singbox_import_url(import_url: str) -> tuple[str, str]:
 def write_or_print(
     value: str,
     output: Path | None,
-    append: bool,
     provider_name: str,
     raw: bool,
 ) -> None:
@@ -854,8 +876,7 @@ def write_or_print(
         return
 
     line = value if raw else f"{provider_name} = {value}"
-    mode = "a" if append else "w"
-    with output.open(mode, encoding="utf-8") as handle:
+    with output.open("a", encoding="utf-8") as handle:
         handle.write(line)
         handle.write("\n")
 

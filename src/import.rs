@@ -10,7 +10,10 @@ use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use crate::clash::{ClashConfig, convert_clash_proxy, is_metadata_entry};
-use crate::config::{build_full_config, build_full_config_with_provider_groups};
+use crate::config::{
+    build_full_config, build_full_config_with_provider_groups,
+    ensure_bypass_rule_set_file_for_config,
+};
 
 pub(crate) fn run_import(
     source: &PathBuf,
@@ -42,6 +45,9 @@ pub(crate) fn run_import(
     if let Some(output) = output {
         fs::write(output, format!("{json_text}\n"))
             .with_context(|| format!("failed to write {}", output.display()))?;
+        if full_config {
+            ensure_bypass_rule_set_file_for_config(output)?;
+        }
         println!("{}", output.display());
     } else {
         println!("{json_text}");
@@ -116,6 +122,7 @@ pub(crate) fn run_subscribe_import(
     if let Some(output) = output {
         fs::write(output, format!("{config_text}\n"))
             .with_context(|| format!("failed to write {}", output.display()))?;
+        ensure_bypass_rule_set_file_for_config(output)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!(SubscriptionImportOutput {
@@ -221,6 +228,7 @@ fn is_mergeable_subscription_outbound(outbound: &Value) -> bool {
 
 fn is_subscription_metadata_tag(tag: &str) -> bool {
     tag.starts_with("剩余流量")
+        || tag.starts_with("距离下次重置剩余")
         || tag.starts_with("套餐到期")
         || tag.contains("官网")
         || tag.contains("刷新订阅")
@@ -299,6 +307,32 @@ mod tests {
             !outbounds
                 .iter()
                 .any(|value| value["tag"] == "TG群：https://t.me/example")
+        );
+    }
+
+    #[test]
+    fn singbox_subscription_filters_reset_countdown_metadata() {
+        let text = r#"{
+          "outbounds": [
+            {"type":"shadowsocks","tag":"node-a","server":"example.com","server_port":443,"method":"aes-128-gcm","password":"secret"},
+            {"type":"vless","tag":"距离下次重置剩余：22 天","server":"notice.example.com","server_port":443,"uuid":"abc"}
+          ]
+        }"#;
+
+        let (config, imported_count) = build_full_config_from_singbox_subscription(
+            &"/tmp/non-existent-config.json".into(),
+            text,
+            false,
+        )
+        .expect("subscription mergeable extraction succeeds");
+
+        assert_eq!(imported_count, 1);
+        let outbounds = config["outbounds"].as_array().expect("outbounds array");
+        assert!(outbounds.iter().any(|value| value["tag"] == "node-a"));
+        assert!(
+            !outbounds
+                .iter()
+                .any(|value| value["tag"] == "距离下次重置剩余：22 天")
         );
     }
 }

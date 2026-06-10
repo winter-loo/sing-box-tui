@@ -11,7 +11,7 @@ Start Chrome with CDP enabled first, for example:
     --remote-debugging-address=127.0.0.1 \
     --remote-debugging-port=9229 \
     --remote-allow-origins='*' \
-    --new-window 'https://user2.bby012.com/#/dashboard'
+    --new-window 'https://web1.bby004.com/#/dashboard'
 
 Then log in to Baobeiyun in that Chrome window. This script prints the direct
 HTTPS subscription URL by default. When writing to a file, it writes
@@ -45,7 +45,7 @@ from cdp_wsl import (
 )
 
 DEFAULT_CDP_URL = os.environ.get(CDP_URL_ENV, "http://127.0.0.1:9229")
-DEFAULT_DASHBOARD_URL = "https://user2.bby012.com/#/dashboard"
+DEFAULT_DASHBOARD_URL = "https://web1.bby004.com/#/dashboard"
 
 
 class ExtractionError(RuntimeError):
@@ -281,7 +281,6 @@ def main() -> int:
             write_or_print(
                 singbox_import_url,
                 args.output,
-                args.append,
                 provider_name=args.provider_name,
                 raw=args.raw,
             )
@@ -289,7 +288,6 @@ def main() -> int:
             write_or_print(
                 subscription_url,
                 args.output,
-                args.append,
                 provider_name=args.provider_name,
                 raw=args.raw,
             )
@@ -390,12 +388,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Write the extracted URL to this file instead of stdout.",
-    )
-    parser.add_argument(
-        "--append",
-        action="store_true",
-        help="Append to --output instead of replacing it.",
+        help="Append the extracted URL to this file instead of printing to stdout.",
     )
     parser.add_argument(
         "-v",
@@ -470,7 +463,7 @@ def baobeiyun_target_score(title: str, url: str, url_hint: str) -> int:
     score = 0
     title_match = "宝贝云" in title or "baobeiyun" in title.lower()
     url_match = url_hint.lower() in url.lower()
-    dashboard_match = "user2.bby012.com" in url or "/#/dashboard" in url
+    dashboard_match = "web1.bby004.com" in url or "/#/dashboard" in url
     if dashboard_match:
         score += 10
     if url_match:
@@ -652,7 +645,6 @@ def decode_singbox_import_url(import_url: str) -> tuple[str, str]:
 def write_or_print(
     value: str,
     output: Path | None,
-    append: bool,
     provider_name: str,
     raw: bool,
 ) -> None:
@@ -661,8 +653,7 @@ def write_or_print(
         return
 
     line = value if raw else f"{provider_name} = {value}"
-    mode = "a" if append else "w"
-    with output.open(mode, encoding="utf-8") as handle:
+    with output.open("a", encoding="utf-8") as handle:
         handle.write(line)
         handle.write("\n")
 
