@@ -105,6 +105,7 @@ pub(crate) fn build_full_config_with_provider_groups_and_options(
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct ProviderNodeSet {
     pub(crate) provider_name: String,
     pub(crate) nodes: Vec<Value>,
@@ -668,6 +669,7 @@ fn add_provider_groups(
     Ok(())
 }
 
+#[cfg(test)]
 fn add_multiple_provider_groups(
     config: &mut Value,
     provider_node_tags: &[(String, Vec<String>)],
@@ -887,6 +889,7 @@ fn is_default_auto_redirect_tun_inbound(inbound: &Value) -> bool {
     })
 }
 
+#[cfg(test)]
 fn remove_provider_managed_nodes(
     config: &mut Value,
     provider_node_tags: &[(String, Vec<String>)],
@@ -930,6 +933,7 @@ fn remove_provider_managed_nodes(
     Ok(())
 }
 
+#[cfg(test)]
 fn is_managed_provider_selector(outbound: &Value, provider_names: &BTreeSet<&str>) -> bool {
     let outbound_type = outbound
         .get("type")

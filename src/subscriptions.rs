@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use crate::config::{
@@ -85,7 +86,6 @@ pub(crate) fn refresh_subscriptions(
             request.input.display()
         );
     }
-
     let cache_store = SubscriptionCacheStore::new(&request.cache_path);
     let mut cache = cache_store.load()?;
     let now_unix = unix_now()?;
@@ -104,9 +104,9 @@ pub(crate) fn refresh_subscriptions(
         now_unix,
     ))?;
 
-    let mut provider_node_sets = Vec::new();
     let mut summaries = Vec::new();
     let mut cache_changed = false;
+    let mut provider_node_sets = Vec::new();
     for item in resolved {
         let nodes = extract_mergeable_outbounds_from_singbox_subscription(&item.subscription_json)
             .with_context(|| {
@@ -143,21 +143,37 @@ pub(crate) fn refresh_subscriptions(
             fetched_at_unix: item.fetched_at_unix,
             warning,
         });
-        provider_node_sets.push(ProviderNodeSet {
+        provider_node_sets.push(ProviderNodeRefresh {
             provider_name: item.source.provider_name,
             nodes,
         });
     }
 
-    let merged_config = build_full_config_with_provider_node_sets_and_options(
-        &request.config_path,
-        provider_node_sets,
-        request.replace_nodes,
-        DefaultConfigOptions {
-            include_geosite_rules: request.include_geosite_rules,
-            include_tun_mode: request.include_tun_mode,
-        },
-    )?;
+    let refreshed_config = if request.config_path.exists() {
+        let mut config = read_existing_config(&request.config_path)?;
+        refresh_provider_node_outbounds_only(
+            &mut config,
+            provider_node_sets,
+            request.replace_nodes,
+        )?;
+        config
+    } else {
+        build_full_config_with_provider_node_sets_and_options(
+            &request.config_path,
+            provider_node_sets
+                .into_iter()
+                .map(|provider| ProviderNodeSet {
+                    provider_name: provider.provider_name,
+                    nodes: provider.nodes,
+                })
+                .collect(),
+            request.replace_nodes,
+            DefaultConfigOptions {
+                include_geosite_rules: request.include_geosite_rules,
+                include_tun_mode: request.include_tun_mode,
+            },
+        )?
+    };
 
     if cache_changed {
         cache_store.save(&cache)?;
@@ -167,8 +183,8 @@ pub(crate) fn refresh_subscriptions(
         &request.merged_path,
         format!(
             "{}\n",
-            serde_json::to_string_pretty(&merged_config)
-                .context("failed to serialize merged subscription config")?
+            serde_json::to_string_pretty(&refreshed_config)
+                .context("failed to serialize refreshed subscription config")?
         ),
     )
     .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
@@ -182,6 +198,266 @@ pub(crate) fn refresh_subscriptions(
         backup_config_path: backup_path.map(|path| path.display().to_string()),
         providers: summaries,
     })
+}
+
+fn read_existing_config(path: &Path) -> Result<Value> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read existing config {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(test)]
+fn refresh_node_outbounds_only(
+    config: &mut Value,
+    refreshed_nodes: Vec<Value>,
+    replace_nodes: bool,
+) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .context("existing config outbounds must be an array")?;
+
+    if replace_nodes {
+        outbounds.retain(|outbound| !is_refreshable_node_outbound(outbound));
+    }
+
+    for node in refreshed_nodes {
+        let tag = node
+            .get("tag")
+            .and_then(Value::as_str)
+            .context("refreshed node outbound is missing a tag")?
+            .to_string();
+        if let Some(existing) = outbounds
+            .iter_mut()
+            .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some(tag.as_str()))
+        {
+            if is_refreshable_node_outbound(existing) {
+                *existing = node;
+            }
+        } else {
+            outbounds.push(node);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ProviderNodeRefresh {
+    provider_name: String,
+    nodes: Vec<Value>,
+}
+
+fn refresh_provider_node_outbounds_only(
+    config: &mut Value,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+    replace_nodes: bool,
+) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .context("existing config outbounds must be an array")?;
+
+    for provider in provider_node_sets {
+        let node_tags = collect_node_tags(&provider.nodes)?;
+        let old_provider_node_tags = provider_selector_members(outbounds, &provider.provider_name);
+        let node_tag_set = node_tags
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        outbounds.retain(|outbound| {
+            let Some(tag) = outbound.get("tag").and_then(Value::as_str) else {
+                return true;
+            };
+            if !is_refreshable_node_outbound(outbound) || !old_provider_node_tags.contains(tag) {
+                return true;
+            }
+            !replace_nodes && node_tag_set.contains(tag)
+        });
+        update_root_selector_for_provider(
+            outbounds,
+            &provider.provider_name,
+            &old_provider_node_tags,
+            &node_tags,
+        );
+        upsert_node_outbounds(outbounds, provider.nodes)?;
+        upsert_provider_selector(outbounds, &provider.provider_name, &node_tags);
+    }
+    Ok(())
+}
+
+fn is_refreshable_node_outbound(outbound: &Value) -> bool {
+    let Some(outbound_type) = outbound.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    !matches!(
+        outbound_type,
+        "selector" | "urltest" | "direct" | "block" | "dns"
+    )
+}
+
+fn collect_node_tags(nodes: &[Value]) -> Result<Vec<String>> {
+    nodes
+        .iter()
+        .map(|node| {
+            node.get("tag")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .context("refreshed node outbound is missing a tag")
+        })
+        .collect()
+}
+
+fn upsert_node_outbounds(outbounds: &mut Vec<Value>, nodes: Vec<Value>) -> Result<()> {
+    for node in nodes {
+        let tag = node
+            .get("tag")
+            .and_then(Value::as_str)
+            .context("refreshed node outbound is missing a tag")?
+            .to_string();
+        if let Some(existing) = outbounds
+            .iter_mut()
+            .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some(tag.as_str()))
+        {
+            if is_refreshable_node_outbound(existing) {
+                *existing = node;
+            }
+        } else {
+            outbounds.push(node);
+        }
+    }
+    Ok(())
+}
+
+fn provider_selector_members(outbounds: &[Value], provider_name: &str) -> BTreeSet<String> {
+    outbounds
+        .iter()
+        .find(|outbound| {
+            outbound.get("type").and_then(Value::as_str) == Some("selector")
+                && outbound.get("tag").and_then(Value::as_str) == Some(provider_name)
+        })
+        .and_then(|outbound| outbound.get("outbounds").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn upsert_provider_selector(outbounds: &mut Vec<Value>, provider_name: &str, node_tags: &[String]) {
+    if let Some(selector) = outbounds.iter_mut().find(|outbound| {
+        outbound.get("type").and_then(Value::as_str) == Some("selector")
+            && outbound.get("tag").and_then(Value::as_str) == Some(provider_name)
+    }) {
+        set_selector_members(selector, node_tags);
+        return;
+    };
+
+    outbounds.push(json!({
+        "type": "selector",
+        "tag": provider_name,
+        "outbounds": node_tags,
+        "default": node_tags.first().cloned().unwrap_or_default(),
+        "interrupt_exist_connections": true
+    }));
+}
+
+fn update_root_selector_for_provider(
+    outbounds: &mut [Value],
+    provider_name: &str,
+    old_provider_node_tags: &BTreeSet<String>,
+    node_tags: &[String],
+) {
+    let Some(root_index) = find_root_selector_index(outbounds) else {
+        return;
+    };
+    let selector_tags = outbounds
+        .iter()
+        .filter(|outbound| outbound.get("type").and_then(Value::as_str) == Some("selector"))
+        .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let Some(selector) = outbounds.get_mut(root_index) else {
+        return;
+    };
+    let Some(object) = selector.as_object_mut() else {
+        return;
+    };
+    let Some(members) = object.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let new_node_tags = node_tags
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut insert_index = None;
+    let mut next_members = Vec::new();
+    for member in members.iter() {
+        let Some(tag) = member.as_str() else {
+            next_members.push(member.clone());
+            continue;
+        };
+        if tag == provider_name
+            || old_provider_node_tags.contains(tag)
+            || new_node_tags.contains(tag)
+        {
+            insert_index.get_or_insert(next_members.len());
+            continue;
+        }
+        next_members.push(member.clone());
+    }
+    let index =
+        insert_index.unwrap_or_else(|| provider_insert_index(&next_members, &selector_tags));
+    next_members.insert(index, Value::String(provider_name.to_string()));
+    *members = next_members;
+}
+
+fn find_root_selector_index(outbounds: &[Value]) -> Option<usize> {
+    ["手动选择", "select"].iter().find_map(|tag| {
+        outbounds.iter().position(|outbound| {
+            outbound.get("type").and_then(Value::as_str) == Some("selector")
+                && outbound.get("tag").and_then(Value::as_str) == Some(*tag)
+        })
+    })
+}
+
+fn provider_insert_index(members: &[Value], selector_tags: &BTreeSet<String>) -> usize {
+    members
+        .iter()
+        .position(|member| {
+            let Some(tag) = member.as_str() else {
+                return true;
+            };
+            !matches!(tag, "自动选择" | "auto" | "国内直连" | "direct")
+                && !selector_tags.contains(tag)
+        })
+        .unwrap_or(members.len())
+}
+
+fn set_selector_members(selector: &mut Value, node_tags: &[String]) {
+    let Some(object) = selector.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "outbounds".to_string(),
+        Value::Array(node_tags.iter().cloned().map(Value::String).collect()),
+    );
+    if let Some(default) = object.get("default").and_then(Value::as_str)
+        && node_tags.iter().any(|tag| tag == default)
+    {
+        return;
+    }
+    if let Some(first) = node_tags.first() {
+        object.insert("default".to_string(), Value::String(first.clone()));
+    } else {
+        object.remove("default");
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,13 +829,368 @@ fn is_secret_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSubscription, backup_existing_config, cache_entry_is_fresh,
-        parse_subscription_sources, redact_url, subscription_config_backup_path,
+        CachedSubscription, ProviderNodeRefresh, backup_existing_config, cache_entry_is_fresh,
+        parse_subscription_sources, redact_url, refresh_node_outbounds_only,
+        refresh_provider_node_outbounds_only, subscription_config_backup_path,
         subscription_source_requires_direct_fetch,
     };
     use std::fs;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn subscription_refresh_updates_only_server_node_outbounds() {
+        let original = serde_json::json!({
+            "log": {
+                "level": "debug"
+            },
+            "dns": {
+                "servers": [{"tag": "local", "address": "https://dns.example/dns-query"}]
+            },
+            "inbounds": [{
+                "type": "tun",
+                "tag": "local-tun",
+                "sniff": true
+            }],
+            "outbounds": [{
+                "type": "selector",
+                "tag": "手动选择",
+                "outbounds": ["自动选择", "国内直连", "node-a"],
+                "default": "自动选择",
+                "interrupt_exist_connections": true
+            }, {
+                "type": "urltest",
+                "tag": "自动选择",
+                "outbounds": ["node-a"],
+                "interval": "5m"
+            }, {
+                "type": "direct",
+                "tag": "国内直连"
+            }, {
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "old.example",
+                "server_port": 443,
+                "password": "old-secret"
+            }],
+            "route": {
+                "rules": [{
+                    "domain_suffix": ["local.example"],
+                    "outbound": "国内直连"
+                }]
+            },
+            "experimental": {
+                "cache_file": {
+                    "enabled": false
+                },
+                "clash_api": {
+                    "external_controller": "127.0.0.1:9090"
+                }
+            }
+        });
+        let mut config = original.clone();
+
+        refresh_node_outbounds_only(
+            &mut config,
+            vec![
+                serde_json::json!({
+                    "type": "trojan",
+                    "tag": "node-a",
+                    "server": "new.example",
+                    "server_port": 8443,
+                    "password": "new-secret"
+                }),
+                serde_json::json!({
+                    "type": "selector",
+                    "tag": "手动选择",
+                    "outbounds": ["should-not-replace-selector"]
+                }),
+                serde_json::json!({
+                    "type": "vless",
+                    "tag": "node-b",
+                    "server": "added.example",
+                    "server_port": 443,
+                    "uuid": "abc"
+                }),
+            ],
+            false,
+        )
+        .expect("node-only refresh succeeds");
+
+        assert_eq!(config["log"], original["log"]);
+        assert_eq!(config["dns"], original["dns"]);
+        assert_eq!(config["inbounds"], original["inbounds"]);
+        assert_eq!(config["route"], original["route"]);
+        assert_eq!(config["experimental"], original["experimental"]);
+        assert_eq!(config["outbounds"][0], original["outbounds"][0]);
+        assert_eq!(config["outbounds"][1], original["outbounds"][1]);
+        assert_eq!(config["outbounds"][2], original["outbounds"][2]);
+        assert_eq!(
+            config["outbounds"][3],
+            serde_json::json!({
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "new.example",
+                "server_port": 8443,
+                "password": "new-secret"
+            })
+        );
+        assert_eq!(
+            config["outbounds"][4],
+            serde_json::json!({
+                "type": "vless",
+                "tag": "node-b",
+                "server": "added.example",
+                "server_port": 443,
+                "uuid": "abc"
+            })
+        );
+    }
+
+    #[test]
+    fn subscription_refresh_updates_nodes_by_provider_selector() {
+        let original = serde_json::json!({
+            "dns": {
+                "servers": [{"tag": "local", "address": "https://dns.example/dns-query"}]
+            },
+            "outbounds": [{
+                "type": "selector",
+                "tag": "手动选择",
+                "outbounds": ["宝贝云", "白嫖机场", "local-node"],
+                "default": "宝贝云"
+            }, {
+                "type": "selector",
+                "tag": "宝贝云",
+                "outbounds": ["bby-old", "bby-stale"],
+                "default": "bby-stale"
+            }, {
+                "type": "selector",
+                "tag": "白嫖机场",
+                "outbounds": ["bp-old"],
+                "default": "bp-old"
+            }, {
+                "type": "trojan",
+                "tag": "bby-old",
+                "server": "old-bby.example",
+                "server_port": 443,
+                "password": "old"
+            }, {
+                "type": "trojan",
+                "tag": "bby-stale",
+                "server": "stale-bby.example",
+                "server_port": 443,
+                "password": "stale"
+            }, {
+                "type": "trojan",
+                "tag": "bp-old",
+                "server": "old-bp.example",
+                "server_port": 443,
+                "password": "bp"
+            }, {
+                "type": "trojan",
+                "tag": "local-node",
+                "server": "local.example",
+                "server_port": 443,
+                "password": "local"
+            }],
+            "route": {
+                "rules": [{"domain_suffix": ["local.example"], "outbound": "local-node"}]
+            }
+        });
+        let mut config = original.clone();
+
+        refresh_provider_node_outbounds_only(
+            &mut config,
+            vec![ProviderNodeRefresh {
+                provider_name: "宝贝云".to_string(),
+                nodes: vec![
+                    serde_json::json!({
+                        "type": "trojan",
+                        "tag": "bby-old",
+                        "server": "new-bby.example",
+                        "server_port": 8443,
+                        "password": "new"
+                    }),
+                    serde_json::json!({
+                        "type": "vless",
+                        "tag": "bby-new",
+                        "server": "new-node.example",
+                        "server_port": 443,
+                        "uuid": "abc"
+                    }),
+                ],
+            }],
+            false,
+        )
+        .expect("provider refresh succeeds");
+
+        assert_eq!(config["dns"], original["dns"]);
+        assert_eq!(config["route"], original["route"]);
+        assert_eq!(config["outbounds"][0], original["outbounds"][0]);
+        assert_eq!(config["outbounds"][2], original["outbounds"][2]);
+        assert_eq!(
+            config["outbounds"][1],
+            serde_json::json!({
+                "type": "selector",
+                "tag": "宝贝云",
+                "outbounds": ["bby-old", "bby-new"],
+                "default": "bby-old"
+            })
+        );
+        assert!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .all(|outbound| outbound["tag"] != "bby-stale")
+        );
+        assert!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| outbound
+                    == &serde_json::json!({
+                        "type": "trojan",
+                        "tag": "bby-old",
+                        "server": "new-bby.example",
+                        "server_port": 8443,
+                        "password": "new"
+                    }))
+        );
+        assert_eq!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|outbound| outbound["tag"] == "bp-old")
+                .expect("other provider node is preserved"),
+            &original["outbounds"][5]
+        );
+        assert_eq!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|outbound| outbound["tag"] == "local-node")
+                .expect("local node is preserved"),
+            &original["outbounds"][6]
+        );
+    }
+
+    #[test]
+    fn subscription_refresh_creates_provider_selector_from_flat_nodes() {
+        let original = serde_json::json!({
+            "dns": {
+                "servers": [{"tag": "local", "address": "https://dns.example/dns-query"}]
+            },
+            "outbounds": [{
+                "type": "selector",
+                "tag": "手动选择",
+                "outbounds": ["自动选择", "bby-old", "bp-old", "local-node"],
+                "default": "自动选择"
+            }, {
+                "type": "urltest",
+                "tag": "自动选择",
+                "outbounds": ["bby-old", "bp-old", "local-node"]
+            }, {
+                "type": "trojan",
+                "tag": "bby-old",
+                "server": "old-bby.example",
+                "server_port": 443,
+                "password": "old"
+            }, {
+                "type": "trojan",
+                "tag": "bp-old",
+                "server": "old-bp.example",
+                "server_port": 443,
+                "password": "bp"
+            }, {
+                "type": "trojan",
+                "tag": "local-node",
+                "server": "local.example",
+                "server_port": 443,
+                "password": "local"
+            }]
+        });
+        let mut config = original.clone();
+
+        refresh_provider_node_outbounds_only(
+            &mut config,
+            vec![ProviderNodeRefresh {
+                provider_name: "宝贝云".to_string(),
+                nodes: vec![
+                    serde_json::json!({
+                        "type": "trojan",
+                        "tag": "bby-old",
+                        "server": "new-bby.example",
+                        "server_port": 8443,
+                        "password": "new"
+                    }),
+                    serde_json::json!({
+                        "type": "vless",
+                        "tag": "bby-new",
+                        "server": "new-node.example",
+                        "server_port": 443,
+                        "uuid": "abc"
+                    }),
+                ],
+            }],
+            false,
+        )
+        .expect("provider refresh succeeds");
+
+        assert_eq!(config["dns"], original["dns"]);
+        assert_eq!(
+            config["outbounds"][0],
+            serde_json::json!({
+                "type": "selector",
+                "tag": "手动选择",
+                "outbounds": ["自动选择", "宝贝云", "bp-old", "local-node"],
+                "default": "自动选择"
+            })
+        );
+        assert_eq!(config["outbounds"][1], original["outbounds"][1]);
+        assert_eq!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|outbound| outbound["tag"] == "宝贝云")
+                .expect("provider selector is created"),
+            &serde_json::json!({
+                "type": "selector",
+                "tag": "宝贝云",
+                "outbounds": ["bby-old", "bby-new"],
+                "default": "bby-old",
+                "interrupt_exist_connections": true
+            })
+        );
+        assert_eq!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|outbound| outbound["tag"] == "bby-old")
+                .expect("provider node updated"),
+            &serde_json::json!({
+                "type": "trojan",
+                "tag": "bby-old",
+                "server": "new-bby.example",
+                "server_port": 8443,
+                "password": "new"
+            })
+        );
+        assert_eq!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|outbound| outbound["tag"] == "bp-old")
+                .expect("other provider flat node is preserved"),
+            &original["outbounds"][3]
+        );
+    }
 
     #[test]
     fn parses_provider_named_subscription_urls() {

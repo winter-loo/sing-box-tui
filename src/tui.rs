@@ -1784,7 +1784,7 @@ impl App {
             .iter()
             .filter(|member| self.is_provider_child_group(member))
             .count();
-        if provider_group_count > 1 {
+        if provider_group_count >= 1 {
             Some(root)
         } else {
             None
@@ -4265,7 +4265,41 @@ mod tests {
 
         app.groups[0].members = vec!["宝贝云".to_string()];
 
-        assert!(!app.implicit_root_mode());
+        assert!(app.implicit_root_mode());
+        assert_eq!(app.displayed_group_names(), vec!["宝贝云".to_string()]);
+    }
+
+    #[test]
+    fn implicit_root_mode_supports_single_provider_selector() {
+        let mut app = provider_app();
+        app.groups = vec![
+            ProxyGroup {
+                name: "手动选择".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("airtcp".to_string()),
+                members: vec!["airtcp".to_string()],
+            },
+            ProxyGroup {
+                name: "airtcp".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("香港-a".to_string()),
+                members: vec!["香港-a".to_string(), "美国-b".to_string()],
+            },
+        ];
+        app.provider_index = 0;
+        app.member_index = 0;
+
+        assert!(app.implicit_root_mode());
+
+        app.apply_benchmark_filter("美国".to_string())
+            .expect("apply filter");
+
+        assert_eq!(app.selected_root_choice_name().as_deref(), Some("airtcp"));
+        assert_eq!(app.displayed_members(), vec!["美国-b".to_string()]);
+        assert_eq!(
+            app.selected_group().map(|group| group.name.as_str()),
+            Some("airtcp")
+        );
     }
 
     #[test]
@@ -4529,6 +4563,46 @@ mod tests {
 
         app.benchmark_filter.clear();
         assert!(app.auto_select_benchmark_due(now));
+    }
+
+    #[test]
+    fn auto_select_uses_single_provider_selector_members() {
+        let mut app = provider_app();
+        app.groups = vec![
+            ProxyGroup {
+                name: "手动选择".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("airtcp".to_string()),
+                members: vec!["airtcp".to_string()],
+            },
+            ProxyGroup {
+                name: "airtcp".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("香港-a".to_string()),
+                members: vec!["香港-a".to_string(), "美国-b".to_string()],
+            },
+        ];
+        app.provider_index = 0;
+        app.auto_select_enabled = true;
+        app.benchmark_filter = "美国".to_string();
+        app.last_auto_select_benchmark = None;
+
+        app.maybe_start_auto_select_benchmark()
+            .expect("auto select starts");
+
+        assert_eq!(app.benchmark_jobs.len(), 1);
+        assert_eq!(app.benchmark_jobs[0].group, "airtcp");
+        assert_eq!(app.benchmark_jobs[0].nodes, vec!["美国-b".to_string()]);
+        let summary = app.benchmarks.get("airtcp").expect("airtcp summary");
+        assert_eq!(summary.selector, "airtcp");
+        assert_eq!(
+            summary
+                .results
+                .iter()
+                .map(|result| result.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["美国-b"]
+        );
     }
 
     #[test]

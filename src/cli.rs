@@ -839,14 +839,14 @@ fn print_subscriptions_usage() {
         "  -i, --input <FILE>       Provider URL file in '<provider> = <url>' format (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
     );
     println!(
-        "      --config <FILE>      Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
+        "      --config <FILE>      Existing sing-box config whose node outbounds are refreshed (default: {DEFAULT_CONFIG_PATH})"
     );
     println!(
         "      --cache <FILE>       Local subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
     );
     println!();
     println!("Output options:");
-    println!("  -o, --output <FILE>      Output merged config path");
+    println!("  -o, --output <FILE>      Output refreshed config path");
     println!("      --write              Overwrite the --config file in place");
     println!();
     println!("Behavior options:");
@@ -854,7 +854,9 @@ fn print_subscriptions_usage() {
         "      --interval-days <N>  Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
     );
     println!("      --force              Fetch every provider even when cache is fresh");
-    println!("      --replace-nodes      Replace all existing node outbounds before merging");
+    println!(
+        "      --replace-nodes      Replace existing provider node outbounds before adding refreshed nodes"
+    );
     println!(
         "      --include-geosite-rules    Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
     );

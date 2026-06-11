@@ -99,19 +99,19 @@ reachable CDP port can control the attached browser profile.
 Set `WSL_CDP_LOG=1` to print CDP helper diagnostics such as host resolution,
 URL rewrites, and relay start/stop events.
 
-Refresh all providers at most once per day and write a merged config:
+Refresh providers at most once per day and update only server node outbounds in an existing config:
 
 ```bash
 cargo run -- subscriptions \
   --input .suburl \
   --cache .suburl.cache.json \
   --config /usr/local/etc/sing-box/config.json \
-  --output ./output/merged-config.json
+  --output ./output/refreshed-config.json
 ```
 
-Use `--write` instead of `--output` to overwrite `--config` in place, and `--force` to fetch even when the cached subscription payload is still fresh. The command stores downloaded subscription JSON in `.suburl.cache.json` so skipped daily runs can still rebuild the config from cached nodes.
+Use `--write` instead of `--output` to overwrite `--config` in place, and `--force` to fetch even when the cached subscription payload is still fresh. The command stores downloaded subscription JSON in `.suburl.cache.json` so skipped daily runs can still refresh node outbound definitions from cached provider configs. DNS, inbounds, routes, selectors, experimental settings, and other non-node config sections are preserved.
 
-When the TUI is running, it also starts a background subscription refresh worker if `.suburl` exists. The worker runs once on startup, then checks again every day. It writes the merged config to the configured sing-box config path and keeps the TUI responsive while network fetches are running:
+When the TUI is running, it also starts a background subscription refresh worker if `.suburl` exists. The worker runs once on startup, then checks again every day. It refreshes node outbounds in the configured sing-box config path and keeps the TUI responsive while network fetches are running:
 
 ```bash
 cargo run -- run --config /usr/local/etc/sing-box/config.json
