@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::defaults::{
-    DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_DELAY_TEST_URL,
-    DEFAULT_SELECTOR_TAG,
+    DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER,
+    DEFAULT_DELAY_TEST_URL, DEFAULT_SELECTOR_TAG,
 };
 use crate::subscriptions::{
     DEFAULT_SUBSCRIPTION_CACHE_PATH, DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
@@ -648,148 +648,139 @@ fn default_subscription_config_path() -> PathBuf {
 }
 
 fn print_usage() {
-    println!("sing-box-tui <command> [options]");
+    println!("Usage: sing-box-tui <COMMAND> [OPTIONS]");
     println!();
     println!("Commands:");
-    println!("  run [--controller URL] [--max-concurrency N]    Start the TUI");
-    println!("  selectors [--controller URL] [--selector NAME]  Show Clash selector groups");
-    println!("  status [--controller URL]                       Show Clash controller status");
-    println!("  import -i <clash.yml> [-o <config.json>] [--config FILE] [--replace-nodes]");
+    println!("  run             Start the TUI");
+    println!("  selectors       Show Clash selector groups");
+    println!("  status          Show Clash controller status");
+    println!("  import          Import Clash YAML into a full sing-box config");
+    println!("  subscribe       Fetch a sing-box subscription URL and merge nodes");
+    println!("  subscriptions   Refresh provider subscription URLs once per day");
     println!(
-        "                                                Import Clash YAML into a full sing-box config"
+        "  sync            Log into a provider site, fetch the sing-box subscription, and merge it"
     );
-    println!("  subscribe --url URL [-o <config.json>] [--config FILE] [--replace-nodes]");
-    println!(
-        "                                                Fetch a sing-box subscription URL and merge nodes"
-    );
-    println!("  subscriptions [-i .suburl] [--config FILE] [-o FILE|--write]");
-    println!(
-        "                                                Refresh provider subscription URLs once per day"
-    );
-    println!("  sync --provider URL --account-file FILE [--config FILE] [-o FILE]");
-    println!(
-        "                                                Log into a provider site, fetch the sing-box subscription, and merge it"
-    );
-    println!(
-        "  benchmark [--selector NAME] [--match TEXT] [--max-concurrency N] [--switch] [--verify] [--verify-discord]"
-    );
-    println!(
-        "                                                Benchmark selector candidates and optionally switch"
-    );
+    println!("  benchmark       Benchmark selector candidates and optionally switch");
 }
 
 fn print_run_usage() {
-    println!("sing-box-tui run [--controller URL] [--max-concurrency N] [--config FILE]");
+    println!("Usage: sing-box-tui run [OPTIONS]");
     println!();
+    println!("Options:");
     println!(
-        "      --max-concurrency <N>   Limit concurrent delay probes in TUI benchmarks (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
-    );
-    println!("      --config <FILE>         sing-box config path for TUI subscription refresh");
-    println!(
-        "      --subscription-input <FILE>   Provider URL file (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
+        "      --controller <URL>              Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
     );
     println!(
-        "      --subscription-cache <FILE>   Subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
+        "      --max-concurrency <N>           Limit concurrent delay probes in TUI benchmarks (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
+    );
+    println!(
+        "      --config <FILE>                 sing-box config path for TUI subscription refresh"
+    );
+    println!(
+        "      --subscription-input <FILE>     Provider URL file (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
+    );
+    println!(
+        "      --subscription-cache <FILE>     Subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
     );
     println!(
         "      --subscription-interval-days <N> Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
     );
-    println!("      --force-subscription-refresh  Fetch on startup even if cache is fresh");
-    println!("      --no-subscription-refresh     Disable TUI background subscription refresh");
+    println!("      --force-subscription-refresh    Fetch on startup even if cache is fresh");
+    println!("      --no-subscription-refresh       Disable TUI background subscription refresh");
 }
 
 fn print_selectors_usage() {
-    println!("sing-box-tui selectors [--controller URL] [--selector NAME]");
+    println!("Usage: sing-box-tui selectors [OPTIONS]");
     println!();
     println!("Options:");
-    println!("      --controller <URL>        Clash controller base URL");
-    println!("      --selector <NAME>         Return only the named selector group");
+    println!(
+        "      --controller <URL>   Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
+    );
+    println!("      --selector <NAME>    Return only the named selector group");
 }
 
 fn print_status_usage() {
-    println!("sing-box-tui status [--controller URL]");
+    println!("Usage: sing-box-tui status [OPTIONS]");
     println!();
     println!("Options:");
-    println!("      --controller <URL>        Clash controller base URL");
+    println!(
+        "      --controller <URL>   Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
+    );
 }
 
 fn print_import_usage() {
-    println!(
-        "sing-box-tui import -i <clash.yml> [-o <config.json>] [--config FILE] [--replace-nodes]"
-    );
+    println!("Usage: sing-box-tui import --input <FILE> [OPTIONS]");
     println!();
     println!("Input options:");
-    println!("  -i, --input <FILE>        Input Clash YAML subscription/config file");
+    println!("  -i, --input <FILE>     Input Clash YAML subscription/config file");
     println!(
-        "      --config <FILE>       Existing sing-box config to merge into (default: /etc/sing-box/config.json)"
+        "      --config <FILE>    Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
     );
     println!();
     println!("Output options:");
-    println!("  -o, --output <FILE>       Output full sing-box config JSON");
+    println!("  -o, --output <FILE>    Output full sing-box config JSON");
     println!();
     println!("Behavior options:");
-    println!("      --replace-nodes       Replace existing node outbounds instead of merging");
+    println!("      --replace-nodes    Replace existing node outbounds instead of merging");
 }
 
 fn print_subscribe_usage() {
-    println!(
-        "sing-box-tui subscribe --url URL [-o <config.json>] [--config FILE] [--replace-nodes]"
-    );
+    println!("Usage: sing-box-tui subscribe --url <URL> [OPTIONS]");
     println!();
     println!("Input options:");
-    println!("      --url <URL>                  sing-box subscription URL");
+    println!("      --url <URL>                       sing-box subscription URL");
     println!(
-        "      --config <FILE>              Existing sing-box config to merge into (default: /etc/sing-box/config.json)"
+        "      --config <FILE>                   Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
     );
     println!();
     println!("Output options:");
-    println!("  -o, --output <FILE>              Output merged config path");
-    println!("      --subscription-output <FILE> Save downloaded sing-box JSON for debugging");
-    println!("      --provider-name <NAME>       Wrap imported nodes in a provider selector");
+    println!("  -o, --output <FILE>                   Output merged config path");
+    println!("      --subscription-output <FILE>      Save downloaded sing-box JSON for debugging");
+    println!("      --provider-name <NAME>            Wrap imported nodes in a provider selector");
     println!(
-        "      --existing-provider-name <NAME> Wrap existing template nodes in a provider selector"
+        "      --existing-provider-name <NAME>   Wrap existing template nodes in a provider selector"
     );
     println!();
     println!("Behavior options:");
     println!(
-        "      --replace-nodes              Replace existing node outbounds instead of merging"
+        "      --replace-nodes                   Replace existing node outbounds instead of merging"
     );
 }
 
 fn print_subscriptions_usage() {
-    println!("sing-box-tui subscriptions [-i .suburl] [--config FILE] [-o FILE|--write]");
+    println!("Usage: sing-box-tui subscriptions [OPTIONS]");
     println!();
     println!("Input options:");
     println!(
-        "  -i, --input <FILE>         Provider URL file in '<provider> = <url>' format (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
+        "  -i, --input <FILE>       Provider URL file in '<provider> = <url>' format (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
     );
     println!(
-        "      --config <FILE>        Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
+        "      --config <FILE>      Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
     );
     println!(
-        "      --cache <FILE>         Local subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
+        "      --cache <FILE>       Local subscription payload cache (default: {DEFAULT_SUBSCRIPTION_CACHE_PATH})"
     );
     println!();
     println!("Output options:");
-    println!("  -o, --output <FILE>        Output merged config path");
-    println!("      --write                Overwrite the --config file in place");
+    println!("  -o, --output <FILE>      Output merged config path");
+    println!("      --write              Overwrite the --config file in place");
     println!();
     println!("Behavior options:");
     println!(
-        "      --interval-days <N>    Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
+        "      --interval-days <N>  Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
     );
-    println!("      --force                Fetch every provider even when cache is fresh");
-    println!("      --replace-nodes        Replace all existing node outbounds before merging");
+    println!("      --force              Fetch every provider even when cache is fresh");
+    println!("      --replace-nodes      Replace all existing node outbounds before merging");
 }
 
 fn print_sync_provider_usage() {
-    println!("sing-box-tui sync --provider URL --account-file FILE [--config FILE] [-o FILE]");
+    println!("Usage: sing-box-tui sync --provider <URL> --account-file <FILE> [OPTIONS]");
     println!();
     println!("Input options:");
     println!("      --provider <URL>              Provider website base URL");
     println!("      --account-file <FILE>         Local text file containing account and password");
     println!(
-        "      --config <FILE>               Existing sing-box config to merge into (default: /etc/sing-box/config.json)"
+        "      --config <FILE>               Existing sing-box config to merge into (default: {DEFAULT_CONFIG_PATH})"
     );
     println!();
     println!("Output options:");
@@ -804,10 +795,12 @@ fn print_sync_provider_usage() {
 }
 
 fn print_benchmark_usage() {
-    println!("sing-box-tui benchmark [options]");
+    println!("Usage: sing-box-tui benchmark [OPTIONS]");
     println!();
     println!("Options:");
-    println!("      --controller <URL>        Clash controller base URL");
+    println!(
+        "      --controller <URL>        Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
+    );
     println!(
         "      --selector <NAME>         Selector group to benchmark (default: {DEFAULT_SELECTOR_TAG})"
     );
