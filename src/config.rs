@@ -132,15 +132,12 @@ pub(crate) fn build_full_config_with_provider_node_sets(
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     let node_tags = collect_tags(&imported_nodes);
     let select_members = with_leading_members(&[DEFAULT_AUTO_SELECTOR_TAG], &node_tags);
-    let inbounds = vec![
-        build_default_tun_inbound(),
-        json!({
-            "type": "mixed",
-            "listen": "::",
-            "listen_port": 5780,
-            "set_system_proxy": false,
-        }),
-    ];
+    let inbounds = vec![json!({
+        "type": "mixed",
+        "listen": "::",
+        "listen_port": 5780,
+        "set_system_proxy": false,
+    })];
 
     let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
     outbounds.push(json!({
@@ -363,28 +360,6 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
             }
         }
     })
-}
-
-fn build_default_tun_inbound() -> Value {
-    let mut inbound = json!({
-        "type": "tun",
-        "mtu": 9000,
-        "address": [
-            "172.19.0.1/30",
-            "2001:0470:f9da:fdfa::1/64",
-        ],
-        "auto_route": true,
-        "strict_route": true,
-        "stack": "mixed",
-        "endpoint_independent_nat": true,
-    });
-    if cfg!(target_os = "linux") {
-        inbound
-            .as_object_mut()
-            .expect("TUN inbound is an object")
-            .insert("auto_redirect".to_string(), Value::Bool(true));
-    }
-    inbound
 }
 
 pub(crate) fn merge_into_existing_config(
@@ -1198,14 +1173,7 @@ mod tests {
 
         let outbounds = config["outbounds"].as_array().expect("outbounds array");
         let inbounds = config["inbounds"].as_array().expect("inbounds array");
-        let tun = inbounds
-            .iter()
-            .find(|value| value["type"] == "tun")
-            .expect("default TUN inbound");
-        assert_eq!(
-            tun.get("auto_redirect").and_then(Value::as_bool),
-            cfg!(target_os = "linux").then_some(true)
-        );
+        assert!(!inbounds.iter().any(|value| value["type"] == "tun"));
         assert!(inbounds.iter().any(|value| value["type"] == "mixed"));
         assert!(outbounds.iter().any(|value| value["tag"] == "手动选择"));
         assert!(outbounds.iter().any(|value| value["tag"] == "自动选择"));
