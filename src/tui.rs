@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +22,7 @@ use ratatui::widgets::{
     Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
 };
 use ratatui::{DefaultTerminal, Frame};
+use serde_json::Value;
 
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
@@ -317,6 +320,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" clash mode  "),
             Span::styled("B", Style::default().fg(Color::Cyan)),
             Span::raw(" bypass  "),
+            Span::styled("p", Style::default().fg(Color::Cyan)),
+            Span::raw(" proxy  "),
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
@@ -834,6 +839,107 @@ fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
         .unwrap_or_else(|| RULE_CLASH_MODE.to_string())
 }
 
+fn default_system_proxy_server(config_path: &Path) -> String {
+    env::var("SING_BOX_TUI_SYSTEM_PROXY_SERVER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            detect_mixed_inbound_proxy_server(config_path)
+                .unwrap_or_else(|| "127.0.0.1:5780".to_string())
+        })
+}
+
+fn detect_mixed_inbound_proxy_server(config_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(config_path).ok()?;
+    let config: Value = serde_json::from_str(&text).ok()?;
+    let inbounds = config.get("inbounds")?.as_array()?;
+    let inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("mixed"))?;
+    let port = inbound.get("listen_port")?.as_u64()?;
+    let listen = inbound
+        .get("listen")
+        .and_then(Value::as_str)
+        .unwrap_or("127.0.0.1");
+    let host = match listen {
+        "::" | "0.0.0.0" | "" => "127.0.0.1",
+        value => value,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+#[cfg(windows)]
+fn run_windows_system_proxy_script(server: &str) -> Result<String> {
+    let script = windows_system_proxy_script_path()
+        .with_context(|| "failed to locate scripts/windows/set-system-proxy.ps1")?;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script
+                .to_str()
+                .context("system proxy script path is not valid UTF-8")?,
+            "-Enable",
+            "-Server",
+            server,
+        ])
+        .output()
+        .context("failed to run PowerShell system proxy script")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return Ok(if stdout.is_empty() {
+            format!("Enabled Windows system proxy: {server}")
+        } else {
+            stdout
+        });
+    }
+
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    bail!(
+        "PowerShell exited with {}: {}",
+        output.status.code().unwrap_or(-1),
+        message
+    )
+}
+
+#[cfg(not(windows))]
+fn run_windows_system_proxy_script(_server: &str) -> Result<String> {
+    bail!("Windows system proxy script is only available on Windows")
+}
+
+#[cfg(windows)]
+fn windows_system_proxy_script_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("SING_BOX_TUI_SYSTEM_PROXY_SCRIPT") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let cwd_path = PathBuf::from("scripts")
+        .join("windows")
+        .join("set-system-proxy.ps1");
+    if cwd_path.exists() {
+        return Some(cwd_path);
+    }
+
+    let exe = env::current_exe().ok()?;
+    for ancestor in exe.ancestors() {
+        let candidate = ancestor
+            .join("scripts")
+            .join("windows")
+            .join("set-system-proxy.ps1");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Focus {
     Groups,
@@ -885,6 +991,7 @@ struct App {
     last_connection_refresh: Instant,
     show_connections: bool,
     subscription_refresh: Option<SubscriptionRefreshState>,
+    system_proxy_server: String,
 }
 
 struct SubscriptionRefreshState {
@@ -947,6 +1054,8 @@ impl App {
     ) -> Result<Self> {
         let state_store = TuiStateStore::new(default_tui_state_path());
         let runtime_state = state_store.load()?;
+        let system_proxy_server =
+            default_system_proxy_server(&subscription_refresh_options.config_path);
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let mut app = Self {
@@ -985,6 +1094,7 @@ impl App {
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
             subscription_refresh,
+            system_proxy_server,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -1477,6 +1587,7 @@ impl App {
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('B') => self.open_bypass_modal(),
+            KeyCode::Char('p') => self.set_windows_system_proxy(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.run_verify(false)?,
@@ -2209,6 +2320,16 @@ impl App {
         Ok(())
     }
 
+    fn set_windows_system_proxy(&mut self) {
+        match run_windows_system_proxy_script(&self.system_proxy_server) {
+            Ok(message) => self.set_status_with_flash(message),
+            Err(error) => self.set_status_with_flash(format!(
+                "System proxy update failed: {}",
+                truncate_for_width(&error.to_string(), 90)
+            )),
+        }
+    }
+
     fn open_benchmark_filter_modal(&mut self) {
         self.filter_input = Some(self.benchmark_filter.clone());
         self.flash = None;
@@ -2417,6 +2538,7 @@ mod tests {
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
             subscription_refresh: None,
+            system_proxy_server: "127.0.0.1:5780".to_string(),
         }
     }
 
@@ -2468,6 +2590,23 @@ mod tests {
         let truncated = truncate_for_width("手动选择-自动选择-节点A", 8);
         assert!(truncated.ends_with('…'));
         assert!(!truncated.is_empty());
+    }
+
+    #[test]
+    fn detects_mixed_inbound_proxy_server_from_config() {
+        let path = std::env::temp_dir().join("sing-box-tui-proxy-config-test.json");
+        std::fs::write(
+            &path,
+            r#"{"inbounds":[{"type":"mixed","listen":"::","listen_port":6780}]}"#,
+        )
+        .expect("write config");
+
+        assert_eq!(
+            super::detect_mixed_inbound_proxy_server(&path).as_deref(),
+            Some("127.0.0.1:6780")
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
