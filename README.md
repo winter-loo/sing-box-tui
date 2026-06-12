@@ -358,7 +358,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
-- `p`: on Windows, set the current user's system proxy to the sing-box mixed inbound by running `scripts/windows/set-system-proxy.ps1`
+- `p`: on Windows, toggle the current user's system proxy for the sing-box mixed inbound
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
@@ -371,6 +371,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `V`: run Google/GitHub/Discord verification checks
 - `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`
 - `r`: refresh groups
+- `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
 - `q`: quit
 
 During async benchmarks, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.

@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -47,6 +49,7 @@ const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const SYSTEM_PROXY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -91,7 +94,8 @@ pub(crate) fn run_tui(
 
 fn setup_terminal() -> Result<DefaultTerminal> {
     enable_raw_mode().context("failed to enable raw mode")?;
-    execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
     Ok(ratatui::DefaultTerminal::new(
         ratatui::backend::CrosstermBackend::new(io::stdout()),
     )?)
@@ -99,7 +103,8 @@ fn setup_terminal() -> Result<DefaultTerminal> {
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(io::stdout(), LeaveAlternateScreen).context("failed to leave alternate screen")?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)
+        .context("failed to leave alternate screen")?;
     Ok(())
 }
 
@@ -107,10 +112,12 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         app.poll_benchmark_updates()?;
         app.poll_subscription_refresh_updates()?;
+        app.poll_system_proxy_updates();
         app.maybe_start_subscription_refresh();
         app.maybe_start_auto_select_benchmark()?;
         app.maybe_refresh_latency_chart()?;
         app.maybe_refresh_connections();
+        app.maybe_refresh_system_proxy_status();
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -122,6 +129,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     return Ok(());
                 }
             }
+            Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -321,7 +329,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("B", Style::default().fg(Color::Cyan)),
             Span::raw(" bypass  "),
             Span::styled("p", Style::default().fg(Color::Cyan)),
-            Span::raw(" proxy  "),
+            Span::styled(
+                " system proxy  ",
+                Style::default().fg(if app.system_proxy_enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
             Span::styled("b/t", Style::default().fg(Color::Cyan)),
             Span::raw(" benchmark  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
@@ -340,6 +355,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" refresh  "),
             Span::styled("u", Style::default().fg(Color::Cyan)),
             Span::raw(" update subs  "),
+            Span::styled("?", Style::default().fg(Color::Cyan)),
+            Span::raw(" help  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(" quit"),
         ]),
@@ -369,6 +386,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_connections {
         draw_connections_panel(frame, app);
     }
+    if app.show_help {
+        draw_help_panel(frame, app);
+    }
     if let Some(input) = app.filter_input.as_deref() {
         let cursor_x = status_area
             .x
@@ -378,6 +398,239 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let cursor_y = status_area.y.saturating_add(6);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+#[derive(Clone, Copy)]
+struct HelpBinding {
+    key: &'static str,
+    summary: &'static str,
+    detail: &'static str,
+}
+
+const HELP_BINDINGS: &[HelpBinding] = &[
+    HelpBinding {
+        key: "up",
+        summary: "Move selection up",
+        detail: "Move the highlighted row up in the active list or help panel.",
+    },
+    HelpBinding {
+        key: "k",
+        summary: "Move selection up",
+        detail: "Vim-style shortcut for moving the highlighted row up.",
+    },
+    HelpBinding {
+        key: "down",
+        summary: "Move selection down",
+        detail: "Move the highlighted row down in the active list or help panel.",
+    },
+    HelpBinding {
+        key: "j",
+        summary: "Move selection down",
+        detail: "Vim-style shortcut for moving the highlighted row down.",
+    },
+    HelpBinding {
+        key: "tab",
+        summary: "Switch pane",
+        detail: "Move focus between the selector/group pane and the candidate node pane.",
+    },
+    HelpBinding {
+        key: "h",
+        summary: "Switch to left pane",
+        detail: "Move focus to the pane on the left.",
+    },
+    HelpBinding {
+        key: "l",
+        summary: "Switch to right pane",
+        detail: "Move focus to the pane on the right.",
+    },
+    HelpBinding {
+        key: "g",
+        summary: "Move to first item",
+        detail: "Jump to the first item in the focused list.",
+    },
+    HelpBinding {
+        key: "G",
+        summary: "Move to last item",
+        detail: "Jump to the last item in the focused list.",
+    },
+    HelpBinding {
+        key: "space",
+        summary: "Switch to selected proxy",
+        detail: "Apply the highlighted proxy or provider selection through the controller API.",
+    },
+    HelpBinding {
+        key: "m",
+        summary: "Cycle Clash mode",
+        detail: "Switch the controller between available Clash modes.",
+    },
+    HelpBinding {
+        key: "s",
+        summary: "Toggle latency sort order",
+        detail: "Toggle candidate display between selector order and successful latency order.",
+    },
+    HelpBinding {
+        key: "b",
+        summary: "Benchmark current group",
+        detail: "Start an asynchronous benchmark for all visible candidates in the selected group.",
+    },
+    HelpBinding {
+        key: "t",
+        summary: "Benchmark selected node",
+        detail: "Start an asynchronous benchmark for only the highlighted node.",
+    },
+    HelpBinding {
+        key: "/",
+        summary: "Edit benchmark filter",
+        detail: "Open the filter editor. Comma-separated values match any listed text.",
+    },
+    HelpBinding {
+        key: "a",
+        summary: "Toggle auto-pick",
+        detail: "Enable or disable periodic benchmarking and automatic switching for the filter.",
+    },
+    HelpBinding {
+        key: "i",
+        summary: "Open latency chart",
+        detail: "Show SQLite-backed latency history for the highlighted node.",
+    },
+    HelpBinding {
+        key: "z",
+        summary: "Zoom latency chart in",
+        detail: "When the latency chart is open, narrow the displayed time window.",
+    },
+    HelpBinding {
+        key: "Z",
+        summary: "Zoom latency chart out",
+        detail: "When the latency chart is open, widen the displayed time window.",
+    },
+    HelpBinding {
+        key: "c",
+        summary: "Show active connections",
+        detail: "Open a panel with active connection targets, outbound chains, and matched rules.",
+    },
+    HelpBinding {
+        key: "B",
+        summary: "Edit bypass rules",
+        detail: "Edit direct-bypass domains, IPs, and CIDRs written to the local rule-set.",
+    },
+    HelpBinding {
+        key: "p",
+        summary: "Toggle system proxy",
+        detail: "Enable or disable WinINET system proxy for the detected sing-box mixed inbound.",
+    },
+    HelpBinding {
+        key: "u",
+        summary: "Update subscriptions",
+        detail: "Force a background subscription refresh when subscription refresh is configured.",
+    },
+    HelpBinding {
+        key: "v",
+        summary: "Verify Google and GitHub",
+        detail: "Run HTTP verification checks against Google and GitHub.",
+    },
+    HelpBinding {
+        key: "V",
+        summary: "Verify Google, GitHub, and Discord",
+        detail: "Run HTTP verification checks and include Discord gateway diagnostics.",
+    },
+    HelpBinding {
+        key: "r",
+        summary: "Refresh groups",
+        detail: "Reload selector groups, mode, and connection state from the controller.",
+    },
+    HelpBinding {
+        key: "?",
+        summary: "Close help",
+        detail: "Close this keybindings panel.",
+    },
+    HelpBinding {
+        key: "esc",
+        summary: "Close help",
+        detail: "Close this keybindings panel.",
+    },
+    HelpBinding {
+        key: "enter",
+        summary: "Close help",
+        detail: "Close this keybindings panel.",
+    },
+    HelpBinding {
+        key: "q",
+        summary: "Quit",
+        detail: "Exit the TUI. When help is open, q still exits the application.",
+    },
+];
+
+fn draw_help_panel(frame: &mut Frame, app: &App) {
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(4).min(108);
+    let height = frame_area.height.saturating_sub(4).min(34);
+    let area = centered_rect(width.max(56), height.max(18), frame_area);
+    frame.render_widget(Clear, area);
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(area);
+    let selected = app.help_index.min(HELP_BINDINGS.len().saturating_sub(1));
+    let visible_rows = list_area.height.saturating_sub(2).max(1) as usize;
+    let first = selected.saturating_sub(visible_rows.saturating_sub(1));
+
+    let lines = HELP_BINDINGS
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+        .map(|(index, binding)| help_binding(*binding, index == selected))
+        .collect::<Vec<_>>();
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title("Keybindings")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    frame.render_widget(widget, list_area);
+
+    let count = format!("{} of {}", selected + 1, HELP_BINDINGS.len());
+    let count_width = unicode_width::UnicodeWidthStr::width(count.as_str()) as u16;
+    let count_area = ratatui::layout::Rect {
+        x: list_area.x + list_area.width.saturating_sub(count_width + 1),
+        y: list_area.y + list_area.height.saturating_sub(1),
+        width: count_width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(count).style(Style::default().fg(Color::Green)),
+        count_area,
+    );
+
+    let detail = HELP_BINDINGS
+        .get(selected)
+        .map(|binding| binding.detail)
+        .unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(detail)
+            .style(Style::default().fg(Color::Gray))
+            .block(Block::default().borders(Borders::ALL)),
+        detail_area,
+    );
+}
+
+fn help_binding(binding: HelpBinding, selected: bool) -> Line<'static> {
+    let line_style = if selected {
+        Style::default().bg(Color::Blue)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:>7}", binding.key),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(binding.summary, Style::default().fg(Color::Gray)),
+    ])
+    .style(line_style)
 }
 
 fn draw_connections_panel(frame: &mut Frame, app: &App) {
@@ -851,7 +1104,12 @@ fn default_system_proxy_server(config_path: &Path) -> String {
 
 fn detect_mixed_inbound_proxy_server(config_path: &Path) -> Option<String> {
     let text = fs::read_to_string(config_path).ok()?;
-    let config: Value = serde_json::from_str(&text).ok()?;
+    detect_mixed_inbound_proxy_server_from_json(&text)
+        .or_else(|| detect_mixed_inbound_proxy_server_from_text(&text))
+}
+
+fn detect_mixed_inbound_proxy_server_from_json(text: &str) -> Option<String> {
+    let config: Value = serde_json::from_str(text).ok()?;
     let inbounds = config.get("inbounds")?.as_array()?;
     let inbound = inbounds
         .iter()
@@ -868,23 +1126,109 @@ fn detect_mixed_inbound_proxy_server(config_path: &Path) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+fn detect_mixed_inbound_proxy_server_from_text(text: &str) -> Option<String> {
+    let inbounds_key = text.find("\"inbounds\"")?;
+    let after_key = &text[inbounds_key..];
+    let array_start = after_key.find('[')? + inbounds_key;
+    let array_end = find_json_array_end(text, array_start)?;
+    let inbounds = &text[array_start..=array_end];
+    let mixed_index = inbounds.find("\"mixed\"")?;
+    let before_mixed = &inbounds[..mixed_index];
+    let object_start = before_mixed.rfind('{')?;
+    let after_object_start = &inbounds[object_start..];
+    let object_end = find_json_object_end(after_object_start, 0)?;
+    let inbound = &after_object_start[..=object_end];
+    let port = find_json_u16_field(inbound, "listen_port")?;
+    let listen = find_json_string_field(inbound, "listen").unwrap_or("127.0.0.1");
+    let host = match listen {
+        "::" | "0.0.0.0" | "" => "127.0.0.1",
+        value => value,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+fn find_json_array_end(text: &str, start: usize) -> Option<usize> {
+    find_json_container_end(text, start, '[', ']')
+}
+
+fn find_json_object_end(text: &str, start: usize) -> Option<usize> {
+    find_json_container_end(text, start, '{', '}')
+}
+
+fn find_json_container_end(text: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+        } else if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(start + offset);
+            }
+        }
+    }
+    None
+}
+
+fn find_json_u16_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{field}\"");
+    let key_index = object.find(&key)?;
+    let after_key = &object[key_index + key.len()..];
+    let colon_index = after_key.find(':')?;
+    let value = after_key[colon_index + 1..].trim_start();
+    let end = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let port = &value[..end];
+    if port.is_empty() { None } else { Some(port) }
+}
+
+fn find_json_string_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{field}\"");
+    let key_index = object.find(&key)?;
+    let after_key = &object[key_index + key.len()..];
+    let colon_index = after_key.find(':')?;
+    let value = after_key[colon_index + 1..].trim_start();
+    let value = value.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(&value[..end])
+}
+
 #[cfg(windows)]
-fn run_windows_system_proxy_script(server: &str) -> Result<String> {
+fn run_windows_system_proxy_script(server: &str, enable: bool) -> Result<String> {
     let script = windows_system_proxy_script_path()
         .with_context(|| "failed to locate scripts/windows/set-system-proxy.ps1")?;
+    let action = if enable { "-Enable" } else { "-Disable" };
+    let mut args = vec![
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script
+            .to_str()
+            .context("system proxy script path is not valid UTF-8")?,
+        action,
+    ];
+    if enable {
+        args.extend(["-Server", server]);
+    }
     let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script
-                .to_str()
-                .context("system proxy script path is not valid UTF-8")?,
-            "-Enable",
-            "-Server",
-            server,
-        ])
+        .args(args)
         .output()
         .context("failed to run PowerShell system proxy script")?;
 
@@ -907,8 +1251,46 @@ fn run_windows_system_proxy_script(server: &str) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn run_windows_system_proxy_script(_server: &str) -> Result<String> {
+fn run_windows_system_proxy_script(_server: &str, _enable: bool) -> Result<String> {
     bail!("Windows system proxy script is only available on Windows")
+}
+
+#[cfg(windows)]
+fn windows_system_proxy_matches(server: &str) -> bool {
+    let output = Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    registry_value_line(&text, "ProxyEnable")
+        .is_some_and(|line| line.split_whitespace().last() == Some("0x1"))
+        && registry_value_line(&text, "ProxyServer").is_some_and(|line| {
+            line.split_once("REG_SZ")
+                .map(|(_, value)| value.trim() == server)
+                .unwrap_or(false)
+        })
+}
+
+#[cfg(not(windows))]
+fn windows_system_proxy_matches(_server: &str) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn registry_value_line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|value| value.eq_ignore_ascii_case(name))
+    })
 }
 
 #[cfg(windows)]
@@ -990,8 +1372,14 @@ struct App {
     connection_error: Option<String>,
     last_connection_refresh: Instant,
     show_connections: bool,
+    show_help: bool,
+    help_index: usize,
     subscription_refresh: Option<SubscriptionRefreshState>,
+    system_proxy_config_path: PathBuf,
     system_proxy_server: String,
+    system_proxy_enabled: bool,
+    system_proxy_job: Option<SystemProxyJob>,
+    last_system_proxy_status_refresh: Instant,
 }
 
 struct SubscriptionRefreshState {
@@ -1010,6 +1398,13 @@ struct SubscriptionRefreshJob {
 
 enum SubscriptionRefreshEvent {
     Finished(Result<SubscriptionRefreshOutput, String>),
+}
+
+struct SystemProxyJob {
+    server: String,
+    enable: bool,
+    receiver: mpsc::Receiver<Result<String, String>>,
+    worker: JoinHandle<()>,
 }
 
 impl SubscriptionRefreshState {
@@ -1056,6 +1451,8 @@ impl App {
         let runtime_state = state_store.load()?;
         let system_proxy_server =
             default_system_proxy_server(&subscription_refresh_options.config_path);
+        let system_proxy_enabled = windows_system_proxy_matches(&system_proxy_server);
+        let system_proxy_config_path = subscription_refresh_options.config_path.clone();
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let mut app = Self {
@@ -1093,8 +1490,14 @@ impl App {
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
+            show_help: false,
+            help_index: 0,
             subscription_refresh,
+            system_proxy_config_path,
             system_proxy_server,
+            system_proxy_enabled,
+            system_proxy_job: None,
+            last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -1531,6 +1934,21 @@ impl App {
         if self.bypass_input.is_some() {
             return self.handle_bypass_input_key(code);
         }
+        if self.show_help {
+            match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                    self.show_help = false;
+                    self.set_status_only("Help closed");
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.move_help_previous(),
+                KeyCode::Char('g') => self.help_index = 0,
+                KeyCode::Char('G') => self.help_index = HELP_BINDINGS.len().saturating_sub(1),
+                KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+            return Ok(true);
+        }
         if self.show_connections {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') => {
@@ -1592,12 +2010,24 @@ impl App {
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.run_verify(false)?,
             KeyCode::Char('V') => self.run_verify(true)?,
+            KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
             KeyCode::Char(' ') => self.activate_selection()?,
             KeyCode::Enter => {}
             _ => {}
         }
         Ok(true)
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        if !self.show_help {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollDown => self.move_help_next(),
+            MouseEventKind::ScrollUp => self.move_help_previous(),
+            _ => {}
+        }
     }
 
     fn selected_member_name(&self) -> Option<String> {
@@ -1610,6 +2040,20 @@ impl App {
     fn open_connections_panel(&mut self) {
         self.show_connections = true;
         self.set_status_only("Showing active connections");
+    }
+
+    fn open_help_panel(&mut self) {
+        self.show_help = true;
+        self.flash = None;
+        self.set_status_only("Showing help");
+    }
+
+    fn move_help_next(&mut self) {
+        self.help_index = (self.help_index + 1).min(HELP_BINDINGS.len().saturating_sub(1));
+    }
+
+    fn move_help_previous(&mut self) {
+        self.help_index = self.help_index.saturating_sub(1);
     }
 
     fn open_latency_chart(&mut self) -> Result<()> {
@@ -2321,13 +2765,79 @@ impl App {
     }
 
     fn set_windows_system_proxy(&mut self) {
-        match run_windows_system_proxy_script(&self.system_proxy_server) {
-            Ok(message) => self.set_status_with_flash(message),
-            Err(error) => self.set_status_with_flash(format!(
-                "System proxy update failed: {}",
-                truncate_for_width(&error.to_string(), 90)
-            )),
+        if self.system_proxy_job.is_some() {
+            self.set_status_only("System proxy update is already running");
+            return;
         }
+        self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
+        let enable = !self.system_proxy_enabled;
+        let server = self.system_proxy_server.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker_server = server.clone();
+        let worker = thread::spawn(move || {
+            let result = run_windows_system_proxy_script(&worker_server, enable)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.system_proxy_job = Some(SystemProxyJob {
+            server: server.clone(),
+            enable,
+            receiver: rx,
+            worker,
+        });
+        if enable {
+            self.set_status_only(format!("Enabling system proxy at {server}..."));
+        } else {
+            self.set_status_only("Disabling system proxy...");
+        }
+    }
+
+    fn poll_system_proxy_updates(&mut self) {
+        let Some(job) = self.system_proxy_job.as_ref() else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("system proxy worker disconnected".to_string()),
+        };
+
+        let job = self
+            .system_proxy_job
+            .take()
+            .expect("system proxy job exists");
+        let _ = job.worker.join();
+        match result {
+            Ok(message) => {
+                self.system_proxy_server = job.server;
+                self.system_proxy_enabled = if job.enable {
+                    windows_system_proxy_matches(&self.system_proxy_server)
+                } else {
+                    false
+                };
+                self.set_status_with_flash(message);
+            }
+            Err(error) => {
+                self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
+                self.set_status_with_flash(format!(
+                    "System proxy update failed: {}",
+                    truncate_for_width(&error, 90)
+                ));
+            }
+        }
+    }
+
+    fn maybe_refresh_system_proxy_status(&mut self) {
+        if self.system_proxy_job.is_some()
+            || self.last_system_proxy_status_refresh.elapsed()
+                < SYSTEM_PROXY_STATUS_REFRESH_INTERVAL
+        {
+            return;
+        }
+        self.last_system_proxy_status_refresh = Instant::now();
+        self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
     }
 
     fn open_benchmark_filter_modal(&mut self) {
@@ -2430,11 +2940,11 @@ mod tests {
     use super::{
         App, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
         LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState,
-        LatencyChartTimeUnit, RULE_CLASH_MODE, connection_is_direct, format_bytes,
-        format_connection_line, format_duration_badge, latency_chart_segments,
-        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
-        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
-        subscription_report_badge, truncate_for_width,
+        LatencyChartTimeUnit, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+        connection_is_direct, format_bytes, format_connection_line, format_duration_badge,
+        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
+        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
+        latency_chart_zoom_out, next_clash_mode, subscription_report_badge, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -2445,8 +2955,10 @@ mod tests {
     use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
+    use crossterm::event::MouseEventKind;
     use reqwest::Client as AsyncClient;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2537,8 +3049,14 @@ mod tests {
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
             show_connections: false,
+            show_help: false,
+            help_index: 0,
             subscription_refresh: None,
+            system_proxy_config_path: PathBuf::from("config.json"),
             system_proxy_server: "127.0.0.1:5780".to_string(),
+            system_proxy_enabled: false,
+            system_proxy_job: None,
+            last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
         }
     }
 
@@ -2607,6 +3125,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detects_mixed_inbound_proxy_server_from_partial_text_when_config_is_invalid() {
+        let text = r#"{
+            "inbounds": [
+                {"type":"mixed","listen":"::","listen_port":6780}
+            ],
+            "outbounds": [broken
+        }"#;
+
+        assert_eq!(
+            super::detect_mixed_inbound_proxy_server_from_text(text).as_deref(),
+            Some("127.0.0.1:6780")
+        );
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
@@ -2723,6 +3256,51 @@ mod tests {
 
         assert!(app.show_connections);
         assert_eq!(app.status, "Showing active connections");
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_help() {
+        let mut app = test_app();
+
+        app.handle_key(KeyCode::Char('?')).expect("open help");
+
+        assert!(app.show_help);
+        assert_eq!(app.status, "Showing help");
+
+        app.handle_key(KeyCode::Esc).expect("close help");
+
+        assert!(!app.show_help);
+        assert_eq!(app.status, "Help closed");
+    }
+
+    #[test]
+    fn help_panel_moves_selection_with_keyboard() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::Char('?')).expect("open help");
+
+        app.handle_key(KeyCode::Down).expect("move down");
+        assert_eq!(app.help_index, 1);
+
+        app.handle_key(KeyCode::Char('j')).expect("move down");
+        assert_eq!(app.help_index, 2);
+
+        app.handle_key(KeyCode::Up).expect("move up");
+        assert_eq!(app.help_index, 1);
+
+        app.handle_key(KeyCode::Char('k')).expect("move up");
+        assert_eq!(app.help_index, 0);
+    }
+
+    #[test]
+    fn help_panel_moves_selection_with_mouse_wheel() {
+        let mut app = test_app();
+        app.handle_key(KeyCode::Char('?')).expect("open help");
+
+        app.handle_mouse(MouseEventKind::ScrollDown);
+        assert_eq!(app.help_index, 1);
+
+        app.handle_mouse(MouseEventKind::ScrollUp);
+        assert_eq!(app.help_index, 0);
     }
 
     #[test]

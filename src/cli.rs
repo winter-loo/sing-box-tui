@@ -635,6 +635,10 @@ fn default_subscription_config_path() -> PathBuf {
     if let Ok(path) = env::var("SING_BOX_CONFIG") {
         return PathBuf::from(path);
     }
+    let local_config = PathBuf::from("config.json");
+    if cfg!(windows) && local_config.exists() {
+        return local_config;
+    }
     for path in [
         "/usr/local/etc/sing-box/config.json",
         "/opt/homebrew/etc/sing-box/config.json",
