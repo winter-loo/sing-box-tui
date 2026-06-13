@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use crate::config::{
-    ProviderNodeSet, build_full_config_with_provider_node_sets,
+    DefaultConfigOptions, ProviderNodeSet, build_full_config_with_provider_node_sets_and_options,
     ensure_bypass_rule_set_file_for_config,
 };
 use crate::import::extract_mergeable_outbounds_from_singbox_subscription;
@@ -30,6 +30,8 @@ pub(crate) struct SubscriptionRefreshRequest {
     pub(crate) config_path: PathBuf,
     pub(crate) merged_path: PathBuf,
     pub(crate) replace_nodes: bool,
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
     pub(crate) force: bool,
     pub(crate) interval_days: u64,
 }
@@ -40,6 +42,8 @@ pub(crate) fn run_subscription_refresh(
     config_path: &Path,
     output: Option<&PathBuf>,
     replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
     write: bool,
     force: bool,
     interval_days: u64,
@@ -58,6 +62,8 @@ pub(crate) fn run_subscription_refresh(
         config_path: config_path_buf,
         merged_path,
         replace_nodes,
+        include_geosite_rules,
+        include_tun_mode,
         force,
         interval_days,
     })?;
@@ -143,10 +149,14 @@ pub(crate) fn refresh_subscriptions(
         });
     }
 
-    let merged_config = build_full_config_with_provider_node_sets(
+    let merged_config = build_full_config_with_provider_node_sets_and_options(
         &request.config_path,
         provider_node_sets,
         request.replace_nodes,
+        DefaultConfigOptions {
+            include_geosite_rules: request.include_geosite_rules,
+            include_tun_mode: request.include_tun_mode,
+        },
     )?;
 
     if cache_changed {

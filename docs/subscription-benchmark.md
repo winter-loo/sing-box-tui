@@ -80,7 +80,7 @@ jq '
       }
     ]
   | .route = {"final":"节点选择"}
-  | .experimental.clash_api.external_controller = "127.0.0.1:9090"
+  | .experimental.clash_api.external_controller = "127.0.0.1:9992"
 ' /tmp/singbox-sub.body > /tmp/singbox-sub-test.json
 
 sing-box check -c /tmp/singbox-sub-test.json
@@ -90,10 +90,10 @@ Adjust `节点选择` if the subscription uses a different selector tag.
 
 ## 3. Start sing-box For Testing
 
-Make sure ports `2334` and `9090` are free:
+Make sure ports `2334` and `9992` are free:
 
 ```bash
-ss -ltnp | rg ':(2334|9090)\b' || true
+ss -ltnp | rg ':(2334|9992)\b' || true
 ```
 
 Start sing-box with the temporary config:
@@ -105,20 +105,20 @@ sing-box run -c /tmp/singbox-sub-test.json
 The temporary config exposes:
 
 - mixed proxy: `127.0.0.1:2334`
-- Clash API: `127.0.0.1:9090`
+- Clash API: `127.0.0.1:9992`
 
 ## 4. Inspect Selectors Through The Clash API
 
 Query all proxies:
 
 ```bash
-curl -sS http://127.0.0.1:9090/proxies | jq '.proxies | keys'
+curl -sS http://127.0.0.1:9992/proxies | jq '.proxies | keys'
 ```
 
 Inspect a selector:
 
 ```bash
-curl -sS http://127.0.0.1:9090/proxies \
+curl -sS http://127.0.0.1:9992/proxies \
   | jq '.proxies["节点选择"] | {now, all_count:(.all|length), all}'
 ```
 
@@ -131,7 +131,7 @@ NODE='L1|日本04|直连|流媒体|2x'
 ENCODED_NODE=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$NODE")
 
 curl -sS \
-  "http://127.0.0.1:9090/proxies/$ENCODED_NODE/delay?timeout=5000&url=https://www.gstatic.com/generate_204"
+  "http://127.0.0.1:9992/proxies/$ENCODED_NODE/delay?timeout=5000&url=https://www.gstatic.com/generate_204"
 ```
 
 For a full benchmark, run concurrent probes and sort successful results by latency:
@@ -144,7 +144,7 @@ import time
 import urllib.parse
 import urllib.request
 
-base = "http://127.0.0.1:9090"
+base = "http://127.0.0.1:9992"
 selector = "节点选择"
 exclude_prefixes = ("剩余流量", "套餐到期")
 exclude_contains = ("直连地址", "TG群", "邀请好友", "请更换客户端")
@@ -217,7 +217,7 @@ SELECTOR='节点选择'
 ENCODED_SELECTOR=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$SELECTOR")
 
 curl -sS -X PUT \
-  "http://127.0.0.1:9090/proxies/$ENCODED_SELECTOR" \
+  "http://127.0.0.1:9992/proxies/$ENCODED_SELECTOR" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"$BEST\"}"
 ```

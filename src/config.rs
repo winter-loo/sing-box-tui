@@ -12,10 +12,17 @@ use crate::defaults::{
     DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, SELECTOR_TAG_ALIASES,
 };
 
-pub(crate) fn build_full_config(
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DefaultConfigOptions {
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
+}
+
+pub(crate) fn build_full_config_with_options(
     config_path: &PathBuf,
     imported_nodes: Vec<Value>,
     replace_nodes: bool,
+    default_config_options: DefaultConfigOptions,
 ) -> Result<Value> {
     if config_path.exists() {
         let text = fs::read_to_string(config_path)
@@ -25,7 +32,10 @@ pub(crate) fn build_full_config(
         merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
         Ok(config)
     } else {
-        Ok(build_default_config(imported_nodes))
+        Ok(build_default_config_with_options(
+            imported_nodes,
+            default_config_options,
+        ))
     }
 }
 
@@ -51,12 +61,13 @@ pub(crate) fn ensure_bypass_rule_set_file_for_config(
     Ok(Some(bypass_path))
 }
 
-pub(crate) fn build_full_config_with_provider_groups(
+pub(crate) fn build_full_config_with_provider_groups_and_options(
     config_path: &PathBuf,
     imported_nodes: Vec<Value>,
     replace_nodes: bool,
     provider_name: &str,
     existing_provider_name: Option<&str>,
+    default_config_options: DefaultConfigOptions,
 ) -> Result<Value> {
     let imported_node_tags = collect_tags(&imported_nodes);
     let mut existing_node_tags = Vec::new();
@@ -80,7 +91,7 @@ pub(crate) fn build_full_config_with_provider_groups(
         merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
         config
     } else {
-        build_default_config(imported_nodes)
+        build_default_config_with_options(imported_nodes, default_config_options)
     };
 
     add_provider_groups(
@@ -104,6 +115,20 @@ pub(crate) fn build_full_config_with_provider_node_sets(
     provider_node_sets: Vec<ProviderNodeSet>,
     replace_nodes: bool,
 ) -> Result<Value> {
+    build_full_config_with_provider_node_sets_and_options(
+        config_path,
+        provider_node_sets,
+        replace_nodes,
+        DefaultConfigOptions::default(),
+    )
+}
+
+pub(crate) fn build_full_config_with_provider_node_sets_and_options(
+    config_path: &PathBuf,
+    provider_node_sets: Vec<ProviderNodeSet>,
+    replace_nodes: bool,
+    default_config_options: DefaultConfigOptions,
+) -> Result<Value> {
     let provider_node_tags = provider_node_sets
         .iter()
         .map(|set| (set.provider_name.clone(), collect_tags(&set.nodes)))
@@ -122,7 +147,7 @@ pub(crate) fn build_full_config_with_provider_node_sets(
         merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
         config
     } else {
-        build_default_config(imported_nodes)
+        build_default_config_with_options(imported_nodes, default_config_options)
     };
 
     add_multiple_provider_groups(&mut config, &provider_node_tags)?;
@@ -130,14 +155,36 @@ pub(crate) fn build_full_config_with_provider_node_sets(
 }
 
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
+    build_default_config_with_options(imported_nodes, DefaultConfigOptions::default())
+}
+
+pub(crate) fn build_default_config_with_options(
+    imported_nodes: Vec<Value>,
+    options: DefaultConfigOptions,
+) -> Value {
     let node_tags = collect_tags(&imported_nodes);
     let select_members = with_leading_members(&[DEFAULT_AUTO_SELECTOR_TAG], &node_tags);
-    let inbounds = vec![json!({
+    let mut inbounds = vec![json!({
         "type": "mixed",
         "listen": "::",
-        "listen_port": 5780,
+        "listen_port": 6780,
         "set_system_proxy": false,
     })];
+    if options.include_tun_mode {
+        inbounds.push(json!({
+            "type": "tun",
+            "tag": "tun-in",
+            "address": [
+                "172.19.0.1/30",
+                "2001:470:f9da:fdfa::1/64"
+            ],
+            "mtu": 9000,
+            "auto_route": true,
+            "strict_route": true,
+            "stack": "mixed",
+            "endpoint_independent_nat": true,
+        }));
+    }
 
     let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
     outbounds.push(json!({
@@ -170,6 +217,164 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
         "tag": DEFAULT_BLOCK_TAG,
     }));
 
+    let mut dns_rules = vec![
+        json!({
+            "clash_mode": "全局",
+            "server": DEFAULT_REMOTE_DNS_TAG,
+        }),
+        json!({
+            "clash_mode": "直连",
+            "server": DEFAULT_LOCAL_DNS_TAG,
+        }),
+    ];
+    if options.include_geosite_rules {
+        dns_rules.extend([
+            json!({
+                "rule_set": "geosite-cn",
+                "server": DEFAULT_LOCAL_DNS_TAG,
+            }),
+            json!({
+                "rule_set": "geosite-geolocation-cn",
+                "server": DEFAULT_LOCAL_DNS_TAG,
+            }),
+            json!({
+                "type": "logical",
+                "mode": "and",
+                "rules": [
+                    {
+                        "rule_set": "geosite-geolocation-!cn",
+                        "invert": true,
+                    },
+                    {
+                        "rule_set": "geoip-cn",
+                    }
+                ],
+                "server": DEFAULT_REMOTE_DNS_TAG,
+                "client_subnet": "114.114.114.114/24",
+            }),
+        ]);
+    }
+    dns_rules.push(json!({
+        "clash_mode": "规则",
+        "server": DEFAULT_REMOTE_DNS_TAG,
+    }));
+
+    let mut route_rules = vec![
+        json!({
+            "type": "logical",
+            "mode": "or",
+            "rules": [
+                {
+                    "protocol": "dns",
+                },
+                {
+                    "port": 53,
+                }
+            ],
+            "action": "hijack-dns",
+        }),
+        json!({
+            "domain_suffix": [
+                "airtcp.me",
+                "airtcp.com",
+                "airapp.link",
+                "mailrelay.us"
+            ],
+            "outbound": DEFAULT_DIRECT_TAG,
+        }),
+        json!({
+            "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
+            "outbound": DEFAULT_DIRECT_TAG,
+        }),
+        json!({
+            "clash_mode": "直连",
+            "outbound": DEFAULT_DIRECT_TAG,
+        }),
+        json!({
+            "clash_mode": "全局",
+            "outbound": DEFAULT_SELECTOR_TAG,
+        }),
+        json!({
+            "ip_is_private": true,
+            "outbound": DEFAULT_DIRECT_TAG,
+        }),
+    ];
+    if options.include_geosite_rules {
+        route_rules.extend([
+            json!({
+                "rule_set": "geoip-cn",
+                "outbound": DEFAULT_DIRECT_TAG,
+            }),
+            json!({
+                "rule_set": "geosite-cn",
+                "outbound": DEFAULT_DIRECT_TAG,
+            }),
+            json!({
+                "rule_set": "geosite-geolocation-cn",
+                "outbound": DEFAULT_DIRECT_TAG,
+            }),
+            json!({
+                "rule_set": "AdGuardSDNSFilter",
+                "outbound": DEFAULT_AD_BLOCK_SELECTOR_TAG,
+            }),
+        ]);
+    }
+    route_rules.push(json!({
+        "clash_mode": "规则",
+        "outbound": DEFAULT_SELECTOR_TAG,
+    }));
+
+    let mut route_rule_sets = vec![json!({
+        "type": "local",
+        "tag": DEFAULT_BYPASS_RULE_SET_TAG,
+        "format": "source",
+        "path": DEFAULT_BYPASS_RULE_SET_PATH,
+    })];
+    if options.include_geosite_rules {
+        route_rule_sets.extend([
+            json!({
+                "type": "remote",
+                "tag": "geoip-cn",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+                "download_detour": DEFAULT_DIRECT_TAG,
+                "update_interval": "30d",
+            }),
+            json!({
+                "type": "remote",
+                "tag": "geosite-cn",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+                "download_detour": DEFAULT_DIRECT_TAG,
+                "update_interval": "30d",
+            }),
+            json!({
+                "type": "remote",
+                "tag": "geosite-geolocation-cn",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-cn.srs",
+                "download_detour": DEFAULT_DIRECT_TAG,
+                "update_interval": "30d",
+            }),
+            json!({
+                "type": "remote",
+                "tag": "geosite-geolocation-!cn",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+                "download_detour": DEFAULT_DIRECT_TAG,
+                "update_interval": "30d",
+            }),
+            json!({
+                "type": "remote",
+                "tag": "AdGuardSDNSFilter",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
+                "download_detour": DEFAULT_DIRECT_TAG,
+                "update_interval": "30d",
+            }),
+        ]);
+    }
+
     json!({
         "log": {
             "level": "error",
@@ -192,43 +397,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                     "server_port": 853,
                 }
             ],
-            "rules": [
-                {
-                    "clash_mode": "全局",
-                    "server": DEFAULT_REMOTE_DNS_TAG,
-                },
-                {
-                    "clash_mode": "直连",
-                    "server": DEFAULT_LOCAL_DNS_TAG,
-                },
-                {
-                    "rule_set": "geosite-cn",
-                    "server": DEFAULT_LOCAL_DNS_TAG,
-                },
-                {
-                    "rule_set": "geosite-geolocation-cn",
-                    "server": DEFAULT_LOCAL_DNS_TAG,
-                },
-                {
-                    "type": "logical",
-                    "mode": "and",
-                    "rules": [
-                        {
-                            "rule_set": "geosite-geolocation-!cn",
-                            "invert": true,
-                        },
-                        {
-                            "rule_set": "geoip-cn",
-                        }
-                    ],
-                    "server": DEFAULT_REMOTE_DNS_TAG,
-                    "client_subnet": "114.114.114.114/24",
-                },
-                {
-                    "clash_mode": "规则",
-                    "server": DEFAULT_REMOTE_DNS_TAG,
-                }
-            ],
+            "rules": dns_rules,
             "strategy": "ipv4_only",
             "independent_cache": false,
         },
@@ -239,114 +408,8 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                 "server": DEFAULT_LOCAL_DNS_TAG,
                 "strategy": "ipv4_only",
             },
-            "rules": [
-                {
-                    "type": "logical",
-                    "mode": "or",
-                    "rules": [
-                        {
-                            "protocol": "dns",
-                        },
-                        {
-                            "port": 53,
-                        }
-                    ],
-                    "action": "hijack-dns",
-                },
-                {
-                    "domain_suffix": [
-                        "airtcp.me",
-                        "airtcp.com",
-                        "airapp.link",
-                        "mailrelay.us"
-                    ],
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "clash_mode": "直连",
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "clash_mode": "全局",
-                    "outbound": DEFAULT_SELECTOR_TAG,
-                },
-                {
-                    "ip_is_private": true,
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "rule_set": "geoip-cn",
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "rule_set": "geosite-cn",
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "rule_set": "geosite-geolocation-cn",
-                    "outbound": DEFAULT_DIRECT_TAG,
-                },
-                {
-                    "rule_set": "AdGuardSDNSFilter",
-                    "outbound": DEFAULT_AD_BLOCK_SELECTOR_TAG,
-                },
-                {
-                    "clash_mode": "规则",
-                    "outbound": DEFAULT_SELECTOR_TAG,
-                }
-            ],
-            "rule_set": [
-                {
-                    "type": "local",
-                    "tag": DEFAULT_BYPASS_RULE_SET_TAG,
-                    "format": "source",
-                    "path": DEFAULT_BYPASS_RULE_SET_PATH,
-                },
-                {
-                    "type": "remote",
-                    "tag": "geoip-cn",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
-                    "download_detour": DEFAULT_DIRECT_TAG,
-                    "update_interval": "30d",
-                },
-                {
-                    "type": "remote",
-                    "tag": "geosite-cn",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-                    "download_detour": DEFAULT_DIRECT_TAG,
-                    "update_interval": "30d",
-                },
-                {
-                    "type": "remote",
-                    "tag": "geosite-geolocation-cn",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-cn.srs",
-                    "download_detour": DEFAULT_DIRECT_TAG,
-                    "update_interval": "30d",
-                },
-                {
-                    "type": "remote",
-                    "tag": "geosite-geolocation-!cn",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
-                    "download_detour": DEFAULT_DIRECT_TAG,
-                    "update_interval": "30d",
-                },
-                {
-                    "type": "remote",
-                    "tag": "AdGuardSDNSFilter",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
-                    "download_detour": DEFAULT_DIRECT_TAG,
-                    "update_interval": "30d",
-                }
-            ],
+            "rules": route_rules,
+            "rule_set": route_rule_sets,
             "auto_detect_interface": true,
         },
         "experimental": {
@@ -355,7 +418,7 @@ pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
                 "store_rdrc": true,
             },
             "clash_api": {
-                "external_controller": "0.0.0.0:9090",
+                "external_controller": "0.0.0.0:9992",
                 "default_mode": "规则",
             }
         }
@@ -507,7 +570,7 @@ pub(crate) fn merge_into_existing_config(
 
     let clash_api_value = experimental.entry("clash_api").or_insert_with(|| {
         json!({
-            "external_controller": "127.0.0.1:9090",
+            "external_controller": "127.0.0.1:9992",
             "secret": "",
         })
     });
@@ -516,7 +579,7 @@ pub(crate) fn merge_into_existing_config(
         .context("existing config experimental.clash_api must be an object")?;
     clash_api
         .entry("external_controller")
-        .or_insert_with(|| Value::String("127.0.0.1:9090".to_string()));
+        .or_insert_with(|| Value::String("127.0.0.1:9992".to_string()));
     clash_api
         .entry("secret")
         .or_insert_with(|| Value::String(String::new()));
@@ -1153,7 +1216,8 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderNodeSet, build_default_config, build_full_config_with_provider_node_sets,
+        DefaultConfigOptions, ProviderNodeSet, build_default_config,
+        build_default_config_with_options, build_full_config_with_provider_node_sets,
         ensure_bypass_rule_set_file_for_config, merge_into_existing_config,
     };
     use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
@@ -1186,6 +1250,11 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(!members.contains(&Value::String("国内直连".to_string())));
         assert_eq!(config["dns"]["servers"][0]["type"], "tls");
+        let mixed = inbounds
+            .iter()
+            .find(|value| value["type"] == "mixed")
+            .expect("mixed inbound");
+        assert_eq!(mixed["listen_port"], 6780);
         assert_eq!(
             config["route"]["default_domain_resolver"]["server"],
             "local"
@@ -1208,7 +1277,79 @@ mod tests {
                     && value["type"] == "local"
                     && value["format"] == "source")
         );
+        assert_eq!(
+            config["experimental"]["clash_api"]["external_controller"],
+            "0.0.0.0:9992"
+        );
+        assert!(!value_references(&config, "geoip-cn"));
+        assert!(!value_references(&config, "geosite-cn"));
+        assert!(!value_references(&config, "geosite-geolocation-cn"));
+        assert!(!value_references(&config, "geosite-geolocation-!cn"));
+        assert!(!value_references(&config, "AdGuardSDNSFilter"));
+        assert!(!value_references(&config, "meta-rules-dat"));
         assert!(config["route"].get("final").is_none());
+    }
+
+    #[test]
+    fn default_full_config_can_include_geosite_rules() {
+        let config = build_default_config_with_options(
+            vec![json!({
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "example.com",
+                "server_port": 443,
+                "password": "secret",
+            })],
+            DefaultConfigOptions {
+                include_geosite_rules: true,
+                include_tun_mode: false,
+            },
+        );
+
+        for tag in [
+            "geoip-cn",
+            "geosite-cn",
+            "geosite-geolocation-cn",
+            "geosite-geolocation-!cn",
+            "AdGuardSDNSFilter",
+        ] {
+            assert!(value_references(&config, tag), "missing {tag}");
+        }
+        assert!(value_references(&config, "meta-rules-dat"));
+    }
+
+    #[test]
+    fn default_full_config_can_include_tun_mode() {
+        let config = build_default_config_with_options(
+            vec![json!({
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "example.com",
+                "server_port": 443,
+                "password": "secret",
+            })],
+            DefaultConfigOptions {
+                include_geosite_rules: false,
+                include_tun_mode: true,
+            },
+        );
+
+        let inbounds = config["inbounds"].as_array().expect("inbounds array");
+        let tun = inbounds
+            .iter()
+            .find(|value| value["type"] == "tun")
+            .expect("tun inbound");
+        assert_eq!(tun["tag"], "tun-in");
+        assert_eq!(
+            tun["address"],
+            json!(["172.19.0.1/30", "2001:470:f9da:fdfa::1/64"])
+        );
+        assert_eq!(tun["mtu"], 9000);
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["strict_route"], true);
+        assert_eq!(tun["stack"], "mixed");
+        assert_eq!(tun["endpoint_independent_nat"], true);
+        assert!(tun.get("auto_redirect").is_none());
     }
 
     #[test]
@@ -1276,7 +1417,7 @@ mod tests {
             }, {
                 "type": "mixed",
                 "listen": "::",
-                "listen_port": 5780
+                "listen_port": 6780
             }],
             "outbounds": [{
                 "type": "selector",
@@ -1631,7 +1772,7 @@ mod tests {
             "inbounds": [{
                 "type": "mixed",
                 "listen": "127.0.0.1",
-                "listen_port": 5780,
+                "listen_port": 6780,
                 "sniff": true,
                 "sniff_timeout": "1s",
                 "domain_strategy": "ipv4_only"
@@ -1652,6 +1793,15 @@ mod tests {
             "action": "sniff",
             "timeout": "1s"
         })));
+    }
+
+    fn value_references(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::String(value) => value.contains(needle),
+            Value::Array(values) => values.iter().any(|value| value_references(value, needle)),
+            Value::Object(values) => values.values().any(|value| value_references(value, needle)),
+            _ => false,
+        }
     }
 
     fn temp_config_path(label: &str) -> std::path::PathBuf {

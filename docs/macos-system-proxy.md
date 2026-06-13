@@ -4,7 +4,7 @@ This note documents how the macOS system proxy was changed from the AirTCP clien
 
 ## Context
 
-The sing-box service was already running with a mixed inbound on port `6780` and a Clash API controller on port `9090`.
+The sing-box service was already running with a mixed inbound on port `6780` and a Clash API controller on port `9992`.
 
 The live config showed the mixed inbound:
 
@@ -191,4 +191,3 @@ Then verify again:
 ```bash
 scutil --proxy
 ```
-

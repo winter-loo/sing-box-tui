@@ -40,6 +40,15 @@ cargo run -- subscribe \
 
 `subscribe` fetches the URL with a `sing-box` user agent, extracts real node outbounds from the subscription JSON, filters provider metadata entries, and merges the nodes into the selector/urltest groups from the template config.
 
+Generated default configs omit remote `geoip-cn`, `geosite-*`, and
+`AdGuardSDNSFilter` rule-sets by default so startup does not depend on fetching
+GitHub-hosted `.srs` files. They also omit TUN mode by default. Add
+`--include-geosite-rules` to `import`, `subscribe`, `subscriptions`, `sync`, or
+`run` if you explicitly want those remote rules in a newly created default
+config. Add `--include-tun-mode` if you explicitly want a TUN inbound in a newly
+created default config. Existing configs keep whatever rule-sets and inbounds
+they already contain.
+
 For multiple saved subscription URLs, keep a local `.suburl` file in provider-name format:
 
 ```text
@@ -140,7 +149,7 @@ Selecting a node inside a provider group updates that provider selector and then
 
 ## Requirements
 
-- `sing-box` must expose `experimental.clash_api.external_controller`, usually `127.0.0.1:9090`
+- `sing-box` must expose `experimental.clash_api.external_controller`, usually `127.0.0.1:9992`
 - The proxies you want to switch must be under at least one `selector` outbound
 - Keep `experimental.cache_file.enabled = true` if you want `sing-box` to remember the last selection
 
@@ -153,7 +162,7 @@ Example config fragment:
       "enabled": true
     },
     "clash_api": {
-      "external_controller": "127.0.0.1:9090",
+      "external_controller": "127.0.0.1:9992",
       "secret": ""
     }
   }
@@ -169,7 +178,7 @@ cargo run -- run
 Or point it at a different controller:
 
 ```bash
-cargo run -- run --controller http://127.0.0.1:9090
+cargo run -- run --controller http://127.0.0.1:9992
 ```
 
 Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Auto-pick benchmarks the filtered nodes every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
@@ -200,7 +209,7 @@ The TUI also shows active sing-box connection totals in the status area. Press `
 Environment variable still works too:
 
 ```bash
-SING_BOX_CONTROLLER=http://127.0.0.1:9090 cargo run -- run
+SING_BOX_CONTROLLER=http://127.0.0.1:9992 cargo run -- run
 ```
 
 If the controller has a secret:
@@ -226,12 +235,14 @@ cargo run -- import -i clash_proxies.txt -o config.json --replace-nodes
 Full-config behavior:
 
 - If `/etc/sing-box/config.json` does not exist, the importer creates a complete config with sane defaults:
-  - mixed inbound on `127.0.0.1:5780`
+  - mixed inbound on `127.0.0.1:6780`
   - `selector` outbound `select`
   - `urltest` outbound `auto`
   - `direct` and `block`
   - `route.final = "select"`
-  - `experimental.clash_api` on `127.0.0.1:9090`
+  - `experimental.clash_api` on `127.0.0.1:9992`
+  - remote `geoip-cn`, `geosite-*`, and `AdGuardSDNSFilter` rule-sets only when `--include-geosite-rules` is passed
+  - TUN inbound only when `--include-tun-mode` is passed
 - If `/etc/sing-box/config.json` exists, the importer reads it and merges the imported nodes into that config by default.
 - With `--replace-nodes`, the importer removes existing node outbounds first, then inserts the newly imported nodes.
 - Existing `select`, `auto`, `direct`, and `block` outbounds are reused when present.
@@ -381,7 +392,7 @@ During async benchmarks, node rows show a brighter pending state (`...` plus a s
 The TUI can set the Windows WinINET system proxy with `p`. It runs:
 
 ```powershell
-scripts\windows\set-system-proxy.cmd -Enable -Server 127.0.0.1:5780
+scripts\windows\set-system-proxy.cmd -Enable -Server 127.0.0.1:6780
 ```
 
 The server is detected from the configured sing-box JSON `mixed` inbound when possible. Override it with:

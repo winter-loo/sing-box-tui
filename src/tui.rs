@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -65,6 +66,8 @@ pub(crate) struct TuiSubscriptionRefreshOptions {
     pub(crate) config_path: PathBuf,
     pub(crate) disabled: bool,
     pub(crate) force: bool,
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
     pub(crate) interval_days: u64,
 }
 
@@ -1098,7 +1101,7 @@ fn default_system_proxy_server(config_path: &Path) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
             detect_mixed_inbound_proxy_server(config_path)
-                .unwrap_or_else(|| "127.0.0.1:5780".to_string())
+                .unwrap_or_else(|| "127.0.0.1:6780".to_string())
         })
 }
 
@@ -1423,6 +1426,8 @@ impl SubscriptionRefreshState {
                 config_path: options.config_path.clone(),
                 merged_path: options.config_path,
                 replace_nodes: false,
+                include_geosite_rules: options.include_geosite_rules,
+                include_tun_mode: options.include_tun_mode,
                 force: options.force,
                 interval_days: options.interval_days,
             },
@@ -3003,7 +3008,7 @@ mod tests {
 
         App {
             client: ApiClient {
-                base_url: "http://127.0.0.1:9090".to_string(),
+                base_url: "http://127.0.0.1:9992".to_string(),
                 runtime,
                 client,
             },
@@ -3053,7 +3058,7 @@ mod tests {
             help_index: 0,
             subscription_refresh: None,
             system_proxy_config_path: PathBuf::from("config.json"),
-            system_proxy_server: "127.0.0.1:5780".to_string(),
+            system_proxy_server: "127.0.0.1:6780".to_string(),
             system_proxy_enabled: false,
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,

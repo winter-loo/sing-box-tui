@@ -22,6 +22,11 @@ TUN mode adds a virtual network interface and routes system traffic into
 sing-box automatically. It requires elevated permissions because sing-box must
 create an interface and modify routes.
 
+Newly generated default configs omit TUN by default. When generating a config
+with `import`, `subscribe`, `subscriptions`, `sync`, or the `run` background
+subscription refresh, pass `--include-tun-mode` to include the TUN inbound
+shown below.
+
 ## 1. Validate The Current Config
 
 Before editing, check whether the config is valid:

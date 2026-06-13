@@ -10,8 +10,8 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
-use crate::config::ensure_bypass_rule_set_file_for_config;
-use crate::import::build_full_config_from_singbox_subscription;
+use crate::config::{DefaultConfigOptions, ensure_bypass_rule_set_file_for_config};
+use crate::import::build_full_config_from_singbox_subscription_with_options;
 
 mod airtcp;
 
@@ -58,6 +58,8 @@ pub(crate) fn run_provider_sync(
     output: Option<&PathBuf>,
     subscription_output: Option<&PathBuf>,
     replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
     write: bool,
 ) -> Result<()> {
     let credentials = ProviderCredentials::from_file(account_file)?;
@@ -107,10 +109,14 @@ pub(crate) fn run_provider_sync(
     }
 
     let config_path_buf = config_path.to_path_buf();
-    let (config, imported_nodes) = build_full_config_from_singbox_subscription(
+    let (config, imported_nodes) = build_full_config_from_singbox_subscription_with_options(
         &config_path_buf,
         &subscription_json,
         replace_nodes,
+        DefaultConfigOptions {
+            include_geosite_rules,
+            include_tun_mode,
+        },
     )?;
 
     let merged_path = if let Some(path) = output.cloned() {

@@ -22,6 +22,8 @@ pub(crate) enum CliCommand {
         subscription_config_path: PathBuf,
         subscription_refresh_disabled: bool,
         force_subscription_refresh: bool,
+        include_geosite_rules: bool,
+        include_tun_mode: bool,
         subscription_interval_days: u64,
     },
     Selectors {
@@ -36,6 +38,8 @@ pub(crate) enum CliCommand {
         output: Option<PathBuf>,
         config_path: PathBuf,
         replace_nodes: bool,
+        include_geosite_rules: bool,
+        include_tun_mode: bool,
     },
     Subscribe {
         url: String,
@@ -43,6 +47,8 @@ pub(crate) enum CliCommand {
         config_path: PathBuf,
         subscription_output: Option<PathBuf>,
         replace_nodes: bool,
+        include_geosite_rules: bool,
+        include_tun_mode: bool,
         provider_name: Option<String>,
         existing_provider_name: Option<String>,
     },
@@ -52,6 +58,8 @@ pub(crate) enum CliCommand {
         output: Option<PathBuf>,
         config_path: PathBuf,
         replace_nodes: bool,
+        include_geosite_rules: bool,
+        include_tun_mode: bool,
         write: bool,
         force: bool,
         interval_days: u64,
@@ -63,6 +71,8 @@ pub(crate) enum CliCommand {
         output: Option<PathBuf>,
         subscription_output: Option<PathBuf>,
         replace_nodes: bool,
+        include_geosite_rules: bool,
+        include_tun_mode: bool,
         write: bool,
     },
     Benchmark {
@@ -94,6 +104,8 @@ impl CliCommand {
                 subscription_config_path: default_subscription_config_path(),
                 subscription_refresh_disabled: false,
                 force_subscription_refresh: false,
+                include_geosite_rules: false,
+                include_tun_mode: false,
                 subscription_interval_days: DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
             });
         }
@@ -124,6 +136,8 @@ impl CliCommand {
         let mut subscription_config_path = default_subscription_config_path();
         let mut subscription_refresh_disabled = false;
         let mut force_subscription_refresh = false;
+        let mut include_geosite_rules = false;
+        let mut include_tun_mode = false;
         let mut subscription_interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
         let mut i = 0;
         while i < args.len() {
@@ -173,6 +187,12 @@ impl CliCommand {
                 "--force-subscription-refresh" => {
                     force_subscription_refresh = true;
                 }
+                "--include-geosite-rules" => {
+                    include_geosite_rules = true;
+                }
+                "--include-tun-mode" => {
+                    include_tun_mode = true;
+                }
                 "--no-subscription-refresh" => {
                     subscription_refresh_disabled = true;
                 }
@@ -193,6 +213,8 @@ impl CliCommand {
             subscription_config_path,
             subscription_refresh_disabled,
             force_subscription_refresh,
+            include_geosite_rules,
+            include_tun_mode,
             subscription_interval_days,
         })
     }
@@ -255,6 +277,8 @@ impl CliCommand {
         let mut output = None;
         let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut replace_nodes = false;
+        let mut include_geosite_rules = false;
+        let mut include_tun_mode = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -275,6 +299,12 @@ impl CliCommand {
                 }
                 "--replace-nodes" => {
                     replace_nodes = true;
+                }
+                "--include-geosite-rules" => {
+                    include_geosite_rules = true;
+                }
+                "--include-tun-mode" => {
+                    include_tun_mode = true;
                 }
                 "--help" | "-h" => {
                     print_import_usage();
@@ -297,6 +327,8 @@ impl CliCommand {
             output,
             config_path,
             replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
         })
     }
 
@@ -306,6 +338,8 @@ impl CliCommand {
         let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut subscription_output = None;
         let mut replace_nodes = false;
+        let mut include_geosite_rules = false;
+        let mut include_tun_mode = false;
         let mut provider_name = None;
         let mut existing_provider_name = None;
         let mut i = 0;
@@ -352,6 +386,12 @@ impl CliCommand {
                 "--replace-nodes" => {
                     replace_nodes = true;
                 }
+                "--include-geosite-rules" => {
+                    include_geosite_rules = true;
+                }
+                "--include-tun-mode" => {
+                    include_tun_mode = true;
+                }
                 "--help" | "-h" => {
                     print_subscribe_usage();
                     std::process::exit(0);
@@ -374,6 +414,8 @@ impl CliCommand {
             config_path,
             subscription_output,
             replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
             provider_name,
             existing_provider_name,
         })
@@ -385,6 +427,8 @@ impl CliCommand {
         let mut output = None;
         let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut replace_nodes = false;
+        let mut include_geosite_rules = false;
+        let mut include_tun_mode = false;
         let mut write = false;
         let mut force = false;
         let mut interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
@@ -412,6 +456,12 @@ impl CliCommand {
                 }
                 "--replace-nodes" => {
                     replace_nodes = true;
+                }
+                "--include-geosite-rules" => {
+                    include_geosite_rules = true;
+                }
+                "--include-tun-mode" => {
+                    include_tun_mode = true;
                 }
                 "--write" => {
                     write = true;
@@ -452,6 +502,8 @@ impl CliCommand {
             output,
             config_path,
             replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
             write,
             force,
             interval_days,
@@ -465,6 +517,8 @@ impl CliCommand {
         let mut output = None;
         let mut subscription_output = None;
         let mut replace_nodes = false;
+        let mut include_geosite_rules = false;
+        let mut include_tun_mode = false;
         let mut write = false;
         let mut i = 0;
         while i < args.len() {
@@ -500,6 +554,12 @@ impl CliCommand {
                 "--replace-nodes" => {
                     replace_nodes = true;
                 }
+                "--include-geosite-rules" => {
+                    include_geosite_rules = true;
+                }
+                "--include-tun-mode" => {
+                    include_tun_mode = true;
+                }
                 "--write" => {
                     write = true;
                 }
@@ -534,6 +594,8 @@ impl CliCommand {
             output,
             subscription_output,
             replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
             write,
         })
     }
@@ -690,6 +752,12 @@ fn print_run_usage() {
         "      --subscription-interval-days <N> Refresh interval in days (default: {DEFAULT_SUBSCRIPTION_INTERVAL_DAYS})"
     );
     println!("      --force-subscription-refresh    Fetch on startup even if cache is fresh");
+    println!(
+        "      --include-geosite-rules         Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
+    );
+    println!(
+        "      --include-tun-mode              Include a TUN inbound when creating a default config"
+    );
     println!("      --no-subscription-refresh       Disable TUI background subscription refresh");
 }
 
@@ -726,6 +794,12 @@ fn print_import_usage() {
     println!();
     println!("Behavior options:");
     println!("      --replace-nodes    Replace existing node outbounds instead of merging");
+    println!(
+        "      --include-geosite-rules    Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
+    );
+    println!(
+        "      --include-tun-mode         Include a TUN inbound when creating a default config"
+    );
 }
 
 fn print_subscribe_usage() {
@@ -748,6 +822,12 @@ fn print_subscribe_usage() {
     println!("Behavior options:");
     println!(
         "      --replace-nodes                   Replace existing node outbounds instead of merging"
+    );
+    println!(
+        "      --include-geosite-rules           Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
+    );
+    println!(
+        "      --include-tun-mode                Include a TUN inbound when creating a default config"
     );
 }
 
@@ -775,6 +855,12 @@ fn print_subscriptions_usage() {
     );
     println!("      --force              Fetch every provider even when cache is fresh");
     println!("      --replace-nodes      Replace all existing node outbounds before merging");
+    println!(
+        "      --include-geosite-rules    Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
+    );
+    println!(
+        "      --include-tun-mode         Include a TUN inbound when creating a default config"
+    );
 }
 
 fn print_sync_provider_usage() {
@@ -794,6 +880,12 @@ fn print_sync_provider_usage() {
     println!("Behavior options:");
     println!(
         "      --replace-nodes               Replace existing node outbounds instead of merging"
+    );
+    println!(
+        "      --include-geosite-rules       Include remote geoip/geosite/AdGuard rule-sets when creating a default config"
+    );
+    println!(
+        "      --include-tun-mode            Include a TUN inbound when creating a default config"
     );
     println!("      --write                       Overwrite the --config file in place");
 }
@@ -930,6 +1022,111 @@ mod tests {
                 ..
             } => assert!(subscription_refresh_disabled),
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn config_generation_commands_parse_default_config_include_flags() {
+        let run = CliCommand::parse([
+            "run".to_string(),
+            "--include-geosite-rules".to_string(),
+            "--include-tun-mode".to_string(),
+        ])
+        .expect("run command parses");
+        match run {
+            CliCommand::Run {
+                include_geosite_rules,
+                include_tun_mode,
+                ..
+            } => {
+                assert!(include_geosite_rules);
+                assert!(include_tun_mode);
+            }
+            _ => panic!("expected run command"),
+        }
+
+        let import = CliCommand::parse([
+            "import".to_string(),
+            "--input".to_string(),
+            "nodes.yaml".to_string(),
+            "--include-geosite-rules".to_string(),
+            "--include-tun-mode".to_string(),
+        ])
+        .expect("import command parses");
+        match import {
+            CliCommand::Import {
+                include_geosite_rules,
+                include_tun_mode,
+                ..
+            } => {
+                assert!(include_geosite_rules);
+                assert!(include_tun_mode);
+            }
+            _ => panic!("expected import command"),
+        }
+
+        let subscribe = CliCommand::parse([
+            "subscribe".to_string(),
+            "--url".to_string(),
+            "https://example.com/sub".to_string(),
+            "--include-geosite-rules".to_string(),
+            "--include-tun-mode".to_string(),
+        ])
+        .expect("subscribe command parses");
+        match subscribe {
+            CliCommand::Subscribe {
+                include_geosite_rules,
+                include_tun_mode,
+                ..
+            } => {
+                assert!(include_geosite_rules);
+                assert!(include_tun_mode);
+            }
+            _ => panic!("expected subscribe command"),
+        }
+
+        let subscriptions = CliCommand::parse([
+            "subscriptions".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+            "--include-geosite-rules".to_string(),
+            "--include-tun-mode".to_string(),
+        ])
+        .expect("subscriptions command parses");
+        match subscriptions {
+            CliCommand::Subscriptions {
+                include_geosite_rules,
+                include_tun_mode,
+                ..
+            } => {
+                assert!(include_geosite_rules);
+                assert!(include_tun_mode);
+            }
+            _ => panic!("expected subscriptions command"),
+        }
+
+        let sync = CliCommand::parse([
+            "sync".to_string(),
+            "--provider".to_string(),
+            "https://3.airtcp.me".to_string(),
+            "--account-file".to_string(),
+            "account.txt".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+            "--include-geosite-rules".to_string(),
+            "--include-tun-mode".to_string(),
+        ])
+        .expect("sync command parses");
+        match sync {
+            CliCommand::SyncProvider {
+                include_geosite_rules,
+                include_tun_mode,
+                ..
+            } => {
+                assert!(include_geosite_rules);
+                assert!(include_tun_mode);
+            }
+            _ => panic!("expected sync command"),
         }
     }
 
@@ -1112,7 +1309,7 @@ mod tests {
         let command = CliCommand::parse([
             "selectors".to_string(),
             "--controller".to_string(),
-            "http://127.0.0.1:9090".to_string(),
+            "http://127.0.0.1:9992".to_string(),
             "--selector".to_string(),
             "select".to_string(),
         ])
@@ -1123,7 +1320,7 @@ mod tests {
                 controller,
                 selector,
             } => {
-                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9090"));
+                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9992"));
                 assert_eq!(selector.as_deref(), Some("select"));
             }
             _ => panic!("expected selectors command"),
@@ -1135,13 +1332,13 @@ mod tests {
         let command = CliCommand::parse([
             "status".to_string(),
             "--controller".to_string(),
-            "http://127.0.0.1:9090".to_string(),
+            "http://127.0.0.1:9992".to_string(),
         ])
         .expect("status command parses");
 
         match command {
             CliCommand::Status { controller } => {
-                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9090"));
+                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9992"));
             }
             _ => panic!("expected status command"),
         }

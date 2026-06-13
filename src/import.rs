@@ -11,8 +11,8 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use crate::clash::{ClashConfig, convert_clash_proxy, is_metadata_entry};
 use crate::config::{
-    build_full_config, build_full_config_with_provider_groups,
-    ensure_bypass_rule_set_file_for_config,
+    DefaultConfigOptions, build_full_config_with_options,
+    build_full_config_with_provider_groups_and_options, ensure_bypass_rule_set_file_for_config,
 };
 
 pub(crate) fn run_import(
@@ -21,6 +21,8 @@ pub(crate) fn run_import(
     full_config: bool,
     config_path: &PathBuf,
     replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
 ) -> Result<()> {
     let text = fs::read_to_string(source)
         .with_context(|| format!("failed to read Clash proxy file {}", source.display()))?;
@@ -34,7 +36,15 @@ pub(crate) fn run_import(
         .collect::<Result<Vec<_>>>()?;
 
     let output_value = if full_config {
-        build_full_config(config_path, converted, replace_nodes)?
+        build_full_config_with_options(
+            config_path,
+            converted,
+            replace_nodes,
+            DefaultConfigOptions {
+                include_geosite_rules,
+                include_tun_mode,
+            },
+        )?
     } else {
         Value::Array(converted)
     };
@@ -62,6 +72,8 @@ pub(crate) fn run_subscribe_import(
     config_path: &PathBuf,
     subscription_output: Option<&PathBuf>,
     replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
     provider_name: Option<&str>,
     existing_provider_name: Option<&str>,
 ) -> Result<()> {
@@ -112,9 +124,21 @@ pub(crate) fn run_subscribe_import(
             replace_nodes,
             provider_name,
             existing_provider_name,
+            DefaultConfigOptions {
+                include_geosite_rules,
+                include_tun_mode,
+            },
         )?
     } else {
-        build_full_config_from_singbox_subscription(config_path, &subscription_json, replace_nodes)?
+        build_full_config_from_singbox_subscription_with_options(
+            config_path,
+            &subscription_json,
+            replace_nodes,
+            DefaultConfigOptions {
+                include_geosite_rules,
+                include_tun_mode,
+            },
+        )?
     };
     let config_text =
         serde_json::to_string_pretty(&config).context("failed to serialize merged config")?;
@@ -153,9 +177,28 @@ pub(crate) fn build_full_config_from_singbox_subscription(
     subscription_json: &str,
     replace_nodes: bool,
 ) -> Result<(Value, usize)> {
+    build_full_config_from_singbox_subscription_with_options(
+        config_path,
+        subscription_json,
+        replace_nodes,
+        DefaultConfigOptions::default(),
+    )
+}
+
+pub(crate) fn build_full_config_from_singbox_subscription_with_options(
+    config_path: &PathBuf,
+    subscription_json: &str,
+    replace_nodes: bool,
+    default_config_options: DefaultConfigOptions,
+) -> Result<(Value, usize)> {
     let imported_nodes = extract_mergeable_outbounds_from_singbox_subscription(subscription_json)?;
     let node_count = imported_nodes.len();
-    let config = build_full_config(config_path, imported_nodes, replace_nodes)?;
+    let config = build_full_config_with_options(
+        config_path,
+        imported_nodes,
+        replace_nodes,
+        default_config_options,
+    )?;
     Ok((config, node_count))
 }
 
@@ -165,15 +208,17 @@ pub(crate) fn build_full_config_from_singbox_subscription_with_provider_groups(
     replace_nodes: bool,
     provider_name: &str,
     existing_provider_name: Option<&str>,
+    default_config_options: DefaultConfigOptions,
 ) -> Result<(Value, usize)> {
     let imported_nodes = extract_mergeable_outbounds_from_singbox_subscription(subscription_json)?;
     let node_count = imported_nodes.len();
-    let config = build_full_config_with_provider_groups(
+    let config = build_full_config_with_provider_groups_and_options(
         config_path,
         imported_nodes,
         replace_nodes,
         provider_name,
         existing_provider_name,
+        default_config_options,
     )?;
     Ok((config, node_count))
 }
