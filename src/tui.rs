@@ -489,7 +489,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "a",
         summary: "Toggle auto-pick",
-        detail: "Enable or disable periodic benchmarking and automatic switching for the filter.",
+        detail: "Enable or disable periodic benchmarking and automatic switching for the current filter, or all nodes when the filter is empty.",
     },
     HelpBinding {
         key: "i",
@@ -1660,7 +1660,7 @@ impl App {
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) {
         self.benchmark_filter = state.benchmark_filter;
-        self.auto_select_enabled = state.auto_pick_enabled && !self.benchmark_filter.is_empty();
+        self.auto_select_enabled = state.auto_pick_enabled;
         self.bypass_entries = state.bypass_entries;
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
@@ -2655,11 +2655,6 @@ impl App {
             return Ok(());
         }
 
-        if self.benchmark_filter.is_empty() {
-            self.set_status_only("Set a filter before enabling auto-pick");
-            return Ok(());
-        }
-
         let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
             self.set_status_only("No selector group available for auto-pick");
             return Ok(());
@@ -2667,9 +2662,9 @@ impl App {
         self.auto_select_enabled = true;
         self.last_auto_select_benchmark = None;
         self.set_status_only(format!(
-            "Auto-pick enabled for {} with filter '{}' ({}ms threshold, every {}s)",
+            "Auto-pick enabled for {} ({}, {}ms threshold, every {}s)",
             group_name,
-            self.benchmark_filter,
+            self.benchmark_scope_label(),
             self.auto_select_threshold_ms,
             self.auto_select_interval.as_secs()
         ));
@@ -2678,7 +2673,7 @@ impl App {
     }
 
     fn auto_select_benchmark_due(&self, now: Instant) -> bool {
-        if !self.auto_select_enabled || self.benchmark_filter.is_empty() {
+        if !self.auto_select_enabled {
             return false;
         }
         self.last_auto_select_benchmark
@@ -2714,8 +2709,9 @@ impl App {
         self.last_auto_select_benchmark = Some(now);
         if candidate_names.is_empty() {
             self.set_status_only(format!(
-                "Auto-pick found no nodes in {} matching '{}'",
-                group.name, self.benchmark_filter
+                "Auto-pick found no nodes in {} for {}",
+                group.name,
+                self.benchmark_scope_label()
             ));
             return Ok(());
         }
@@ -2728,10 +2724,19 @@ impl App {
             BenchmarkJobKind::AutoSelect,
         );
         self.set_status_only(format!(
-            "Auto-pick benchmarking {} with filter '{}'...",
-            group.name, self.benchmark_filter
+            "Auto-pick benchmarking {} ({})...",
+            group.name,
+            self.benchmark_scope_label()
         ));
         Ok(())
+    }
+
+    fn benchmark_scope_label(&self) -> String {
+        if self.benchmark_filter.is_empty() {
+            "all nodes".to_string()
+        } else {
+            format!("filter '{}'", self.benchmark_filter)
+        }
     }
 
     fn auto_select_target(&self, group: &ProxyGroup, summary: &BenchmarkSummary) -> Option<String> {
@@ -3059,7 +3064,6 @@ impl App {
         self.sync_selection_to_displayed_members();
         self.last_auto_select_benchmark = None;
         if self.benchmark_filter.is_empty() {
-            self.auto_select_enabled = false;
             self.set_status_only("Benchmark filter cleared");
         } else {
             self.set_status_only(format!(
@@ -3575,6 +3579,21 @@ mod tests {
     }
 
     #[test]
+    fn app_applies_persisted_auto_pick_without_filter() {
+        let mut app = test_app();
+        let state = TuiRuntimeState {
+            benchmark_filter: String::new(),
+            auto_pick_enabled: true,
+            ..TuiRuntimeState::default()
+        };
+
+        app.apply_runtime_state(state);
+
+        assert!(app.benchmark_filter.is_empty());
+        assert!(app.auto_select_enabled);
+    }
+
+    #[test]
     fn filter_and_auto_pick_changes_are_saved_to_tui_state() {
         let path = test_state_path();
         let mut app = test_app();
@@ -4006,6 +4025,7 @@ mod tests {
     #[test]
     fn filter_modal_empty_submit_clears_filter() {
         let mut app = test_app();
+        app.auto_select_enabled = true;
 
         app.handle_key(KeyCode::Char('/')).expect("open modal");
         app.handle_key(KeyCode::Backspace).expect("backspace");
@@ -4015,6 +4035,7 @@ mod tests {
         assert!(app.benchmark_filter.is_empty());
         assert_eq!(app.filter_input, None);
         assert_eq!(app.status, "Benchmark filter cleared");
+        assert!(app.auto_select_enabled);
         assert!(app.flash.is_none());
     }
 
@@ -4294,17 +4315,23 @@ mod tests {
 
         app.last_auto_select_benchmark = Some(now - Duration::from_secs(30));
         assert!(app.auto_select_benchmark_due(now));
+
+        app.benchmark_filter.clear();
+        assert!(app.auto_select_benchmark_due(now));
     }
 
     #[test]
-    fn auto_select_toggle_requires_filter() {
+    fn auto_select_toggle_allows_empty_filter() {
         let mut app = test_app();
         app.benchmark_filter.clear();
 
         app.handle_key(KeyCode::Char('a')).expect("toggle handled");
 
-        assert!(!app.auto_select_enabled);
-        assert_eq!(app.status, "Set a filter before enabling auto-pick");
+        assert!(app.auto_select_enabled);
+        assert_eq!(
+            app.status,
+            "Auto-pick enabled for select (all nodes, 600ms threshold, every 30s)"
+        );
     }
 
     #[test]
