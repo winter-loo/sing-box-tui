@@ -185,7 +185,7 @@ Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,�
 
 TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and benchmark kind (`group`, `single`, or `auto`).
 
-TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last benchmark filter, whether auto-pick is enabled, and the current selected node for each selector group.
+TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last benchmark filter, whether auto-pick is enabled, and the current selected node for each selector group. On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
 
 TUI bypass entries are stored in that same state file and written to a sing-box source rule-set at `./sing-box-tui-bypass.json` by default. Set `SING_BOX_TUI_BYPASS_RULE_SET=/path/to/sing-box-tui-bypass.json` to use a different file. Generated and merged configs reference this local rule-set near the top of `route.rules`, routing matched domains/IPs/CIDRs to `direct` / `国内直连`. If an older live config does not yet reference the rule-set, regenerate/merge the config and restart or reload sing-box once; after that, the local rule-set file can be edited by the TUI and sing-box will reload it.
 

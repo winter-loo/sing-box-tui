@@ -1653,6 +1653,7 @@ impl App {
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
+        app.restore_persisted_selections(&runtime_state)?;
         app.apply_runtime_state(runtime_state);
         app.save_bypass_rule_set()?;
         Ok(app)
@@ -1695,6 +1696,59 @@ impl App {
             return Ok(());
         };
         store.save(&self.runtime_state())
+    }
+
+    fn persisted_selection_restore_plan(&self, state: &TuiRuntimeState) -> Vec<(String, String)> {
+        self.groups
+            .iter()
+            .filter(|group| group.kind.eq_ignore_ascii_case("selector"))
+            .filter_map(|group| {
+                let node = state.current_selected_nodes.get(&group.name)?;
+                if group.current.as_ref() == Some(node) {
+                    return None;
+                }
+                if !group.members.iter().any(|member| member == node) {
+                    return None;
+                }
+                Some((group.name.clone(), node.clone()))
+            })
+            .collect()
+    }
+
+    fn restore_persisted_selections(&mut self, state: &TuiRuntimeState) -> Result<()> {
+        let plan = self.persisted_selection_restore_plan(state);
+        if plan.is_empty() {
+            return Ok(());
+        }
+
+        let mut restored = 0usize;
+        let mut failures = Vec::new();
+        for (group, node) in plan {
+            match self.client.switch_proxy(&group, &node) {
+                Ok(()) => restored += 1,
+                Err(error) => failures.push(format!("{group} -> {node}: {error}")),
+            }
+        }
+
+        if restored > 0 {
+            if REFRESH_DEBOUNCE > Duration::ZERO {
+                std::thread::sleep(REFRESH_DEBOUNCE);
+            }
+            self.refresh()?;
+        }
+
+        if failures.is_empty() {
+            if restored > 0 {
+                self.set_status_only(format!("Restored {restored} saved selector selection(s)"));
+            }
+        } else {
+            let detail = truncate_for_width(&failures.join("; "), 90);
+            self.set_status_only(format!(
+                "Restored {restored} saved selector selection(s); failed: {detail}"
+            ));
+        }
+
+        Ok(())
     }
 
     fn save_bypass_rule_set(&self) -> Result<()> {
@@ -3576,6 +3630,55 @@ mod tests {
         assert_eq!(app.benchmark_filter, "node-b,node-c");
         assert!(app.auto_select_enabled);
         assert_eq!(app.member_index, 2);
+    }
+
+    #[test]
+    fn restore_plan_targets_changed_valid_selector_nodes() {
+        let mut app = test_app();
+        app.groups = vec![
+            ProxyGroup {
+                name: "select".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("node-a".to_string()),
+                members: vec!["node-a".to_string(), "node-b".to_string()],
+            },
+            ProxyGroup {
+                name: "auto".to_string(),
+                kind: "URLTest".to_string(),
+                current: Some("node-a".to_string()),
+                members: vec!["node-a".to_string(), "node-b".to_string()],
+            },
+            ProxyGroup {
+                name: "same".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("node-a".to_string()),
+                members: vec!["node-a".to_string(), "node-b".to_string()],
+            },
+            ProxyGroup {
+                name: "stale".to_string(),
+                kind: "Selector".to_string(),
+                current: Some("node-a".to_string()),
+                members: vec!["node-a".to_string()],
+            },
+        ];
+        let mut state = TuiRuntimeState::default();
+        state
+            .current_selected_nodes
+            .insert("select".to_string(), "node-b".to_string());
+        state
+            .current_selected_nodes
+            .insert("auto".to_string(), "node-b".to_string());
+        state
+            .current_selected_nodes
+            .insert("same".to_string(), "node-a".to_string());
+        state
+            .current_selected_nodes
+            .insert("stale".to_string(), "node-missing".to_string());
+
+        assert_eq!(
+            app.persisted_selection_restore_plan(&state),
+            vec![("select".to_string(), "node-b".to_string())]
+        );
     }
 
     #[test]
