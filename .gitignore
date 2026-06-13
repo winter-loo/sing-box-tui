@@ -4,6 +4,7 @@
 # Local runtime/subscription artifacts.
 /cache.db
 /config.json
+/core.log
 /clash_proxies.txt
 /imported_nodes.json
 /sing_box_nodes.json
