@@ -829,6 +829,12 @@ fn latency_chart_y_bounds(min_y: f64, max_y: f64, threshold_ms: u64) -> [f64; 2]
     [0.0_f64.max(min_y - padding), max_y + padding]
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoSelectSwitchPlan {
+    target_node: Option<String>,
+    parent_switch: Option<(String, String)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LatencyChartTimeUnit {
     Minutes,
@@ -1825,6 +1831,21 @@ impl App {
             .is_some_and(|group| group.kind.eq_ignore_ascii_case("selector"))
     }
 
+    fn implicit_root_parent_switch_for_group(&self, group_name: &str) -> Option<(String, String)> {
+        let root = self.implicit_root_group()?;
+        if root.current.as_deref() == Some(group_name) {
+            return None;
+        }
+        if self
+            .provider_child_group_names(root)
+            .iter()
+            .any(|provider| provider == group_name)
+        {
+            return Some((root.name.clone(), group_name.to_string()));
+        }
+        None
+    }
+
     fn selected_member_panel_group(&self) -> Option<&ProxyGroup> {
         if self.implicit_root_mode() {
             let choice = self.selected_root_choice_name()?;
@@ -2809,6 +2830,17 @@ impl App {
         Some(best.name.clone())
     }
 
+    fn auto_select_switch_plan(
+        &self,
+        group: &ProxyGroup,
+        summary: &BenchmarkSummary,
+    ) -> AutoSelectSwitchPlan {
+        AutoSelectSwitchPlan {
+            target_node: self.auto_select_target(group, summary),
+            parent_switch: self.implicit_root_parent_switch_for_group(&group.name),
+        }
+    }
+
     fn finish_auto_select_benchmark(
         &mut self,
         group_name: &str,
@@ -2827,24 +2859,52 @@ impl App {
             return Ok(());
         };
 
-        let Some(target) = self.auto_select_target(&group, summary) else {
+        let plan = self.auto_select_switch_plan(&group, summary);
+        if plan.target_node.is_none() && plan.parent_switch.is_none() {
             let current = group.current.as_deref().unwrap_or("unset");
             self.set_status_only(format!(
                 "Auto-pick kept {} on {} (threshold {}ms)",
                 group_name, current, self.auto_select_threshold_ms
             ));
             return Ok(());
-        };
+        }
 
-        self.client
-            .switch_proxy(group_name, &target)
-            .with_context(|| format!("auto-pick failed to switch {} to {}", group_name, target))?;
+        if let Some(target) = &plan.target_node {
+            self.client
+                .switch_proxy(group_name, target)
+                .with_context(|| {
+                    format!("auto-pick failed to switch {} to {}", group_name, target)
+                })?;
+        }
+        if let Some((parent, provider)) = &plan.parent_switch {
+            self.client
+                .switch_proxy(parent, provider)
+                .with_context(|| {
+                    format!("auto-pick failed to switch {} to {}", parent, provider)
+                })?;
+        }
         if REFRESH_DEBOUNCE > Duration::ZERO {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }
         self.refresh()?;
         self.save_runtime_state()?;
-        self.set_status_only(format!("Auto-pick switched {} to {}", group_name, target));
+        match (&plan.target_node, &plan.parent_switch) {
+            (Some(target), Some((_, provider))) => self.set_status_only(format!(
+                "Auto-pick switched {} to {} and selected {}",
+                group_name, target, provider
+            )),
+            (Some(target), None) => {
+                self.set_status_only(format!("Auto-pick switched {} to {}", group_name, target))
+            }
+            (None, Some((_, provider))) => {
+                let current = group.current.as_deref().unwrap_or("unset");
+                self.set_status_only(format!(
+                    "Auto-pick selected {}; kept {} on {} (threshold {}ms)",
+                    provider, group_name, current, self.auto_select_threshold_ms
+                ));
+            }
+            (None, None) => {}
+        }
         Ok(())
     }
 
@@ -3148,13 +3208,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
-        LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState,
-        LatencyChartTimeUnit, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
-        connection_is_direct, format_bytes, format_connection_line, format_duration_badge,
-        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
-        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
-        latency_chart_zoom_out, next_clash_mode, subscription_report_badge, truncate_for_width,
+        App, AutoSelectSwitchPlan, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
+        GLOBAL_CLASH_MODE, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
+        LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE,
+        SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, connection_is_direct, format_bytes,
+        format_connection_line, format_duration_badge, latency_chart_segments,
+        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
+        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        subscription_report_badge, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -4243,6 +4304,19 @@ mod tests {
     }
 
     #[test]
+    fn implicit_root_parent_switch_targets_non_current_provider() {
+        let app = provider_app();
+
+        assert_eq!(
+            app.implicit_root_parent_switch_for_group("AirTCP"),
+            Some(("手动选择".to_string(), "AirTCP".to_string()))
+        );
+        assert_eq!(app.implicit_root_parent_switch_for_group("宝贝云"), None);
+        assert_eq!(app.implicit_root_parent_switch_for_group("自动选择"), None);
+        assert_eq!(app.implicit_root_parent_switch_for_group("missing"), None);
+    }
+
+    #[test]
     fn implicit_root_benchmark_summary_is_scoped_to_selected_choice() {
         let mut app = provider_app();
         app.benchmarks.insert(
@@ -4404,6 +4478,40 @@ mod tests {
         assert_eq!(
             app.auto_select_target(&group, &summary),
             Some("美国-b".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_select_plan_selects_provider_even_when_node_is_kept() {
+        let app = provider_app();
+        let group = app.group_by_name("AirTCP").expect("provider").clone();
+        let summary = BenchmarkSummary {
+            selector: "AirTCP".to_string(),
+            current: Some("air-1".to_string()),
+            pattern: String::new(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![
+                BenchmarkResult {
+                    name: "air-1".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "air-2".to_string(),
+                    delay: Some(90),
+                    completed: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            app.auto_select_switch_plan(&group, &summary),
+            AutoSelectSwitchPlan {
+                target_node: None,
+                parent_switch: Some(("手动选择".to_string(), "AirTCP".to_string())),
+            }
         );
     }
 
