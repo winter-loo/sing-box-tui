@@ -369,7 +369,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
-- `p`: on Windows, toggle the current user's system proxy for the sing-box mixed inbound
+- `p`: on Windows/macOS, toggle the system proxy for the sing-box mixed inbound
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
@@ -387,15 +387,24 @@ Two read-only controller commands are available in addition to the TUI and bench
 
 During async benchmarks, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.
 
-## Windows System Proxy
+## System Proxy
 
-The TUI can set the Windows WinINET system proxy with `p`. It runs:
+The TUI can set the OS system proxy with `p`. On Windows, it updates the current
+user's WinINET proxy:
 
 ```powershell
 scripts\windows\set-system-proxy.cmd -Enable -Server 127.0.0.1:6780
 ```
 
-The server is detected from the configured sing-box JSON `mixed` inbound when possible. Override it with:
+On macOS, it uses `networksetup` to update HTTP, HTTPS, and SOCKS proxies on
+all enabled network services. To target specific macOS network services, set a
+comma-separated service list:
+
+```bash
+SING_BOX_TUI_SYSTEM_PROXY_SERVICE="Wi-Fi,USB 10/100 LAN" cargo run -- run
+```
+
+The proxy server is detected from the configured sing-box JSON `mixed` inbound when possible. Override it with:
 
 ```powershell
 $env:SING_BOX_TUI_SYSTEM_PROXY_SERVER = "127.0.0.1:6780"
@@ -405,6 +414,14 @@ To disable the Windows system proxy manually:
 
 ```powershell
 scripts\windows\set-system-proxy.cmd -Disable
+```
+
+To disable the macOS system proxy manually for a service:
+
+```bash
+networksetup -setwebproxystate Wi-Fi off
+networksetup -setsecurewebproxystate Wi-Fi off
+networksetup -setsocksfirewallproxystate Wi-Fi off
 ```
 
 If you call the PowerShell script directly, pass a process-scoped execution policy override:

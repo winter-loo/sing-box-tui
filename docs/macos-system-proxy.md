@@ -6,6 +6,11 @@ This note documents how the macOS system proxy was changed from the AirTCP clien
 
 The sing-box service was already running with a mixed inbound on port `6780` and a Clash API controller on port `9992`.
 
+The TUI can now toggle these proxy settings with `p`. By default it applies the
+proxy to every enabled macOS network service. Set
+`SING_BOX_TUI_SYSTEM_PROXY_SERVICE` to a comma-separated list such as
+`Wi-Fi,USB 10/100 LAN` if you want to target specific services.
+
 The live config showed the mixed inbound:
 
 ```bash

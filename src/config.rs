@@ -110,6 +110,7 @@ pub(crate) struct ProviderNodeSet {
     pub(crate) nodes: Vec<Value>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_full_config_with_provider_node_sets(
     config_path: &PathBuf,
     provider_node_sets: Vec<ProviderNodeSet>,
@@ -154,6 +155,7 @@ pub(crate) fn build_full_config_with_provider_node_sets_and_options(
     Ok(config)
 }
 
+#[cfg(test)]
 pub(crate) fn build_default_config(imported_nodes: Vec<Value>) -> Value {
     build_default_config_with_options(imported_nodes, DefaultConfigOptions::default())
 }

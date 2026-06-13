@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -519,7 +519,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "p",
         summary: "Toggle system proxy",
-        detail: "Enable or disable WinINET system proxy for the detected sing-box mixed inbound.",
+        detail: "Enable or disable the OS system proxy for the detected sing-box mixed inbound.",
     },
     HelpBinding {
         key: "u",
@@ -1213,7 +1213,7 @@ fn find_json_string_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
 }
 
 #[cfg(windows)]
-fn run_windows_system_proxy_script(server: &str, enable: bool) -> Result<String> {
+fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
     let script = windows_system_proxy_script_path()
         .with_context(|| "failed to locate scripts/windows/set-system-proxy.ps1")?;
     let action = if enable { "-Enable" } else { "-Disable" };
@@ -1253,13 +1253,44 @@ fn run_windows_system_proxy_script(server: &str, enable: bool) -> Result<String>
     )
 }
 
-#[cfg(not(windows))]
-fn run_windows_system_proxy_script(_server: &str, _enable: bool) -> Result<String> {
-    bail!("Windows system proxy script is only available on Windows")
+#[cfg(target_os = "macos")]
+fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
+    let services = macos_system_proxy_services()?;
+    if services.is_empty() {
+        bail!("no enabled macOS network services found");
+    }
+
+    if enable {
+        let (host, port) = parse_proxy_server(server)?;
+        for service in &services {
+            run_networksetup(&["-setwebproxy", service, &host, &port])?;
+            run_networksetup(&["-setsecurewebproxy", service, &host, &port])?;
+            run_networksetup(&["-setsocksfirewallproxy", service, &host, &port])?;
+        }
+        Ok(format!(
+            "Enabled macOS system proxy for {} at {server}",
+            services.join(", ")
+        ))
+    } else {
+        for service in &services {
+            run_networksetup(&["-setwebproxystate", service, "off"])?;
+            run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
+            run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
+        }
+        Ok(format!(
+            "Disabled macOS system proxy for {}",
+            services.join(", ")
+        ))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn run_system_proxy_update(_server: &str, _enable: bool) -> Result<String> {
+    bail!("system proxy toggle is only available on Windows and macOS")
 }
 
 #[cfg(windows)]
-fn windows_system_proxy_matches(server: &str) -> bool {
+fn system_proxy_matches(server: &str) -> bool {
     let output = Command::new("reg.exe")
         .args([
             "query",
@@ -1282,9 +1313,125 @@ fn windows_system_proxy_matches(server: &str) -> bool {
         })
 }
 
-#[cfg(not(windows))]
-fn windows_system_proxy_matches(_server: &str) -> bool {
+#[cfg(target_os = "macos")]
+fn system_proxy_matches(server: &str) -> bool {
+    let Ok((host, port)) = parse_proxy_server(server) else {
+        return false;
+    };
+    let output = Command::new("scutil").arg("--proxy").output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    macos_proxy_value(&text, "HTTPEnable") == Some("1")
+        && macos_proxy_value(&text, "HTTPProxy") == Some(host.as_str())
+        && macos_proxy_value(&text, "HTTPPort") == Some(port.as_str())
+        && macos_proxy_value(&text, "HTTPSEnable") == Some("1")
+        && macos_proxy_value(&text, "HTTPSProxy") == Some(host.as_str())
+        && macos_proxy_value(&text, "HTTPSPort") == Some(port.as_str())
+        && macos_proxy_value(&text, "SOCKSEnable") == Some("1")
+        && macos_proxy_value(&text, "SOCKSProxy") == Some(host.as_str())
+        && macos_proxy_value(&text, "SOCKSPort") == Some(port.as_str())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_proxy_matches(_server: &str) -> bool {
     false
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn parse_proxy_server(server: &str) -> Result<(String, String)> {
+    let server = server.trim();
+    let (host, port) = server
+        .rsplit_once(':')
+        .with_context(|| format!("system proxy server must be host:port, got {server}"))?;
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = port.trim().to_string();
+    if host.is_empty() {
+        bail!("system proxy server host is empty");
+    }
+    let parsed_port = port
+        .parse::<u16>()
+        .with_context(|| format!("system proxy server port must be a number, got {port}"))?;
+    if parsed_port == 0 {
+        bail!("system proxy server port must be greater than 0");
+    }
+    Ok((host, port))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_proxy_services() -> Result<Vec<String>> {
+    if let Ok(value) = env::var("SING_BOX_TUI_SYSTEM_PROXY_SERVICE") {
+        let services = value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !services.is_empty() {
+            return Ok(services);
+        }
+    }
+
+    let output = Command::new("networksetup")
+        .arg("-listallnetworkservices")
+        .output()
+        .context("failed to list macOS network services")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        bail!(
+            "networksetup -listallnetworkservices exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            message
+        );
+    }
+
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("An asterisk"))
+        .filter(|line| !line.starts_with('*'))
+        .map(ToString::to_string)
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn run_networksetup(args: &[&str]) -> Result<()> {
+    let output = Command::new("networksetup")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run networksetup {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    bail!(
+        "networksetup {} exited with {}: {}",
+        args.join(" "),
+        output.status.code().unwrap_or(-1),
+        message
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_proxy_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        (key.trim() == name).then_some(value.trim())
+    })
 }
 
 #[cfg(windows)]
@@ -1456,7 +1603,7 @@ impl App {
         let runtime_state = state_store.load()?;
         let system_proxy_server =
             default_system_proxy_server(&subscription_refresh_options.config_path);
-        let system_proxy_enabled = windows_system_proxy_matches(&system_proxy_server);
+        let system_proxy_enabled = system_proxy_matches(&system_proxy_server);
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
@@ -2010,7 +2157,7 @@ impl App {
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('B') => self.open_bypass_modal(),
-            KeyCode::Char('p') => self.set_windows_system_proxy(),
+            KeyCode::Char('p') => self.set_system_proxy(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.run_verify(false)?,
@@ -2769,20 +2916,20 @@ impl App {
         Ok(())
     }
 
-    fn set_windows_system_proxy(&mut self) {
+    fn set_system_proxy(&mut self) {
         if self.system_proxy_job.is_some() {
             self.set_status_only("System proxy update is already running");
             return;
         }
         self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
-        self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
+        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
         let enable = !self.system_proxy_enabled;
         let server = self.system_proxy_server.clone();
         let (tx, rx) = mpsc::channel();
         let worker_server = server.clone();
         let worker = thread::spawn(move || {
-            let result = run_windows_system_proxy_script(&worker_server, enable)
-                .map_err(|error| error.to_string());
+            let result =
+                run_system_proxy_update(&worker_server, enable).map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
         self.system_proxy_job = Some(SystemProxyJob {
@@ -2817,14 +2964,14 @@ impl App {
             Ok(message) => {
                 self.system_proxy_server = job.server;
                 self.system_proxy_enabled = if job.enable {
-                    windows_system_proxy_matches(&self.system_proxy_server)
+                    system_proxy_matches(&self.system_proxy_server)
                 } else {
                     false
                 };
                 self.set_status_with_flash(message);
             }
             Err(error) => {
-                self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
+                self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
                 self.set_status_with_flash(format!(
                     "System proxy update failed: {}",
                     truncate_for_width(&error, 90)
@@ -2842,7 +2989,7 @@ impl App {
         }
         self.last_system_proxy_status_refresh = Instant::now();
         self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
-        self.system_proxy_enabled = windows_system_proxy_matches(&self.system_proxy_server);
+        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
     }
 
     fn open_benchmark_filter_modal(&mut self) {

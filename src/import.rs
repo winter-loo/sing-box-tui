@@ -172,6 +172,7 @@ struct SubscriptionImportOutput {
     subscription_output_path: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_full_config_from_singbox_subscription(
     config_path: &PathBuf,
     subscription_json: &str,
