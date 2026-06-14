@@ -369,7 +369,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
-- `p`: on Windows/macOS, toggle the system proxy for the sing-box mixed inbound
+- `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
 - `Enter`: unused for selection
 - `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
 - `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
@@ -404,6 +404,19 @@ comma-separated service list:
 SING_BOX_TUI_SYSTEM_PROXY_SERVICE="Wi-Fi,USB 10/100 LAN" cargo run -- run
 ```
 
+On Linux, it uses `gsettings` to update the GNOME desktop proxy settings for
+HTTP, HTTPS, and SOCKS:
+
+```bash
+gsettings set org.gnome.system.proxy mode manual
+gsettings set org.gnome.system.proxy.http host 127.0.0.1
+gsettings set org.gnome.system.proxy.http port 6780
+gsettings set org.gnome.system.proxy.https host 127.0.0.1
+gsettings set org.gnome.system.proxy.https port 6780
+gsettings set org.gnome.system.proxy.socks host 127.0.0.1
+gsettings set org.gnome.system.proxy.socks port 6780
+```
+
 The proxy server is detected from the configured sing-box JSON `mixed` inbound when possible. Override it with:
 
 ```powershell
@@ -422,6 +435,12 @@ To disable the macOS system proxy manually for a service:
 networksetup -setwebproxystate Wi-Fi off
 networksetup -setsecurewebproxystate Wi-Fi off
 networksetup -setsocksfirewallproxystate Wi-Fi off
+```
+
+To disable the Linux system proxy manually:
+
+```bash
+gsettings set org.gnome.system.proxy mode none
 ```
 
 If you call the PowerShell script directly, pass a process-scoped execution policy override:

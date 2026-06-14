@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -1290,9 +1290,34 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
+    if !command_exists("gsettings") {
+        bail!("Linux system proxy toggle requires gsettings");
+    }
+
+    if enable {
+        let (host, port) = parse_proxy_server(server)?;
+        let host_value = gsettings_string_value(&host);
+        run_gsettings(&["set", "org.gnome.system.proxy", "mode", "manual"])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.http", "host", &host_value])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.http", "port", &port])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.https", "host", &host_value])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.socks", "host", &host_value])?;
+        run_gsettings(&["set", "org.gnome.system.proxy.socks", "port", &port])?;
+        Ok(format!(
+            "Enabled Linux system proxy via gsettings: {server}"
+        ))
+    } else {
+        run_gsettings(&["set", "org.gnome.system.proxy", "mode", "none"])?;
+        Ok("Disabled Linux system proxy via gsettings".to_string())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn run_system_proxy_update(_server: &str, _enable: bool) -> Result<String> {
-    bail!("system proxy toggle is only available on Windows and macOS")
+    bail!("system proxy toggle is only available on Windows, macOS, and Linux")
 }
 
 #[cfg(windows)]
@@ -1343,12 +1368,26 @@ fn system_proxy_matches(server: &str) -> bool {
         && macos_proxy_value(&text, "SOCKSPort") == Some(port.as_str())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn system_proxy_matches(server: &str) -> bool {
+    let Ok((host, port)) = parse_proxy_server(server) else {
+        return false;
+    };
+    gsettings_value("org.gnome.system.proxy", "mode").as_deref() == Some("manual")
+        && gsettings_value("org.gnome.system.proxy.http", "host").as_deref() == Some(host.as_str())
+        && gsettings_value("org.gnome.system.proxy.http", "port").as_deref() == Some(port.as_str())
+        && gsettings_value("org.gnome.system.proxy.https", "host").as_deref() == Some(host.as_str())
+        && gsettings_value("org.gnome.system.proxy.https", "port").as_deref() == Some(port.as_str())
+        && gsettings_value("org.gnome.system.proxy.socks", "host").as_deref() == Some(host.as_str())
+        && gsettings_value("org.gnome.system.proxy.socks", "port").as_deref() == Some(port.as_str())
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn system_proxy_matches(_server: &str) -> bool {
     false
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn parse_proxy_server(server: &str) -> Result<(String, String)> {
     let server = server.trim();
     let (host, port) = server
@@ -1370,6 +1409,56 @@ fn parse_proxy_server(server: &str) -> Result<(String, String)> {
         bail!("system proxy server port must be greater than 0");
     }
     Ok((host, port))
+}
+
+#[cfg(target_os = "linux")]
+fn run_gsettings(args: &[&str]) -> Result<()> {
+    let output = Command::new("gsettings")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run gsettings {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    bail!(
+        "gsettings {} exited with {}: {}",
+        args.join(" "),
+        output.status.code().unwrap_or(-1),
+        message
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_value(schema: &str, key: &str) -> Option<String> {
+    let output = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Some(parse_gsettings_scalar(&value).to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_gsettings_scalar(value: &str) -> &str {
+    value.trim().trim_start_matches('\'').trim_end_matches('\'')
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_string_value(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(command: &str) -> bool {
+    env::var_os("PATH")
+        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).is_file()))
 }
 
 #[cfg(target_os = "macos")]
