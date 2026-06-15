@@ -147,6 +147,30 @@ Selector Groups | Providers | Nodes
 
 Selecting a node inside a provider group updates that provider selector and then points the parent selector at the provider. This supports configs shaped like `手动选择 -> 宝贝云 -> node`.
 
+## Onboarding
+
+Run the onboarding script before first use. It checks whether `sing-box` is already on `PATH`; if not, it downloads the matching official sing-box release for the current OS/CPU and installs it into a user-local bin directory.
+
+Windows:
+
+```powershell
+scripts\onboard.cmd
+```
+
+macOS/Linux:
+
+```sh
+scripts/onboard.sh
+```
+
+Useful options:
+
+```sh
+python3 scripts/onboard.py --check-only
+python3 scripts/onboard.py --dry-run --force
+python3 scripts/onboard.py --install-dir ./tools/bin --force
+```
+
 ## Requirements
 
 - `sing-box` must expose `experimental.clash_api.external_controller`, usually `127.0.0.1:9992`
