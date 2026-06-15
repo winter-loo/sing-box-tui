@@ -1387,7 +1387,7 @@ fn system_proxy_matches(_server: &str) -> bool {
     false
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_proxy_server(server: &str) -> Result<(String, String)> {
     let server = server.trim();
     let (host, port) = server
