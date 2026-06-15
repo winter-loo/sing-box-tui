@@ -62,7 +62,7 @@ from cdp_wsl import (
 )
 
 DEFAULT_CDP_URL = os.environ.get(CDP_URL_ENV, "http://127.0.0.1:9229")
-DEFAULT_CONSOLE_URL = "https://yes.xn--mesv7f5toqlp.biz/console"
+DEFAULT_CONSOLE_URL = "https://白嫖机场.com/"
 DEFAULT_PROVIDER_NAME = "白嫖机场"
 
 
@@ -574,11 +574,12 @@ def ensure_console_page(cdp: CdpConnection, console_url: str, timeout_ms: int) -
         "(() => window.location.href)()",
         timeout=min(5.0, timeout_ms / 1000),
     )
-    if same_normalized_url(str(current_url), console_url):
+    if is_expected_console_page(str(current_url), console_url):
         return
 
     cdp.call("Page.navigate", {"url": console_url}, timeout=min(5.0, timeout_ms / 1000))
     deadline = time.monotonic() + timeout_ms / 1000
+    last_state: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         try:
             state = evaluate(
@@ -589,14 +590,19 @@ def ensure_console_page(cdp: CdpConnection, console_url: str, timeout_ms: int) -
         except ExtractionError:
             time.sleep(0.2)
             continue
+        if isinstance(state, dict):
+            last_state = state
         if (
             isinstance(state, dict)
-            and same_normalized_url(str(state.get("url", "")), console_url)
+            and is_expected_console_page(str(state.get("url", "")), console_url)
             and state.get("ready") != "loading"
         ):
             return
         time.sleep(0.2)
-    raise ExtractionError(f"timed out waiting for BaiPiao console page: {console_url}")
+    detail = ""
+    if last_state:
+        detail = f"; last url={last_state.get('url', '')}, ready={last_state.get('ready', '')}"
+    raise ExtractionError(f"timed out waiting for BaiPiao console page: {console_url}{detail}")
 
 
 def same_normalized_url(left: str, right: str) -> bool:
@@ -607,6 +613,12 @@ def same_normalized_url(left: str, right: str) -> bool:
         and left_parsed.netloc == right_parsed.netloc
         and left_parsed.path.rstrip("/") == right_parsed.path.rstrip("/")
     )
+
+
+def is_expected_console_page(current_url: str, requested_url: str) -> bool:
+    if same_normalized_url(current_url, requested_url):
+        return True
+    return baipiao_target_score("", current_url, "xn--mesv7f5toqlp") >= 20
 
 
 def capture_import_url_from_interaction(cdp: CdpConnection, timeout_ms: int) -> str | None:
