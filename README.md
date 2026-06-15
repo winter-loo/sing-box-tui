@@ -49,12 +49,27 @@ config. Add `--include-tun-mode` if you explicitly want a TUN inbound in a newly
 created default config. Existing configs keep whatever rule-sets and inbounds
 they already contain.
 
-For multiple saved subscription URLs, keep a local `.suburl` file in provider-name format:
+To import one or more provider subscription URLs, copy the sing-box subscription
+URL from the provider website and save it in a local `.suburl` file. Each line
+uses `provider name = subscription url`:
 
 ```text
 baobeiyun = https://example.com/api/subscribe?token=REDACTED
 airtcp = https://spring.mailrelay.us/link/REDACTED?singbox=1
 ```
+
+Then refresh those subscriptions into a config:
+
+```bash
+cargo run -- subscriptions \
+  --input .suburl \
+  --cache .suburl.cache.json \
+  --config ./config.json \
+  --output ./output/refreshed-config.json
+```
+
+Keep `.suburl` private because provider subscription URLs usually contain
+account tokens.
 
 Provider helper scripts under `scripts/` can extract subscription URLs from an
 already-authenticated Chrome tab through CDP. When Chrome runs on Windows and
@@ -99,7 +114,9 @@ reachable CDP port can control the attached browser profile.
 Set `WSL_CDP_LOG=1` to print CDP helper diagnostics such as host resolution,
 URL rewrites, and relay start/stop events.
 
-Refresh providers at most once per day and update only server node outbounds in an existing config:
+For scheduled or repeated refreshes, use the same `subscriptions` command. It
+refreshes providers at most once per day by default and updates only server node
+outbounds in an existing config:
 
 ```bash
 cargo run -- subscriptions \

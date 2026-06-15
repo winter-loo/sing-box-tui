@@ -7,12 +7,25 @@ already-running Chrome DevTools Protocol (CDP) endpoint, matching the existing
 provider extractor workflow.
 
 Start Chrome with CDP enabled first, for example:
-  open -n -a "Google Chrome" --args \
-    --user-data-dir=/tmp/chrome-cdp-profile-9229 \
-    --remote-debugging-address=127.0.0.1 \
-    --remote-debugging-port=9229 \
-    --remote-allow-origins='*' \
-    --new-window 'https://yes.xn--mesv7f5toqlp.biz/console'
+  PowerShell on Windows:
+    $chrome = "${env:ProgramFiles}\\Google\\Chrome\\Application\\chrome.exe"
+    if (-not (Test-Path $chrome)) { $chrome = "${env:ProgramFiles(x86)}\\Google\\Chrome\\Application\\chrome.exe" }
+    Start-Process -FilePath $chrome -ArgumentList @(
+      "--user-data-dir=$env:TEMP\\chrome-cdp-profile-9229",
+      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-port=9229",
+      "--remote-allow-origins=*",
+      "--new-window",
+      "https://yes.xn--mesv7f5toqlp.biz/console"
+    )
+
+  macOS:
+    open -n -a "Google Chrome" --args \
+      --user-data-dir=/tmp/chrome-cdp-profile-9229 \
+      --remote-debugging-address=127.0.0.1 \
+      --remote-debugging-port=9229 \
+      --remote-allow-origins='*' \
+      --new-window 'https://yes.xn--mesv7f5toqlp.biz/console'
 
 Then log in to 白嫖机场 in that Chrome window. This script prints the direct
 HTTPS subscription URL by default. When writing to a file, it writes
@@ -426,13 +439,18 @@ def format_cdp_connection_error(cdp_url: str, path: str, reason: object) -> str:
     return (
         f"Cannot connect to Chrome DevTools at {endpoint}.\n"
         f"Chrome is probably not running with remote debugging enabled on this port.\n"
-        f"Start Chrome with CDP enabled, then log in to BaiPiao:\n"
-        f"  Start-Process chrome -ArgumentList "
-        f"'--remote-debugging-address=127.0.0.1', "
-        f"'--remote-debugging-port=9229', "
-        f"'--remote-allow-origins=*', "
-        f"'--new-window', "
-        f"'{DEFAULT_CONSOLE_URL}'\n"
+        f"Start a separate Chrome profile with CDP enabled, then log in to BaiPiao:\n"
+        f"  $chrome = \"${{env:ProgramFiles}}\\Google\\Chrome\\Application\\chrome.exe\"\n"
+        f"  if (-not (Test-Path $chrome)) {{ $chrome = \"${{env:ProgramFiles(x86)}}\\Google\\Chrome\\Application\\chrome.exe\" }}\n"
+        f"  Start-Process -FilePath $chrome -ArgumentList @(\n"
+        f"    \"--user-data-dir=$env:TEMP\\chrome-cdp-profile-9229\",\n"
+        f"    \"--remote-debugging-address=127.0.0.1\",\n"
+        f"    \"--remote-debugging-port=9229\",\n"
+        f"    \"--remote-allow-origins=*\",\n"
+        f"    \"--new-window\",\n"
+        f"    \"{DEFAULT_CONSOLE_URL}\"\n"
+        f"  )\n"
+        f"Verify it with: Invoke-RestMethod http://127.0.0.1:9229/json/version\n"
         f"If Chrome uses another port, pass it with --cdp-url, for example "
         f"--cdp-url http://127.0.0.1:9230.\n"
         f"Original error: {reason}"
