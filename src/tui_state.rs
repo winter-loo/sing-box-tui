@@ -14,7 +14,7 @@ use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
 
 const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) benchmark_filter: String,
@@ -24,6 +24,24 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) current_selected_nodes: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) bypass_entries: Vec<String>,
+    #[serde(default)]
+    pub(crate) onboarding_complete: bool,
+    #[serde(default)]
+    pub(crate) benchmark_url: Option<String>,
+    #[serde(default)]
+    pub(crate) benchmark_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) benchmark_request_timeout: Option<f64>,
+    #[serde(default)]
+    pub(crate) benchmark_max_concurrency: Option<usize>,
+    #[serde(default)]
+    pub(crate) auto_select_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) auto_select_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub(crate) system_proxy_server: Option<String>,
+    #[serde(default)]
+    pub(crate) system_proxy_server_override: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +54,10 @@ impl TuiStateStore {
         Self {
             path: path.as_ref().to_path_buf(),
         }
+    }
+
+    pub(crate) fn exists(&self) -> bool {
+        self.path.exists()
     }
 
     pub(crate) fn load(&self) -> Result<TuiRuntimeState> {

@@ -1,5 +1,46 @@
 # sing-box-tui
 
+Terminal UI for managing sing-box selector nodes, benchmarks, subscription
+refresh, bypass rules, and OS system proxy settings.
+
+![Main screen](docs/assets/main-screen.svg)
+
+## Quick start on Windows
+
+Install the latest prebuilt Windows release:
+
+```powershell
+irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 | iex
+```
+
+The installer downloads the latest `sing-box-tui` Windows x64 release from
+GitHub, installs it under `%LOCALAPPDATA%\sing-box-tui`, adds that directory to
+the user `PATH`, and installs `sing-box` with `winget` when it is missing.
+
+From a local checkout, you can run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -AddToPath
+```
+
+Start the TUI:
+
+```powershell
+sing-box-tui run
+```
+
+On first launch, the TUI shows a setup wizard. Paste a sing-box subscription URL
+to create `.suburl`, or press `s` to skip. Press `o` later to open TUI settings.
+
+## Prebuilt releases
+
+Tagged releases build these archives automatically:
+
+- Windows x64: `sing-box-tui-<version>-x86_64-pc-windows-msvc.zip`
+- Linux x64: `sing-box-tui-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple Silicon: `sing-box-tui-<version>-aarch64-apple-darwin.tar.gz`
+- macOS Intel: `sing-box-tui-<version>-x86_64-apple-darwin.tar.gz`
+
 ## Provider sync
 
 `sync` logs into a provider website, downloads the sing-box subscription JSON, and merges provider nodes into your local sing-box config.
@@ -425,8 +466,8 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
 - `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
-- `v`: run Google/GitHub verification checks
-- `V`: run Google/GitHub/Discord verification checks
+- `v`: immediately start background Google, ChatGPT, and Discord verification checks
+- `o`: open TUI settings for benchmark, auto-pick, and system proxy values
 - `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`
 - `r`: refresh groups
 - `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
@@ -498,3 +539,38 @@ If you call the PowerShell script directly, pass a process-scoped execution poli
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\set-system-proxy.ps1 -Disable
 ```
+
+## FAQ
+
+### Why does the browser not use sing-box after I enable system proxy?
+
+Check that the TUI status line shows system proxy enabled and that the detected
+mixed inbound is correct. Press `o` to edit the system proxy server if your
+sing-box mixed inbound is not `127.0.0.1:6780`.
+
+### What is the difference between bypass rules and system proxy bypass?
+
+TUI bypass rules are written to `sing-box-tui-bypass.json` so sing-box can route
+matching domains/IPs to direct. When system proxy is enabled, the same entries
+are also written to the OS proxy bypass list so system-proxy-aware apps can skip
+the local proxy for those targets.
+
+### How do I restore the Windows proxy manually?
+
+Run:
+
+```powershell
+scripts\windows\set-system-proxy.cmd -Disable
+```
+
+### What should I use: TUN mode or system proxy?
+
+System proxy is easier to toggle and works for applications that respect OS
+proxy settings. TUN mode captures more traffic but needs a sing-box config with
+a TUN inbound and usually requires higher system permissions.
+
+### Why does the first-run wizard appear?
+
+It appears until setup is completed or skipped. Paste a subscription URL to
+create `.suburl`, or press `s` to mark onboarding complete. You can still edit
+settings later with `o`.

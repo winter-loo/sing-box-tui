@@ -13,8 +13,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: sing-box-tui.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: sing-box-tui
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: sing-box-tui
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: sing-box-tui
 
     steps:
       - name: Checkout repository
@@ -23,10 +44,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Resolve release version
         shell: bash
@@ -36,28 +59,46 @@ jobs:
           else
             version="manual-${GITHUB_SHA::7}"
           fi
-
           echo "RELEASE_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Run tests
         run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package release archive
-        run: ./scripts/package-release.sh x86_64-unknown-linux-gnu "${RELEASE_VERSION}"
+      - name: Package Windows release
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "dist/sing-box-tui-${env:RELEASE_VERSION}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$staging/"
+          Copy-Item README.md "$staging/"
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$staging/" }
+          if (Test-Path LICENSE.md) { Copy-Item LICENSE.md "$staging/" }
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip" -Force
+          Remove-Item -Recurse -Force $staging
+
+      - name: Package Unix release
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: ./scripts/package-release.sh "${{ matrix.target }}" "${RELEASE_VERSION}" "${{ matrix.binary }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-tui-${{ env.RELEASE_VERSION }}-x86_64-unknown-linux-gnu
-          path: dist/*.tar.gz
+          name: sing-box-tui-${{ env.RELEASE_VERSION }}-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
           if-no-files-found: error
 
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
           generate_release_notes: true

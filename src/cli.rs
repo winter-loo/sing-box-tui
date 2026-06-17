@@ -912,7 +912,7 @@ fn print_benchmark_usage() {
         "      --max-concurrency <N>     Limit concurrent delay probes (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
     );
     println!("      --switch                  Switch selector to the best successful node");
-    println!("      --verify                  Run post-switch verification HTTP checks");
+    println!("      --verify                  Run post-switch Google and ChatGPT checks");
     println!("      --verify-discord          Include Discord checks during verification");
 }
 

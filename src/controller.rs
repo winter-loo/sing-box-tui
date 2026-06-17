@@ -900,7 +900,7 @@ impl ShellCheck {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct VerificationReport {
     pub(crate) google_v4: ShellCheck,
-    pub(crate) github: ShellCheck,
+    pub(crate) chatgpt: ShellCheck,
     pub(crate) discord_gateway_rest: Option<ShellCheck>,
     pub(crate) discord_gateway_logs: Option<ShellCheck>,
 }
@@ -909,7 +909,7 @@ impl VerificationReport {
     pub(crate) fn summary_line(&self) -> String {
         let mut parts = vec![
             format!("google={}", if self.google_v4.ok() { "ok" } else { "fail" }),
-            format!("github={}", if self.github.ok() { "ok" } else { "fail" }),
+            format!("chatgpt={}", if self.chatgpt.ok() { "ok" } else { "fail" }),
         ];
         if let Some(rest) = &self.discord_gateway_rest {
             parts.push(format!(
@@ -930,7 +930,7 @@ impl VerificationReport {
 pub(crate) fn run_verification(include_discord: bool) -> VerificationReport {
     let google_v4 =
         run_http_verification("https://www.google.com", true, 5, Some(("accept", "*/*")));
-    let github = run_http_verification("https://github.com", false, 5, Some(("accept", "*/*")));
+    let chatgpt = run_http_verification("https://chatgpt.com", false, 5, Some(("accept", "*/*")));
     let discord_gateway_rest = include_discord.then(|| {
         run_http_verification(
             "https://discord.com/api/v10/gateway",
@@ -943,7 +943,7 @@ pub(crate) fn run_verification(include_discord: bool) -> VerificationReport {
 
     VerificationReport {
         google_v4,
-        github,
+        chatgpt,
         discord_gateway_rest,
         discord_gateway_logs,
     }

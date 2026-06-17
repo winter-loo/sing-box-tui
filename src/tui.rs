@@ -29,7 +29,8 @@ use serde_json::Value;
 
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
-    ConnectionInfo, ConnectionsSnapshot, ProxyGroup, run_verification, spawn_benchmark_worker,
+    ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport, run_verification,
+    spawn_benchmark_worker,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
@@ -39,7 +40,8 @@ use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
 use crate::subscriptions::{
-    SubscriptionRefreshOutput, SubscriptionRefreshRequest, refresh_subscriptions,
+    DEFAULT_SUBSCRIPTION_SOURCE_PATH, SubscriptionRefreshOutput, SubscriptionRefreshRequest,
+    refresh_subscriptions,
 };
 use crate::tui_state::{
     BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
@@ -80,6 +82,15 @@ const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &[
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
+const SETTINGS_FIELDS: &[SettingsField] = &[
+    SettingsField::BenchmarkUrl,
+    SettingsField::BenchmarkTimeoutMs,
+    SettingsField::RequestTimeoutSec,
+    SettingsField::MaxConcurrency,
+    SettingsField::AutoPickThresholdMs,
+    SettingsField::AutoPickIntervalSec,
+    SettingsField::SystemProxyServer,
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct TuiSubscriptionRefreshOptions {
@@ -138,6 +149,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_benchmark_updates()?;
         app.poll_subscription_refresh_updates()?;
         app.poll_system_proxy_updates();
+        app.poll_verify_updates();
         app.maybe_start_subscription_refresh();
         app.maybe_start_auto_select_benchmark()?;
         app.maybe_refresh_latency_chart()?;
@@ -372,8 +384,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" info  "),
             Span::styled("c", Style::default().fg(Color::Cyan)),
             Span::raw(" connections  "),
-            Span::styled("v/V", Style::default().fg(Color::Cyan)),
+            Span::styled("v", Style::default().fg(Color::Cyan)),
             Span::raw(" verify  "),
+            Span::styled("o", Style::default().fg(Color::Cyan)),
+            Span::raw(" settings  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" filter  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
@@ -413,6 +427,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.show_help {
         draw_help_panel(frame, app);
+    }
+    if app.show_settings {
+        draw_settings_panel(frame, app);
+    }
+    if app.onboarding.is_some() {
+        draw_onboarding_panel(frame, app);
     }
     if let Some(input) = app.filter_input.as_deref() {
         let cursor_x = status_area
@@ -550,13 +570,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "v",
-        summary: "Verify Google and GitHub",
-        detail: "Run HTTP verification checks against Google and GitHub.",
+        summary: "Verify network",
+        detail: "Run Google, ChatGPT, and Discord connectivity checks in the background.",
     },
     HelpBinding {
-        key: "V",
-        summary: "Verify Google, GitHub, and Discord",
-        detail: "Run HTTP verification checks and include Discord gateway diagnostics.",
+        key: "o",
+        summary: "Open settings",
+        detail: "Edit TUI benchmark, auto-pick, and system proxy settings.",
     },
     HelpBinding {
         key: "r",
@@ -656,6 +676,129 @@ fn help_binding(binding: HelpBinding, selected: bool) -> Line<'static> {
         Span::styled(binding.summary, Style::default().fg(Color::Gray)),
     ])
     .style(line_style)
+}
+
+fn draw_settings_panel(frame: &mut Frame, app: &App) {
+    let frame_area = frame.area();
+    let area = centered_rect(86, 18, frame_area);
+    frame.render_widget(Clear, area);
+    let selected = app
+        .settings_index
+        .min(SETTINGS_FIELDS.len().saturating_sub(1));
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan)),
+        Span::raw(" edit  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" close"),
+    ]));
+    lines.push(Line::raw(""));
+    for (index, field) in SETTINGS_FIELDS.iter().enumerate() {
+        let marker = if index == selected { "> " } else { "  " };
+        let style = if index == selected {
+            Style::default().bg(Color::Blue)
+        } else {
+            Style::default()
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(marker),
+                Span::styled(
+                    settings_field_label(*field),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw("  "),
+                Span::raw(settings_field_value(app, *field)),
+            ])
+            .style(style),
+        );
+    }
+    if let Some(edit) = &app.settings_edit {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("Editing ", Style::default().fg(Color::Yellow)),
+            Span::raw(settings_field_label(edit.field)),
+            Span::raw(": "),
+            Span::raw(edit.input.as_str()),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Settings")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
+        area,
+    );
+}
+
+fn draw_onboarding_panel(frame: &mut Frame, app: &App) {
+    let frame_area = frame.area();
+    let area = centered_rect(86, 13, frame_area);
+    frame.render_widget(Clear, area);
+    let Some(onboarding) = &app.onboarding else {
+        return;
+    };
+    let lines = vec![
+        Line::from("First run setup"),
+        Line::raw(""),
+        Line::from("Paste one sing-box subscription URL and press Enter to save it to .suburl."),
+        Line::from("Press s to skip, or Esc to keep this wizard for next time."),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("URL: ", Style::default().fg(Color::Cyan)),
+            Span::raw(onboarding.input.as_str()),
+        ]),
+        Line::raw(""),
+        Line::from(onboarding.message.as_str()),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Welcome")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
+        area,
+    );
+}
+
+fn settings_field_label(field: SettingsField) -> &'static str {
+    match field {
+        SettingsField::BenchmarkUrl => "Benchmark URL",
+        SettingsField::BenchmarkTimeoutMs => "Benchmark timeout ms",
+        SettingsField::RequestTimeoutSec => "Request timeout sec",
+        SettingsField::MaxConcurrency => "Max concurrency",
+        SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
+        SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
+        SettingsField::SystemProxyServer => "System proxy server",
+    }
+}
+
+fn settings_field_value(app: &App, field: SettingsField) -> String {
+    match field {
+        SettingsField::BenchmarkUrl => app.benchmark_url.clone(),
+        SettingsField::BenchmarkTimeoutMs => app.benchmark_timeout_ms.to_string(),
+        SettingsField::RequestTimeoutSec => app.benchmark_request_timeout.to_string(),
+        SettingsField::MaxConcurrency => app.benchmark_max_concurrency.to_string(),
+        SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
+        SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
+        SettingsField::SystemProxyServer => app.system_proxy_server.clone(),
+    }
+}
+
+fn parse_positive<T>(value: &str) -> Result<T>
+where
+    T: std::str::FromStr + PartialOrd + From<u8>,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let parsed = value.parse::<T>().context("value must be a number")?;
+    if parsed <= T::from(0) {
+        bail!("value must be greater than 0");
+    }
+    Ok(parsed)
 }
 
 fn draw_connections_panel(frame: &mut Frame, app: &App) {
@@ -1696,6 +1839,27 @@ struct LatencyChartState {
     last_refresh: Instant,
 }
 
+struct OnboardingState {
+    input: String,
+    message: String,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettingsField {
+    BenchmarkUrl,
+    BenchmarkTimeoutMs,
+    RequestTimeoutSec,
+    MaxConcurrency,
+    AutoPickThresholdMs,
+    AutoPickIntervalSec,
+    SystemProxyServer,
+}
+
+struct SettingsEditState {
+    field: SettingsField,
+    input: String,
+}
+
 struct App {
     client: ApiClient,
     groups: Vec<ProxyGroup>,
@@ -1733,12 +1897,19 @@ struct App {
     show_connections: bool,
     show_help: bool,
     help_index: usize,
+    onboarding_complete: bool,
+    onboarding: Option<OnboardingState>,
+    show_settings: bool,
+    settings_index: usize,
+    settings_edit: Option<SettingsEditState>,
     subscription_refresh: Option<SubscriptionRefreshState>,
     system_proxy_config_path: PathBuf,
     system_proxy_server: String,
+    system_proxy_server_override: bool,
     system_proxy_enabled: bool,
     system_proxy_job: Option<SystemProxyJob>,
     last_system_proxy_status_refresh: Instant,
+    verify_job: Option<VerifyJob>,
 }
 
 struct SubscriptionRefreshState {
@@ -1763,6 +1934,11 @@ struct SystemProxyJob {
     server: String,
     enable: bool,
     receiver: mpsc::Receiver<Result<String, String>>,
+    worker: JoinHandle<()>,
+}
+
+struct VerifyJob {
+    receiver: mpsc::Receiver<VerificationReport>,
     worker: JoinHandle<()>,
 }
 
@@ -1809,7 +1985,9 @@ impl App {
         subscription_refresh_options: TuiSubscriptionRefreshOptions,
     ) -> Result<Self> {
         let state_store = TuiStateStore::new(default_tui_state_path());
+        let existing_state_file = state_store.exists();
         let runtime_state = state_store.load()?;
+        let onboarding_complete = runtime_state.onboarding_complete || existing_state_file;
         let system_proxy_server =
             default_system_proxy_server(&subscription_refresh_options.config_path);
         let system_proxy_enabled = system_proxy_matches(&system_proxy_server);
@@ -1853,12 +2031,22 @@ impl App {
             show_connections: false,
             show_help: false,
             help_index: 0,
+            onboarding_complete,
+            onboarding: (!onboarding_complete).then(|| OnboardingState {
+                input: String::new(),
+                message: String::from("Paste a subscription URL, or press s to skip setup."),
+            }),
+            show_settings: false,
+            settings_index: 0,
+            settings_edit: None,
             subscription_refresh,
             system_proxy_config_path,
             system_proxy_server,
+            system_proxy_server_override: false,
             system_proxy_enabled,
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            verify_job: None,
         };
         app.apply_runtime_state(runtime_state.clone());
         app.refresh()?;
@@ -1872,6 +2060,31 @@ impl App {
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.bypass_entries = state.bypass_entries;
+        if let Some(value) = state.benchmark_url.filter(|value| !value.trim().is_empty()) {
+            self.benchmark_url = value;
+        }
+        if let Some(value) = state.benchmark_timeout_ms.filter(|value| *value > 0) {
+            self.benchmark_timeout_ms = value;
+        }
+        if let Some(value) = state.benchmark_request_timeout.filter(|value| *value > 0.0) {
+            self.benchmark_request_timeout = value;
+        }
+        if let Some(value) = state.benchmark_max_concurrency.filter(|value| *value > 0) {
+            self.benchmark_max_concurrency = value;
+        }
+        if let Some(value) = state.auto_select_threshold_ms.filter(|value| *value > 0) {
+            self.auto_select_threshold_ms = value;
+        }
+        if let Some(value) = state.auto_select_interval_secs.filter(|value| *value > 0) {
+            self.auto_select_interval = Duration::from_secs(value);
+        }
+        if let Some(value) = state
+            .system_proxy_server
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.system_proxy_server = value;
+            self.system_proxy_server_override = state.system_proxy_server_override;
+        }
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
             && let Some(node) = state.current_selected_nodes.get(&group.name)
@@ -1897,6 +2110,15 @@ impl App {
                 })
                 .collect(),
             bypass_entries: self.bypass_entries.clone(),
+            onboarding_complete: self.onboarding_complete,
+            benchmark_url: Some(self.benchmark_url.clone()),
+            benchmark_timeout_ms: Some(self.benchmark_timeout_ms),
+            benchmark_request_timeout: Some(self.benchmark_request_timeout),
+            benchmark_max_concurrency: Some(self.benchmark_max_concurrency),
+            auto_select_threshold_ms: Some(self.auto_select_threshold_ms),
+            auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
+            system_proxy_server: Some(self.system_proxy_server.clone()),
+            system_proxy_server_override: self.system_proxy_server_override,
         }
     }
 
@@ -2358,6 +2580,12 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.onboarding.is_some() {
+            return self.handle_onboarding_key(code);
+        }
+        if self.show_settings {
+            return self.handle_settings_key(code);
+        }
         if self.filter_input.is_some() {
             return self.handle_filter_input_key(code);
         }
@@ -2438,8 +2666,8 @@ impl App {
             KeyCode::Char('p') => self.set_system_proxy(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
-            KeyCode::Char('v') => self.run_verify(false)?,
-            KeyCode::Char('V') => self.run_verify(true)?,
+            KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('o') => self.open_settings_panel(),
             KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
             KeyCode::Char(' ') => self.activate_selection()?,
@@ -2476,6 +2704,175 @@ impl App {
         self.show_help = true;
         self.flash = None;
         self.set_status_only("Showing help");
+    }
+
+    fn open_settings_panel(&mut self) {
+        self.show_settings = true;
+        self.settings_edit = None;
+        self.flash = None;
+        self.set_status_only("Showing settings");
+    }
+
+    fn handle_onboarding_key(&mut self, code: KeyCode) -> Result<bool> {
+        match code {
+            KeyCode::Esc => {
+                self.onboarding = None;
+                self.set_status_only("First run setup postponed");
+            }
+            KeyCode::Char('s') => {
+                self.onboarding_complete = true;
+                self.onboarding = None;
+                self.save_runtime_state()?;
+                self.set_status_only("First run setup skipped");
+            }
+            KeyCode::Enter => self.finish_onboarding_with_subscription()?,
+            KeyCode::Backspace => {
+                if let Some(onboarding) = &mut self.onboarding {
+                    onboarding.input.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(onboarding) = &mut self.onboarding {
+                    onboarding.input.push(ch);
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn finish_onboarding_with_subscription(&mut self) -> Result<()> {
+        let Some(onboarding) = &mut self.onboarding else {
+            return Ok(());
+        };
+        let url = onboarding.input.trim();
+        if url.is_empty() {
+            onboarding.message = "Paste a subscription URL first, or press s to skip.".to_string();
+            return Ok(());
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            onboarding.message = "Subscription URL must start with http:// or https://".to_string();
+            return Ok(());
+        }
+        let line = format!("default = {url}\n");
+        let path = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
+        if path.exists() {
+            let existing = fs::read_to_string(&path).unwrap_or_default();
+            if !existing.contains(url) {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("failed to open {}", path.display()))?;
+                use std::io::Write;
+                if !existing.ends_with('\n') && !existing.is_empty() {
+                    writeln!(file)
+                        .with_context(|| format!("failed to write {}", path.display()))?;
+                }
+                file.write_all(line.as_bytes())
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+        } else {
+            fs::write(&path, line)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+        self.onboarding = None;
+        self.onboarding_complete = true;
+        self.save_runtime_state()?;
+        self.set_status_only("First run setup saved .suburl; press u to refresh subscriptions");
+        Ok(())
+    }
+
+    fn handle_settings_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.settings_edit.is_some() {
+            return self.handle_settings_edit_key(code);
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('o') => {
+                self.show_settings = false;
+                self.set_status_only("Settings closed");
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_index =
+                    (self.settings_index + 1).min(SETTINGS_FIELDS.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_index = self.settings_index.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let field = SETTINGS_FIELDS[self.settings_index];
+                self.settings_edit = Some(SettingsEditState {
+                    field,
+                    input: settings_field_value(self, field),
+                });
+            }
+            KeyCode::Char('q') => return Ok(false),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_settings_edit_key(&mut self, code: KeyCode) -> Result<bool> {
+        let Some(edit) = self.settings_edit.as_mut() else {
+            return Ok(true);
+        };
+        match code {
+            KeyCode::Esc => {
+                self.settings_edit = None;
+            }
+            KeyCode::Enter => {
+                let edit = self.settings_edit.take().expect("settings edit exists");
+                self.apply_settings_value(edit.field, edit.input)?;
+            }
+            KeyCode::Backspace => {
+                edit.input.pop();
+            }
+            KeyCode::Char(ch) => {
+                edit.input.push(ch);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn apply_settings_value(&mut self, field: SettingsField, input: String) -> Result<()> {
+        let value = input.trim();
+        match field {
+            SettingsField::BenchmarkUrl => {
+                if value.is_empty() {
+                    bail!("benchmark URL cannot be empty");
+                }
+                self.benchmark_url = value.to_string();
+            }
+            SettingsField::BenchmarkTimeoutMs => self.benchmark_timeout_ms = parse_positive(value)?,
+            SettingsField::RequestTimeoutSec => {
+                self.benchmark_request_timeout = value
+                    .parse::<f64>()
+                    .context("request timeout must be a number")?;
+                if self.benchmark_request_timeout <= 0.0 {
+                    bail!("request timeout must be greater than 0");
+                }
+            }
+            SettingsField::MaxConcurrency => {
+                self.benchmark_max_concurrency = parse_positive(value)?
+            }
+            SettingsField::AutoPickThresholdMs => {
+                self.auto_select_threshold_ms = parse_positive(value)?
+            }
+            SettingsField::AutoPickIntervalSec => {
+                let seconds: u64 = parse_positive(value)?;
+                self.auto_select_interval = Duration::from_secs(seconds);
+            }
+            SettingsField::SystemProxyServer => {
+                if value.is_empty() {
+                    bail!("system proxy server cannot be empty");
+                }
+                self.system_proxy_server = value.to_string();
+                self.system_proxy_server_override = true;
+            }
+        }
+        self.save_runtime_state()?;
+        self.set_status_only(format!("Saved {}", settings_field_label(field)));
+        Ok(())
     }
 
     fn move_help_next(&mut self) {
@@ -3227,15 +3624,39 @@ impl App {
         Ok(())
     }
 
-    fn run_verify(&mut self, include_discord: bool) -> Result<()> {
-        self.status = if include_discord {
-            "Running verification (google/github/discord)...".to_string()
-        } else {
-            "Running verification (google/github)...".to_string()
+    fn start_verify(&mut self) {
+        if self.verify_job.is_some() {
+            self.set_status_only("Network verification is already running");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let report = run_verification(true);
+            let _ = tx.send(report);
+        });
+        self.verify_job = Some(VerifyJob {
+            receiver: rx,
+            worker,
+        });
+        self.set_status_only("Running network verification (google/chatgpt/discord)...");
+    }
+
+    fn poll_verify_updates(&mut self) {
+        let Some(job) = self.verify_job.as_ref() else {
+            return;
         };
-        let report = run_verification(include_discord);
-        self.set_status_with_flash(report.summary_line());
-        Ok(())
+        let result = match job.receiver.try_recv() {
+            Ok(report) => report,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.verify_job = None;
+                self.set_status_with_flash("Network verification failed: worker disconnected");
+                return;
+            }
+        };
+        let job = self.verify_job.take().expect("verify job exists");
+        let _ = job.worker.join();
+        self.set_status_with_flash(result.summary_line());
     }
 
     fn set_system_proxy(&mut self) {
@@ -3243,7 +3664,9 @@ impl App {
             self.set_status_only("System proxy update is already running");
             return;
         }
-        self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        if !self.system_proxy_server_override {
+            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        }
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
         let enable = !self.system_proxy_enabled;
         let server = self.system_proxy_server.clone();
@@ -3311,7 +3734,9 @@ impl App {
             return;
         }
         self.last_system_proxy_status_refresh = Instant::now();
-        self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        if !self.system_proxy_server_override {
+            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        }
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
     }
 
@@ -3526,12 +3951,19 @@ mod tests {
             show_connections: false,
             show_help: false,
             help_index: 0,
+            onboarding_complete: true,
+            onboarding: None,
+            show_settings: false,
+            settings_index: 0,
+            settings_edit: None,
             subscription_refresh: None,
             system_proxy_config_path: PathBuf::from("config.json"),
             system_proxy_server: "127.0.0.1:6780".to_string(),
+            system_proxy_server_override: false,
             system_proxy_enabled: false,
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            verify_job: None,
         }
     }
 
