@@ -108,13 +108,17 @@ pub(crate) fn refresh_subscriptions(
     let mut cache_changed = false;
     let mut provider_node_sets = Vec::new();
     for item in resolved {
-        let nodes = extract_mergeable_outbounds_from_singbox_subscription(&item.subscription_json)
-            .with_context(|| {
-                format!(
-                    "failed to parse sing-box subscription JSON for {}",
-                    item.source.provider_name
-                )
-            })?;
+        let mut nodes =
+            extract_mergeable_outbounds_from_singbox_subscription(&item.subscription_json)
+                .with_context(|| {
+                    format!(
+                        "failed to parse sing-box subscription JSON for {}",
+                        item.source.provider_name
+                    )
+                })?;
+        if subscription_source_strips_flag_emoji(&item.source) {
+            strip_flag_emoji_from_node_tags(&mut nodes);
+        }
         if matches!(item.status, SubscriptionFetchStatus::Fetched) {
             cache.entries.insert(
                 item.source.provider_name.clone(),
@@ -311,6 +315,40 @@ fn collect_node_tags(nodes: &[Value]) -> Result<Vec<String>> {
                 .context("refreshed node outbound is missing a tag")
         })
         .collect()
+}
+
+fn subscription_source_strips_flag_emoji(source: &SubscriptionSource) -> bool {
+    let provider = source.provider_name.to_ascii_lowercase();
+    source.provider_name.contains("白嫖")
+        || provider.contains("baipiao")
+        || source
+            .url
+            .host_str()
+            .is_some_and(|host| host.contains("xn--mesv7f5toqlp"))
+}
+
+fn strip_flag_emoji_from_node_tags(nodes: &mut [Value]) {
+    for node in nodes {
+        let Some(object) = node.as_object_mut() else {
+            continue;
+        };
+        let Some(tag) = object.get("tag").and_then(Value::as_str) else {
+            continue;
+        };
+        let stripped = strip_regional_indicator_symbols(tag);
+        if stripped != tag {
+            object.insert("tag".to_string(), Value::String(stripped));
+        }
+    }
+}
+
+fn strip_regional_indicator_symbols(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !('\u{1F1E6}'..='\u{1F1FF}').contains(ch))
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn upsert_node_outbounds(outbounds: &mut Vec<Value>, nodes: Vec<Value>) -> Result<()> {
@@ -831,8 +869,9 @@ mod tests {
     use super::{
         CachedSubscription, ProviderNodeRefresh, backup_existing_config, cache_entry_is_fresh,
         parse_subscription_sources, redact_url, refresh_node_outbounds_only,
-        refresh_provider_node_outbounds_only, subscription_config_backup_path,
-        subscription_source_requires_direct_fetch,
+        refresh_provider_node_outbounds_only, strip_flag_emoji_from_node_tags,
+        subscription_config_backup_path, subscription_source_requires_direct_fetch,
+        subscription_source_strips_flag_emoji,
     };
     use std::fs;
     use std::time::Duration;
@@ -1224,6 +1263,45 @@ mod tests {
 
         assert!(subscription_source_requires_direct_fetch(&sources[0]));
         assert!(!subscription_source_requires_direct_fetch(&sources[1]));
+    }
+
+    #[test]
+    fn baipiao_subscription_sources_strip_flag_emoji() {
+        let sources = parse_subscription_sources(
+            r#"
+            白嫖机场 = https://yes.xn--mesv7f5toqlp.biz/api/subscribe?token=secret
+            other = https://example.com/api/subscribe?token=secret
+            "#,
+        )
+        .expect("sources parse");
+
+        assert!(subscription_source_strips_flag_emoji(&sources[0]));
+        assert!(!subscription_source_strips_flag_emoji(&sources[1]));
+    }
+
+    #[test]
+    fn strips_country_flag_emoji_from_baipiao_node_tags() {
+        let mut nodes = vec![
+            serde_json::json!({
+                "type": "trojan",
+                "tag": "🇺🇸美国HY1轻量",
+                "server": "us.example",
+                "server_port": 443,
+                "password": "secret"
+            }),
+            serde_json::json!({
+                "type": "hysteria2",
+                "tag": "🇯🇵日本Trojan2",
+                "server": "jp.example",
+                "server_port": 443,
+                "password": "secret"
+            }),
+        ];
+
+        strip_flag_emoji_from_node_tags(&mut nodes);
+
+        assert_eq!(nodes[0]["tag"], "美国HY1轻量");
+        assert_eq!(nodes[1]["tag"], "日本Trojan2");
     }
 
     #[test]
