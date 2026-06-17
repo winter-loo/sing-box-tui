@@ -443,6 +443,9 @@ user's WinINET proxy:
 scripts\windows\set-system-proxy.cmd -Enable -Server 127.0.0.1:6780
 ```
 
+When enabling the system proxy, TUI bypass entries are also written to the OS
+proxy bypass list, alongside the default local/private network bypasses.
+
 On macOS, it uses `networksetup` to update HTTP, HTTPS, and SOCKS proxies on
 all enabled network services. To target specific macOS network services, set a
 comma-separated service list:

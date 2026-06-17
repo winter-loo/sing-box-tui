@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -55,6 +55,28 @@ const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &[
+    "localhost",
+    "127.*",
+    "10.*",
+    "172.16.*",
+    "172.17.*",
+    "172.18.*",
+    "172.19.*",
+    "172.20.*",
+    "172.21.*",
+    "172.22.*",
+    "172.23.*",
+    "172.24.*",
+    "172.25.*",
+    "172.26.*",
+    "172.27.*",
+    "172.28.*",
+    "172.29.*",
+    "172.30.*",
+    "172.31.*",
+    "192.168.*",
+];
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
@@ -1218,23 +1240,81 @@ fn find_json_string_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
     Some(&value[..end])
 }
 
+fn system_proxy_bypass_entries(entries: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut bypass = Vec::new();
+    for entry in DEFAULT_SYSTEM_PROXY_BYPASS {
+        push_unique_system_proxy_bypass_value(&mut bypass, &mut seen, entry);
+    }
+    for entry in entries {
+        push_system_proxy_bypass_entry(&mut bypass, &mut seen, entry);
+    }
+    bypass
+}
+
+fn push_system_proxy_bypass_entry(
+    bypass: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    entry: &str,
+) {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return;
+    }
+    push_unique_system_proxy_bypass_value(bypass, seen, entry);
+    if !entry.contains('*')
+        && !entry.contains('/')
+        && !entry.starts_with('<')
+        && !entry.parse::<std::net::IpAddr>().is_ok()
+    {
+        push_unique_system_proxy_bypass_value(bypass, seen, &format!("*.{entry}"));
+    }
+}
+
+fn push_unique_system_proxy_bypass_value(
+    bypass: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    value: &str,
+) {
+    let value = value.trim().to_ascii_lowercase();
+    if !value.is_empty() && seen.insert(value.clone()) {
+        bypass.push(value);
+    }
+}
+
 #[cfg(windows)]
-fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
+fn wininet_proxy_override_entries(entries: &[String]) -> Vec<String> {
+    let mut entries = system_proxy_bypass_entries(entries);
+    if !entries.iter().any(|entry| entry == "<local>") {
+        entries.push("<local>".to_string());
+    }
+    entries
+}
+
+#[cfg(windows)]
+fn run_system_proxy_update(
+    server: &str,
+    enable: bool,
+    bypass_entries: &[String],
+) -> Result<String> {
     let script = windows_system_proxy_script_path()
         .with_context(|| "failed to locate scripts/windows/set-system-proxy.ps1")?;
     let action = if enable { "-Enable" } else { "-Disable" };
     let mut args = vec![
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
         script
             .to_str()
-            .context("system proxy script path is not valid UTF-8")?,
-        action,
+            .context("system proxy script path is not valid UTF-8")?
+            .to_string(),
+        action.to_string(),
     ];
     if enable {
-        args.extend(["-Server", server]);
+        args.extend(["-Server".to_string(), server.to_string()]);
+        let override_list = wininet_proxy_override_entries(bypass_entries).join(";");
+        args.extend(["-Override".to_string(), override_list]);
     }
     let output = Command::new("powershell.exe")
         .args(args)
@@ -1260,7 +1340,11 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
+fn run_system_proxy_update(
+    server: &str,
+    enable: bool,
+    bypass_entries: &[String],
+) -> Result<String> {
     let services = macos_system_proxy_services()?;
     if services.is_empty() {
         bail!("no enabled macOS network services found");
@@ -1268,10 +1352,14 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
 
     if enable {
         let (host, port) = parse_proxy_server(server)?;
+        let bypass = system_proxy_bypass_entries(bypass_entries);
         for service in &services {
             run_networksetup(&["-setwebproxy", service, &host, &port])?;
             run_networksetup(&["-setsecurewebproxy", service, &host, &port])?;
             run_networksetup(&["-setsocksfirewallproxy", service, &host, &port])?;
+            let mut args = vec!["-setproxybypassdomains", service.as_str()];
+            args.extend(bypass.iter().map(String::as_str));
+            run_networksetup(&args)?;
         }
         Ok(format!(
             "Enabled macOS system proxy for {} at {server}",
@@ -1291,7 +1379,11 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
+fn run_system_proxy_update(
+    server: &str,
+    enable: bool,
+    bypass_entries: &[String],
+) -> Result<String> {
     if !command_exists("gsettings") {
         bail!("Linux system proxy toggle requires gsettings");
     }
@@ -1306,6 +1398,14 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
         run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port])?;
         run_gsettings(&["set", "org.gnome.system.proxy.socks", "host", &host_value])?;
         run_gsettings(&["set", "org.gnome.system.proxy.socks", "port", &port])?;
+        let ignore_hosts =
+            gsettings_string_list_value(&system_proxy_bypass_entries(bypass_entries));
+        run_gsettings(&[
+            "set",
+            "org.gnome.system.proxy",
+            "ignore-hosts",
+            &ignore_hosts,
+        ])?;
         Ok(format!(
             "Enabled Linux system proxy via gsettings: {server}"
         ))
@@ -1316,7 +1416,11 @@ fn run_system_proxy_update(server: &str, enable: bool) -> Result<String> {
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn run_system_proxy_update(_server: &str, _enable: bool) -> Result<String> {
+fn run_system_proxy_update(
+    _server: &str,
+    _enable: bool,
+    _bypass_entries: &[String],
+) -> Result<String> {
     bail!("system proxy toggle is only available on Windows, macOS, and Linux")
 }
 
@@ -1453,6 +1557,16 @@ fn parse_gsettings_scalar(value: &str) -> &str {
 #[cfg(target_os = "linux")]
 fn gsettings_string_value(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_string_list_value(values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| gsettings_string_value(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{values}]")
 }
 
 #[cfg(target_os = "linux")]
@@ -3133,11 +3247,12 @@ impl App {
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
         let enable = !self.system_proxy_enabled;
         let server = self.system_proxy_server.clone();
+        let bypass_entries = self.bypass_entries.clone();
         let (tx, rx) = mpsc::channel();
         let worker_server = server.clone();
         let worker = thread::spawn(move || {
-            let result =
-                run_system_proxy_update(&worker_server, enable).map_err(|error| error.to_string());
+            let result = run_system_proxy_update(&worker_server, enable, &bypass_entries)
+                .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
         self.system_proxy_job = Some(SystemProxyJob {
@@ -3304,7 +3419,7 @@ mod tests {
         format_connection_line, format_duration_badge, latency_chart_segments,
         latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
         latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
-        subscription_report_badge, truncate_for_width,
+        subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -3500,6 +3615,23 @@ mod tests {
             super::detect_mixed_inbound_proxy_server_from_text(text).as_deref(),
             Some("127.0.0.1:6780")
         );
+    }
+
+    #[test]
+    fn system_proxy_bypass_entries_include_tui_bypass_rules() {
+        let entries = system_proxy_bypass_entries(&[
+            "example.com".to_string(),
+            "*.github.com".to_string(),
+            "10.0.0.0/8".to_string(),
+            "1.1.1.1".to_string(),
+        ]);
+
+        assert!(entries.contains(&"localhost".to_string()));
+        assert!(entries.contains(&"example.com".to_string()));
+        assert!(entries.contains(&"*.example.com".to_string()));
+        assert!(entries.contains(&"*.github.com".to_string()));
+        assert!(entries.contains(&"10.0.0.0/8".to_string()));
+        assert!(entries.contains(&"1.1.1.1".to_string()));
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
