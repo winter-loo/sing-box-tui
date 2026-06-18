@@ -548,6 +548,32 @@ Check that the TUI status line shows system proxy enabled and that the detected
 mixed inbound is correct. Press `o` to edit the system proxy server if your
 sing-box mixed inbound is not `127.0.0.1:6780`.
 
+### Why does `netsh winhttp show proxy` say no proxy is set on Windows?
+
+On Windows, sing-box-tui updates the current user's WinINET proxy, which is the
+proxy used by Windows Settings, Internet Options, and many desktop apps.
+`netsh winhttp show proxy` reports the separate WinHTTP proxy used by some
+services and command-line components, so it can still show direct access after
+the system proxy is enabled.
+
+To copy the current WinINET proxy into WinHTTP, run an elevated shell:
+
+```powershell
+netsh winhttp import proxy source=ie
+```
+
+To set or reset the WinHTTP proxy manually:
+
+```powershell
+netsh winhttp set proxy 127.0.0.1:6780
+netsh winhttp reset proxy
+```
+
+Services such as Tailscale may not use the current user's WinINET proxy. If
+Tailscale cannot reach the network after enabling the TUI system proxy, either
+configure the WinHTTP proxy as above or configure an HTTP/HTTPS proxy for
+Tailscale separately.
+
 ### What is the difference between bypass rules and system proxy bypass?
 
 TUI bypass rules are written to `sing-box-tui-bypass.json` so sing-box can route
