@@ -29,12 +29,13 @@ use serde_json::Value;
 
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
-    ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport, run_verification,
-    spawn_benchmark_worker,
+    ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport, VerificationTarget,
+    run_verification, spawn_benchmark_worker,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
-    DEFAULT_SELECTOR_TAG, REFRESH_DEBOUNCE, SINGLE_NODE_RETEST_DEBOUNCE,
+    DEFAULT_SELECTOR_TAG, DEFAULT_VERIFICATION_TARGETS, REFRESH_DEBOUNCE,
+    SINGLE_NODE_RETEST_DEBOUNCE,
 };
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
@@ -87,6 +88,7 @@ const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::BenchmarkTimeoutMs,
     SettingsField::RequestTimeoutSec,
     SettingsField::MaxConcurrency,
+    SettingsField::VerifyTargets,
     SettingsField::AutoPickThresholdMs,
     SettingsField::AutoPickIntervalSec,
     SettingsField::SystemProxyServer,
@@ -412,7 +414,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(help, status_area);
 
     if let Some(message) = app.flash_message() {
-        let area = centered_rect(80, 7, frame.area());
+        let height = (message.lines().count() as u16).saturating_add(2).max(7);
+        let area = centered_rect(80, height, frame.area());
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
@@ -571,7 +574,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "v",
         summary: "Verify network",
-        detail: "Run Google, ChatGPT, and Discord connectivity checks in the background.",
+        detail: "Run configured connectivity checks in the background.",
     },
     HelpBinding {
         key: "o",
@@ -771,6 +774,7 @@ fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::BenchmarkTimeoutMs => "Benchmark timeout ms",
         SettingsField::RequestTimeoutSec => "Request timeout sec",
         SettingsField::MaxConcurrency => "Max concurrency",
+        SettingsField::VerifyTargets => "Verification targets",
         SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
         SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
         SettingsField::SystemProxyServer => "System proxy server",
@@ -783,6 +787,7 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::BenchmarkTimeoutMs => app.benchmark_timeout_ms.to_string(),
         SettingsField::RequestTimeoutSec => app.benchmark_request_timeout.to_string(),
         SettingsField::MaxConcurrency => app.benchmark_max_concurrency.to_string(),
+        SettingsField::VerifyTargets => app.verify_targets.clone(),
         SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
         SettingsField::SystemProxyServer => app.system_proxy_server.clone(),
@@ -799,6 +804,47 @@ where
         bail!("value must be greater than 0");
     }
     Ok(parsed)
+}
+
+fn normalize_optional_setting(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_verification_targets_setting() -> String {
+    DEFAULT_VERIFICATION_TARGETS
+        .iter()
+        .map(|(name, url)| format!("{name}={url}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_verification_targets(input: &str) -> Result<Vec<VerificationTarget>> {
+    input
+        .split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_verification_target)
+        .collect()
+}
+
+fn parse_verification_target(input: &str) -> Result<VerificationTarget> {
+    let (name, url) = input
+        .split_once('=')
+        .with_context(|| format!("verification target must be NAME=URL, got {input}"))?;
+    let name = name.trim();
+    let url = url.trim();
+    if name.is_empty() {
+        bail!("verification target name cannot be empty");
+    }
+    if url.is_empty() {
+        bail!("verification target URL cannot be empty");
+    }
+    Ok(VerificationTarget {
+        name: name.to_string(),
+        url: url.to_string(),
+    })
 }
 
 fn draw_connections_panel(frame: &mut Frame, app: &App) {
@@ -1850,6 +1896,7 @@ enum SettingsField {
     BenchmarkTimeoutMs,
     RequestTimeoutSec,
     MaxConcurrency,
+    VerifyTargets,
     AutoPickThresholdMs,
     AutoPickIntervalSec,
     SystemProxyServer,
@@ -1874,6 +1921,7 @@ struct App {
     benchmark_timeout_ms: u64,
     benchmark_request_timeout: f64,
     benchmark_max_concurrency: usize,
+    verify_targets: String,
     benchmarks: BTreeMap<String, BenchmarkSummary>,
     benchmark_jobs: Vec<BenchmarkJob>,
     latency_sort_mode: bool,
@@ -2008,6 +2056,7 @@ impl App {
             benchmark_timeout_ms: 5000,
             benchmark_request_timeout: 12.0,
             benchmark_max_concurrency,
+            verify_targets: default_verification_targets_setting(),
             benchmarks: BTreeMap::new(),
             benchmark_jobs: Vec::new(),
             latency_sort_mode: false,
@@ -2072,6 +2121,9 @@ impl App {
         if let Some(value) = state.benchmark_max_concurrency.filter(|value| *value > 0) {
             self.benchmark_max_concurrency = value;
         }
+        if let Some(value) = normalize_optional_setting(state.verify_targets) {
+            self.verify_targets = value;
+        }
         if let Some(value) = state.auto_select_threshold_ms.filter(|value| *value > 0) {
             self.auto_select_threshold_ms = value;
         }
@@ -2115,6 +2167,7 @@ impl App {
             benchmark_timeout_ms: Some(self.benchmark_timeout_ms),
             benchmark_request_timeout: Some(self.benchmark_request_timeout),
             benchmark_max_concurrency: Some(self.benchmark_max_concurrency),
+            verify_targets: normalize_optional_setting(Some(self.verify_targets.clone())),
             auto_select_threshold_ms: Some(self.auto_select_threshold_ms),
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy_server.clone()),
@@ -2854,6 +2907,12 @@ impl App {
             }
             SettingsField::MaxConcurrency => {
                 self.benchmark_max_concurrency = parse_positive(value)?
+            }
+            SettingsField::VerifyTargets => {
+                if !value.is_empty() {
+                    parse_verification_targets(value)?;
+                }
+                self.verify_targets = value.to_string();
             }
             SettingsField::AutoPickThresholdMs => {
                 self.auto_select_threshold_ms = parse_positive(value)?
@@ -3630,15 +3689,33 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        if !self.system_proxy_server_override {
+            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
+        }
+        let targets = match parse_verification_targets(&self.verify_targets) {
+            Ok(targets) if !targets.is_empty() => targets,
+            Ok(_) => {
+                self.set_status_only("Configure verification targets in settings first");
+                return;
+            }
+            Err(error) => {
+                self.set_status_only(format!("Verification targets invalid: {error}"));
+                return;
+            }
+        };
+        let proxy_server = self.system_proxy_server.clone();
+        let worker_proxy_server = proxy_server.clone();
         let worker = thread::spawn(move || {
-            let report = run_verification(true);
+            let report = run_verification(&worker_proxy_server, &targets);
             let _ = tx.send(report);
         });
         self.verify_job = Some(VerifyJob {
             receiver: rx,
             worker,
         });
-        self.set_status_only("Running network verification (google/chatgpt/discord)...");
+        self.set_status_only(format!(
+            "Running network verification via {proxy_server}..."
+        ));
     }
 
     fn poll_verify_updates(&mut self) {
@@ -3924,6 +4001,7 @@ mod tests {
             benchmark_timeout_ms: 5000,
             benchmark_request_timeout: 12.0,
             benchmark_max_concurrency: DEFAULT_BENCHMARK_MAX_CONCURRENCY,
+            verify_targets: super::default_verification_targets_setting(),
             benchmarks: BTreeMap::new(),
             benchmark_jobs: Vec::new(),
             latency_sort_mode: false,

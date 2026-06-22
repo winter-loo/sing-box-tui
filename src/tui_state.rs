@@ -35,6 +35,8 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) benchmark_max_concurrency: Option<usize>,
     #[serde(default)]
+    pub(crate) verify_targets: Option<String>,
+    #[serde(default)]
     pub(crate) auto_select_threshold_ms: Option<u64>,
     #[serde(default)]
     pub(crate) auto_select_interval_secs: Option<u64>,

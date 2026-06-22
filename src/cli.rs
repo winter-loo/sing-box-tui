@@ -85,7 +85,7 @@ pub(crate) enum CliCommand {
         max_concurrency: usize,
         switch: bool,
         verify: bool,
-        verify_discord: bool,
+        verify_urls: Vec<String>,
     },
 }
 
@@ -610,7 +610,7 @@ impl CliCommand {
         let mut max_concurrency = DEFAULT_BENCHMARK_MAX_CONCURRENCY;
         let mut switch = false;
         let mut verify = false;
-        let mut verify_discord = false;
+        let mut verify_urls = Vec::new();
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -656,7 +656,14 @@ impl CliCommand {
                 }
                 "--switch" => switch = true,
                 "--verify" => verify = true,
-                "--verify-discord" => verify_discord = true,
+                "--verify-url" => {
+                    i += 1;
+                    verify_urls.push(
+                        args.get(i)
+                            .context("--verify-url requires a value")?
+                            .clone(),
+                    );
+                }
                 "--help" | "-h" => {
                     print_benchmark_usage();
                     std::process::exit(0);
@@ -677,7 +684,7 @@ impl CliCommand {
             max_concurrency,
             switch,
             verify,
-            verify_discord,
+            verify_urls,
         })
     }
 }
@@ -912,8 +919,10 @@ fn print_benchmark_usage() {
         "      --max-concurrency <N>     Limit concurrent delay probes (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
     );
     println!("      --switch                  Switch selector to the best successful node");
-    println!("      --verify                  Run post-switch Google and ChatGPT checks");
-    println!("      --verify-discord          Include Discord checks during verification");
+    println!("      --verify                  Run post-switch verification targets");
+    println!(
+        "      --verify-url <NAME=URL>   Add a target to the default verification list; repeatable"
+    );
 }
 
 #[cfg(test)]

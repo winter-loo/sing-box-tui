@@ -428,7 +428,7 @@ cargo run -- benchmark
 cargo run -- benchmark --max-concurrency 8
 cargo run -- benchmark --selector select --match 美国 --switch
 cargo run -- benchmark --match 美国 --switch --verify
-cargo run -- benchmark --match 美国 --switch --verify --verify-discord
+cargo run -- benchmark --match 美国 --switch --verify --verify-url NAME=URL
 cargo run -- run --max-concurrency 8
 ```
 
@@ -466,7 +466,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
 - `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
-- `v`: immediately start background Google, ChatGPT, and Discord verification checks
+- `v`: immediately start configured background verification checks
 - `o`: open TUI settings for benchmark, auto-pick, and system proxy values
 - `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`
 - `r`: refresh groups

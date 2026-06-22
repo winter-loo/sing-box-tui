@@ -6,16 +6,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client as AsyncClient;
+use reqwest::Proxy;
 use reqwest::Version;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::task::JoinSet;
 use urlencoding::encode;
 
-use crate::defaults::DEFAULT_CONTROLLER;
+use crate::defaults::{DEFAULT_CONTROLLER, DEFAULT_MIXED_PROXY_SERVER};
 
 pub(crate) fn run_selectors(options: SelectorsOptions) -> Result<()> {
     let client = build_api_client(options.controller)?;
@@ -71,7 +71,13 @@ pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
     }
 
     let verification = if options.verify {
-        Some(run_verification(options.verify_discord))
+        if options.verification_targets.is_empty() {
+            bail!("verification requires at least one --verify-url <NAME=URL> target");
+        }
+        Some(run_verification(
+            DEFAULT_MIXED_PROXY_SERVER,
+            &options.verification_targets,
+        ))
     } else {
         None
     };
@@ -724,7 +730,7 @@ pub(crate) struct BenchmarkOptions {
     pub(crate) max_concurrency: usize,
     pub(crate) switch: bool,
     pub(crate) verify: bool,
-    pub(crate) verify_discord: bool,
+    pub(crate) verification_targets: Vec<VerificationTarget>,
 }
 
 #[derive(Clone)]
@@ -899,61 +905,83 @@ impl ShellCheck {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct VerificationReport {
-    pub(crate) google_v4: ShellCheck,
-    pub(crate) chatgpt: ShellCheck,
-    pub(crate) discord_gateway_rest: Option<ShellCheck>,
-    pub(crate) discord_gateway_logs: Option<ShellCheck>,
+    pub(crate) proxy: String,
+    pub(crate) targets: Vec<VerificationTargetResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct VerificationTargetResult {
+    pub(crate) name: String,
+    pub(crate) check: ShellCheck,
 }
 
 impl VerificationReport {
     pub(crate) fn summary_line(&self) -> String {
-        let mut parts = vec![
-            format!("google={}", if self.google_v4.ok() { "ok" } else { "fail" }),
-            format!("chatgpt={}", if self.chatgpt.ok() { "ok" } else { "fail" }),
-        ];
-        if let Some(rest) = &self.discord_gateway_rest {
-            parts.push(format!(
-                "discord_rest={}",
-                if rest.ok() { "ok" } else { "fail" }
-            ));
-        }
-        if let Some(logs) = &self.discord_gateway_logs {
-            parts.push(format!(
-                "discord_logs={}",
-                if logs.ok() { "hits" } else { "clean/none" }
-            ));
-        }
-        format!("Verification: {}", parts.join("  "))
+        let mut lines = vec!["Verification:".to_string()];
+        lines.push(format!("proxy: {}", self.proxy));
+        lines.extend(self.targets.iter().map(|target| {
+            format!(
+                "{}: {}",
+                target.name,
+                verification_check_label(&target.check)
+            )
+        }));
+        lines.join("\n")
     }
 }
 
-pub(crate) fn run_verification(include_discord: bool) -> VerificationReport {
-    let google_v4 =
-        run_http_verification("https://www.google.com", true, 5, Some(("accept", "*/*")));
-    let chatgpt = run_http_verification("https://chatgpt.com", false, 5, Some(("accept", "*/*")));
-    let discord_gateway_rest = include_discord.then(|| {
-        run_http_verification(
-            "https://discord.com/api/v10/gateway",
-            false,
-            8,
-            Some(("accept", "application/json")),
-        )
-    });
-    let discord_gateway_logs = include_discord.then(run_journalctl_verification);
+#[derive(Clone, Debug)]
+pub(crate) struct VerificationTarget {
+    pub(crate) name: String,
+    pub(crate) url: String,
+}
+
+fn verification_check_label(check: &ShellCheck) -> String {
+    if check.ok() {
+        return "ok".to_string();
+    }
+    let reason = check
+        .stdout
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .or_else(|| {
+            check
+                .stderr
+                .lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+        });
+    match reason {
+        Some(reason) => format!("fail ({reason})"),
+        None => "fail".to_string(),
+    }
+}
+
+pub(crate) fn run_verification(
+    proxy_server: &str,
+    targets: &[VerificationTarget],
+) -> VerificationReport {
+    let proxy_url = verification_proxy_url(proxy_server);
+    let targets = targets
+        .iter()
+        .map(|target| VerificationTargetResult {
+            name: target.name.clone(),
+            check: run_http_verification(&target.url, 5, Some(("accept", "*/*")), &proxy_url),
+        })
+        .collect();
 
     VerificationReport {
-        google_v4,
-        chatgpt,
-        discord_gateway_rest,
-        discord_gateway_logs,
+        proxy: proxy_url,
+        targets,
     }
 }
 
 fn run_http_verification(
     url: &str,
-    force_ipv4: bool,
     max_lines: usize,
     extra_header: Option<(&str, &str)>,
+    proxy_url: &str,
 ) -> ShellCheck {
     let runtime = match TokioRuntimeBuilder::new_current_thread()
         .enable_all()
@@ -971,13 +999,20 @@ fn run_http_verification(
 
     runtime.block_on(async move {
         let mut builder = AsyncClient::builder()
-            .no_proxy()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(12))
             .user_agent("sing-box-tui/0.1 verification");
-        if force_ipv4 {
-            builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        }
+        let proxy = match Proxy::all(proxy_url) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                return ShellCheck {
+                    code: -1,
+                    stdout: String::new(),
+                    stderr: format!("invalid verification proxy {proxy_url}: {error}"),
+                };
+            }
+        };
+        builder = builder.proxy(proxy);
         let client = match builder.build() {
             Ok(client) => client,
             Err(error) => {
@@ -996,7 +1031,7 @@ fn run_http_verification(
 
         match request.send().await {
             Ok(response) => ShellCheck {
-                code: if response.status().is_success() { 0 } else { 1 },
+                code: 0,
                 stdout: format_response_head(&response, max_lines),
                 stderr: String::new(),
             },
@@ -1007,6 +1042,15 @@ fn run_http_verification(
             },
         }
     })
+}
+
+fn verification_proxy_url(server: &str) -> String {
+    let server = server.trim();
+    if server.contains("://") {
+        server.to_string()
+    } else {
+        format!("http://{server}")
+    }
 }
 
 fn format_response_head(response: &reqwest::Response, max_lines: usize) -> String {
@@ -1039,86 +1083,12 @@ fn format_http_version(version: Version) -> &'static str {
     }
 }
 
-fn run_journalctl_verification() -> ShellCheck {
-    let runtime = match TokioRuntimeBuilder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return ShellCheck {
-                code: -1,
-                stdout: String::new(),
-                stderr: format!(
-                    "failed to build Tokio runtime for journalctl verification: {error}"
-                ),
-            };
-        }
-    };
-
-    runtime.block_on(async move {
-        match TokioCommand::new("journalctl")
-            .args([
-                "--user",
-                "-u",
-                "openclaw-gateway",
-                "--since",
-                "5 min ago",
-                "--no-pager",
-                "-l",
-            ])
-            .output()
-            .await
-        {
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                if !output.status.success() {
-                    return ShellCheck {
-                        code: output.status.code().unwrap_or(-1),
-                        stdout: String::new(),
-                        stderr,
-                    };
-                }
-
-                let patterns = [
-                    "discord",
-                    "1006",
-                    "econnreset",
-                    "fetch failed",
-                    "gateway error",
-                ];
-                let lines = String::from_utf8_lossy(&output.stdout);
-                let matched = lines
-                    .lines()
-                    .filter(|line| {
-                        let lower = line.to_ascii_lowercase();
-                        patterns.iter().any(|pattern| lower.contains(pattern))
-                    })
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                let start = matched.len().saturating_sub(40);
-
-                ShellCheck {
-                    code: if matched.is_empty() { 1 } else { 0 },
-                    stdout: matched[start..].join("\n"),
-                    stderr,
-                }
-            }
-            Err(error) => ShellCheck {
-                code: -1,
-                stdout: String::new(),
-                stderr: error.to_string(),
-            },
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
-        ProxiesResponse, TrafficSnapshot, UpdateConfigRequest, selectors_from_payload,
-        status_from_parts,
+        ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest, selectors_from_payload,
+        status_from_parts, verification_check_label,
     };
 
     #[test]
@@ -1191,6 +1161,17 @@ mod tests {
         };
 
         assert_eq!(request.max_concurrency, 3);
+    }
+
+    #[test]
+    fn verification_label_treats_any_http_response_as_connection_success() {
+        let check = ShellCheck {
+            code: 0,
+            stdout: "HTTP/1.1 403 Forbidden".to_string(),
+            stderr: String::new(),
+        };
+
+        assert_eq!(verification_check_label(&check), "ok");
     }
 
     #[test]
