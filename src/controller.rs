@@ -849,6 +849,17 @@ impl BenchmarkSummary {
         }
     }
 
+    pub(crate) fn reset_pending(&mut self, names: Vec<String>) {
+        self.results = names
+            .into_iter()
+            .map(|name| BenchmarkResult {
+                name,
+                delay: None,
+                completed: false,
+            })
+            .collect();
+    }
+
     pub(crate) fn update_result(&mut self, result: BenchmarkResult) {
         if let Some(existing) = self
             .results
@@ -870,6 +881,16 @@ impl BenchmarkSummary {
     pub(crate) fn best_success(&self) -> Option<&BenchmarkResult> {
         self.results
             .iter()
+            .filter(|item| item.completed)
+            .filter_map(|item| item.delay.map(|delay| (item, delay)))
+            .min_by_key(|(_, delay)| *delay)
+            .map(|(item, _)| item)
+    }
+
+    pub(crate) fn best_success_matching_filter(&self) -> Option<&BenchmarkResult> {
+        self.results
+            .iter()
+            .filter(|item| matches_filter(&item.name, &self.pattern))
             .filter(|item| item.completed)
             .filter_map(|item| item.delay.map(|delay| (item, delay)))
             .min_by_key(|(_, delay)| *delay)
@@ -1230,6 +1251,37 @@ mod tests {
             ),
             vec!["us-a".to_string()]
         );
+    }
+
+    #[test]
+    fn benchmark_summary_reset_pending_discards_stale_results() {
+        let mut summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("hk-a".to_string()),
+            pattern: "us".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 3,
+            results: vec![
+                BenchmarkResult {
+                    name: "hk-a".to_string(),
+                    delay: Some(10),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "us-a".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+            ],
+        };
+
+        summary.reset_pending(vec!["us-a".to_string()]);
+
+        assert_eq!(summary.results.len(), 1);
+        assert_eq!(summary.results[0].name, "us-a");
+        assert_eq!(summary.results[0].delay, None);
+        assert!(!summary.results[0].completed);
     }
 
     #[test]

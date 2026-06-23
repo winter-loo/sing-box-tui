@@ -3314,9 +3314,7 @@ impl App {
         summary.url = self.benchmark_url.clone();
         summary.timeout_ms = self.benchmark_timeout_ms;
         summary.max_concurrency = self.benchmark_max_concurrency.max(1);
-        for name in candidates {
-            summary.upsert_pending(name);
-        }
+        summary.reset_pending(candidates);
     }
 
     fn prepare_node_benchmark(&mut self, group: &str, node: &str) {
@@ -3459,12 +3457,15 @@ impl App {
     }
 
     fn auto_select_target(&self, group: &ProxyGroup, summary: &BenchmarkSummary) -> Option<String> {
-        let best = summary.best_success()?;
+        let best = summary.best_success_matching_filter()?;
         let current = group.current.as_deref();
+        let current_matches_filter =
+            current.is_some_and(|name| matches_filter(name, &summary.pattern));
         let current_result = current.and_then(|name| summary.find_result(name));
-        let current_is_acceptable = current_result
-            .and_then(|result| result.delay)
-            .is_some_and(|delay| delay <= self.auto_select_threshold_ms);
+        let current_is_acceptable = current_matches_filter
+            && current_result
+                .and_then(|result| result.delay)
+                .is_some_and(|delay| delay <= self.auto_select_threshold_ms);
         if current_is_acceptable {
             return None;
         }
@@ -5253,6 +5254,42 @@ mod tests {
         assert_eq!(
             app.auto_select_target(&group, &summary),
             Some("美国-b".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_select_ignores_stale_results_outside_filter() {
+        let app = test_app();
+        let group = ProxyGroup {
+            name: "select".to_string(),
+            kind: "Selector".to_string(),
+            current: Some("hk-a".to_string()),
+            members: vec!["hk-a".to_string(), "us-b".to_string()],
+        };
+        let summary = BenchmarkSummary {
+            selector: "select".to_string(),
+            current: Some("hk-a".to_string()),
+            pattern: "us".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![
+                BenchmarkResult {
+                    name: "hk-a".to_string(),
+                    delay: Some(10),
+                    completed: true,
+                },
+                BenchmarkResult {
+                    name: "us-b".to_string(),
+                    delay: Some(80),
+                    completed: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            app.auto_select_target(&group, &summary),
+            Some("us-b".to_string())
         );
     }
 
