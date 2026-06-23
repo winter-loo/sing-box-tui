@@ -910,7 +910,7 @@ fn print_benchmark_usage() {
         "      --selector <NAME>         Selector group to benchmark (default: {DEFAULT_SELECTOR_TAG})"
     );
     println!(
-        "      --match <TEXT>            Substring filter for candidate tags (default: empty)"
+        "      --match <TEXT>            Comma-separated include/exclude filter for candidate tags; prefix exclusions with ! or -"
     );
     println!("      --url <URL>               Delay test URL (default: {DEFAULT_DELAY_TEST_URL})");
     println!("      --timeout-ms <MS>         Delay probe timeout in ms (default: 5000)");

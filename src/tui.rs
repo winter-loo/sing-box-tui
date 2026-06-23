@@ -30,7 +30,7 @@ use serde_json::Value;
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
     ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport, VerificationTarget,
-    run_verification, spawn_benchmark_worker,
+    matches_filter, run_verification, spawn_benchmark_worker,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
@@ -529,7 +529,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "/",
         summary: "Edit benchmark filter",
-        detail: "Open the filter editor. Comma-separated values match any listed text.",
+        detail: "Open the filter editor. Comma-separated values include matches; prefix with ! or - to exclude.",
     },
     HelpBinding {
         key: "a",
@@ -1279,21 +1279,6 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
     }
     output.push('…');
     output
-}
-
-fn matches_filter(value: &str, filter: &str) -> bool {
-    let mut has_pattern = false;
-    for pattern in filter
-        .split([',', '，'])
-        .map(str::trim)
-        .filter(|pattern| !pattern.is_empty())
-    {
-        has_pattern = true;
-        if value.contains(pattern) {
-            return true;
-        }
-    }
-    !has_pattern
 }
 
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
@@ -5145,6 +5130,31 @@ mod tests {
         assert_eq!(
             app.displayed_members(),
             vec!["美国-1".to_string(), "香港-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn displayed_members_exclude_negative_filter_terms() {
+        let mut app = test_app();
+        app.groups[0].members = vec!["us-1".to_string(), "us-x2".to_string(), "hk-1".to_string()];
+
+        app.apply_benchmark_filter("us,!x2".to_string())
+            .expect("apply filter");
+
+        assert_eq!(app.displayed_members(), vec!["us-1".to_string()]);
+    }
+
+    #[test]
+    fn displayed_members_support_exclude_only_filter() {
+        let mut app = test_app();
+        app.groups[0].members = vec!["us-1".to_string(), "us-x2".to_string(), "hk-1".to_string()];
+
+        app.apply_benchmark_filter("!x2".to_string())
+            .expect("apply filter");
+
+        assert_eq!(
+            app.displayed_members(),
+            vec!["us-1".to_string(), "hk-1".to_string()]
         );
     }
 

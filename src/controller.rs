@@ -454,10 +454,40 @@ pub(crate) fn filter_benchmark_candidates(
             .collect()
     } else {
         all.iter()
-            .filter(|name| name.contains(&request.pattern))
+            .filter(|name| matches_filter(name, &request.pattern))
             .cloned()
             .collect()
     }
+}
+
+pub(crate) fn matches_filter(value: &str, filter: &str) -> bool {
+    let mut has_include = false;
+    let mut include_matched = false;
+    for pattern in filter
+        .split(|ch| ch == ',' || ch == '，')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let (exclude, pattern) = match pattern
+            .strip_prefix('!')
+            .or_else(|| pattern.strip_prefix('-'))
+        {
+            Some(pattern) => (true, pattern.trim()),
+            None => (false, pattern),
+        };
+        if pattern.is_empty() {
+            continue;
+        }
+        if exclude {
+            if value.contains(pattern) {
+                return false;
+            }
+        } else {
+            has_include = true;
+            include_matched |= value.contains(pattern);
+        }
+    }
+    !has_include || include_matched
 }
 
 pub(crate) fn spawn_benchmark_worker(
@@ -1087,8 +1117,9 @@ fn format_http_version(version: Version) -> &'static str {
 mod tests {
     use super::{
         BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
-        ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest, selectors_from_payload,
-        status_from_parts, verification_check_label,
+        ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest,
+        filter_benchmark_candidates, matches_filter, selectors_from_payload, status_from_parts,
+        verification_check_label,
     };
 
     #[test]
@@ -1161,6 +1192,44 @@ mod tests {
         };
 
         assert_eq!(request.max_concurrency, 3);
+    }
+
+    #[test]
+    fn filter_matches_any_include_token() {
+        assert!(matches_filter("us-a", "us,hk"));
+        assert!(matches_filter("hk-a", "us,hk"));
+        assert!(!matches_filter("jp-a", "us,hk"));
+    }
+
+    #[test]
+    fn filter_excludes_negative_tokens() {
+        assert!(matches_filter("us-a", "!x2"));
+        assert!(!matches_filter("us-x2", "!x2"));
+        assert!(matches_filter("us-a", "us,!x2"));
+        assert!(!matches_filter("us-x2", "us,!x2"));
+        assert!(!matches_filter("hk-a", "us,!x2"));
+        assert!(!matches_filter("us-x2", "us,-x2"));
+    }
+
+    #[test]
+    fn benchmark_candidate_filter_supports_excludes() {
+        let request = BenchmarkRequest {
+            selector: "select".to_string(),
+            pattern: "us,!x2".to_string(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            request_timeout: 12.0,
+            max_concurrency: 3,
+            nodes: None,
+        };
+
+        assert_eq!(
+            filter_benchmark_candidates(
+                &["us-a".to_string(), "us-x2".to_string(), "hk-a".to_string()],
+                &request
+            ),
+            vec!["us-a".to_string()]
+        );
     }
 
     #[test]

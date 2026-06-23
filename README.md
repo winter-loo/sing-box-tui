@@ -269,7 +269,7 @@ Or point it at a different controller:
 cargo run -- run --controller http://127.0.0.1:9992
 ```
 
-Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Auto-pick benchmarks the filtered nodes every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
+Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Prefix a filter term with `!` or `-` to exclude matching nodes, for example `美国,!倍率` keeps US nodes except names containing `倍率`, and `!香港` keeps all nodes except names containing `香港`. Auto-pick benchmarks the filtered nodes every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
 
 TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and benchmark kind (`group`, `single`, or `auto`).
 
@@ -432,7 +432,7 @@ cargo run -- benchmark --match 美国 --switch --verify --verify-url NAME=URL
 cargo run -- run --max-concurrency 8
 ```
 
-If `--match` is omitted, benchmarking runs without a substring filter. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
+If `--match` is omitted, benchmarking runs without a substring filter. `--match` accepts the same comma-separated include/exclude syntax as the TUI filter, such as `美国,!倍率` or `!香港`. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
 
 JSON output includes:
 
@@ -468,7 +468,7 @@ Two read-only controller commands are available in addition to the TUI and bench
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
 - `v`: immediately start configured background verification checks
 - `o`: open TUI settings for benchmark, auto-pick, and system proxy values
-- `/`: change the benchmark substring filter; comma-separated values match any value, for example `美国,香港`
+- `/`: change the benchmark substring filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
 - `r`: refresh groups
 - `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
 - `q`: quit
