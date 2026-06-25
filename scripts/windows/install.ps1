@@ -3,6 +3,9 @@ param(
     [string]$Repo = "winter-loo/sing-box-tui",
     [string]$Version = "latest",
     [string]$InstallDir = "$env:LOCALAPPDATA\sing-box-tui",
+    [string]$SingBoxRepo = "winter-loo/sing-box",
+    [string]$SingBoxVersion = "v1.13.13-winterloo.2",
+    [string]$SingBoxSha256 = "dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9",
     [switch]$SkipSingBox,
     [switch]$AddToPath,
     [switch]$NoPath,
@@ -31,6 +34,18 @@ function Get-ReleaseAsset {
     return $asset
 }
 
+function Get-SingBoxReleaseAsset {
+    $releaseUrl = "https://api.github.com/repos/$SingBoxRepo/releases/tags/$SingBoxVersion"
+    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    $asset = $release.assets | Where-Object {
+        $_.name -match "windows-amd64" -and $_.name.EndsWith(".exe")
+    } | Select-Object -First 1
+    if (-not $asset) {
+        throw "No Windows amd64 sing-box exe asset found in $SingBoxRepo release '$SingBoxVersion'"
+    }
+    return $asset
+}
+
 function Add-UserPath([string]$PathToAdd) {
     $current = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @()
@@ -45,14 +60,40 @@ function Add-UserPath([string]$PathToAdd) {
     $env:Path = "$env:Path;$PathToAdd"
 }
 
+function Install-SingBoxCore {
+    $coreDir = Join-Path $InstallDir "core"
+    $coreExe = Join-Path $coreDir "sing-box.exe"
+    if ((Test-Path $coreExe) -and -not $Force) {
+        Write-Step "sing-box core already installed at $coreExe"
+        Add-UserPath $coreDir
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $coreDir | Out-Null
+    $asset = Get-SingBoxReleaseAsset
+    $download = Join-Path $env:TEMP $asset.name
+    Write-Step "Downloading sing-box core $($asset.name)"
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $download
+
+    if ($SingBoxSha256) {
+        $actual = (Get-FileHash -Path $download -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $SingBoxSha256.ToLowerInvariant()) {
+            Remove-Item -Force $download
+            throw "sing-box SHA256 mismatch. Expected $SingBoxSha256 but got $actual"
+        }
+    }
+
+    Copy-Item -Path $download -Destination $coreExe -Force
+    Remove-Item -Force $download
+    Add-UserPath $coreDir
+    Write-Step "Installed sing-box core to $coreExe"
+}
+
 if (-not $SkipSingBox) {
     if (Get-Command sing-box -ErrorAction SilentlyContinue) {
         Write-Step "sing-box already found"
-    } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Step "Installing sing-box with winget"
-        winget install sing-box --accept-package-agreements --accept-source-agreements
     } else {
-        Write-Warning "winget was not found; install sing-box manually from https://sing-box.sagernet.org/"
+        Install-SingBoxCore
     }
 }
 

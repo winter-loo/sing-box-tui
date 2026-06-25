@@ -2,6 +2,9 @@
 setlocal EnableExtensions
 
 set "VERSION="
+set "REPO=winter-loo/sing-box"
+set "SHA256=dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9"
+set "INSTALL_DIR=%LOCALAPPDATA%\sing-box-tui\core"
 set "FORCE=0"
 set "CHECK_ONLY=0"
 set "DRY_RUN=0"
@@ -16,6 +19,36 @@ if /I "%~1"=="--version" (
     exit /b 2
   )
   set "VERSION=%~2"
+  shift
+  shift
+  goto parse
+)
+if /I "%~1"=="--repo" (
+  if "%~2"=="" (
+    echo error: --repo requires a value 1>&2
+    exit /b 2
+  )
+  set "REPO=%~2"
+  shift
+  shift
+  goto parse
+)
+if /I "%~1"=="--sha256" (
+  if "%~2"=="" (
+    echo error: --sha256 requires a value 1>&2
+    exit /b 2
+  )
+  set "SHA256=%~2"
+  shift
+  shift
+  goto parse
+)
+if /I "%~1"=="--install-dir" (
+  if "%~2"=="" (
+    echo error: --install-dir requires a value 1>&2
+    exit /b 2
+  )
+  set "INSTALL_DIR=%~2"
   shift
   shift
   goto parse
@@ -55,27 +88,31 @@ if "%CHECK_ONLY%"=="1" (
   exit /b 1
 )
 
-where winget >nul 2>nul
+where powershell.exe >nul 2>nul
 if not %errorlevel%==0 (
-  echo error: winget was not found. Install App Installer from Microsoft Store, then rerun this script. 1>&2
+  echo error: powershell.exe was not found 1>&2
   exit /b 1
 )
 
-set "CMD=winget install sing-box --accept-package-agreements --accept-source-agreements"
-if not "%VERSION%"=="" set "CMD=%CMD% --version %VERSION%"
+if "%VERSION%"=="" set "VERSION=v1.13.13-winterloo.2"
+set "CORE_INSTALLER=%~dp0windows\install-sing-box-core.ps1"
+if not exist "%CORE_INSTALLER%" set "CORE_INSTALLER=%~dp0scripts\windows\install-sing-box-core.ps1"
+set "FORCE_ARG="
+set "DRY_RUN_ARG="
+if "%FORCE%"=="1" set "FORCE_ARG=-Force"
+if "%DRY_RUN%"=="1" set "DRY_RUN_ARG=-DryRun"
 
 if "%DRY_RUN%"=="1" (
-  echo %CMD%
-  exit /b 0
+  echo powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CORE_INSTALLER%" -Repo "%REPO%" -Version "%VERSION%" -InstallDir "%INSTALL_DIR%" -Sha256 "%SHA256%" -DryRun
 )
 
-echo Installing sing-box with winget...
-%CMD%
+echo Installing sing-box from %REPO% %VERSION%...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CORE_INSTALLER%" -Repo "%REPO%" -Version "%VERSION%" -InstallDir "%INSTALL_DIR%" -Sha256 "%SHA256%" %FORCE_ARG% %DRY_RUN_ARG%
 exit /b %errorlevel%
 
 :usage
-echo Usage: scripts\onboard.cmd [--version VERSION] [--force] [--check-only] [--dry-run]
+echo Usage: scripts\onboard.cmd [--version VERSION] [--repo OWNER/REPO] [--sha256 SHA256] [--install-dir DIR] [--force] [--check-only] [--dry-run]
 echo.
-echo Installs sing-box with: winget install sing-box
+echo Installs sing-box from a GitHub release asset.
 echo Skips installation when sing-box is already on PATH unless --force is set.
 exit /b 0
