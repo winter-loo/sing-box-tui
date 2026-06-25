@@ -1,0 +1,946 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="sing-box-tui is a terminal UI for managing sing-box nodes, benchmarks, subscriptions, bypass rules, active connections, and OS system proxy settings.">
+  <title>sing-box-tui — Terminal-native sing-box control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #02040a;
+      --bg-2: #06100d;
+      --panel: rgba(7, 17, 22, 0.82);
+      --panel-strong: rgba(9, 24, 31, 0.96);
+      --line: rgba(79, 255, 176, 0.22);
+      --line-hot: rgba(71, 255, 167, 0.62);
+      --ink: #e5fff4;
+      --muted: #8ba99d;
+      --dim: #587166;
+      --green: #47ffa7;
+      --cyan: #55d7ff;
+      --yellow: #ffdd66;
+      --red: #ff5f7a;
+      --violet: #a78bfa;
+      --shadow: 0 0 42px rgba(71, 255, 167, 0.13), 0 16px 60px rgba(0, 0, 0, 0.55);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 18% -10%, rgba(85, 215, 255, 0.18), transparent 31rem),
+        radial-gradient(circle at 88% 10%, rgba(71, 255, 167, 0.14), transparent 28rem),
+        linear-gradient(180deg, #02040a 0%, #04100d 46%, #02040a 100%);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(71, 255, 167, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(71, 255, 167, 0.035) 1px, transparent 1px),
+        linear-gradient(rgba(255,255,255,0.035), rgba(255,255,255,0));
+      background-size: 44px 44px, 44px 44px, 100% 3px;
+      mask-image: linear-gradient(180deg, black 0%, black 70%, transparent 100%);
+    }
+
+    a { color: inherit; }
+
+    .wrap {
+      width: min(1180px, calc(100% - 36px));
+      margin: 0 auto;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid rgba(71, 255, 167, 0.14);
+      background: rgba(2, 4, 10, 0.78);
+      backdrop-filter: blur(18px);
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      min-height: 72px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--ink);
+      text-decoration: none;
+      font-family: var(--mono);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line-hot);
+      border-radius: 10px;
+      background: linear-gradient(145deg, rgba(71, 255, 167, 0.18), rgba(85, 215, 255, 0.08));
+      color: var(--green);
+      box-shadow: 0 0 24px rgba(71, 255, 167, 0.22);
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.92rem;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+    }
+
+    .nav-links a:hover { color: var(--green); }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(500px, 1.1fr);
+      gap: 34px;
+      align-items: center;
+      padding: 78px 0 64px;
+    }
+
+    .kicker,
+    .prompt,
+    .metric-label,
+    .eyebrow {
+      font-family: var(--mono);
+    }
+
+    .kicker {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      margin: 0 0 18px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(7, 17, 22, 0.72);
+      color: var(--green);
+      font-size: 0.86rem;
+    }
+
+    .kicker::before {
+      content: "●";
+      color: var(--green);
+      text-shadow: 0 0 12px var(--green);
+      animation: blink 1.6s steps(2, start) infinite;
+    }
+
+    @keyframes blink { 50% { opacity: 0.25; } }
+
+    h1, h2, h3 { line-height: 1.05; }
+
+    h1 {
+      margin: 0;
+      max-width: 800px;
+      font-size: clamp(3rem, 8vw, 6.75rem);
+      letter-spacing: -0.085em;
+    }
+
+    .glow {
+      color: var(--green);
+      text-shadow: 0 0 30px rgba(71, 255, 167, 0.42);
+    }
+
+    .lead {
+      max-width: 680px;
+      margin: 24px 0 0;
+      color: #b3d1c5;
+      font-size: clamp(1.08rem, 2vw, 1.28rem);
+    }
+
+    .terminal-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 100%;
+      margin: 28px 0 0;
+      padding: 13px 15px;
+      border: 1px solid rgba(85, 215, 255, 0.24);
+      border-radius: 12px;
+      background: rgba(3, 9, 13, 0.86);
+      color: var(--cyan);
+      font-family: var(--mono);
+      overflow: auto;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.025);
+    }
+
+    .terminal-line span:last-child {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .prompt { color: var(--green); }
+
+    .cta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 30px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      min-height: 48px;
+      padding: 0 18px;
+      border: 1px solid var(--line-hot);
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(71, 255, 167, 0.18), rgba(85, 215, 255, 0.08));
+      color: var(--ink);
+      font-family: var(--mono);
+      font-weight: 800;
+      text-decoration: none;
+      box-shadow: 0 0 34px rgba(71, 255, 167, 0.18);
+    }
+
+    .button.secondary {
+      border-color: rgba(255, 255, 255, 0.16);
+      background: rgba(255, 255, 255, 0.035);
+      color: #c7ddd5;
+      box-shadow: none;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0 44px rgba(71, 255, 167, 0.28);
+    }
+
+    .hero-card {
+      position: relative;
+      align-self: start;
+      margin-top: 170px;
+      border: 1px solid #2a2a2a;
+      border-radius: 4px;
+      background: #050505;
+      box-shadow: 0 18px 54px rgba(0, 0, 0, 0.62), 0 0 26px rgba(0, 205, 0, 0.12);
+      overflow: hidden;
+    }
+
+    .hero > .hero-card + .hero-card {
+      display: none;
+    }
+
+    .terminal-shot {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1749 / 758;
+      object-fit: contain;
+      background: #050505;
+    }
+
+    .hero-card[aria-label="Actual sing-box-tui terminal preview"] .mock-tui {
+      display: none;
+    }
+
+    .hero-card::before {
+      content: none;
+    }
+
+    .mock-tui {
+      position: relative;
+      min-width: 660px;
+      padding: 8px;
+      background: #050505;
+      color: #cfcfcf;
+      font-family: var(--mono);
+      font-size: clamp(0.72rem, 1.1vw, 0.86rem);
+      line-height: 1.12;
+      overflow: hidden;
+    }
+
+    .tui-main {
+      display: grid;
+      grid-template-columns: 31% 69%;
+      gap: 8px;
+    }
+
+    .tui-pane,
+    .tui-status {
+      position: relative;
+      min-height: 300px;
+      border: 1px solid #b7b7b7;
+      background: #070707;
+      padding: 13px 4px 8px;
+    }
+
+    .tui-providers {
+      border-color: #00b800;
+    }
+
+    .tui-title {
+      position: absolute;
+      top: -0.72em;
+      left: 4px;
+      padding: 0 3px;
+      background: #050505;
+      color: #cfcfcf;
+      font-size: 1.02em;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .tui-providers .tui-title,
+    .tui-provider-name,
+    .tui-node-current {
+      color: #00c800;
+    }
+
+    .tui-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 1.24em;
+      padding: 0 3px;
+      color: #cfcfcf;
+      white-space: nowrap;
+    }
+
+    .tui-row.selected {
+      background: #0d48dc;
+      color: #ffffff;
+      font-weight: 800;
+    }
+
+    .tui-secondary {
+      color: #21aef7;
+      padding-left: 1.4em;
+    }
+
+    .tui-provider-tag {
+      color: #c5a600;
+    }
+
+    .tui-cursor {
+      color: #ffffff;
+      font-weight: 800;
+    }
+
+    .tui-latency {
+      color: #b513cb;
+      min-width: 4.5em;
+      margin-left: 1em;
+      text-align: right;
+    }
+
+    .tui-status {
+      min-height: 78px;
+      margin-top: 12px;
+      border-color: #b7b7b7;
+      padding-top: 18px;
+    }
+
+    .tui-status .tui-title {
+      color: #cfcfcf;
+    }
+
+    .tui-help {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.78em;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tui-key {
+      color: #1ea7ff;
+      font-weight: 900;
+    }
+
+    .tui-on {
+      color: #00c800;
+      font-weight: 900;
+    }
+
+    .tui-muted {
+      color: #7e7e7e;
+    }
+
+    .tui-status-line {
+      margin-top: 0.2em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      padding: 0 0 48px;
+    }
+
+    .metric {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(7, 17, 22, 0.65);
+    }
+
+    .metric strong {
+      display: block;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 1.32rem;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    section { padding: 58px 0; }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 26px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--green);
+      font-size: 0.82rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      margin: 0;
+      max-width: 820px;
+      font-size: clamp(2rem, 5vw, 4rem);
+      letter-spacing: -0.06em;
+    }
+
+    .section-copy {
+      max-width: 520px;
+      color: var(--muted);
+      margin: 0;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .feature-card,
+    .code-panel,
+    .step,
+    .quote-card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 14px 40px rgba(0,0,0,0.26);
+    }
+
+    .feature-card {
+      padding: 22px;
+      min-height: 236px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::after {
+      content: attr(data-index);
+      position: absolute;
+      right: 16px;
+      top: 12px;
+      color: rgba(71, 255, 167, 0.12);
+      font-family: var(--mono);
+      font-size: 3rem;
+      font-weight: 900;
+    }
+
+    .icon {
+      display: inline-grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      margin-bottom: 18px;
+      border: 1px solid rgba(85, 215, 255, 0.24);
+      border-radius: 12px;
+      color: var(--cyan);
+      background: rgba(85, 215, 255, 0.07);
+      font-family: var(--mono);
+      font-weight: 800;
+    }
+
+    .feature-card h3,
+    .step h3,
+    .quote-card h3 {
+      margin: 0 0 10px;
+      font-size: 1.18rem;
+      letter-spacing: -0.02em;
+    }
+
+    .feature-card p,
+    .step p,
+    .quote-card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 0.92fr 1.08fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .code-panel {
+      overflow: hidden;
+      background: var(--panel-strong);
+    }
+
+    .code-panel pre {
+      margin: 0;
+      padding: 22px;
+      overflow: auto;
+      color: #bce6d4;
+      font-family: var(--mono);
+      font-size: 0.94rem;
+      line-height: 1.65;
+    }
+
+    .code-panel code { font-family: inherit; }
+    .cmd { color: var(--green); }
+    .comment { color: #587166; }
+    .flag { color: var(--cyan); }
+    .str { color: var(--yellow); }
+
+    .steps {
+      display: grid;
+      gap: 14px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr);
+      gap: 16px;
+      padding: 18px;
+    }
+
+    .step-num {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      border: 1px solid var(--line-hot);
+      color: var(--green);
+      font-family: var(--mono);
+      box-shadow: 0 0 22px rgba(71, 255, 167, 0.18);
+    }
+
+    .deep-panel {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+
+    .quote-card {
+      padding: 24px;
+    }
+
+    .quote-card.wide {
+      grid-column: span 2;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .tag {
+      padding: 5px 9px;
+      border: 1px solid rgba(71, 255, 167, 0.18);
+      border-radius: 999px;
+      color: #a7c8bb;
+      background: rgba(71, 255, 167, 0.045);
+      font-family: var(--mono);
+      font-size: 0.78rem;
+    }
+
+    .final-cta {
+      padding: 54px 0 76px;
+    }
+
+    .cta-panel {
+      position: relative;
+      padding: clamp(28px, 6vw, 58px);
+      border: 1px solid var(--line-hot);
+      border-radius: 28px;
+      background:
+        linear-gradient(135deg, rgba(71, 255, 167, 0.12), rgba(85, 215, 255, 0.06)),
+        rgba(4, 12, 15, 0.92);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .cta-panel::after {
+      content: "sing-box-tui run";
+      position: absolute;
+      right: -20px;
+      bottom: -30px;
+      color: rgba(255,255,255,0.035);
+      font-family: var(--mono);
+      font-size: clamp(3rem, 10vw, 8rem);
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .cta-panel > * { position: relative; z-index: 1; }
+
+    .cta-panel h2 { max-width: 780px; }
+    .cta-panel p { max-width: 650px; color: #b3d1c5; font-size: 1.08rem; }
+
+    footer {
+      border-top: 1px solid rgba(71, 255, 167, 0.14);
+      padding: 28px 0;
+      color: var(--dim);
+      font-family: var(--mono);
+      font-size: 0.86rem;
+    }
+
+    @media (max-width: 980px) {
+      .hero,
+      .split,
+      .section-head {
+        grid-template-columns: 1fr;
+        display: grid;
+      }
+
+      .hero { padding-top: 48px; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      .feature-grid { grid-template-columns: repeat(2, 1fr); }
+      .deep-panel { grid-template-columns: 1fr; }
+      .quote-card.wide { grid-column: auto; }
+    }
+
+    @media (max-width: 680px) {
+      .nav { align-items: flex-start; flex-direction: column; padding: 16px 0; }
+      .nav-links { flex-wrap: wrap; }
+      .hero { grid-template-columns: 1fr; }
+      .hero-card { margin: 0 -8px; }
+      .kicker { max-width: 100%; white-space: normal; }
+      .terminal-line {
+        display: flex;
+        align-items: flex-start;
+        white-space: normal;
+      }
+      .mock-tui { font-size: 0.68rem; padding: 12px; }
+      .tui-grid { grid-template-columns: 1fr; }
+      .pane { min-height: auto; }
+      .metrics,
+      .feature-grid { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 1fr; }
+      h1 {
+        font-size: clamp(2.5rem, 12.5vw, 3.35rem);
+        letter-spacing: -0.045em;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap nav">
+      <a class="brand" href="#top" aria-label="sing-box-tui home">
+        <span class="brand-mark">$</span>
+        <span>sing-box-tui</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a href="#features">features</a>
+        <a href="#workflow">workflow</a>
+        <a href="#ops">ops</a>
+        <a href="#install">install</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <div class="wrap hero">
+      <div>
+        <p class="kicker">terminal-native control plane for sing-box</p>
+        <h1>Manage <span class="glow">sing-box</span> from the terminal.</h1>
+        <p class="lead">
+          A geek-grade terminal UI for sing-box selector nodes, live latency benchmarks,
+          subscription refresh, direct-bypass rules, connection inspection, and one-key
+          OS system proxy control.
+        </p>
+        <div class="terminal-line" aria-label="Install command">
+          <span class="prompt">PS&gt;</span>
+          <span>irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 | iex</span>
+        </div>
+        <div class="cta-row">
+          <a class="button" href="#install">boot sequence -></a>
+          <a class="button secondary" href="../README.md">read the manual</a>
+        </div>
+      </div>
+
+      <aside class="hero-card" aria-label="Actual sing-box-tui terminal preview">
+        <img class="terminal-shot" src="assets/sing-box-tui-terminal-real.png" alt="sing-box-tui terminal UI showing Providers, Candidates for 宝贝云 in latency order, and Status panels">
+        <div class="mock-tui">
+          <div class="tui-main">
+            <div class="tui-pane tui-providers">
+              <div class="tui-title">Providers</div>
+              <div class="tui-row selected"><span>&gt;</span><span>宝贝云 [L1|新加坡06|...]</span><span>*</span></div>
+              <div class="tui-row tui-secondary"><span>白嫖机场</span><span class="tui-provider-tag">[马来西亚Troja...]</span></div>
+            </div>
+            <div class="tui-pane">
+              <div class="tui-title">Candidates for 宝贝云 [LATENCY ORDER]</div>
+              <div class="tui-row"><span></span><span>L1|日本01|直连|流媒体|2x</span><span class="tui-latency">139ms</span></div>
+              <div class="tui-row"><span class="tui-cursor">&gt;</span><span class="tui-node-current">L1|新加坡06|流媒体|3x</span><span class="tui-latency">191ms</span><span>*</span></div>
+              <div class="tui-row"><span></span><span>L1|日本03|直连|流媒体|2x</span><span class="tui-latency">245ms</span></div>
+              <div class="tui-row"><span></span><span>L1|日本05|直连|流媒体|2x</span><span class="tui-latency">301ms</span></div>
+              <div class="tui-row"><span></span><span>L1|新加坡04|直连|流媒体|2x</span><span class="tui-latency">321ms</span></div>
+              <div class="tui-row"><span></span><span>L1|美国02|直连|流媒体|2x</span><span class="tui-latency">351ms</span></div>
+              <div class="tui-row"><span></span><span>L1|新加坡03|直连|流媒体|2x</span><span class="tui-latency">359ms</span></div>
+              <div class="tui-row"><span></span><span>L1|日本04|直连|流媒体|2x</span><span class="tui-latency">373ms</span></div>
+              <div class="tui-row"><span></span><span>L1|美国03|直连|流媒体|2x</span><span class="tui-latency">394ms</span></div>
+              <div class="tui-row"><span></span><span>L1|美国05|直连|流媒体|2x</span><span class="tui-latency">484ms</span></div>
+              <div class="tui-row"><span></span><span>L1|美国04|直连|流媒体|2x</span><span class="tui-latency">575ms</span></div>
+              <div class="tui-row"><span></span><span>L1|美国01|直连|流媒体|2x</span><span class="tui-latency">706ms</span></div>
+            </div>
+          </div>
+          <div class="tui-status">
+            <div class="tui-title">Status</div>
+            <div class="tui-help">
+              <span><span class="tui-key">Arrows/jk</span> move</span>
+              <span><span class="tui-key">Tab/h/l</span> switch pane</span>
+              <span><span class="tui-key">Space</span> select</span>
+              <span><span class="tui-key">m</span> clash mode</span>
+              <span><span class="tui-key">B</span> bypass</span>
+              <span><span class="tui-key">p</span> <span class="tui-on">system proxy</span></span>
+              <span><span class="tui-key">b/t</span> benchmark</span>
+              <span><span class="tui-key">s</span> sort order</span>
+            </div>
+            <div class="tui-status-line"><span class="tui-muted">Controller:</span> http://127.0.0.1:9992</div>
+            <div class="tui-status-line">filter='!香港' tested=64 clash=规则 order=LATENCY ORDER auto=ON best=L1|日本01|直连|流媒体|2x...</div>
+            <div class="tui-status-line">connections active=8 proxy=8 direct=0 up=137.0MiB down=1.1GiB&nbsp;&nbsp; c details</div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="wrap metrics" aria-label="Product highlights">
+      <div class="metric"><strong>TUI</strong><span class="metric-label">keyboard-first selector control</span></div>
+      <div class="metric"><strong>30s</strong><span class="metric-label">auto-pick benchmark loop</span></div>
+      <div class="metric"><strong>SQLite</strong><span class="metric-label">latency history and charts</span></div>
+      <div class="metric"><strong>Win/mac/Linux</strong><span class="metric-label">system proxy toggles</span></div>
+    </div>
+
+    <section id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">capabilities</p>
+            <h2>Everything power users wanted around sing-box, wired into one terminal surface.</h2>
+          </div>
+          <p class="section-copy">
+            sing-box-tui talks to the Clash-compatible controller API, keeps your local config intact,
+            and gives you operational controls without leaving the keyboard.
+          </p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card" data-index="01">
+            <span class="icon">↯</span>
+            <h3>Selector switching that understands providers</h3>
+            <p>Navigate selector groups, provider groups, and nodes in two- or three-column layouts. Selecting a node can update the child provider selector and point the parent selector at it.</p>
+          </article>
+          <article class="feature-card" data-index="02">
+            <span class="icon">ms</span>
+            <h3>Async benchmarking + latency sorting</h3>
+            <p>Benchmark an entire selector or a single highlighted node. Sort healthy results by latency, hide failed probes, and keep the TUI responsive while checks run.</p>
+          </article>
+          <article class="feature-card" data-index="03">
+            <span class="icon">ap</span>
+            <h3>Runtime auto-pick</h3>
+            <p>Apply include/exclude filters like <code>美国,!倍率</code>, then let auto-pick benchmark every 30 seconds and switch only when the current node is slow, failed, or outside policy.</p>
+          </article>
+          <article class="feature-card" data-index="04">
+            <span class="icon">sub</span>
+            <h3>Subscription refresh without config drift</h3>
+            <p>Refresh provider subscriptions from <code>.suburl</code>, cache payloads, update only server node outbounds, preserve DNS/routes/inbounds, and keep a fixed backup before writes.</p>
+          </article>
+          <article class="feature-card" data-index="05">
+            <span class="icon">B</span>
+            <h3>Direct-bypass editor</h3>
+            <p>Edit domains, IPs, and CIDRs from the TUI. Entries are written to a local sing-box source rule-set and mirrored into OS proxy bypass lists when system proxy is enabled.</p>
+          </article>
+          <article class="feature-card" data-index="06">
+            <span class="icon">cx</span>
+            <h3>Live traffic visibility</h3>
+            <p>Inspect active connection totals and drill into inbound type, destination host/IP, outbound chain, and matched route rule from inside the interface.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflow">
+      <div class="wrap split">
+        <div>
+          <p class="eyebrow">operator workflow</p>
+          <h2>From subscription URL to healthy route in a few keystrokes.</h2>
+          <p class="section-copy">
+            Install the binary, launch the TUI, paste a sing-box subscription URL on first run,
+            then control nodes, filters, benchmarks, and proxy state from one cockpit.
+          </p>
+        </div>
+        <div class="steps">
+          <article class="step">
+            <span class="step-num">1</span>
+            <div><h3>Launch</h3><p>Run <code>sing-box-tui run</code>. The first-run wizard can create <code>.suburl</code> or skip setup for manual configs.</p></div>
+          </article>
+          <article class="step">
+            <span class="step-num">2</span>
+            <div><h3>Filter</h3><p>Press <code>/</code> and type include/exclude rules. Use regional, provider, or pricing hints already encoded in node names.</p></div>
+          </article>
+          <article class="step">
+            <span class="step-num">3</span>
+            <div><h3>Benchmark</h3><p>Press <code>b</code> for group probes or <code>t</code> for the highlighted node. Results are stored in SQLite for charts and history.</p></div>
+          </article>
+          <article class="step">
+            <span class="step-num">4</span>
+            <div><h3>Switch / automate</h3><p>Press <code>Space</code> to switch manually, or <code>a</code> to arm auto-pick so the best healthy filtered node wins when it matters.</p></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="ops">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">ops-grade details</p>
+            <h2>Built for people who read logs, diff configs, and hate mystery daemons.</h2>
+          </div>
+          <p class="section-copy">
+            No magic cloud account. No opaque sync service. Just a local Rust app, local state files,
+            explicit controller calls, and generated configs you can inspect.
+          </p>
+        </div>
+
+        <div class="deep-panel">
+          <article class="quote-card wide">
+            <h3>Config-respecting by design</h3>
+            <p>Generated and merged configs set selector/urltest <code>interrupt_exist_connections</code> to <code>false</code>, so switching nodes does not tear down existing flows. Existing connections finish on their original outbound; new traffic uses the new selection.</p>
+            <div class="tag-row">
+              <span class="tag">preserve DNS</span>
+              <span class="tag">preserve routes</span>
+              <span class="tag">preserve inbounds</span>
+              <span class="tag">replace nodes only when asked</span>
+            </div>
+          </article>
+          <article class="quote-card">
+            <h3>Cross-platform proxy toggles</h3>
+            <p>Press <code>p</code> to toggle the OS system proxy for the detected sing-box mixed inbound. Windows uses WinINET, macOS uses <code>networksetup</code>, and Linux GNOME uses <code>gsettings</code>.</p>
+          </article>
+          <article class="quote-card">
+            <h3>CLI escape hatches</h3>
+            <p>Use <code>selectors</code>, <code>status</code>, <code>benchmark</code>, <code>subscribe</code>, <code>subscriptions</code>, <code>sync</code>, and <code>import</code> when you want JSON output, scripts, or CI-friendly workflows.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="install">
+      <div class="wrap split">
+        <div class="code-panel" aria-label="Installation commands">
+          <div class="window-bar">
+            <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+            <span>install.sh</span>
+          </div>
+          <pre><code><span class="comment"># Windows x64: install latest release + sing-box if missing</span>
+<span class="cmd">irm</span> <span class="str">https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1</span> | <span class="cmd">iex</span>
+
+<span class="comment"># Start the cockpit</span>
+<span class="cmd">sing-box-tui</span> <span class="flag">run</span>
+
+<span class="comment"># Or use CLI probes directly</span>
+<span class="cmd">sing-box-tui</span> <span class="flag">benchmark --match</span> <span class="str">"美国,!倍率"</span> <span class="flag">--switch --verify</span>
+<span class="cmd">sing-box-tui</span> <span class="flag">status</span>
+<span class="cmd">sing-box-tui</span> <span class="flag">selectors --selector</span> <span class="str">select</span></code></pre>
+        </div>
+        <div>
+          <p class="eyebrow">ship targets</p>
+          <h2>Prebuilt for the machines where tunnels actually run.</h2>
+          <p class="section-copy">
+            Tagged releases build archives for Windows x64, Linux x64, macOS Apple Silicon,
+            and macOS Intel. From source, it is a Rust project using ratatui and the sing-box
+            Clash-compatible controller API.
+          </p>
+          <div class="tag-row">
+            <span class="tag">x86_64-pc-windows-msvc</span>
+            <span class="tag">x86_64-unknown-linux-gnu</span>
+            <span class="tag">aarch64-apple-darwin</span>
+            <span class="tag">x86_64-apple-darwin</span>
+            <span class="tag">ratatui</span>
+            <span class="tag">rusqlite</span>
+            <span class="tag">tokio</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="final-cta">
+      <div class="wrap">
+        <div class="cta-panel">
+          <p class="eyebrow">ready</p>
+          <h2>Make sing-box feel like an instrument panel, not a JSON chore.</h2>
+          <p>
+            Keep your routes observable, your subscriptions fresh, your bypasses explicit,
+            and your fastest nodes one keystroke away.
+          </p>
+          <div class="cta-row">
+            <a class="button" href="#install">install now</a>
+            <a class="button secondary" href="../README.md">open docs</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      // sing-box-tui landing page · static HTML · no external assets · designed for terminal people
+    </div>
+  </footer>
+</body>
+</html>
