@@ -41,6 +41,12 @@ if ($Enable) {
         throw "Proxy server must use host:port format, got '$Server'"
     }
 
+    # Keep Tailscale and other RFC6598 CGNAT overlay addresses off the system proxy.
+    if (-not $PSBoundParameters.ContainsKey("Override")) {
+        $cgnatBypass = 64..127 | ForEach-Object { "100.$_.*" }
+        $Override = (($Override -split ";") + $cgnatBypass | Where-Object { $_ } | Select-Object -Unique) -join ";"
+    }
+
     New-ItemProperty -Path $internetSettings -Name ProxyEnable -PropertyType DWord -Value 1 -Force | Out-Null
     New-ItemProperty -Path $internetSettings -Name ProxyServer -PropertyType String -Value $Server -Force | Out-Null
     New-ItemProperty -Path $internetSettings -Name ProxyOverride -PropertyType String -Value $Override -Force | Out-Null

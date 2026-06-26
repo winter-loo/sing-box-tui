@@ -1420,10 +1420,17 @@ fn system_proxy_bypass_entries(entries: &[String]) -> Vec<String> {
     for entry in DEFAULT_SYSTEM_PROXY_BYPASS {
         push_unique_system_proxy_bypass_value(&mut bypass, &mut seen, entry);
     }
+    push_cgnat_system_proxy_bypass_values(&mut bypass, &mut seen);
     for entry in entries {
         push_system_proxy_bypass_entry(&mut bypass, &mut seen, entry);
     }
     bypass
+}
+
+fn push_cgnat_system_proxy_bypass_values(bypass: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+    for octet in 64..=127 {
+        push_unique_system_proxy_bypass_value(bypass, seen, &format!("100.{octet}.*"));
+    }
 }
 
 fn push_system_proxy_bypass_entry(
@@ -4128,6 +4135,16 @@ mod tests {
         assert!(entries.contains(&"*.github.com".to_string()));
         assert!(entries.contains(&"10.0.0.0/8".to_string()));
         assert!(entries.contains(&"1.1.1.1".to_string()));
+    }
+
+    #[test]
+    fn system_proxy_bypass_entries_include_cgnat_overlay_range() {
+        let entries = system_proxy_bypass_entries(&[]);
+
+        assert!(entries.contains(&"100.64.*".to_string()));
+        assert!(entries.contains(&"100.121.*".to_string()));
+        assert!(entries.contains(&"100.127.*".to_string()));
+        assert!(!entries.contains(&"100.128.*".to_string()));
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {

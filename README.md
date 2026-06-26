@@ -277,6 +277,9 @@ TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_
 
 TUI bypass entries are stored in that same state file and written to a sing-box source rule-set at `./sing-box-tui-bypass.json` by default. Set `SING_BOX_TUI_BYPASS_RULE_SET=/path/to/sing-box-tui-bypass.json` to use a different file. Generated and merged configs reference this local rule-set near the top of `route.rules`, routing matched domains/IPs/CIDRs to `direct` / `国内直连`. If an older live config does not yet reference the rule-set, regenerate/merge the config and restart or reload sing-box once; after that, the local rule-set file can be edited by the TUI and sing-box will reload it.
 
+Generated and merged configs also route `100.64.0.0/10` direct so Tailscale and
+other CGNAT overlay addresses do not go through the proxy.
+
 Generated and merged configs set selector/urltest `interrupt_exist_connections` to `false`, so switching nodes does not tear down existing connections. Existing connections keep their original outbound until they close or fail; new/retried connections use the current selection.
 
 List selector groups through the Clash API:
@@ -485,7 +488,8 @@ scripts\windows\set-system-proxy.cmd -Enable -Server 127.0.0.1:6780
 ```
 
 When enabling the system proxy, TUI bypass entries are also written to the OS
-proxy bypass list, alongside the default local/private network bypasses.
+proxy bypass list, alongside the default local/private and CGNAT overlay
+network bypasses.
 
 On macOS, it uses `networksetup` to update HTTP, HTTPS, and SOCKS proxies on
 all enabled network services. To target specific macOS network services, set a

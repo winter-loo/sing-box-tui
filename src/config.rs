@@ -12,6 +12,9 @@ use crate::defaults::{
     DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, SELECTOR_TAG_ALIASES,
 };
 
+// Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
+const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DefaultConfigOptions {
     pub(crate) include_geosite_rules: bool,
@@ -289,6 +292,10 @@ pub(crate) fn build_default_config_with_options(
             "outbound": DEFAULT_DIRECT_TAG,
         }),
         json!({
+            "ip_cidr": [CGNAT_OVERLAY_CIDR],
+            "outbound": DEFAULT_DIRECT_TAG,
+        }),
+        json!({
             "clash_mode": "直连",
             "outbound": DEFAULT_DIRECT_TAG,
         }),
@@ -555,6 +562,7 @@ pub(crate) fn merge_into_existing_config(
         .or_insert_with(|| Value::String(selector_tag));
     ensure_subscription_direct_route(route, &direct_tag)?;
     ensure_bypass_route(route, &direct_tag)?;
+    ensure_cgnat_direct_route(route, &direct_tag)?;
 
     let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
     let experimental = experimental_value
@@ -1031,10 +1039,59 @@ fn ensure_bypass_route(route: &mut serde_json::Map<String, Value>, direct_tag: &
     Ok(())
 }
 
+fn ensure_cgnat_direct_route(
+    route: &mut serde_json::Map<String, Value>,
+    direct_tag: &str,
+) -> Result<()> {
+    let rules_value = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rules = rules_value
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    if let Some(rule) = rules
+        .iter_mut()
+        .find(|rule| rule_matches_cgnat_overlay_cidr(rule))
+    {
+        set_rule_outbound(rule, direct_tag);
+        return Ok(());
+    }
+
+    let index = rules
+        .iter()
+        .position(|rule| rule_references_rule_set(rule, DEFAULT_BYPASS_RULE_SET_TAG))
+        .map(|index| index + 1)
+        .or_else(|| {
+            rules
+                .iter()
+                .rposition(|existing| existing.get("action").is_some())
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    rules.insert(
+        index,
+        json!({
+            "ip_cidr": [CGNAT_OVERLAY_CIDR],
+            "outbound": direct_tag,
+        }),
+    );
+    Ok(())
+}
+
 fn rule_references_rule_set(rule: &Value, tag: &str) -> bool {
     match rule.get("rule_set") {
         Some(Value::String(value)) => value == tag,
         Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(tag)),
+        _ => false,
+    }
+}
+
+fn rule_matches_cgnat_overlay_cidr(rule: &Value) -> bool {
+    match rule.get("ip_cidr") {
+        Some(Value::String(value)) => value == CGNAT_OVERLAY_CIDR,
+        Some(Value::Array(values)) => values
+            .iter()
+            .any(|value| value.as_str() == Some(CGNAT_OVERLAY_CIDR)),
         _ => false,
     }
 }
@@ -1269,6 +1326,14 @@ mod tests {
         assert!(
             config["route"]["rules"].as_array().expect("route rules")[2]["rule_set"]
                 == "sing-box-tui-bypass"
+        );
+        assert_eq!(
+            config["route"]["rules"].as_array().expect("route rules")[3]["ip_cidr"],
+            json!(["100.64.0.0/10"])
+        );
+        assert_eq!(
+            config["route"]["rules"].as_array().expect("route rules")[3]["outbound"],
+            "国内直连"
         );
         assert!(
             config["route"]["rule_set"]
@@ -1542,6 +1607,14 @@ mod tests {
                 .expect("route rules")
                 .iter()
                 .any(|value| value["rule_set"] == "sing-box-tui-bypass"
+                    && value["outbound"] == "direct")
+        );
+        assert!(
+            config["route"]["rules"]
+                .as_array()
+                .expect("route rules")
+                .iter()
+                .any(|value| value["ip_cidr"] == json!(["100.64.0.0/10"])
                     && value["outbound"] == "direct")
         );
         assert!(
