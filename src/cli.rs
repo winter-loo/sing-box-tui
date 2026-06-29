@@ -701,23 +701,9 @@ fn parse_max_concurrency(value: Option<&String>, flag: &str) -> Result<usize> {
 }
 
 fn default_subscription_config_path() -> PathBuf {
-    if let Ok(path) = env::var("SING_BOX_CONFIG") {
-        return PathBuf::from(path);
-    }
-    let local_config = PathBuf::from("config.json");
-    if cfg!(windows) && local_config.exists() {
-        return local_config;
-    }
-    for path in [
-        "/usr/local/etc/sing-box/config.json",
-        "/opt/homebrew/etc/sing-box/config.json",
-    ] {
-        let candidate = PathBuf::from(path);
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from(DEFAULT_CONFIG_PATH)
+    env::var("SING_BOX_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
 fn print_usage() {
@@ -928,7 +914,7 @@ fn print_benchmark_usage() {
 #[cfg(test)]
 mod tests {
     use super::CliCommand;
-    use crate::defaults::DEFAULT_BENCHMARK_MAX_CONCURRENCY;
+    use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH};
     use std::path::PathBuf;
 
     #[test]
@@ -1033,6 +1019,74 @@ mod tests {
                 ..
             } => assert!(subscription_refresh_disabled),
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn config_commands_default_to_workspace_config() {
+        let run = CliCommand::parse(["run".to_string()]).expect("run command parses");
+        match run {
+            CliCommand::Run {
+                subscription_config_path,
+                ..
+            } => assert_eq!(subscription_config_path, PathBuf::from(DEFAULT_CONFIG_PATH)),
+            _ => panic!("expected run command"),
+        }
+
+        let import = CliCommand::parse([
+            "import".to_string(),
+            "--input".to_string(),
+            "nodes.yaml".to_string(),
+        ])
+        .expect("import command parses");
+        match import {
+            CliCommand::Import { config_path, .. } => {
+                assert_eq!(config_path, PathBuf::from(DEFAULT_CONFIG_PATH))
+            }
+            _ => panic!("expected import command"),
+        }
+
+        let subscribe = CliCommand::parse([
+            "subscribe".to_string(),
+            "--url".to_string(),
+            "https://example.com/sub".to_string(),
+        ])
+        .expect("subscribe command parses");
+        match subscribe {
+            CliCommand::Subscribe { config_path, .. } => {
+                assert_eq!(config_path, PathBuf::from(DEFAULT_CONFIG_PATH))
+            }
+            _ => panic!("expected subscribe command"),
+        }
+
+        let subscriptions = CliCommand::parse([
+            "subscriptions".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+        ])
+        .expect("subscriptions command parses");
+        match subscriptions {
+            CliCommand::Subscriptions { config_path, .. } => {
+                assert_eq!(config_path, PathBuf::from(DEFAULT_CONFIG_PATH))
+            }
+            _ => panic!("expected subscriptions command"),
+        }
+
+        let sync = CliCommand::parse([
+            "sync".to_string(),
+            "--provider".to_string(),
+            "https://3.airtcp.me".to_string(),
+            "--account-file".to_string(),
+            "account.txt".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+        ])
+        .expect("sync command parses");
+        match sync {
+            CliCommand::SyncProvider { config_path, .. } => {
+                assert_eq!(config_path, PathBuf::from(DEFAULT_CONFIG_PATH))
+            }
+            _ => panic!("expected sync command"),
         }
     }
 

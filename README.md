@@ -51,19 +51,19 @@ Example:
 cargo run -- sync \
   --provider https://3.airtcp.me \
   --account-file ./provider-account.txt \
-  --config /etc/sing-box/config.json \
+  --config ./config.json \
   --subscription-output ./output/airtcp-singbox.json
 
 cargo run -- sync \
   --provider https://3.airtcp.me \
   --account-file ./provider-account.txt \
-  --config /etc/sing-box/config.json \
+  --config ./config.json \
   --output ./output/merged-config.json
 
 cargo run -- sync \
   --provider https://3.airtcp.me \
   --account-file ./provider-account.txt \
-  --config /etc/sing-box/config.json \
+  --config ./config.json \
   --write
 ```
 
@@ -163,7 +163,7 @@ outbounds in an existing config:
 cargo run -- subscriptions \
   --input .suburl \
   --cache .suburl.cache.json \
-  --config /usr/local/etc/sing-box/config.json \
+  --config ./config.json \
   --output ./output/refreshed-config.json
 ```
 
@@ -172,7 +172,7 @@ Use `--write` instead of `--output` to overwrite `--config` in place, and `--for
 When the TUI is running, it also starts a background subscription refresh worker if `.suburl` exists. The worker runs once on startup, then checks again every day. It refreshes node outbounds in the configured sing-box config path and keeps the TUI responsive while network fetches are running:
 
 ```bash
-cargo run -- run --config /usr/local/etc/sing-box/config.json
+cargo run -- run --config ./config.json
 ```
 
 Set `SING_BOX_CONFIG=/path/to/config.json` or pass `--config` to control the write target. Use `--no-subscription-refresh` to disable the TUI worker and `--force-subscription-refresh` to fetch on startup even when the cache is fresh. After the worker writes a new config, restart or reload sing-box for the new nodes to become active in the running service.
@@ -325,7 +325,7 @@ cargo run -- import -i clash_proxies.txt -o config.json --replace-nodes
 
 Full-config behavior:
 
-- If `/etc/sing-box/config.json` does not exist, the importer creates a complete config with sane defaults:
+- If `./config.json` does not exist, the importer creates a complete workspace-local config with sane defaults:
   - mixed inbound on `127.0.0.1:6780`
   - `selector` outbound `select`
   - `urltest` outbound `auto`
@@ -334,7 +334,7 @@ Full-config behavior:
   - `experimental.clash_api` on `127.0.0.1:9992`
   - remote `geoip-cn`, `geosite-*`, and `AdGuardSDNSFilter` rule-sets only when `--include-geosite-rules` is passed
   - TUN inbound only when `--include-tun-mode` is passed
-- If `/etc/sing-box/config.json` exists, the importer reads it and merges the imported nodes into that config by default.
+- If `./config.json` exists, the importer reads it and merges the imported nodes into that config by default.
 - With `--replace-nodes`, the importer removes existing node outbounds first, then inserts the newly imported nodes.
 - Existing `select`, `auto`, `direct`, and `block` outbounds are reused when present.
 - Imported node tags replace same-tag outbounds and are appended otherwise.
@@ -412,7 +412,7 @@ Example with entries:
 Validate and restart once:
 
 ```bash
-sing-box check -c /etc/sing-box/config.json
+sing-box check -c ./config.json
 sudo systemctl restart sing-box
 ```
 

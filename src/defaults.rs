@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 pub(crate) const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:9992";
-pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/sing-box/config.json";
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "config.json";
 pub(crate) const DEFAULT_MIXED_PROXY_SERVER: &str = "127.0.0.1:6780";
 pub(crate) const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 pub(crate) const DEFAULT_VERIFICATION_TARGETS: &[(&str, &str)] = &[
