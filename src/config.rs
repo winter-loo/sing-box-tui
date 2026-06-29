@@ -10,6 +10,7 @@ use crate::defaults::{
     DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_BYPASS_RULE_SET_PATH,
     DEFAULT_BYPASS_RULE_SET_TAG, DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG, DEFAULT_LOCAL_DNS_TAG,
     DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, SELECTOR_TAG_ALIASES,
+    default_clash_api_external_controller,
 };
 
 // Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
@@ -580,7 +581,7 @@ pub(crate) fn merge_into_existing_config(
 
     let clash_api_value = experimental.entry("clash_api").or_insert_with(|| {
         json!({
-            "external_controller": "127.0.0.1:9992",
+            "external_controller": default_clash_api_external_controller(),
             "secret": "",
         })
     });
@@ -589,7 +590,7 @@ pub(crate) fn merge_into_existing_config(
         .context("existing config experimental.clash_api must be an object")?;
     clash_api
         .entry("external_controller")
-        .or_insert_with(|| Value::String("127.0.0.1:9992".to_string()));
+        .or_insert_with(|| Value::String(default_clash_api_external_controller().to_string()));
     clash_api
         .entry("secret")
         .or_insert_with(|| Value::String(String::new()));

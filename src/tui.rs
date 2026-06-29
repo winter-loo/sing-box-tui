@@ -3921,7 +3921,7 @@ mod tests {
         BenchmarkResult, BenchmarkSummary, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
         ProxyGroup,
     };
-    use crate::defaults::DEFAULT_BENCHMARK_MAX_CONCURRENCY;
+    use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
     use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
@@ -3973,7 +3973,7 @@ mod tests {
 
         App {
             client: ApiClient {
-                base_url: "http://127.0.0.1:9992".to_string(),
+                base_url: DEFAULT_CONTROLLER.to_string(),
                 runtime,
                 client,
             },

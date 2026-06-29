@@ -873,6 +873,7 @@ mod tests {
         subscription_config_backup_path, subscription_source_requires_direct_fetch,
         subscription_source_strips_flag_emoji,
     };
+    use crate::defaults::default_clash_api_external_controller;
     use std::fs;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -923,7 +924,7 @@ mod tests {
                     "enabled": false
                 },
                 "clash_api": {
-                    "external_controller": "127.0.0.1:9992"
+                    "external_controller": default_clash_api_external_controller()
                 }
             }
         });

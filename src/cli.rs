@@ -914,7 +914,9 @@ fn print_benchmark_usage() {
 #[cfg(test)]
 mod tests {
     use super::CliCommand;
-    use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH};
+    use crate::defaults::{
+        DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1374,7 +1376,7 @@ mod tests {
         let command = CliCommand::parse([
             "selectors".to_string(),
             "--controller".to_string(),
-            "http://127.0.0.1:9992".to_string(),
+            DEFAULT_CONTROLLER.to_string(),
             "--selector".to_string(),
             "select".to_string(),
         ])
@@ -1385,7 +1387,7 @@ mod tests {
                 controller,
                 selector,
             } => {
-                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9992"));
+                assert_eq!(controller.as_deref(), Some(DEFAULT_CONTROLLER));
                 assert_eq!(selector.as_deref(), Some("select"));
             }
             _ => panic!("expected selectors command"),
@@ -1397,13 +1399,13 @@ mod tests {
         let command = CliCommand::parse([
             "status".to_string(),
             "--controller".to_string(),
-            "http://127.0.0.1:9992".to_string(),
+            DEFAULT_CONTROLLER.to_string(),
         ])
         .expect("status command parses");
 
         match command {
             CliCommand::Status { controller } => {
-                assert_eq!(controller.as_deref(), Some("http://127.0.0.1:9992"));
+                assert_eq!(controller.as_deref(), Some(DEFAULT_CONTROLLER));
             }
             _ => panic!("expected status command"),
         }
