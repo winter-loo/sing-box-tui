@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -182,16 +182,10 @@ pub(crate) fn refresh_subscriptions(
     if cache_changed {
         cache_store.save(&cache)?;
     }
+    let update_path = subscription_config_update_path(&request.merged_path);
+    write_refreshed_config_update(&update_path, &refreshed_config)?;
     let backup_path = backup_existing_config(&request.merged_path)?;
-    fs::write(
-        &request.merged_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&refreshed_config)
-                .context("failed to serialize refreshed subscription config")?
-        ),
-    )
-    .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
+    commit_refreshed_config_update(&update_path, &request.merged_path)?;
     ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
 
     Ok(SubscriptionRefreshOutput {
@@ -208,6 +202,43 @@ fn read_existing_config(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read existing config {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_refreshed_config_update(update_path: &Path, config: &Value) -> Result<()> {
+    let mut file = File::create(update_path)
+        .with_context(|| format!("failed to create {}", update_path.display()))?;
+    file.write_all(
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(config)
+                .context("failed to serialize refreshed subscription config")?
+        )
+        .as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", update_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", update_path.display()))
+}
+
+fn commit_refreshed_config_update(update_path: &Path, config_path: &Path) -> Result<()> {
+    match fs::rename(update_path, config_path) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                config_path.display(),
+                update_path.display()
+            )
+        }),
+    }
+}
+
+fn subscription_config_update_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    path.with_file_name(format!("{file_name}.update"))
 }
 
 #[cfg(test)]
@@ -870,8 +901,8 @@ mod tests {
         CachedSubscription, ProviderNodeRefresh, backup_existing_config, cache_entry_is_fresh,
         parse_subscription_sources, redact_url, refresh_node_outbounds_only,
         refresh_provider_node_outbounds_only, strip_flag_emoji_from_node_tags,
-        subscription_config_backup_path, subscription_source_requires_direct_fetch,
-        subscription_source_strips_flag_emoji,
+        subscription_config_backup_path, subscription_config_update_path,
+        subscription_source_requires_direct_fetch, subscription_source_strips_flag_emoji,
     };
     use crate::defaults::default_clash_api_external_controller;
     use std::fs;
@@ -1419,6 +1450,16 @@ mod tests {
         assert!(!subscription_config_backup_path(&config).exists());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_path_uses_config_json_update_sidecar() {
+        let path = std::path::PathBuf::from("/tmp/config.json");
+
+        assert_eq!(
+            subscription_config_update_path(&path),
+            std::path::PathBuf::from("/tmp/config.json.update")
+        );
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
