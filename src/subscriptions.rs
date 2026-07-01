@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -183,7 +185,7 @@ pub(crate) fn refresh_subscriptions(
         cache_store.save(&cache)?;
     }
     let update_path = subscription_config_update_path(&request.merged_path);
-    write_refreshed_config_update(&update_path, &refreshed_config)?;
+    write_refreshed_config_update(&update_path, &request.merged_path, &refreshed_config)?;
     let backup_path = backup_existing_config(&request.merged_path)?;
     commit_refreshed_config_update(&update_path, &request.merged_path)?;
     ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
@@ -204,9 +206,14 @@ fn read_existing_config(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn write_refreshed_config_update(update_path: &Path, config: &Value) -> Result<()> {
+fn write_refreshed_config_update(
+    update_path: &Path,
+    config_path: &Path,
+    config: &Value,
+) -> Result<()> {
     let mut file = File::create(update_path)
         .with_context(|| format!("failed to create {}", update_path.display()))?;
+    set_update_file_permissions(&file, update_path, config_path)?;
     file.write_all(
         format!(
             "{}\n",
@@ -218,6 +225,32 @@ fn write_refreshed_config_update(update_path: &Path, config: &Value) -> Result<(
     .with_context(|| format!("failed to write {}", update_path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {}", update_path.display()))
+}
+
+#[cfg(unix)]
+fn set_update_file_permissions(file: &File, update_path: &Path, config_path: &Path) -> Result<()> {
+    let mode = match fs::metadata(config_path) {
+        Ok(metadata) => metadata.permissions().mode(),
+        Err(error) if error.kind() == ErrorKind::NotFound => 0o600,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read metadata for {}", config_path.display()));
+        }
+    };
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set permissions on {}", update_path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_update_file_permissions(file: &File, update_path: &Path, config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        let permissions = fs::metadata(config_path)
+            .with_context(|| format!("failed to read metadata for {}", config_path.display()))?
+            .permissions();
+        file.set_permissions(permissions)
+            .with_context(|| format!("failed to set permissions on {}", update_path.display()))?;
+    }
+    Ok(())
 }
 
 fn commit_refreshed_config_update(update_path: &Path, config_path: &Path) -> Result<()> {
