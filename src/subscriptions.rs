@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -182,16 +186,10 @@ pub(crate) fn refresh_subscriptions(
     if cache_changed {
         cache_store.save(&cache)?;
     }
+    let temp_path = subscription_config_temp_path(&request.merged_path)?;
+    write_refreshed_config_temp(&temp_path, &request.merged_path, &refreshed_config)?;
     let backup_path = backup_existing_config(&request.merged_path)?;
-    fs::write(
-        &request.merged_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&refreshed_config)
-                .context("failed to serialize refreshed subscription config")?
-        ),
-    )
-    .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
+    commit_refreshed_config_temp(&temp_path, &request.merged_path)?;
     ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
 
     Ok(SubscriptionRefreshOutput {
@@ -208,6 +206,116 @@ fn read_existing_config(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read existing config {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_refreshed_config_temp(temp_path: &Path, config_path: &Path, config: &Value) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
+    set_temp_file_permissions(&file, temp_path, config_path)?;
+    file.write_all(
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(config)
+                .context("failed to serialize refreshed subscription config")?
+        )
+        .as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", temp_path.display()))
+}
+
+#[cfg(unix)]
+fn set_temp_file_permissions(file: &File, temp_path: &Path, config_path: &Path) -> Result<()> {
+    let mode = match fs::metadata(config_path) {
+        Ok(metadata) => metadata.permissions().mode(),
+        Err(error) if error.kind() == ErrorKind::NotFound => 0o600,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read metadata for {}", config_path.display()));
+        }
+    };
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set permissions on {}", temp_path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_temp_file_permissions(file: &File, temp_path: &Path, config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        let permissions = fs::metadata(config_path)
+            .with_context(|| format!("failed to read metadata for {}", config_path.display()))?
+            .permissions();
+        file.set_permissions(permissions)
+            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
+    }
+    Ok(())
+}
+
+fn commit_refreshed_config_temp(temp_path: &Path, config_path: &Path) -> Result<()> {
+    atomic_replace(temp_path, config_path).with_context(|| {
+        format!(
+            "failed to atomically replace {} with {}",
+            config_path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(temp_path: &Path, config_path: &Path) -> Result<()> {
+    fs::rename(temp_path, config_path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_replace(temp_path: &Path, config_path: &Path) -> Result<()> {
+    use std::io;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    let old_path = wide_null(temp_path);
+    let new_path = wide_null(config_path);
+    let result = unsafe {
+        MoveFileExW(
+            old_path.as_ptr(),
+            new_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+fn subscription_config_temp_path(path: &Path) -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    Ok(path.with_file_name(format!(".{file_name}.tmp.{}.{}", std::process::id(), now)))
 }
 
 #[cfg(test)]
@@ -870,8 +978,8 @@ mod tests {
         CachedSubscription, ProviderNodeRefresh, backup_existing_config, cache_entry_is_fresh,
         parse_subscription_sources, redact_url, refresh_node_outbounds_only,
         refresh_provider_node_outbounds_only, strip_flag_emoji_from_node_tags,
-        subscription_config_backup_path, subscription_source_requires_direct_fetch,
-        subscription_source_strips_flag_emoji,
+        subscription_config_backup_path, subscription_config_temp_path,
+        subscription_source_requires_direct_fetch, subscription_source_strips_flag_emoji,
     };
     use crate::defaults::default_clash_api_external_controller;
     use std::fs;
@@ -1419,6 +1527,19 @@ mod tests {
         assert!(!subscription_config_backup_path(&config).exists());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn temp_path_uses_hidden_unique_sidecar_name() {
+        let path = std::path::PathBuf::from("/tmp/config.json");
+        let temp_path = subscription_config_temp_path(&path).expect("temp path");
+        let file_name = temp_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp file name");
+
+        assert_eq!(temp_path.parent(), path.parent());
+        assert!(file_name.starts_with(&format!(".config.json.tmp.{}.", std::process::id())));
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
