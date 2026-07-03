@@ -10,12 +10,14 @@ refresh, bypass rules, and OS system proxy settings.
 Install the latest prebuilt Windows release:
 
 ```powershell
-irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 | iex
+try { irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 -ErrorAction Stop } catch { irm https://deeloo.cn/anywhere/https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 } | iex
 ```
 
 The installer downloads the latest `sing-box-tui` Windows x64 release from
-GitHub, installs it under `%LOCALAPPDATA%\sing-box-tui`, adds that directory to
-the user `PATH`, and installs `sing-box` with `winget` when it is missing.
+GitHub directly when possible, falls back to the `https://deeloo.cn/anywhere`
+proxy when GitHub is not reachable, installs it under
+`%LOCALAPPDATA%\sing-box-tui`, adds that directory to the user `PATH`, and
+installs `sing-box` from the configured GitHub release when it is missing.
 
 From a local checkout, you can run:
 

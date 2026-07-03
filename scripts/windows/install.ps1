@@ -6,6 +6,7 @@ param(
     [string]$SingBoxRepo = "winter-loo/sing-box",
     [string]$SingBoxVersion = "v1.13.13-winterloo.2",
     [string]$SingBoxSha256 = "dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9",
+    [string]$GitHubProxy = "https://deeloo.cn/anywhere",
     [switch]$SkipSingBox,
     [switch]$AddToPath,
     [switch]$NoPath,
@@ -18,13 +19,45 @@ function Write-Step([string]$Message) {
     Write-Host "==> $Message"
 }
 
+function Join-GitHubProxyUrl([string]$Url) {
+    if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+        return $Url
+    }
+    return $GitHubProxy.TrimEnd("/") + "/" + $Url
+}
+
+function Invoke-GitHubApi([string]$Url) {
+    try {
+        return Invoke-RestMethod -Uri $Url -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    } catch {
+        if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+            throw
+        }
+        Write-Step "GitHub is not directly accessible; retrying through $GitHubProxy"
+        return Invoke-RestMethod -Uri (Join-GitHubProxyUrl $Url) -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    }
+}
+
+function Invoke-GitHubAssetDownload($Asset, [string]$OutFile) {
+    try {
+        Invoke-WebRequest -Uri $Asset.url -Headers @{ "User-Agent" = "sing-box-tui-installer"; "Accept" = "application/octet-stream" } -OutFile $OutFile
+    } catch {
+        if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+            throw
+        }
+        Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+        Write-Step "GitHub download is not directly accessible; retrying through $GitHubProxy"
+        Invoke-WebRequest -Uri (Join-GitHubProxyUrl $Asset.url) -Headers @{ "User-Agent" = "sing-box-tui-installer"; "Accept" = "application/octet-stream" } -OutFile $OutFile
+    }
+}
+
 function Get-ReleaseAsset {
     $releaseUrl = if ($Version -eq "latest") {
         "https://api.github.com/repos/$Repo/releases/latest"
     } else {
         "https://api.github.com/repos/$Repo/releases/tags/$Version"
     }
-    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    $release = Invoke-GitHubApi $releaseUrl
     $asset = $release.assets | Where-Object {
         $_.name -match "windows" -and $_.name -match "x86_64|x64" -and $_.name.EndsWith(".zip")
     } | Select-Object -First 1
@@ -36,7 +69,7 @@ function Get-ReleaseAsset {
 
 function Get-SingBoxReleaseAsset {
     $releaseUrl = "https://api.github.com/repos/$SingBoxRepo/releases/tags/$SingBoxVersion"
-    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    $release = Invoke-GitHubApi $releaseUrl
     $asset = $release.assets | Where-Object {
         $_.name -match "windows-amd64" -and $_.name.EndsWith(".exe")
     } | Select-Object -First 1
@@ -73,7 +106,7 @@ function Install-SingBoxCore {
     $asset = Get-SingBoxReleaseAsset
     $download = Join-Path $env:TEMP $asset.name
     Write-Step "Downloading sing-box core $($asset.name)"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $download
+    Invoke-GitHubAssetDownload $asset $download
 
     if ($SingBoxSha256) {
         $actual = (Get-FileHash -Path $download -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -106,7 +139,7 @@ if ((Test-Path $exe) -and -not $Force) {
     $zip = Join-Path $env:TEMP $asset.name
     $extract = Join-Path $env:TEMP ("sing-box-tui-install-" + [Guid]::NewGuid().ToString("N"))
     Write-Step "Downloading $($asset.name)"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+    Invoke-GitHubAssetDownload $asset $zip
     New-Item -ItemType Directory -Force -Path $extract | Out-Null
     Expand-Archive -Path $zip -DestinationPath $extract -Force
     $downloadedExe = Get-ChildItem -Path $extract -Recurse -Filter "sing-box-tui.exe" | Select-Object -First 1
