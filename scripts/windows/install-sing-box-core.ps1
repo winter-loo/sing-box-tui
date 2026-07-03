@@ -4,11 +4,44 @@ param(
     [string]$Version = "v1.13.13-winterloo.2",
     [string]$InstallDir = "$env:LOCALAPPDATA\sing-box-tui\core",
     [string]$Sha256 = "dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9",
+    [string]$GitHubProxy = "https://deeloo.cn/anywhere",
     [switch]$Force,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+
+function Join-GitHubProxyUrl([string]$Url) {
+    if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+        return $Url
+    }
+    return $GitHubProxy.TrimEnd("/") + "/" + $Url
+}
+
+function Invoke-GitHubApi([string]$Url) {
+    try {
+        return Invoke-RestMethod -Uri $Url -Headers @{ "User-Agent" = "sing-box-tui-onboard" }
+    } catch {
+        if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+            throw
+        }
+        Write-Host "GitHub is not directly accessible; retrying through $GitHubProxy"
+        return Invoke-RestMethod -Uri (Join-GitHubProxyUrl $Url) -Headers @{ "User-Agent" = "sing-box-tui-onboard" }
+    }
+}
+
+function Invoke-GitHubAssetDownload($Asset, [string]$OutFile) {
+    try {
+        Invoke-WebRequest -Uri $Asset.url -Headers @{ "User-Agent" = "sing-box-tui-onboard"; "Accept" = "application/octet-stream" } -OutFile $OutFile
+    } catch {
+        if ([string]::IsNullOrWhiteSpace($GitHubProxy)) {
+            throw
+        }
+        Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+        Write-Host "GitHub download is not directly accessible; retrying through $GitHubProxy"
+        Invoke-WebRequest -Uri (Join-GitHubProxyUrl $Asset.url) -Headers @{ "User-Agent" = "sing-box-tui-onboard"; "Accept" = "application/octet-stream" } -OutFile $OutFile
+    }
+}
 
 function Add-UserPath([string]$PathToAdd) {
     $current = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -37,7 +70,7 @@ if ($DryRun) {
     exit 0
 }
 
-$release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "sing-box-tui-onboard" }
+$release = Invoke-GitHubApi $releaseUrl
 $asset = $release.assets | Where-Object {
     $_.name -match "windows-amd64" -and $_.name.EndsWith(".exe")
 } | Select-Object -First 1
@@ -48,7 +81,7 @@ if (-not $asset) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $download = Join-Path $env:TEMP $asset.name
 Write-Host "Downloading $($asset.name)"
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $download
+Invoke-GitHubAssetDownload $asset $download
 
 if ($Sha256) {
     $actual = (Get-FileHash -Path $download -Algorithm SHA256).Hash.ToLowerInvariant()
