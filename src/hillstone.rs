@@ -27,11 +27,11 @@ type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type HmacMd5 = Hmac<Md5>;
 
-#[derive(Clone, Debug)]
 pub(crate) struct HillstoneProbeOptions {
     pub(crate) server: String,
     pub(crate) port: u16,
     pub(crate) username: String,
+    pub(crate) password: Option<String>,
     pub(crate) password_env: Option<String>,
     pub(crate) password_stdin: bool,
     pub(crate) host_id: Option<String>,
@@ -44,10 +44,28 @@ pub(crate) struct HillstoneProbeOptions {
     pub(crate) udp_tcp_probe: Option<String>,
     pub(crate) udp_http_get: Option<String>,
     pub(crate) udp_http_proxy: Option<String>,
-    pub(crate) udp_http_target: Option<String>,
     pub(crate) route_config_path: PathBuf,
     pub(crate) apply_routes: bool,
+    pub(crate) apply_routes_for_proxy: bool,
     pub(crate) route_proxy: Option<SocketAddrV4>,
+    pub(crate) event_sink: Option<Arc<dyn HillstoneEventSink>>,
+    pub(crate) shutdown: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HillstoneNetworkInfo {
+    pub(crate) client_ipv4: Option<Ipv4Addr>,
+    pub(crate) prefix_len: Option<u32>,
+    pub(crate) gateway_ipv4: Option<Ipv4Addr>,
+    pub(crate) server_udp_port: Option<u16>,
+    pub(crate) dns_ipv4: Vec<Ipv4Addr>,
+    pub(crate) route_cidrs: Vec<String>,
+    pub(crate) bridge_listen: Option<SocketAddrV4>,
+}
+
+pub(crate) trait HillstoneEventSink: Send + Sync {
+    fn state_changed(&self, state: &str, message: &str) -> Result<()>;
+    fn routes_pushed(&self, info: &HillstoneNetworkInfo) -> Result<()>;
 }
 
 pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> {
@@ -63,7 +81,7 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         .or_else(local_host_name)
         .unwrap_or_else(|| "sing-box-tui".to_string());
 
-    println!(
+    eprintln!(
         "Connecting to {}:{} (tls verification: {})",
         options.server,
         options.port,
@@ -73,9 +91,10 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
             "disabled"
         }
     );
+    emit_hillstone_state(&options, "connecting", "connecting to gateway")?;
 
     let mut stream = connect_tls(&options)?;
-    println!("TLS connected");
+    eprintln!("TLS connected");
 
     send_auth(
         &mut stream,
@@ -85,62 +104,69 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         &host_id,
         &host_name,
     )?;
-    println!("AUTH accepted");
+    eprintln!("AUTH accepted");
+    emit_hillstone_state(&options, "connecting", "authentication accepted")?;
 
     send_client_info(&mut stream, &options.server, options.port)?;
-    println!("CLNT_INFO accepted");
+    eprintln!("CLNT_INFO accepted");
 
     let network = wait_network_setup(&mut stream)?;
-    println!("Network setup:");
+    eprintln!("Network setup:");
     if let Some(ip) = network.client_private_ipv4 {
-        println!("  client_ipv4: {ip}/{}", network.prefix_len.unwrap_or(32));
+        eprintln!("  client_ipv4: {ip}/{}", network.prefix_len.unwrap_or(32));
     }
     if let Some(gateway) = network.server_private_ipv4 {
-        println!("  gateway_ipv4: {gateway}");
+        eprintln!("  gateway_ipv4: {gateway}");
     }
     if let Some(port) = network.server_udp_port {
-        println!("  server_udp_port: {port}");
+        eprintln!("  server_udp_port: {port}");
     }
     if !network.dns_ipv4.is_empty() {
-        println!("  dns_ipv4: {}", join_ipv4(&network.dns_ipv4));
+        eprintln!("  dns_ipv4: {}", join_ipv4(&network.dns_ipv4));
     }
     if !network.route_ipv4.is_empty() {
-        println!("  route_ipv4_raw_len: {}", network.route_ipv4.len());
+        eprintln!("  route_ipv4_raw_len: {}", network.route_ipv4.len());
         for route in decode_ipv4_routes(&network.route_ipv4) {
-            println!("  route_ipv4: {route}");
+            eprintln!("  route_ipv4: {route}");
         }
     }
+    emit_hillstone_routes(&options, &network)?;
     let routes_applied = apply_pushed_routes_to_config(&options, &network)?;
 
     if options.stop_before_new_key {
         send_logout(&mut stream)?;
-        println!("Stopped before NEW_KEY as requested");
+        eprintln!("Stopped before NEW_KEY as requested");
+        emit_hillstone_state(&options, "disconnected", "stopped before key negotiation")?;
         return Ok(());
     }
 
     let key_summary = send_new_key(&mut stream)?;
-    println!("NEW_KEY accepted:");
-    println!(
+    eprintln!("NEW_KEY accepted:");
+    eprintln!(
         "  enc_alg: {}",
         describe_algorithm(key_summary.enc_alg, encryption_algorithm_name)
     );
-    println!(
+    eprintln!(
         "  auth_alg: {}",
         describe_algorithm(key_summary.auth_alg, auth_algorithm_name)
     );
-    println!(
+    eprintln!(
         "  ipcomp_alg: {}",
         describe_algorithm(key_summary.ipcomp_alg, ipcomp_algorithm_name)
     );
     if let Some(spi) = key_summary.outbound_spi {
-        println!("  outbound_spi: 0x{spi:08x}");
+        eprintln!("  outbound_spi: 0x{spi:08x}");
     }
     if key_summary.session_id_present {
-        println!("  session_id: <redacted>");
+        eprintln!("  session_id: <redacted>");
     }
+    emit_hillstone_state(&options, "connected", "data tunnel ready")?;
 
     let shutdown = if options.udp_http_proxy.is_some() {
-        Some(install_shutdown_handler()?)
+        Some(match &options.shutdown {
+            Some(shutdown) => Arc::clone(shutdown),
+            None => install_shutdown_handler()?,
+        })
     } else {
         None
     };
@@ -150,14 +176,12 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         run_udp_tcp_probe(&options, &network, &key_summary, target)
     } else if let Some(url) = &options.udp_http_get {
         run_udp_http_get(&options, &network, &key_summary, url)
-    } else if let (Some(listen), Some(target)) = (&options.udp_http_proxy, &options.udp_http_target)
-    {
+    } else if let Some(listen) = &options.udp_http_proxy {
         run_udp_http_proxy(
             &options,
             &network,
             &key_summary,
             listen,
-            target,
             shutdown.expect("UDP HTTP proxy shutdown flag is installed"),
         )
     } else {
@@ -174,22 +198,50 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         return Err(error);
     }
     logout_result?;
+    emit_hillstone_state(&options, "disconnected", "logout sent")?;
     let route_status = if routes_applied {
         "routes were applied to config"
     } else {
         "no routes were changed"
     };
     if options.udp_icmp_probe {
-        println!("Probe complete; one UDP ESP ICMP probe was attempted and {route_status}");
+        eprintln!("Probe complete; one UDP ESP ICMP probe was attempted and {route_status}");
     } else if options.udp_tcp_probe.is_some() {
-        println!("Probe complete; one UDP ESP TCP SYN probe succeeded and {route_status}");
+        eprintln!("Probe complete; one UDP ESP TCP SYN probe succeeded and {route_status}");
     } else if options.udp_http_get.is_some() {
-        println!("Probe complete; one UDP ESP HTTP GET succeeded and {route_status}");
+        eprintln!("Probe complete; one UDP ESP HTTP GET succeeded and {route_status}");
     } else if options.udp_http_proxy.is_some() {
-        println!("Probe complete; UDP ESP HTTP proxy exited and {route_status}");
+        eprintln!("Probe complete; UDP ESP HTTP proxy exited and {route_status}");
     } else {
-        println!("Probe complete; no UDP data tunnel was opened and {route_status}");
+        eprintln!("Probe complete; no UDP data tunnel was opened and {route_status}");
     }
+    Ok(())
+}
+
+fn emit_hillstone_state(options: &HillstoneProbeOptions, state: &str, message: &str) -> Result<()> {
+    if let Some(sink) = &options.event_sink {
+        sink.state_changed(state, message)?;
+    }
+    Ok(())
+}
+
+fn emit_hillstone_routes(options: &HillstoneProbeOptions, network: &NetworkSetup) -> Result<()> {
+    let Some(sink) = &options.event_sink else {
+        return Ok(());
+    };
+    let bridge_listen = hillstone_route_proxy(options)?;
+    // SET_ROUTE is the only authoritative source we currently have for the intranet ranges.
+    // Emitting it before local route application lets the TUI own sing-box config changes while
+    // the Hillstone provider process stays focused on protocol/session handling.
+    sink.routes_pushed(&HillstoneNetworkInfo {
+        client_ipv4: network.client_private_ipv4,
+        prefix_len: network.prefix_len,
+        gateway_ipv4: network.server_private_ipv4,
+        server_udp_port: network.server_udp_port,
+        dns_ipv4: network.dns_ipv4.clone(),
+        route_cidrs: decode_ipv4_route_cidrs(&network.route_ipv4),
+        bridge_listen,
+    })?;
     Ok(())
 }
 
@@ -208,13 +260,15 @@ fn apply_pushed_routes_to_config(
     options: &HillstoneProbeOptions,
     network: &NetworkSetup,
 ) -> Result<bool> {
-    if !options.apply_routes && options.udp_http_proxy.is_none() {
+    if !options.apply_routes
+        && !(options.apply_routes_for_proxy && options.udp_http_proxy.is_some())
+    {
         return Ok(false);
     }
 
     let cidrs = decode_ipv4_route_cidrs(&network.route_ipv4);
     if cidrs.is_empty() {
-        println!("No parsable Hillstone route table was pushed; config not changed");
+        eprintln!("No parsable Hillstone route table was pushed; config not changed");
         return Ok(false);
     }
     let proxy = hillstone_route_proxy(options)?.context(
@@ -233,7 +287,7 @@ fn apply_pushed_routes_to_config(
             proxy,
         },
     )?;
-    println!(
+    eprintln!(
         "Applied Hillstone route table to {} via {}: {}",
         options.route_config_path.display(),
         proxy,
@@ -366,7 +420,7 @@ fn wait_network_setup(stream: &mut TlsStream<TcpStream>) -> Result<NetworkSetup>
             MessageType::KeyDone => return Ok(setup),
             MessageType::ServerDisconnect => bail!("server disconnected during network setup"),
             other => {
-                println!("  ignored_message: {}", other.name());
+                eprintln!("  ignored_message: {}", other.name());
             }
         }
     }
@@ -438,9 +492,9 @@ fn run_udp_icmp_probe(
     let inner_packet = build_ipv4_packet(client_ip, gateway_ip, IPPROTO_ICMP, &echo_request)?;
     let esp_packet = esp.encap_ipv4(&inner_packet)?;
 
-    println!("UDP ESP probe:");
-    println!("  target: {server_ip}:{server_udp_port}");
-    println!("  inner_ipv4: {client_ip} -> {gateway_ip} icmp_echo_id=0x{echo_id:04x}");
+    eprintln!("UDP ESP probe:");
+    eprintln!("  target: {server_ip}:{server_udp_port}");
+    eprintln!("  inner_ipv4: {client_ip} -> {gateway_ip} icmp_echo_id=0x{echo_id:04x}");
     socket
         .send_to(&esp_packet, (server_ip, server_udp_port))
         .context("failed to send UDP ESP probe")?;
@@ -448,17 +502,17 @@ fn run_udp_icmp_probe(
     let mut buffer = [0_u8; 4096];
     match socket.recv_from(&mut buffer) {
         Ok((size, source)) => {
-            println!("  udp_response_bytes: {size} from {source}");
+            eprintln!("  udp_response_bytes: {size} from {source}");
             let inner_response = esp
                 .decap_ipv4(&buffer[..size])
                 .context("received UDP response but could not decrypt ESP packet")?;
-            println!(
+            eprintln!(
                 "  decrypted_inner: {}",
                 describe_ipv4_packet(&inner_response)
             );
         }
         Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            println!("  udp_response: timed out after {}s", options.timeout_secs);
+            eprintln!("  udp_response: timed out after {}s", options.timeout_secs);
         }
         Err(error) => return Err(error).context("failed to receive UDP ESP probe response"),
     }
@@ -505,9 +559,9 @@ fn run_udp_tcp_probe(
         payload: &[],
     })?;
 
-    println!("UDP ESP TCP probe:");
-    println!("  target: {server_ip}:{server_udp_port}");
-    println!(
+    eprintln!("UDP ESP TCP probe:");
+    eprintln!("  target: {server_ip}:{server_udp_port}");
+    eprintln!(
         "  inner_tcp_syn: {client_ip}:{source_port} -> {}:{} seq=0x{sequence:08x}",
         target.ip(),
         target.port()
@@ -535,11 +589,11 @@ fn run_udp_tcp_probe(
 
         match socket.recv_from(&mut buffer) {
             Ok((size, source)) => {
-                println!("  udp_response_bytes: {size} from {source} after attempt {attempts}");
+                eprintln!("  udp_response_bytes: {size} from {source} after attempt {attempts}");
                 let inner_response = esp
                     .decap_ipv4(&buffer[..size])
                     .context("received UDP response but could not decrypt ESP packet")?;
-                println!(
+                eprintln!(
                     "  decrypted_inner: {}",
                     describe_ipv4_packet(&inner_response)
                 );
@@ -551,7 +605,7 @@ fn run_udp_tcp_probe(
                     target.port(),
                     sequence,
                 )?;
-                println!("  tcp_probe_result: {}", outcome.description());
+                eprintln!("  tcp_probe_result: {}", outcome.description());
                 if !outcome.is_success() {
                     bail!("UDP ESP TCP probe did not receive a SYN-ACK from {target}");
                 }
@@ -594,9 +648,9 @@ fn run_udp_http_get(
         .set_write_timeout(Some(timeout))
         .context("failed to set UDP write timeout")?;
 
-    println!("UDP ESP HTTP GET:");
-    println!("  target: {server_ip}:{server_udp_port}");
-    println!(
+    eprintln!("UDP ESP HTTP GET:");
+    eprintln!("  target: {server_ip}:{server_udp_port}");
+    eprintln!(
         "  request: http://{}:{}{}",
         request.host, request.port, request.path_with_query
     );
@@ -616,8 +670,8 @@ fn run_udp_http_get(
         timeout,
     )?;
     let status_line = http_status_line(&response).unwrap_or("<missing status line>");
-    println!("  http_status: {status_line}");
-    println!("  http_response_bytes: {}", response.len());
+    eprintln!("  http_status: {status_line}");
+    eprintln!("  http_response_bytes: {}", response.len());
     if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
         bail!("UDP ESP HTTP GET returned non-200 status: {status_line}");
     }
@@ -630,13 +684,11 @@ fn run_udp_http_proxy(
     network: &NetworkSetup,
     key_summary: &NewKeySummary,
     listen: &str,
-    target: &str,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let listen = listen.parse::<SocketAddrV4>().with_context(|| {
         format!("--udp-http-proxy listen address must be IPv4:PORT, got {listen}")
     })?;
-    let target = parse_tcp_probe_target(target)?;
     let client_ip = network
         .client_private_ipv4
         .context("UDP HTTP proxy requires SET_IP client private IPv4")?;
@@ -660,11 +712,10 @@ fn run_udp_http_proxy(
     listener
         .set_nonblocking(true)
         .context("failed to set local HTTP proxy listener nonblocking")?;
-    println!("UDP ESP HTTP proxy:");
-    println!("  listen: http://{listen}");
-    println!("  target: http://{target}");
-    println!("  esp_gateway: {server_ip}:{server_udp_port}");
-    println!("  note: keep this process running while testing in the browser");
+    eprintln!("UDP ESP HTTP proxy:");
+    eprintln!("  listen: http://{listen}");
+    eprintln!("  esp_gateway: {server_ip}:{server_udp_port}");
+    eprintln!("  note: keep this process running while testing in the browser");
 
     let mut source_ports = SourcePortAllocator::new();
     let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
@@ -684,7 +735,6 @@ fn run_udp_http_proxy(
                     (server_ip, server_udp_port),
                     client_ip,
                     listen,
-                    target,
                     &mut source_ports,
                     timeout,
                 ) {
@@ -719,7 +769,7 @@ fn run_udp_http_proxy(
     // Ctrl-C used to kill the process while the Hillstone control channel was still open, leaving
     // the gateway to expire the session on its own. Returning here lets run_hillstone_probe send a
     // CLIENT_LOGOUT frame and release the local bridge port as our own client exits.
-    println!("UDP ESP HTTP proxy stopped by local shutdown request");
+    eprintln!("UDP ESP HTTP proxy stopped by local shutdown request");
     Ok(())
 }
 
@@ -746,14 +796,13 @@ fn handle_http_proxy_client(
     server_endpoint: (Ipv4Addr, u16),
     client_ip: Ipv4Addr,
     listen: SocketAddrV4,
-    target: SocketAddrV4,
     source_ports: &mut SourcePortAllocator,
     timeout: Duration,
 ) -> Result<()> {
     let browser_request = read_http_request(client, timeout)?;
-    let target = resolve_http_proxy_target(&browser_request, listen, target)?;
+    let target = resolve_http_proxy_target(&browser_request, listen)?;
     let proxy_request = build_upstream_http_request(&browser_request, listen, target)?;
-    println!(
+    eprintln!(
         "  browser_request: {} {} -> {}",
         proxy_request.method, proxy_request.path, target
     );
@@ -768,7 +817,7 @@ fn handle_http_proxy_client(
         timeout,
     )?;
     let status_line = http_status_line(&response).unwrap_or("<missing status line>");
-    println!("  browser_response: {status_line} bytes={}", response.len());
+    eprintln!("  browser_response: {status_line} bytes={}", response.len());
     let response = rewrite_http_response_for_proxy(&response, target, &proxy_request.browser_base);
     client
         .write_all(&response)
@@ -809,7 +858,7 @@ fn http_request_over_esp_from_source_port(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     let client_isn = random_u32();
-    println!("  inner_tcp: {client_ip}:{source_port} -> {target} seq=0x{client_isn:08x}");
+    eprintln!("  inner_tcp: {client_ip}:{source_port} -> {target} seq=0x{client_isn:08x}");
     let mut state = tcp_handshake_over_esp(
         socket,
         esp,
@@ -945,10 +994,10 @@ fn tcp_handshake_over_esp(
                     // non-matching inner packets made the user-space TCP handshake reliable.
                     Err(_) => continue,
                 };
-                println!(
+                eprintln!(
                     "  tcp_handshake_response_bytes: {size} from {source} after attempt {attempts}"
                 );
-                println!(
+                eprintln!(
                     "  tcp_handshake_inner: {}",
                     describe_ipv4_packet(&inner_response)
                 );
@@ -1758,15 +1807,10 @@ struct UpstreamHttpRequest {
     browser_base: String,
 }
 
-fn resolve_http_proxy_target(
-    browser_request: &[u8],
-    listen: SocketAddrV4,
-    fallback_target: SocketAddrV4,
-) -> Result<SocketAddrV4> {
+fn resolve_http_proxy_target(browser_request: &[u8], listen: SocketAddrV4) -> Result<SocketAddrV4> {
     // Sing-box override_address keeps one system-proxy entry point, but the bridge only sees
-    // the rewritten TCP peer (127.0.0.1:18080). The original intranet IP:port survives in the
-    // HTTP request line/Host header, so derive the ESP target per request and keep the configured
-    // target only as the localhost testing fallback.
+    // the rewritten TCP peer (127.0.0.1:16780). The original intranet IP:port must survive in the
+    // HTTP request line or Host header; otherwise this bridge cannot know where to send ESP data.
     let header_end = find_http_header_end(browser_request).context("missing HTTP header end")?;
     let headers = std::str::from_utf8(&browser_request[..header_end])
         .context("browser request headers are not valid UTF-8")?;
@@ -1781,7 +1825,7 @@ fn resolve_http_proxy_target(
     if let Some(target) = request_host_target(headers, listen) {
         return Ok(target);
     }
-    Ok(fallback_target)
+    bail!("HTTP request does not contain an inferable intranet IPv4 target")
 }
 
 fn http_uri_target(uri: &str, listen: SocketAddrV4) -> Option<SocketAddrV4> {
@@ -2137,7 +2181,7 @@ fn print_frame_summary(label: &str, frame: &Frame) {
         .map(|key| payload_name(*key).to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
+    eprintln!(
         "{label}: type={} reply={} payloads=[{}]",
         frame.message_type.name(),
         frame.reply,
@@ -2426,6 +2470,10 @@ fn payload_name(value: u16) -> &'static str {
 }
 
 fn read_password(options: &HillstoneProbeOptions) -> Result<String> {
+    if let Some(password) = options.password.as_ref().filter(|value| !value.is_empty()) {
+        return Ok(password.clone());
+    }
+
     if options.password_stdin {
         let mut password = String::new();
         io::stdin()
@@ -2920,7 +2968,6 @@ mod tests {
         let target = resolve_http_proxy_target(
             browser_request,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
-            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
         )
         .expect("target resolves");
 
@@ -2937,7 +2984,6 @@ mod tests {
         let target = resolve_http_proxy_target(
             browser_request,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
-            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
         )
         .expect("target resolves");
 
@@ -2948,20 +2994,20 @@ mod tests {
     }
 
     #[test]
-    fn resolves_proxy_target_to_fallback_for_local_listener() {
+    fn rejects_proxy_target_when_request_only_names_local_listener() {
         let browser_request =
             b"GET / HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUser-Agent: test\r\n\r\n";
 
-        let target = resolve_http_proxy_target(
+        let error = resolve_http_proxy_target(
             browser_request,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
-            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
         )
-        .expect("target resolves");
+        .expect_err("local listener request has no intranet target");
 
-        assert_eq!(
-            target,
-            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011)
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain an inferable intranet IPv4 target")
         );
     }
 

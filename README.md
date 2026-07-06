@@ -442,6 +442,10 @@ The former Python skill script is now built into the Rust app.
 
 For a manual provider-subscription workflow, including fetching a sing-box subscription JSON, converting legacy config syntax for local testing, benchmarking every node through the Clash API, and verifying real traffic, see [docs/subscription-benchmark.md](docs/subscription-benchmark.md).
 
+For enterprise intranet access through an external Remote Access provider process,
+including the Hillstone provider, TUI settings, and troubleshooting, see
+[docs/remote-access-provider.md](docs/remote-access-provider.md).
+
 CLI examples:
 
 ```bash

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
+use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::process::Command;
@@ -27,6 +28,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 
+use crate::config::{RemoteAccessRouteTableOptions, run_remote_access_route_table_config};
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkSummary,
     ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport, VerificationTarget,
@@ -37,6 +39,11 @@ use crate::defaults::{
     DEFAULT_SELECTOR_TAG, DEFAULT_VERIFICATION_TARGETS, REFRESH_DEBOUNCE,
     SINGLE_NODE_RETEST_DEBOUNCE,
 };
+use crate::network_access::{
+    ExternalRemoteAccessProvider, RemoteAccessBridge, RemoteAccessCommand, RemoteAccessEvent,
+    RemoteAccessProviderManifest, RemoteAccessRoute, RemoteAccessState, default_hillstone_manifest,
+    load_remote_access_manifest,
+};
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
@@ -45,8 +52,8 @@ use crate::subscriptions::{
     refresh_subscriptions,
 };
 use crate::tui_state::{
-    BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
-    default_tui_state_path, parse_bypass_entries,
+    BypassRuleSetStore, RemoteAccessProviderRuntimeState, TuiRuntimeState, TuiStateStore,
+    default_bypass_rule_set_path, default_tui_state_path, parse_bypass_entries,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -75,6 +82,15 @@ const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::AutoPickThresholdMs,
     SettingsField::AutoPickIntervalSec,
     SettingsField::SystemProxyServer,
+    SettingsField::RemoteAccessProvider,
+    SettingsField::RemoteAccessManifestPath,
+    SettingsField::RemoteAccessServer,
+    SettingsField::RemoteAccessPort,
+    SettingsField::RemoteAccessUsername,
+    SettingsField::RemoteAccessPassword,
+    SettingsField::RemoteAccessPasswordEnv,
+    SettingsField::RemoteAccessBridgeListen,
+    SettingsField::RemoteAccessTlsVerify,
 ];
 
 #[derive(Clone, Debug)]
@@ -134,6 +150,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_benchmark_updates()?;
         app.poll_subscription_refresh_updates()?;
         app.poll_system_proxy_updates();
+        app.poll_remote_access_updates()?;
         app.poll_verify_updates();
         app.maybe_start_subscription_refresh();
         app.maybe_start_auto_select_benchmark()?;
@@ -160,7 +177,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(8)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(10), Constraint::Length(9)]).areas(frame.area());
     let implicit_root_mode = app.implicit_root_mode();
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
@@ -371,6 +388,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" connections  "),
             Span::styled("v", Style::default().fg(Color::Cyan)),
             Span::raw(" verify  "),
+            Span::styled("V", Style::default().fg(Color::Cyan)),
+            Span::raw(" remote access  "),
             Span::styled("o", Style::default().fg(Color::Cyan)),
             Span::raw(" settings  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
@@ -391,6 +410,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Line::from(benchmark_hint),
         Line::from(app.connections_summary_line()),
         Line::from(app.subscription_summary_line()),
+        app.remote_access.summary_line(),
         bottom_line,
     ])
     .block(Block::default().title("Status").borders(Borders::ALL));
@@ -426,7 +446,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .saturating_add(1)
             .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
             .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
-        let cursor_y = status_area.y.saturating_add(6);
+        let cursor_y = status_area.y.saturating_add(7);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -560,6 +580,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Run configured connectivity checks in the background.",
     },
     HelpBinding {
+        key: "V",
+        summary: "Toggle Remote Access",
+        detail: "Connect or disconnect the configured remote-access provider.",
+    },
+    HelpBinding {
         key: "o",
         summary: "Open settings",
         detail: "Edit TUI benchmark, auto-pick, and system proxy settings.",
@@ -666,7 +691,7 @@ fn help_binding(binding: HelpBinding, selected: bool) -> Line<'static> {
 
 fn draw_settings_panel(frame: &mut Frame, app: &App) {
     let frame_area = frame.area();
-    let area = centered_rect(86, 18, frame_area);
+    let area = centered_rect(96, 26, frame_area);
     frame.render_widget(Clear, area);
     let selected = app
         .settings_index
@@ -694,7 +719,7 @@ fn draw_settings_panel(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw("  "),
-                Span::raw(settings_field_value(app, *field)),
+                Span::raw(settings_field_display_value(app, *field)),
             ])
             .style(style),
         );
@@ -761,6 +786,15 @@ fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
         SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
         SettingsField::SystemProxyServer => "System proxy server",
+        SettingsField::RemoteAccessProvider => "Remote access provider",
+        SettingsField::RemoteAccessManifestPath => "Remote access manifest path",
+        SettingsField::RemoteAccessServer => "Remote access server",
+        SettingsField::RemoteAccessPort => "Remote access port",
+        SettingsField::RemoteAccessUsername => "Remote access username",
+        SettingsField::RemoteAccessPassword => "Remote access password",
+        SettingsField::RemoteAccessPasswordEnv => "Remote access password env",
+        SettingsField::RemoteAccessBridgeListen => "Remote access bridge listen",
+        SettingsField::RemoteAccessTlsVerify => "Remote access TLS verify",
     }
 }
 
@@ -774,6 +808,31 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
         SettingsField::SystemProxyServer => app.system_proxy_server.clone(),
+        SettingsField::RemoteAccessProvider => app.remote_access.focused_id().to_string(),
+        SettingsField::RemoteAccessManifestPath => app
+            .remote_access
+            .focused()
+            .manifest_path
+            .clone()
+            .unwrap_or_default(),
+        SettingsField::RemoteAccessServer => app.remote_access.focused().server.clone(),
+        SettingsField::RemoteAccessPort => app.remote_access.focused().port.to_string(),
+        SettingsField::RemoteAccessUsername => app.remote_access.focused().username.clone(),
+        SettingsField::RemoteAccessPassword => app.remote_access.focused().password.clone(),
+        SettingsField::RemoteAccessPasswordEnv => app.remote_access.focused().password_env.clone(),
+        SettingsField::RemoteAccessBridgeListen => {
+            app.remote_access.focused().bridge_listen.clone()
+        }
+        SettingsField::RemoteAccessTlsVerify => app.remote_access.focused().tls_verify.to_string(),
+    }
+}
+
+fn settings_field_display_value(app: &App, field: SettingsField) -> String {
+    match field {
+        SettingsField::RemoteAccessPassword if !app.remote_access.focused().password.is_empty() => {
+            "<set>".to_string()
+        }
+        _ => settings_field_value(app, field),
     }
 }
 
@@ -787,6 +846,14 @@ where
         bail!("value must be greater than 0");
     }
     Ok(parsed)
+}
+
+fn parse_bool_setting(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => bail!("value must be true or false"),
+    }
 }
 
 fn normalize_optional_setting(value: Option<String>) -> Option<String> {
@@ -1875,6 +1942,15 @@ enum SettingsField {
     AutoPickThresholdMs,
     AutoPickIntervalSec,
     SystemProxyServer,
+    RemoteAccessProvider,
+    RemoteAccessManifestPath,
+    RemoteAccessServer,
+    RemoteAccessPort,
+    RemoteAccessUsername,
+    RemoteAccessPassword,
+    RemoteAccessPasswordEnv,
+    RemoteAccessBridgeListen,
+    RemoteAccessTlsVerify,
 }
 
 struct SettingsEditState {
@@ -1933,6 +2009,7 @@ struct App {
     system_proxy_job: Option<SystemProxyJob>,
     last_system_proxy_status_refresh: Instant,
     verify_job: Option<VerifyJob>,
+    remote_access: RemoteAccessRuntime,
 }
 
 struct SubscriptionRefreshState {
@@ -1963,6 +2040,284 @@ struct SystemProxyJob {
 struct VerifyJob {
     receiver: mpsc::Receiver<VerificationReport>,
     worker: JoinHandle<()>,
+}
+
+struct RemoteAccessProfileRuntime {
+    id: String,
+    manifest_path: Option<String>,
+    manifest: RemoteAccessProviderManifest,
+    process: Option<ExternalRemoteAccessProvider>,
+    state: RemoteAccessState,
+    server: String,
+    port: u16,
+    username: String,
+    password: String,
+    password_env: String,
+    bridge_listen: String,
+    tls_verify: bool,
+    routes: Vec<RemoteAccessRoute>,
+    dns: Vec<String>,
+    bridge: Option<RemoteAccessBridge>,
+    last_error: Option<String>,
+}
+
+impl RemoteAccessProfileRuntime {
+    fn default_hillstone() -> Result<Self> {
+        let manifest_path = env::var("SING_BOX_TUI_REMOTE_ACCESS_MANIFEST")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
+        let manifest =
+            load_remote_access_manifest_for_profile("hillstone", manifest_path.as_deref())?;
+        Ok(Self {
+            id: "hillstone".to_string(),
+            manifest_path,
+            manifest,
+            process: None,
+            state: RemoteAccessState::Disconnected,
+            server: env::var("HILLSTONE_SERVER").unwrap_or_default(),
+            port: 4433,
+            username: env::var("HILLSTONE_USERNAME").unwrap_or_default(),
+            password: String::new(),
+            password_env: "HILLSTONE_PASSWORD".to_string(),
+            bridge_listen: "127.0.0.1:16780".to_string(),
+            tls_verify: false,
+            routes: Vec::new(),
+            dns: Vec::new(),
+            bridge: None,
+            last_error: None,
+        })
+    }
+
+    fn from_state(state: RemoteAccessProviderRuntimeState) -> Result<Self> {
+        let id = normalize_optional_setting(Some(state.id.clone()))
+            .unwrap_or_else(|| "hillstone".to_string());
+        let manifest_path = normalize_optional_setting(state.manifest_path.clone());
+        let manifest = load_remote_access_manifest_for_profile(&id, manifest_path.as_deref())?;
+        let mut profile = Self {
+            id,
+            manifest_path,
+            manifest,
+            process: None,
+            state: RemoteAccessState::Disconnected,
+            server: String::new(),
+            port: 4433,
+            username: String::new(),
+            password: String::new(),
+            password_env: String::new(),
+            bridge_listen: "127.0.0.1:16780".to_string(),
+            tls_verify: false,
+            routes: Vec::new(),
+            dns: Vec::new(),
+            bridge: None,
+            last_error: None,
+        };
+        profile.apply_state(state);
+        Ok(profile)
+    }
+
+    fn apply_state(&mut self, state: RemoteAccessProviderRuntimeState) {
+        if let Some(value) = normalize_optional_setting(state.server) {
+            self.server = value;
+        }
+        if let Some(value) = state.port.filter(|value| *value > 0) {
+            self.port = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.username) {
+            self.username = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.password) {
+            self.password = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.password_env) {
+            self.password_env = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.bridge_listen) {
+            self.bridge_listen = value;
+        }
+        self.tls_verify = state.tls_verify;
+    }
+
+    fn runtime_state(&self) -> RemoteAccessProviderRuntimeState {
+        RemoteAccessProviderRuntimeState {
+            id: self.id.clone(),
+            manifest_path: self.manifest_path.clone(),
+            server: normalize_optional_setting(Some(self.server.clone())),
+            port: Some(self.port),
+            username: normalize_optional_setting(Some(self.username.clone())),
+            password: normalize_optional_setting(Some(self.password.clone())),
+            password_env: normalize_optional_setting(Some(self.password_env.clone())),
+            bridge_listen: normalize_optional_setting(Some(self.bridge_listen.clone())),
+            tls_verify: self.tls_verify,
+        }
+    }
+}
+
+struct RemoteAccessRuntime {
+    profiles: Vec<RemoteAccessProfileRuntime>,
+    focused_index: usize,
+}
+
+impl RemoteAccessRuntime {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            profiles: vec![RemoteAccessProfileRuntime::default_hillstone()?],
+            focused_index: 0,
+        })
+    }
+
+    fn focused(&self) -> &RemoteAccessProfileRuntime {
+        &self.profiles[self.focused_index]
+    }
+
+    fn focused_mut(&mut self) -> &mut RemoteAccessProfileRuntime {
+        &mut self.profiles[self.focused_index]
+    }
+
+    fn focused_id(&self) -> &str {
+        self.focused().id.as_str()
+    }
+
+    fn set_focus_by_id(&mut self, id: &str) -> Result<bool> {
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            bail!("unknown remote access provider profile: {id}");
+        };
+        let changed = self.focused_index != index;
+        self.focused_index = index;
+        Ok(changed)
+    }
+
+    fn apply_state(&mut self, state: &TuiRuntimeState) -> Result<()> {
+        if !state.remote_access_providers.is_empty() {
+            let mut profiles = Vec::new();
+            for profile_state in state.remote_access_providers.clone() {
+                profiles.push(RemoteAccessProfileRuntime::from_state(profile_state)?);
+            }
+            self.profiles = profiles;
+            self.focused_index = self
+                .focused_index
+                .min(self.profiles.len().saturating_sub(1));
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn runtime_states(&self) -> Vec<RemoteAccessProviderRuntimeState> {
+        self.profiles
+            .iter()
+            .map(RemoteAccessProfileRuntime::runtime_state)
+            .collect()
+    }
+
+    fn summary_line(&self) -> Line<'static> {
+        let focused = self.focused();
+        let mut spans = vec![Span::styled(
+            "remote access: ",
+            Style::default().fg(Color::DarkGray),
+        )];
+        for (index, profile) in self.profiles.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.extend(remote_access_profile_badge(
+                profile,
+                index == self.focused_index,
+            ));
+        }
+        if !focused.routes.is_empty() {
+            spans.push(Span::styled(
+                format!(" routes={}", focused.routes.len()),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        let bridge = focused
+            .bridge
+            .as_ref()
+            .map(|bridge| bridge.listen.as_str())
+            .unwrap_or(focused.bridge_listen.as_str());
+        if matches!(
+            focused.state,
+            RemoteAccessState::Connected | RemoteAccessState::Connecting
+        ) {
+            spans.push(Span::styled(
+                format!(" bridge={bridge}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(error) = focused.last_error.as_ref() {
+            spans.push(Span::raw(" error="));
+            spans.push(Span::styled(
+                truncate_for_width(error, 48),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
+    }
+}
+
+fn remote_access_profile_badge(
+    profile: &RemoteAccessProfileRuntime,
+    focused: bool,
+) -> Vec<Span<'static>> {
+    let label = remote_access_state_badge(profile.state.clone());
+    let state_style = remote_access_state_style(&profile.state);
+    let id_style = if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    vec![
+        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if focused { ">" } else { "" },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(profile.id.clone(), id_style),
+        Span::raw(" "),
+        Span::styled(label, state_style),
+        Span::styled("]", Style::default().fg(Color::DarkGray)),
+    ]
+}
+
+fn remote_access_state_badge(state: RemoteAccessState) -> &'static str {
+    match state {
+        RemoteAccessState::Disabled => "DISABLED",
+        RemoteAccessState::Disconnected => "DISCONNECTED",
+        RemoteAccessState::Connecting => "CONNECTING",
+        RemoteAccessState::Connected => "CONNECTED",
+        RemoteAccessState::Disconnecting => "DISCONNECTING",
+        RemoteAccessState::Error => "ERROR",
+    }
+}
+
+fn remote_access_state_style(state: &RemoteAccessState) -> Style {
+    match state {
+        RemoteAccessState::Connected => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        RemoteAccessState::Connecting | RemoteAccessState::Disconnecting => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        RemoteAccessState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        RemoteAccessState::Disabled | RemoteAccessState::Disconnected => {
+            Style::default().fg(Color::DarkGray)
+        }
+    }
+}
+
+fn load_remote_access_manifest_for_profile(
+    profile_id: &str,
+    manifest_path: Option<&str>,
+) -> Result<RemoteAccessProviderManifest> {
+    if let Some(path) = manifest_path.filter(|path| !path.trim().is_empty()) {
+        return load_remote_access_manifest(Path::new(path));
+    }
+    // Profiles are user-facing connection slots. Multiple profiles can share the same
+    // provider implementation, so an omitted manifest path means "use the built-in Hillstone
+    // provider" regardless of the profile id.
+    let _ = profile_id;
+    default_hillstone_manifest()
 }
 
 impl SubscriptionRefreshState {
@@ -2071,16 +2426,18 @@ impl App {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
+            remote_access: RemoteAccessRuntime::new()?,
         };
-        app.apply_runtime_state(runtime_state.clone());
+        app.apply_runtime_state(runtime_state.clone())?;
         app.refresh()?;
         app.restore_persisted_selections(&runtime_state)?;
-        app.apply_runtime_state(runtime_state);
+        app.apply_runtime_state(runtime_state)?;
         app.save_bypass_rule_set()?;
         Ok(app)
     }
 
-    fn apply_runtime_state(&mut self, state: TuiRuntimeState) {
+    fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
+        self.remote_access.apply_state(&state)?;
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.bypass_entries = state.bypass_entries;
@@ -2107,6 +2464,7 @@ impl App {
         }
         if let Some(value) = state
             .system_proxy_server
+            .clone()
             .filter(|value| !value.trim().is_empty())
         {
             self.system_proxy_server = value;
@@ -2120,6 +2478,7 @@ impl App {
             self.sync_selection_to_member_name(&node);
         }
         self.sync_selection_to_displayed_members();
+        Ok(())
     }
 
     fn runtime_state(&self) -> TuiRuntimeState {
@@ -2147,6 +2506,7 @@ impl App {
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy_server.clone()),
             system_proxy_server_override: self.system_proxy_server_override,
+            remote_access_providers: self.remote_access.runtime_states(),
         }
     }
 
@@ -2695,6 +3055,7 @@ impl App {
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('V') => self.toggle_remote_access()?,
             KeyCode::Char('o') => self.open_settings_panel(),
             KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
@@ -2902,6 +3263,45 @@ impl App {
                 }
                 self.system_proxy_server = value.to_string();
                 self.system_proxy_server_override = true;
+            }
+            SettingsField::RemoteAccessProvider => {
+                self.remote_access.set_focus_by_id(value)?;
+            }
+            SettingsField::RemoteAccessManifestPath => {
+                if self.remote_access.focused().process.is_some() {
+                    bail!("disconnect Remote Access before changing provider manifest");
+                }
+                let profile_id = self.remote_access.focused().id.clone();
+                let manifest_path = normalize_optional_setting(Some(value.to_string()));
+                let manifest =
+                    load_remote_access_manifest_for_profile(&profile_id, manifest_path.as_deref())?;
+                let focused = self.remote_access.focused_mut();
+                focused.manifest_path = manifest_path;
+                focused.manifest = manifest;
+            }
+            SettingsField::RemoteAccessServer => {
+                self.remote_access.focused_mut().server = value.to_string();
+            }
+            SettingsField::RemoteAccessPort => {
+                self.remote_access.focused_mut().port = parse_positive(value)?
+            }
+            SettingsField::RemoteAccessUsername => {
+                self.remote_access.focused_mut().username = value.to_string();
+            }
+            SettingsField::RemoteAccessPassword => {
+                self.remote_access.focused_mut().password = value.to_string();
+            }
+            SettingsField::RemoteAccessPasswordEnv => {
+                self.remote_access.focused_mut().password_env = value.to_string();
+            }
+            SettingsField::RemoteAccessBridgeListen => {
+                value
+                    .parse::<SocketAddrV4>()
+                    .context("bridge listen must be an IPv4:PORT address")?;
+                self.remote_access.focused_mut().bridge_listen = value.to_string();
+            }
+            SettingsField::RemoteAccessTlsVerify => {
+                self.remote_access.focused_mut().tls_verify = parse_bool_setting(value)?;
             }
         }
         self.save_runtime_state()?;
@@ -3712,6 +4112,260 @@ impl App {
         self.set_status_with_flash(result.summary_line());
     }
 
+    fn toggle_remote_access(&mut self) -> Result<()> {
+        match self.remote_access.focused().state {
+            RemoteAccessState::Connected | RemoteAccessState::Connecting => {
+                self.disconnect_remote_access()
+            }
+            RemoteAccessState::Disconnecting => {
+                self.set_status_only("Remote Access disconnect is already running");
+                Ok(())
+            }
+            RemoteAccessState::Disabled
+            | RemoteAccessState::Disconnected
+            | RemoteAccessState::Error => self.connect_remote_access(),
+        }
+    }
+
+    fn connect_remote_access(&mut self) -> Result<()> {
+        if self.remote_access.focused().server.trim().is_empty() {
+            self.set_status_only("Configure Remote access server in settings first");
+            return Ok(());
+        }
+        if self.remote_access.focused().username.trim().is_empty() {
+            self.set_status_only("Configure Remote access username in settings first");
+            return Ok(());
+        }
+        if let Err(error) = self
+            .remote_access
+            .focused()
+            .bridge_listen
+            .parse::<SocketAddrV4>()
+        {
+            self.set_status_only(format!("Remote access bridge listen invalid: {error}"));
+            return Ok(());
+        }
+
+        if self.remote_access.focused().process.is_none() {
+            match ExternalRemoteAccessProvider::spawn(self.remote_access.focused().manifest.clone())
+            {
+                Ok(process) => {
+                    self.remote_access.focused_mut().process = Some(process);
+                }
+                Err(error) => {
+                    self.remote_access.focused_mut().state = RemoteAccessState::Error;
+                    self.remote_access.focused_mut().last_error = Some(error.to_string());
+                    self.set_status_with_flash(format!(
+                        "Remote Access failed to start provider: {error}"
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        let profile_id = self.remote_access.focused().id.clone();
+        let provider = self.remote_access.focused().manifest.id.clone();
+        let password =
+            normalize_optional_setting(Some(self.remote_access.focused().password.clone()));
+        let password_env =
+            normalize_optional_setting(Some(self.remote_access.focused().password_env.clone()));
+        // Direct passwords are deliberately supported for a simpler local workflow. The value is
+        // sent only to the provider process; the settings list masks it unless the field is edited.
+        let command = RemoteAccessCommand::Connect {
+            id: "tui-connect".to_string(),
+            provider: provider.clone(),
+            config: serde_json::json!({
+                "server": self.remote_access.focused().server,
+                "port": self.remote_access.focused().port,
+                "username": self.remote_access.focused().username,
+                "password": password,
+                "password_env": password_env,
+                "bridge_listen": self.remote_access.focused().bridge_listen,
+                "tls_verify": self.remote_access.focused().tls_verify,
+            }),
+        };
+        if let Some(process) = self.remote_access.focused_mut().process.as_mut() {
+            if let Err(error) = process.send(&command) {
+                self.remote_access.focused_mut().state = RemoteAccessState::Error;
+                self.remote_access.focused_mut().last_error = Some(error.to_string());
+                self.set_status_with_flash(format!(
+                    "Remote Access failed to send connect command: {error}"
+                ));
+                return Ok(());
+            }
+        }
+        self.remote_access.focused_mut().state = RemoteAccessState::Connecting;
+        self.remote_access.focused_mut().last_error = None;
+        self.set_status_only(format!(
+            "Remote Access {profile_id} ({provider}) connecting..."
+        ));
+        self.save_runtime_state()?;
+        Ok(())
+    }
+
+    fn disconnect_remote_access(&mut self) -> Result<()> {
+        let Some(process) = self.remote_access.focused_mut().process.as_mut() else {
+            self.remote_access.focused_mut().state = RemoteAccessState::Disconnected;
+            self.set_status_only("Remote Access is already disconnected");
+            return Ok(());
+        };
+        let provider = process.provider_id().to_string();
+        if let Err(error) = process.send(&RemoteAccessCommand::Disconnect {
+            id: "tui-disconnect".to_string(),
+            provider: provider.clone(),
+            session_id: None,
+        }) {
+            self.remote_access.focused_mut().state = RemoteAccessState::Error;
+            self.remote_access.focused_mut().last_error = Some(error.to_string());
+            self.set_status_with_flash(format!(
+                "Remote Access failed to send disconnect command: {error}"
+            ));
+            return Ok(());
+        }
+        self.remote_access.focused_mut().state = RemoteAccessState::Disconnecting;
+        let profile_id = self.remote_access.focused().id.clone();
+        self.set_status_only(format!(
+            "Remote Access {profile_id} ({provider}) disconnecting..."
+        ));
+        Ok(())
+    }
+
+    fn poll_remote_access_updates(&mut self) -> Result<()> {
+        for profile_index in 0..self.remote_access.profiles.len() {
+            let mut stop_process = false;
+            loop {
+                let profile_id = self.remote_access.profiles[profile_index].id.clone();
+                let event = match self.remote_access.profiles[profile_index].process.as_ref() {
+                    Some(process) => match process.try_recv() {
+                        Ok(Some(event)) => event,
+                        Ok(None) => break,
+                        Err(error) => {
+                            self.remote_access.profiles[profile_index].last_error =
+                                Some(error.clone());
+                            self.remote_access.profiles[profile_index].state =
+                                RemoteAccessState::Error;
+                            self.set_status_with_flash(format!(
+                                "Remote Access {profile_id} failed: {error}"
+                            ));
+                            stop_process = true;
+                            break;
+                        }
+                    },
+                    None => break,
+                };
+                match event.event {
+                    RemoteAccessEvent::StateChanged {
+                        provider,
+                        state,
+                        message,
+                    } => {
+                        self.remote_access.profiles[profile_index].state = state.clone();
+                        if matches!(state, RemoteAccessState::Disconnected) {
+                            stop_process = true;
+                        }
+                        self.set_status_only(format!(
+                            "Remote Access {profile_id} ({provider}) {}: {message}",
+                            state.label()
+                        ));
+                    }
+                    RemoteAccessEvent::RoutesPushed {
+                        provider,
+                        routes,
+                        dns,
+                        bridge,
+                        ..
+                    } => {
+                        self.remote_access.profiles[profile_index].routes = routes.clone();
+                        self.remote_access.profiles[profile_index].dns = dns;
+                        self.remote_access.profiles[profile_index].bridge = bridge.clone();
+                        let fallback_listen = self.remote_access.profiles[profile_index]
+                            .bridge_listen
+                            .clone();
+                        match self.apply_remote_access_routes(
+                            &profile_id,
+                            &routes,
+                            bridge,
+                            &fallback_listen,
+                        ) {
+                            Ok(true) => {
+                                self.set_status_only(format!(
+                                    "Remote Access {profile_id} ({provider}) applied {} route(s); reload/restart sing-box to apply",
+                                    routes.len()
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.remote_access.profiles[profile_index].last_error =
+                                    Some(error.to_string());
+                                self.remote_access.profiles[profile_index].state =
+                                    RemoteAccessState::Error;
+                                self.set_status_with_flash(format!(
+                                    "Remote Access route application failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    RemoteAccessEvent::Error {
+                        provider,
+                        code,
+                        message,
+                    } => {
+                        let error = format!("{code}: {message}");
+                        self.remote_access.profiles[profile_index].last_error = Some(error.clone());
+                        self.remote_access.profiles[profile_index].state = RemoteAccessState::Error;
+                        self.set_status_with_flash(format!(
+                            "Remote Access {profile_id} ({provider}) error: {error}"
+                        ));
+                        stop_process = true;
+                    }
+                    RemoteAccessEvent::Log { provider, message } => {
+                        self.set_status_only(format!(
+                            "Remote Access {profile_id} ({provider}): {message}"
+                        ));
+                    }
+                }
+            }
+            if stop_process
+                && let Some(process) = self.remote_access.profiles[profile_index].process.take()
+            {
+                process.stop()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_remote_access_routes(
+        &self,
+        provider: &str,
+        routes: &[RemoteAccessRoute],
+        bridge: Option<RemoteAccessBridge>,
+        fallback_listen: &str,
+    ) -> Result<bool> {
+        if routes.is_empty() {
+            return Ok(false);
+        }
+        let listen = bridge
+            .as_ref()
+            .map(|bridge| bridge.listen.as_str())
+            .unwrap_or(fallback_listen);
+        let proxy = listen
+            .parse::<SocketAddrV4>()
+            .with_context(|| format!("remote access bridge listen must be IPv4:PORT: {listen}"))?;
+        // SET_ROUTE is pushed by the remote-access gateway, so the TUI applies it as a provider
+        // owned sing-box rule without a port matcher. That keeps one system proxy/TUN entry point
+        // while still sending all matching intranet ports through the local bridge.
+        run_remote_access_route_table_config(
+            &self.system_proxy_config_path,
+            None,
+            true,
+            RemoteAccessRouteTableOptions {
+                provider_id: provider.to_string(),
+                cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
+                proxy,
+            },
+        )?;
+        Ok(true)
+    }
+
     fn set_system_proxy(&mut self) {
         if self.system_proxy_job.is_some() {
             self.set_status_only("System proxy update is already running");
@@ -3892,12 +4546,14 @@ mod tests {
     use super::{
         App, AutoSelectSwitchPlan, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
         GLOBAL_CLASH_MODE, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE,
-        SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, connection_is_direct, format_bytes,
-        format_connection_line, format_duration_badge, latency_chart_segments,
-        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
-        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
-        subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
+        LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE, RemoteAccessRuntime,
+        RemoteAccessState, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, SettingsField,
+        connection_is_direct, format_bytes, format_connection_line, format_duration_badge,
+        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
+        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
+        latency_chart_zoom_out, next_clash_mode, settings_field_display_value,
+        settings_field_value, subscription_report_badge, system_proxy_bypass_entries,
+        truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -3905,13 +4561,16 @@ mod tests {
         ProxyGroup,
     };
     use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
+    use crate::network_access::{RemoteAccessBridge, RemoteAccessRoute};
     use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
-    use crate::tui_state::{TuiRuntimeState, TuiStateStore};
+    use crate::tui_state::{RemoteAccessProviderRuntimeState, TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
     use crossterm::event::MouseEventKind;
     use reqwest::Client as AsyncClient;
+    use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -3920,28 +4579,36 @@ mod tests {
 
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
 
-    fn test_db_path() -> std::path::PathBuf {
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_test_suffix() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("sing-box-tui-tui-test-{nanos}.sqlite3"))
+        let counter = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{nanos}-{counter}")
+    }
+
+    fn test_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sing-box-tui-tui-test-{}.sqlite3",
+            unique_test_suffix()
+        ))
     }
 
     fn test_state_path() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sing-box-tui-state-test-{nanos}.json"))
+        std::env::temp_dir().join(format!(
+            "sing-box-tui-state-test-{}.json",
+            unique_test_suffix()
+        ))
     }
 
     fn test_bypass_rule_set_path() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sing-box-tui-bypass-test-{nanos}.json"))
+        std::env::temp_dir().join(format!(
+            "sing-box-tui-bypass-test-{}.json",
+            unique_test_suffix()
+        ))
     }
 
     fn test_app() -> App {
@@ -4018,7 +4685,15 @@ mod tests {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
+            remote_access: RemoteAccessRuntime::new().expect("remote access runtime"),
         }
+    }
+
+    fn line_text(line: ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     fn provider_app() -> App {
@@ -4316,6 +4991,162 @@ mod tests {
     }
 
     #[test]
+    fn pressing_uppercase_v_without_remote_access_settings_updates_status() {
+        let mut app = test_app();
+        app.remote_access.focused_mut().server.clear();
+        app.remote_access.focused_mut().username.clear();
+
+        app.handle_key(KeyCode::Char('V'))
+            .expect("remote access missing settings is handled");
+
+        assert_eq!(
+            app.status,
+            "Configure Remote access server in settings first"
+        );
+        assert!(app.remote_access.focused().process.is_none());
+    }
+
+    #[test]
+    fn remote_access_provider_spawn_failure_stays_inside_tui_state() {
+        let mut app = test_app();
+        app.remote_access.focused_mut().server = "sslvpn.example.com".to_string();
+        app.remote_access.focused_mut().username = "alice".to_string();
+        app.remote_access.focused_mut().manifest.executable =
+            "/path/that/does/not/exist/remote-access-provider".to_string();
+
+        app.handle_key(KeyCode::Char('V'))
+            .expect("remote access spawn failure is handled");
+
+        assert_eq!(app.remote_access.focused().state, RemoteAccessState::Error);
+        assert!(app.remote_access.focused().process.is_none());
+        assert!(app.status.contains("failed to start provider"));
+    }
+
+    #[test]
+    fn remote_access_route_application_writes_pushed_cidrs_without_port_matcher() {
+        let mut app = test_app();
+        let config_path = test_state_path();
+        let config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {
+                "rules": [
+                    { "ip_is_private": true, "outbound": "direct" }
+                ]
+            }
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("config writes");
+        app.system_proxy_config_path = config_path.clone();
+
+        let applied = app
+            .apply_remote_access_routes(
+                "hillstone",
+                &[RemoteAccessRoute {
+                    cidr: "10.1.0.0/16".to_string(),
+                }],
+                Some(RemoteAccessBridge {
+                    kind: "http".to_string(),
+                    listen: "127.0.0.1:16780".to_string(),
+                }),
+                "127.0.0.1:16780",
+            )
+            .expect("remote access routes apply");
+
+        assert!(applied);
+        let text = std::fs::read_to_string(&config_path).expect("config reads");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let rule = rules
+            .iter()
+            .find(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
+            .expect("remote access rule exists");
+        assert!(rule.get("port").is_none());
+        assert_eq!(rule["override_address"], "127.0.0.1");
+        assert_eq!(rule["override_port"], 16780);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn remote_access_route_application_keeps_provider_bridges_separate() {
+        let mut app = test_app();
+        let config_path = test_state_path();
+        let config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [] }
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("config writes");
+        app.system_proxy_config_path = config_path.clone();
+
+        app.apply_remote_access_routes(
+            "office",
+            &[RemoteAccessRoute {
+                cidr: "10.1.0.0/16".to_string(),
+            }],
+            None,
+            "127.0.0.1:16780",
+        )
+        .expect("office routes apply");
+        app.apply_remote_access_routes(
+            "lab",
+            &[RemoteAccessRoute {
+                cidr: "10.2.0.0/16".to_string(),
+            }],
+            None,
+            "127.0.0.1:18081",
+        )
+        .expect("lab routes apply");
+
+        let text = std::fs::read_to_string(&config_path).expect("config reads");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let office = rules
+            .iter()
+            .find(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
+            .expect("office route exists");
+        let lab = rules
+            .iter()
+            .find(|rule| rule["ip_cidr"] == json!(["10.2.0.0/16"]))
+            .expect("lab route exists");
+        assert_eq!(office["override_port"], 16780);
+        assert_eq!(lab["override_port"], 18081);
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn remote_access_summary_shows_explicit_state_and_details() {
+        let mut app = test_app();
+        let focused = app.remote_access.focused_mut();
+        focused.state = RemoteAccessState::Connected;
+        focused.routes = vec![RemoteAccessRoute {
+            cidr: "10.1.0.0/16".to_string(),
+        }];
+        focused.bridge = Some(RemoteAccessBridge {
+            kind: "http".to_string(),
+            listen: "127.0.0.1:16780".to_string(),
+        });
+
+        let connected = line_text(app.remote_access.summary_line());
+        assert!(connected.contains("[>hillstone CONNECTED]"));
+        assert!(connected.contains("routes=1"));
+        assert!(connected.contains("bridge=127.0.0.1:16780"));
+
+        let focused = app.remote_access.focused_mut();
+        focused.state = RemoteAccessState::Error;
+        focused.last_error = Some("session_failed: auth rejected".to_string());
+
+        let errored = line_text(app.remote_access.summary_line());
+        assert!(errored.contains("[>hillstone ERROR]"));
+        assert!(errored.contains("error=session_failed: auth rejected"));
+    }
+
+    #[test]
     fn next_clash_mode_cycles_controller_mode_list() {
         let modes = vec![
             GLOBAL_CLASH_MODE.to_string(),
@@ -4343,6 +5174,93 @@ mod tests {
             next_clash_mode(Some(DIRECT_CLASH_MODE), &[]),
             RULE_CLASH_MODE
         );
+    }
+
+    #[test]
+    fn remote_access_password_persists_but_settings_display_masks_it() {
+        let mut app = test_app();
+        app.remote_access.focused_mut().password = "plain-secret".to_string();
+
+        let state = app.runtime_state();
+        assert_eq!(
+            state.remote_access_providers[0].password.as_deref(),
+            Some("plain-secret")
+        );
+        assert_eq!(
+            settings_field_value(&app, SettingsField::RemoteAccessPassword),
+            "plain-secret"
+        );
+        assert_eq!(
+            settings_field_display_value(&app, SettingsField::RemoteAccessPassword),
+            "<set>"
+        );
+    }
+
+    #[test]
+    fn remote_access_uses_first_provider_profile_as_initial_focus() {
+        let mut app = test_app();
+        let state = TuiRuntimeState {
+            remote_access_providers: vec![
+                RemoteAccessProviderRuntimeState {
+                    id: "office-backup".to_string(),
+                    server: Some("sslvpn.backup.example.com".to_string()),
+                    username: Some("bob".to_string()),
+                    password: Some("backup-secret".to_string()),
+                    ..RemoteAccessProviderRuntimeState::default()
+                },
+                RemoteAccessProviderRuntimeState {
+                    id: "office".to_string(),
+                    server: Some("sslvpn.office.example.com".to_string()),
+                    username: Some("alice".to_string()),
+                    ..RemoteAccessProviderRuntimeState::default()
+                },
+            ],
+            ..TuiRuntimeState::default()
+        };
+
+        app.apply_runtime_state(state).expect("state applies");
+
+        assert_eq!(app.remote_access.focused_id(), "office-backup");
+        assert_eq!(
+            app.remote_access.focused().server,
+            "sslvpn.backup.example.com"
+        );
+        assert_eq!(app.remote_access.profiles.len(), 2);
+        let saved = app.runtime_state();
+        assert_eq!(saved.remote_access_providers[0].id, "office-backup");
+        assert_eq!(saved.remote_access_providers.len(), 2);
+    }
+
+    #[test]
+    fn remote_access_provider_setting_changes_focus_without_reordering_profiles() {
+        let mut app = test_app();
+        let state = TuiRuntimeState {
+            remote_access_providers: vec![
+                RemoteAccessProviderRuntimeState {
+                    id: "office".to_string(),
+                    server: Some("sslvpn.office.example.com".to_string()),
+                    username: Some("alice".to_string()),
+                    ..RemoteAccessProviderRuntimeState::default()
+                },
+                RemoteAccessProviderRuntimeState {
+                    id: "backup-office".to_string(),
+                    server: Some("sslvpn.backup.example.com".to_string()),
+                    username: Some("bob".to_string()),
+                    ..RemoteAccessProviderRuntimeState::default()
+                },
+            ],
+            ..TuiRuntimeState::default()
+        };
+        app.apply_runtime_state(state).expect("state applies");
+
+        app.apply_settings_value(
+            SettingsField::RemoteAccessProvider,
+            "backup-office".to_string(),
+        )
+        .expect("provider switches");
+
+        assert_eq!(app.remote_access.focused_id(), "backup-office");
+        assert_eq!(app.runtime_state().remote_access_providers[0].id, "office");
     }
 
     #[test]
@@ -4414,7 +5332,7 @@ mod tests {
             .current_selected_nodes
             .insert("select".to_string(), "node-c".to_string());
 
-        app.apply_runtime_state(state);
+        app.apply_runtime_state(state).expect("state applies");
 
         assert_eq!(app.benchmark_filter, "node-b,node-c");
         assert!(app.auto_select_enabled);
@@ -4479,7 +5397,7 @@ mod tests {
             ..TuiRuntimeState::default()
         };
 
-        app.apply_runtime_state(state);
+        app.apply_runtime_state(state).expect("state applies");
 
         assert!(app.benchmark_filter.is_empty());
         assert!(app.auto_select_enabled);

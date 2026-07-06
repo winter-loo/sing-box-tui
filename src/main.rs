@@ -10,6 +10,7 @@ mod controller;
 mod defaults;
 mod hillstone;
 mod import;
+mod network_access;
 mod provider;
 mod storage;
 mod subscriptions;
@@ -25,6 +26,7 @@ use controller::{
 use defaults::DEFAULT_VERIFICATION_TARGETS;
 use hillstone::{HillstoneProbeOptions, run_hillstone_probe};
 use import::{run_import, run_subscribe_import};
+use network_access::run_remote_access_provider_stdio;
 use provider::run_provider_sync;
 use subscriptions::run_subscription_refresh;
 use tui::{TuiSubscriptionRefreshOptions, run_tui};
@@ -184,7 +186,6 @@ fn main() -> Result<()> {
             udp_tcp_probe,
             udp_http_get,
             udp_http_proxy,
-            udp_http_target,
             route_config_path,
             apply_routes,
             route_proxy,
@@ -192,6 +193,7 @@ fn main() -> Result<()> {
             server,
             port,
             username,
+            password: None,
             password_env,
             password_stdin,
             host_id,
@@ -204,9 +206,9 @@ fn main() -> Result<()> {
             udp_tcp_probe,
             udp_http_get,
             udp_http_proxy,
-            udp_http_target,
             route_config_path,
             apply_routes,
+            apply_routes_for_proxy: true,
             route_proxy: route_proxy
                 .as_deref()
                 .map(|value| {
@@ -215,6 +217,8 @@ fn main() -> Result<()> {
                         .with_context(|| format!("invalid --route-proxy IPv4:PORT: {value}"))
                 })
                 .transpose()?,
+            event_sink: None,
+            shutdown: None,
         }),
         CliCommand::HillstoneRoute {
             config_path,
@@ -233,6 +237,9 @@ fn main() -> Result<()> {
                     .with_context(|| format!("invalid --proxy IPv4:PORT: {proxy}"))?,
             },
         ),
+        CliCommand::RemoteAccessProvider { provider, stdio } => {
+            run_remote_access_provider_stdio(&provider, stdio)
+        }
     }
 }
 
