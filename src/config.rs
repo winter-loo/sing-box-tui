@@ -29,6 +29,13 @@ pub(crate) struct HillstoneRouteTableOptions {
     pub(crate) proxy: SocketAddrV4,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteAccessRouteTableOptions {
+    pub(crate) provider_id: String,
+    pub(crate) cidrs: Vec<String>,
+    pub(crate) proxy: SocketAddrV4,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DefaultConfigOptions {
     pub(crate) include_geosite_rules: bool,
@@ -211,11 +218,29 @@ pub(crate) fn run_hillstone_route_table_config(
     write: bool,
     options: HillstoneRouteTableOptions,
 ) -> Result<()> {
+    run_remote_access_route_table_config(
+        config_path,
+        output,
+        write,
+        RemoteAccessRouteTableOptions {
+            provider_id: "hillstone".to_string(),
+            cidrs: options.cidrs,
+            proxy: options.proxy,
+        },
+    )
+}
+
+pub(crate) fn run_remote_access_route_table_config(
+    config_path: &Path,
+    output: Option<&PathBuf>,
+    write: bool,
+    options: RemoteAccessRouteTableOptions,
+) -> Result<()> {
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    ensure_hillstone_route_table(&mut config, options)?;
+    ensure_remote_access_route_table(&mut config, options)?;
     let contents =
         serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
 
@@ -230,10 +255,28 @@ pub(crate) fn run_hillstone_route_table_config(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_hillstone_route_table(
     config: &mut Value,
     options: HillstoneRouteTableOptions,
 ) -> Result<()> {
+    ensure_remote_access_route_table(
+        config,
+        RemoteAccessRouteTableOptions {
+            provider_id: "hillstone".to_string(),
+            cidrs: options.cidrs,
+            proxy: options.proxy,
+        },
+    )
+}
+
+pub(crate) fn ensure_remote_access_route_table(
+    config: &mut Value,
+    options: RemoteAccessRouteTableOptions,
+) -> Result<()> {
+    if options.provider_id.trim().is_empty() {
+        anyhow::bail!("remote access provider id cannot be empty");
+    }
     let target_cidrs = normalize_ipv4_cidrs(&options.cidrs)?;
     if target_cidrs.is_empty() {
         return Ok(());
@@ -270,6 +313,9 @@ pub(crate) fn ensure_hillstone_route_table(
         .context("existing config route.rules must be an array")?;
     rules.retain(|rule| !rule_matches_hillstone_route_targets(rule, &target_cidrs));
 
+    // Provider-owned route metadata cannot be written into sing-box route rules because sing-box
+    // may reject unknown fields. Ownership is tracked by the TUI/provider session; the config rule
+    // itself stays valid sing-box JSON and intentionally has no port matcher.
     let rule = json!({
         "action": "route",
         "ip_cidr": target_cidrs.iter().map(Ipv4Cidr::to_string).collect::<Vec<_>>(),
@@ -1602,10 +1648,10 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultConfigOptions, HillstoneRouteTableOptions, ProviderNodeSet, build_default_config,
-        build_default_config_with_options, build_full_config_with_provider_node_sets,
-        ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
-        merge_into_existing_config,
+        DefaultConfigOptions, HillstoneRouteTableOptions, ProviderNodeSet,
+        RemoteAccessRouteTableOptions, build_default_config, build_default_config_with_options,
+        build_full_config_with_provider_node_sets, ensure_bypass_rule_set_file_for_config,
+        ensure_hillstone_route_table, ensure_remote_access_route_table, merge_into_existing_config,
     };
     use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
     use serde_json::{Value, json};
@@ -1824,6 +1870,31 @@ mod tests {
         assert_eq!(rule["ip_cidr"], json!(["10.1.126.5/32"]));
         assert!(rule.get("port").is_none());
         assert_eq!(rule["outbound"], "国内直连");
+        assert_eq!(rule["override_address"], "127.0.0.1");
+        assert_eq!(rule["override_port"], 18080);
+    }
+
+    #[test]
+    fn remote_access_route_table_overrides_pushed_cidrs_without_port_matcher() {
+        let mut config = build_default_config(Vec::new());
+
+        ensure_remote_access_route_table(
+            &mut config,
+            RemoteAccessRouteTableOptions {
+                provider_id: "hillstone".to_string(),
+                cidrs: vec!["10.1.0.0/16".to_string()],
+                proxy: "127.0.0.1:18080".parse().expect("proxy parses"),
+            },
+        )
+        .expect("remote access route is inserted");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let rule = rules
+            .iter()
+            .find(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
+            .expect("remote access route exists");
+        assert_eq!(rule["action"], "route");
+        assert!(rule.get("port").is_none());
         assert_eq!(rule["override_address"], "127.0.0.1");
         assert_eq!(rule["override_port"], 18080);
     }

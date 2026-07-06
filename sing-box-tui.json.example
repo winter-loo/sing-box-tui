@@ -1,0 +1,54 @@
+{
+  "benchmark_filter": "",
+  "auto_pick_enabled": false,
+  "current_selected_nodes": {},
+  "bypass_entries": [
+    "example.com",
+    "10.0.0.0/8"
+  ],
+  "onboarding_complete": true,
+  "benchmark_url": "https://www.gstatic.com/generate_204",
+  "benchmark_timeout_ms": 5000,
+  "benchmark_request_timeout": 12.0,
+  "benchmark_max_concurrency": 8,
+  "verify_targets": "https://www.gstatic.com/generate_204,http://www.gstatic.com/generate_204",
+  "auto_select_threshold_ms": 600,
+  "auto_select_interval_secs": 30,
+  "system_proxy_server": "127.0.0.1:6780",
+  "system_proxy_server_override": false,
+  "remote_access_providers": [
+    {
+      "id": "office",
+      "manifest_path": null,
+      "server": "sslvpn.example.com",
+      "port": 4433,
+      "username": "your-username",
+      "password": "your-password",
+      "password_env": "HILLSTONE_PASSWORD",
+      "bridge_listen": "127.0.0.1:16780",
+      "tls_verify": false
+    },
+    {
+      "id": "backup-office",
+      "manifest_path": null,
+      "server": "backup-sslvpn.example.com",
+      "port": 4433,
+      "username": "your-backup-username",
+      "password": "",
+      "password_env": "BACKUP_HILLSTONE_PASSWORD",
+      "bridge_listen": "127.0.0.1:18081",
+      "tls_verify": false
+    },
+    {
+      "id": "custom-provider",
+      "manifest_path": "./providers/custom-remote-access.json",
+      "server": "vpn.example.com",
+      "port": 443,
+      "username": "your-custom-username",
+      "password": "",
+      "password_env": "CUSTOM_REMOTE_ACCESS_PASSWORD",
+      "bridge_listen": "127.0.0.1:18082",
+      "tls_verify": true
+    }
+  ]
+}

@@ -103,7 +103,6 @@ pub(crate) enum CliCommand {
         udp_tcp_probe: Option<String>,
         udp_http_get: Option<String>,
         udp_http_proxy: Option<String>,
-        udp_http_target: Option<String>,
         route_config_path: PathBuf,
         apply_routes: bool,
         route_proxy: Option<String>,
@@ -114,6 +113,10 @@ pub(crate) enum CliCommand {
         write: bool,
         target: String,
         proxy: String,
+    },
+    RemoteAccessProvider {
+        provider: String,
+        stdio: bool,
     },
 }
 
@@ -149,6 +152,7 @@ impl CliCommand {
             "benchmark" => Self::parse_benchmark(&args[1..]),
             "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
+            "remote-access-provider" => Self::parse_remote_access_provider(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -734,7 +738,6 @@ impl CliCommand {
         let mut udp_tcp_probe = None;
         let mut udp_http_get = None;
         let mut udp_http_proxy = None;
-        let mut udp_http_target = None;
         let mut route_config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut apply_routes = false;
         let mut route_proxy = None;
@@ -827,14 +830,6 @@ impl CliCommand {
                             .clone(),
                     );
                 }
-                "--udp-http-target" => {
-                    i += 1;
-                    udp_http_target = Some(
-                        args.get(i)
-                            .context("--udp-http-target requires an IPv4:PORT target")?
-                            .clone(),
-                    );
-                }
                 "--config" => {
                     i += 1;
                     route_config_path =
@@ -883,12 +878,6 @@ impl CliCommand {
                 "use only one of --udp-icmp-probe, --udp-tcp-probe, --udp-http-get, or --udp-http-proxy"
             );
         }
-        if udp_http_proxy.is_some() && udp_http_target.is_none() {
-            bail!("--udp-http-proxy requires --udp-http-target <IP:PORT>");
-        }
-        if udp_http_proxy.is_none() && udp_http_target.is_some() {
-            bail!("--udp-http-target is only valid with --udp-http-proxy");
-        }
         if apply_routes && route_proxy.is_none() && udp_http_proxy.is_none() {
             bail!("--apply-routes requires --route-proxy <IP:PORT> or --udp-http-proxy <IP:PORT>");
         }
@@ -909,7 +898,6 @@ impl CliCommand {
             udp_tcp_probe,
             udp_http_get,
             udp_http_proxy,
-            udp_http_target,
             route_config_path,
             apply_routes,
             route_proxy,
@@ -977,6 +965,36 @@ impl CliCommand {
             write,
             target: target.context("hillstone-route requires --target <IP[:PORT]>")?,
             proxy: proxy.context("hillstone-route requires --proxy <IP:PORT>")?,
+        })
+    }
+
+    fn parse_remote_access_provider(args: &[String]) -> Result<Self> {
+        let mut provider = None;
+        let mut stdio = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--stdio" => stdio = true,
+                "--help" | "-h" => {
+                    print_remote_access_provider_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for remote-access-provider: {value}")
+                }
+                value => {
+                    if provider.is_none() {
+                        provider = Some(value.to_string());
+                    } else {
+                        bail!("unexpected positional argument for remote-access-provider: {value}");
+                    }
+                }
+            }
+            i += 1;
+        }
+        Ok(Self::RemoteAccessProvider {
+            provider: provider.context("remote-access-provider requires <PROVIDER>")?,
+            stdio,
         })
     }
 }
@@ -1239,7 +1257,6 @@ fn print_hillstone_probe_usage() {
     println!(
         "                                   Also applies pushed routes to config via this local bridge"
     );
-    println!("      --udp-http-target <IP:PORT>  Internal HTTP target for --udp-http-proxy");
     println!(
         "      --config <FILE>              sing-box config to update when applying routes (default: {DEFAULT_CONFIG_PATH})"
     );
@@ -1266,6 +1283,12 @@ fn print_hillstone_route_usage() {
     println!();
     println!("The inserted route keeps the system proxy pointed at sing-box while rewriting");
     println!("only the matched internal service to the local Hillstone bridge.");
+}
+
+fn print_remote_access_provider_usage() {
+    println!("Usage: sing-box-tui remote-access-provider <PROVIDER> --stdio");
+    println!();
+    println!("Internal command used by the TUI to run a remote-access provider process.");
 }
 
 #[cfg(test)]
@@ -1840,19 +1863,12 @@ mod tests {
             "alice".to_string(),
             "--udp-http-proxy".to_string(),
             "127.0.0.1:18080".to_string(),
-            "--udp-http-target".to_string(),
-            "10.1.126.5:10011".to_string(),
         ])
         .expect("hillstone-probe command parses");
 
         match command {
-            CliCommand::HillstoneProbe {
-                udp_http_proxy,
-                udp_http_target,
-                ..
-            } => {
+            CliCommand::HillstoneProbe { udp_http_proxy, .. } => {
                 assert_eq!(udp_http_proxy.as_deref(), Some("127.0.0.1:18080"));
-                assert_eq!(udp_http_target.as_deref(), Some("10.1.126.5:10011"));
             }
             _ => panic!("expected hillstone-probe command"),
         }
@@ -1957,6 +1973,24 @@ mod tests {
                 .to_string()
                 .contains("hillstone-route requires either --output <FILE> or --write")
         );
+    }
+
+    #[test]
+    fn remote_access_provider_parses_hidden_stdio_command() {
+        let command = CliCommand::parse([
+            "remote-access-provider".to_string(),
+            "hillstone".to_string(),
+            "--stdio".to_string(),
+        ])
+        .expect("remote access provider command parses");
+
+        match command {
+            CliCommand::RemoteAccessProvider { provider, stdio } => {
+                assert_eq!(provider, "hillstone");
+                assert!(stdio);
+            }
+            _ => panic!("expected remote access provider command"),
+        }
     }
 
     #[test]

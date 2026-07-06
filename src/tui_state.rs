@@ -15,6 +15,28 @@ use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
 const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub(crate) struct RemoteAccessProviderRuntimeState {
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) manifest_path: Option<String>,
+    #[serde(default)]
+    pub(crate) server: Option<String>,
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+    #[serde(default)]
+    pub(crate) username: Option<String>,
+    #[serde(default)]
+    pub(crate) password: Option<String>,
+    #[serde(default)]
+    pub(crate) password_env: Option<String>,
+    #[serde(default)]
+    pub(crate) bridge_listen: Option<String>,
+    #[serde(default)]
+    pub(crate) tls_verify: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) benchmark_filter: String,
@@ -44,6 +66,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) system_proxy_server: Option<String>,
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
+    #[serde(default)]
+    pub(crate) remote_access_providers: Vec<RemoteAccessProviderRuntimeState>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,4 +208,31 @@ fn normalize_domain_suffix(value: &str) -> String {
 
 fn is_ip_entry(value: &str) -> bool {
     value.contains('/') || IpAddr::from_str(value).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TuiRuntimeState;
+
+    #[test]
+    fn state_without_remote_access_providers_uses_empty_provider_list() {
+        let state: TuiRuntimeState = serde_json::from_str(
+            r#"{
+              "benchmark_filter": "",
+              "auto_pick_enabled": true,
+              "current_selected_nodes": {},
+              "bypass_entries": ["tianditu.gov.cn"],
+              "onboarding_complete": true,
+              "benchmark_url": "https://www.gstatic.com/generate_204",
+              "benchmark_timeout_ms": 5000,
+              "benchmark_request_timeout": 12.0,
+              "benchmark_max_concurrency": 16,
+              "system_proxy_server": "127.0.0.1:6780",
+              "system_proxy_server_override": false
+            }"#,
+        )
+        .expect("state parses");
+
+        assert!(state.remote_access_providers.is_empty());
+    }
 }
