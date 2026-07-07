@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,6 +17,18 @@ use crate::defaults::{
 // Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
 const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HillstoneRouteOptions {
+    pub(crate) target: Ipv4Addr,
+    pub(crate) proxy: SocketAddrV4,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HillstoneRouteTableOptions {
+    pub(crate) cidrs: Vec<String>,
+    pub(crate) proxy: SocketAddrV4,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DefaultConfigOptions {
     pub(crate) include_geosite_rules: bool,
@@ -31,7 +44,7 @@ pub(crate) fn build_full_config_with_options(
     if config_path.exists() {
         let text = fs::read_to_string(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
-        let mut config: Value = serde_json::from_str(&text)
+        let mut config: Value = parse_sing_box_config_text(&text)
             .with_context(|| format!("failed to parse {}", config_path.display()))?;
         merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
         Ok(config)
@@ -65,6 +78,210 @@ pub(crate) fn ensure_bypass_rule_set_file_for_config(
     Ok(Some(bypass_path))
 }
 
+fn parse_sing_box_config_text(text: &str) -> Result<Value> {
+    match serde_json::from_str(text) {
+        Ok(value) => Ok(value),
+        Err(strict_error) => {
+            // Sing-box accepts JSONC-style operator edits such as comments and trailing commas.
+            // Normalizing those cases here lets this tool edit the same config sing-box can run
+            // while keeping the written result as portable strict JSON.
+            let normalized = normalize_sing_box_jsonc(text);
+            serde_json::from_str(&normalized).with_context(|| {
+                format!(
+                    "strict JSON parse failed ({strict_error}); failed again after normalizing sing-box JSONC"
+                )
+            })
+        }
+    }
+}
+
+fn normalize_sing_box_jsonc(text: &str) -> String {
+    strip_json_trailing_commas(&strip_json_comments(text))
+}
+
+fn strip_json_comments(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    output.push(escaped);
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                output.push(ch);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                for comment_char in chars.by_ref() {
+                    if comment_char == '\n' {
+                        output.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = '\0';
+                for comment_char in chars.by_ref() {
+                    if comment_char == '\n' {
+                        output.push('\n');
+                    }
+                    if previous == '*' && comment_char == '/' {
+                        break;
+                    }
+                    previous = comment_char;
+                }
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    output
+}
+
+fn strip_json_trailing_commas(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    output.push(escaped);
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                output.push(ch);
+            }
+            ',' => {
+                let mut lookahead = chars.clone();
+                let next_significant = lookahead.find(|next| !next.is_whitespace());
+                if !matches!(next_significant, Some(']' | '}')) {
+                    output.push(ch);
+                }
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    output
+}
+
+pub(crate) fn run_hillstone_route_config(
+    config_path: &Path,
+    output: Option<&PathBuf>,
+    write: bool,
+    options: HillstoneRouteOptions,
+) -> Result<()> {
+    run_hillstone_route_table_config(
+        config_path,
+        output,
+        write,
+        HillstoneRouteTableOptions {
+            cidrs: vec![format!("{}/32", options.target)],
+            proxy: options.proxy,
+        },
+    )
+}
+
+pub(crate) fn run_hillstone_route_table_config(
+    config_path: &Path,
+    output: Option<&PathBuf>,
+    write: bool,
+    options: HillstoneRouteTableOptions,
+) -> Result<()> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    ensure_hillstone_route_table(&mut config, options)?;
+    let contents =
+        serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
+
+    if write {
+        fs::write(config_path, format!("{contents}\n"))
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    if let Some(output) = output {
+        fs::write(output, format!("{contents}\n"))
+            .with_context(|| format!("failed to write {}", output.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_hillstone_route_table(
+    config: &mut Value,
+    options: HillstoneRouteTableOptions,
+) -> Result<()> {
+    let target_cidrs = normalize_ipv4_cidrs(&options.cidrs)?;
+    if target_cidrs.is_empty() {
+        return Ok(());
+    }
+
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds_value = root
+        .entry("outbounds")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let outbounds = outbounds_value
+        .as_array_mut()
+        .context("existing config outbounds must be an array")?;
+    let direct_tag = preferred_existing_tag(outbounds, DIRECT_TAG_ALIASES, DEFAULT_DIRECT_TAG);
+    upsert_special_outbound(
+        outbounds,
+        &direct_tag,
+        || json!({ "type": "direct", "tag": direct_tag }),
+        |value| {
+            ensure_string_field(value, "type", "direct");
+        },
+    )?;
+
+    let route_value = root.entry("route").or_insert_with(|| json!({}));
+    let route = route_value
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    let rules_value = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let rules = rules_value
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    rules.retain(|rule| !rule_matches_hillstone_route_targets(rule, &target_cidrs));
+
+    let rule = json!({
+        "action": "route",
+        "ip_cidr": target_cidrs.iter().map(Ipv4Cidr::to_string).collect::<Vec<_>>(),
+        "outbound": direct_tag,
+        "override_address": options.proxy.ip().to_string(),
+        "override_port": options.proxy.port(),
+    });
+    let index = hillstone_route_insert_index(rules);
+    rules.insert(index, rule);
+    Ok(())
+}
+
 pub(crate) fn build_full_config_with_provider_groups_and_options(
     config_path: &PathBuf,
     imported_nodes: Vec<Value>,
@@ -79,7 +296,7 @@ pub(crate) fn build_full_config_with_provider_groups_and_options(
     let mut config = if config_path.exists() {
         let text = fs::read_to_string(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
-        let mut config: Value = serde_json::from_str(&text)
+        let mut config: Value = parse_sing_box_config_text(&text)
             .with_context(|| format!("failed to parse {}", config_path.display()))?;
         if let Some(outbounds) = config.get("outbounds").and_then(Value::as_array)
             && !replace_nodes
@@ -146,7 +363,7 @@ pub(crate) fn build_full_config_with_provider_node_sets_and_options(
     let mut config = if config_path.exists() {
         let text = fs::read_to_string(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
-        let mut config: Value = serde_json::from_str(&text)
+        let mut config: Value = parse_sing_box_config_text(&text)
             .with_context(|| format!("failed to parse {}", config_path.display()))?;
         remove_provider_managed_nodes(&mut config, &provider_node_tags)?;
         merge_into_existing_config(&mut config, imported_nodes, replace_nodes)?;
@@ -1079,6 +1296,113 @@ fn ensure_cgnat_direct_route(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv4Cidr {
+    network: Ipv4Addr,
+    prefix_len: u32,
+}
+
+impl Ipv4Cidr {
+    fn parse(value: &str) -> Result<Self> {
+        let (ip, prefix_len) = value
+            .split_once('/')
+            .with_context(|| format!("expected IPv4 CIDR, got {value}"))?;
+        let ip = ip
+            .parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid IPv4 CIDR address: {value}"))?;
+        let prefix_len = prefix_len
+            .parse::<u32>()
+            .with_context(|| format!("invalid IPv4 CIDR prefix length: {value}"))?;
+        if prefix_len > 32 {
+            anyhow::bail!("invalid IPv4 CIDR prefix length: {value}");
+        }
+        let network = Ipv4Addr::from(u32::from(ip) & prefix_mask(prefix_len));
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let prefix_len = self.prefix_len.min(other.prefix_len);
+        (u32::from(self.network) & prefix_mask(prefix_len))
+            == (u32::from(other.network) & prefix_mask(prefix_len))
+    }
+}
+
+impl std::fmt::Display for Ipv4Cidr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+fn prefix_mask(prefix_len: u32) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    }
+}
+
+fn normalize_ipv4_cidrs(values: &[String]) -> Result<Vec<Ipv4Cidr>> {
+    let mut seen = BTreeSet::new();
+    let mut cidrs = Vec::new();
+    for value in values {
+        let cidr = Ipv4Cidr::parse(value)?;
+        if seen.insert(cidr.to_string()) {
+            cidrs.push(cidr);
+        }
+    }
+    Ok(cidrs)
+}
+
+fn rule_matches_hillstone_route_targets(rule: &Value, target_cidrs: &[Ipv4Cidr]) -> bool {
+    if rule.get("action").and_then(Value::as_str) != Some("route") {
+        return false;
+    }
+    if !(rule.get("override_address").is_some() || rule.get("override_port").is_some()) {
+        return false;
+    }
+    rule_ip_cidrs(rule).into_iter().any(|rule_cidr| {
+        target_cidrs
+            .iter()
+            .any(|target| rule_cidr.overlaps(*target))
+    })
+}
+
+fn rule_ip_cidrs(rule: &Value) -> Vec<Ipv4Cidr> {
+    match rule.get("ip_cidr") {
+        Some(Value::String(value)) => Ipv4Cidr::parse(value).into_iter().collect(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|value| Ipv4Cidr::parse(value).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn hillstone_route_insert_index(rules: &[Value]) -> usize {
+    // Sing-box already sees user traffic through its normal mixed/system-proxy inbound.
+    // This rule keeps that single user-facing entry point and rewrites the matched
+    // internal host to the local Hillstone ESP bridge without a port matcher. The bridge
+    // still receives the original HTTP Host/authority, so one host-level rule covers
+    // services like 10011 and 8099 instead of requiring fragile per-port entries.
+    rules
+        .iter()
+        .position(|rule| {
+            rule.get("ip_is_private").and_then(Value::as_bool) == Some(true)
+                || rule.get("clash_mode").is_some()
+        })
+        .unwrap_or_else(|| {
+            rules
+                .iter()
+                .rposition(|existing| existing.get("action").is_some())
+                .map(|index| index + 1)
+                .unwrap_or(0)
+        })
+}
+
 fn rule_references_rule_set(rule: &Value, tag: &str) -> bool {
     match rule.get("rule_set") {
         Some(Value::String(value)) => value == tag,
@@ -1088,11 +1412,13 @@ fn rule_references_rule_set(rule: &Value, tag: &str) -> bool {
 }
 
 fn rule_matches_cgnat_overlay_cidr(rule: &Value) -> bool {
+    rule_matches_ip_cidr(rule, CGNAT_OVERLAY_CIDR)
+}
+
+fn rule_matches_ip_cidr(rule: &Value, cidr: &str) -> bool {
     match rule.get("ip_cidr") {
-        Some(Value::String(value)) => value == CGNAT_OVERLAY_CIDR,
-        Some(Value::Array(values)) => values
-            .iter()
-            .any(|value| value.as_str() == Some(CGNAT_OVERLAY_CIDR)),
+        Some(Value::String(value)) => value == cidr,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(cidr)),
         _ => false,
     }
 }
@@ -1276,9 +1602,10 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultConfigOptions, ProviderNodeSet, build_default_config,
+        DefaultConfigOptions, HillstoneRouteTableOptions, ProviderNodeSet, build_default_config,
         build_default_config_with_options, build_full_config_with_provider_node_sets,
-        ensure_bypass_rule_set_file_for_config, merge_into_existing_config,
+        ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
+        merge_into_existing_config,
     };
     use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
     use serde_json::{Value, json};
@@ -1464,6 +1791,209 @@ mod tests {
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(bypass_path);
+    }
+
+    #[test]
+    fn hillstone_route_overrides_internal_host_to_local_bridge() {
+        let mut config = build_default_config(Vec::new());
+
+        ensure_hillstone_route_table(
+            &mut config,
+            HillstoneRouteTableOptions {
+                cidrs: vec!["10.1.126.5/32".to_string()],
+                proxy: "127.0.0.1:18080".parse().expect("proxy parses"),
+            },
+        )
+        .expect("route is inserted");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let hillstone_index = rules
+            .iter()
+            .position(|rule| rule["override_address"] == "127.0.0.1")
+            .expect("hillstone route exists");
+        let private_index = rules
+            .iter()
+            .position(|rule| rule["ip_is_private"] == true)
+            .expect("private direct route exists");
+        assert!(
+            hillstone_index < private_index,
+            "Hillstone override must run before generic private direct routing"
+        );
+        let rule = &rules[hillstone_index];
+        assert_eq!(rule["action"], "route");
+        assert_eq!(rule["ip_cidr"], json!(["10.1.126.5/32"]));
+        assert!(rule.get("port").is_none());
+        assert_eq!(rule["outbound"], "国内直连");
+        assert_eq!(rule["override_address"], "127.0.0.1");
+        assert_eq!(rule["override_port"], 18080);
+    }
+
+    #[test]
+    fn hillstone_route_updates_existing_target_without_duplicates() {
+        let mut config = json!({
+            "outbounds": [{
+                "type": "direct",
+                "tag": "direct"
+            }],
+            "route": {
+                "rules": [{
+                    "action": "route",
+                    "ip_cidr": ["10.1.126.5/32"],
+                    "port": 10011,
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }, {
+                    "action": "route",
+                    "ip_cidr": ["10.1.126.5/32"],
+                    "port": 8099,
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }, {
+                    "ip_is_private": true,
+                    "outbound": "direct"
+                }]
+            }
+        });
+
+        ensure_hillstone_route_table(
+            &mut config,
+            HillstoneRouteTableOptions {
+                cidrs: vec!["10.1.126.5/32".to_string()],
+                proxy: "127.0.0.1:18081".parse().expect("proxy parses"),
+            },
+        )
+        .expect("route is updated");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let hillstone_rules = rules
+            .iter()
+            .filter(|rule| rule["ip_cidr"] == json!(["10.1.126.5/32"]))
+            .collect::<Vec<_>>();
+        assert_eq!(hillstone_rules.len(), 1);
+        assert!(hillstone_rules[0].get("port").is_none());
+        assert_eq!(hillstone_rules[0]["override_port"], 18081);
+        assert_eq!(hillstone_rules[0]["outbound"], "direct");
+    }
+
+    #[test]
+    fn hillstone_route_table_replaces_covered_host_routes() {
+        let mut config = json!({
+            "outbounds": [{
+                "type": "direct",
+                "tag": "direct"
+            }],
+            "route": {
+                "rules": [{
+                    "action": "route",
+                    "ip_cidr": ["10.1.126.5/32"],
+                    "port": 10011,
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }, {
+                    "action": "route",
+                    "ip_cidr": ["10.255.0.0/24"],
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }, {
+                    "ip_cidr": ["10.2.0.0/16"],
+                    "outbound": "direct"
+                }, {
+                    "ip_is_private": true,
+                    "outbound": "direct"
+                }]
+            }
+        });
+
+        ensure_hillstone_route_table(
+            &mut config,
+            HillstoneRouteTableOptions {
+                cidrs: vec![
+                    "10.1.0.0/16".to_string(),
+                    "10.255.0.0/24".to_string(),
+                    "10.253.0.7/24".to_string(),
+                ],
+                proxy: "127.0.0.1:18081".parse().expect("proxy parses"),
+            },
+        )
+        .expect("route table is inserted");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let hillstone_rules = rules
+            .iter()
+            .filter(|rule| rule.get("override_address").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(hillstone_rules.len(), 1);
+        let rule = hillstone_rules[0];
+        assert_eq!(
+            rule["ip_cidr"],
+            json!(["10.1.0.0/16", "10.255.0.0/24", "10.253.0.0/24"])
+        );
+        assert!(rule.get("port").is_none());
+        assert_eq!(rule["override_address"], "127.0.0.1");
+        assert_eq!(rule["override_port"], 18081);
+        assert_eq!(rule["outbound"], "direct");
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["ip_cidr"] == json!(["10.2.0.0/16"]))
+        );
+
+        let hillstone_index = rules
+            .iter()
+            .position(|rule| rule.get("override_address").is_some())
+            .expect("hillstone route exists");
+        let private_index = rules
+            .iter()
+            .position(|rule| rule["ip_is_private"] == true)
+            .expect("private direct route exists");
+        assert!(hillstone_index < private_index);
+    }
+
+    #[test]
+    fn hillstone_route_accepts_sing_box_jsonc_config() {
+        let mut config = super::parse_sing_box_config_text(
+            r#"{
+                // sing-box accepts this style, so config editing must too.
+                "metadata": {
+                    "url": "https://example.com/not//a-comment",
+                },
+                "outbounds": [{
+                    "type": "direct",
+                    "tag": "direct",
+                },],
+                "route": {
+                    "rules": [{
+                        "ip_is_private": true,
+                        "outbound": "direct",
+                    },],
+                },
+            }"#,
+        )
+        .expect("sing-box JSONC parses");
+
+        ensure_hillstone_route_table(
+            &mut config,
+            HillstoneRouteTableOptions {
+                cidrs: vec!["10.1.126.5/32".to_string()],
+                proxy: "127.0.0.1:18080".parse().expect("proxy parses"),
+            },
+        )
+        .expect("route is inserted into JSONC config");
+
+        assert_eq!(
+            config["metadata"]["url"],
+            "https://example.com/not//a-comment"
+        );
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.iter().any(|rule| {
+            rule["ip_cidr"] == json!(["10.1.126.5/32"])
+                && rule.get("port").is_none()
+                && rule["override_port"] == 18080
+        }));
     }
 
     #[cfg(not(target_os = "linux"))]

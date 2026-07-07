@@ -104,6 +104,16 @@ pub(crate) enum CliCommand {
         udp_http_get: Option<String>,
         udp_http_proxy: Option<String>,
         udp_http_target: Option<String>,
+        route_config_path: PathBuf,
+        apply_routes: bool,
+        route_proxy: Option<String>,
+    },
+    HillstoneRoute {
+        config_path: PathBuf,
+        output: Option<PathBuf>,
+        write: bool,
+        target: String,
+        proxy: String,
     },
 }
 
@@ -138,6 +148,7 @@ impl CliCommand {
             "sync" => Self::parse_sync_provider(&args[1..]),
             "benchmark" => Self::parse_benchmark(&args[1..]),
             "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
+            "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -724,6 +735,9 @@ impl CliCommand {
         let mut udp_http_get = None;
         let mut udp_http_proxy = None;
         let mut udp_http_target = None;
+        let mut route_config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut apply_routes = false;
+        let mut route_proxy = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -821,6 +835,22 @@ impl CliCommand {
                             .clone(),
                     );
                 }
+                "--config" => {
+                    i += 1;
+                    route_config_path =
+                        PathBuf::from(args.get(i).context("--config requires a file path")?);
+                }
+                "--apply-routes" => {
+                    apply_routes = true;
+                }
+                "--route-proxy" => {
+                    i += 1;
+                    route_proxy = Some(
+                        args.get(i)
+                            .context("--route-proxy requires a local IPv4:PORT")?
+                            .clone(),
+                    );
+                }
                 "--help" | "-h" => {
                     print_hillstone_probe_usage();
                     std::process::exit(0);
@@ -859,6 +889,9 @@ impl CliCommand {
         if udp_http_proxy.is_none() && udp_http_target.is_some() {
             bail!("--udp-http-target is only valid with --udp-http-proxy");
         }
+        if apply_routes && route_proxy.is_none() && udp_http_proxy.is_none() {
+            bail!("--apply-routes requires --route-proxy <IP:PORT> or --udp-http-proxy <IP:PORT>");
+        }
 
         Ok(Self::HillstoneProbe {
             server: server.context("hillstone-probe requires --server <HOST>")?,
@@ -877,6 +910,73 @@ impl CliCommand {
             udp_http_get,
             udp_http_proxy,
             udp_http_target,
+            route_config_path,
+            apply_routes,
+            route_proxy,
+        })
+    }
+
+    fn parse_hillstone_route(args: &[String]) -> Result<Self> {
+        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let mut output = None;
+        let mut write = false;
+        let mut target = None;
+        let mut proxy = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--config" => {
+                    i += 1;
+                    config_path =
+                        PathBuf::from(args.get(i).context("--config requires a file path")?);
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    output = Some(PathBuf::from(
+                        args.get(i).context("-o/--output requires a file path")?,
+                    ));
+                }
+                "--write" => write = true,
+                "--target" => {
+                    i += 1;
+                    target = Some(
+                        args.get(i)
+                            .context("--target requires an internal IPv4 or IPv4:PORT")?
+                            .clone(),
+                    );
+                }
+                "--proxy" => {
+                    i += 1;
+                    proxy = Some(
+                        args.get(i)
+                            .context("--proxy requires a local IPv4:PORT")?
+                            .clone(),
+                    );
+                }
+                "--help" | "-h" => {
+                    print_hillstone_route_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for hillstone-route: {value}")
+                }
+                value => bail!("unexpected positional argument for hillstone-route: {value}"),
+            }
+            i += 1;
+        }
+        if write && output.is_some() {
+            bail!("hillstone-route accepts either --write or --output, not both");
+        }
+        if !write && output.is_none() {
+            bail!("hillstone-route requires either --output <FILE> or --write");
+        }
+
+        Ok(Self::HillstoneRoute {
+            config_path,
+            output,
+            write,
+            target: target.context("hillstone-route requires --target <IP[:PORT]>")?,
+            proxy: proxy.context("hillstone-route requires --proxy <IP:PORT>")?,
         })
     }
 }
@@ -913,6 +1013,7 @@ fn print_usage() {
     );
     println!("  benchmark       Benchmark selector candidates and optionally switch");
     println!("  hillstone-probe Probe Hillstone SSL VPN control-plane compatibility");
+    println!("  hillstone-route Add a sing-box route to reach an internal Hillstone HTTP service");
 }
 
 fn print_run_usage() {
@@ -1136,12 +1237,35 @@ fn print_hillstone_probe_usage() {
         "      --udp-http-proxy <IP:PORT>   Listen locally and reverse-proxy browser HTTP over ESP"
     );
     println!(
-        "                                   Can also be used as a browser HTTP proxy to keep target IP URLs"
+        "                                   Also applies pushed routes to config via this local bridge"
     );
     println!("      --udp-http-target <IP:PORT>  Internal HTTP target for --udp-http-proxy");
+    println!(
+        "      --config <FILE>              sing-box config to update when applying routes (default: {DEFAULT_CONFIG_PATH})"
+    );
+    println!("      --apply-routes               Write SET_ROUTE CIDRs into the sing-box config");
+    println!("      --route-proxy <IP:PORT>      Local Hillstone HTTP bridge for --apply-routes");
     println!();
     println!("By default the probe accepts the gateway's self-signed certificate and reads");
     println!("the password from HILLSTONE_PASSWORD unless --password-stdin is supplied.");
+}
+
+fn print_hillstone_route_usage() {
+    println!(
+        "Usage: sing-box-tui hillstone-route --target <IP[:PORT]> --proxy <IP:PORT> [OPTIONS]"
+    );
+    println!();
+    println!("Options:");
+    println!("      --target <IP[:PORT]>   Internal host reached through Hillstone");
+    println!("      --proxy <IP:PORT>      Local Hillstone HTTP bridge listener");
+    println!(
+        "      --config <FILE>        sing-box config to update (default: {DEFAULT_CONFIG_PATH})"
+    );
+    println!("  -o, --output <FILE>        Write updated config to a separate file");
+    println!("      --write                Overwrite --config in place");
+    println!();
+    println!("The inserted route keeps the system proxy pointed at sing-box while rewriting");
+    println!("only the matched internal service to the local Hillstone bridge.");
 }
 
 #[cfg(test)]
@@ -1639,6 +1763,9 @@ mod tests {
                 udp_icmp_probe,
                 udp_tcp_probe,
                 udp_http_get,
+                route_config_path,
+                apply_routes,
+                route_proxy,
                 ..
             } => {
                 assert_eq!(server, "sslvpn.example.com");
@@ -1652,6 +1779,9 @@ mod tests {
                 assert!(!udp_icmp_probe);
                 assert_eq!(udp_tcp_probe.as_deref(), Some("10.1.126.5:10011"));
                 assert!(udp_http_get.is_none());
+                assert_eq!(route_config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
+                assert!(!apply_routes);
+                assert!(route_proxy.is_none());
             }
             _ => panic!("expected hillstone-probe command"),
         }
@@ -1726,6 +1856,107 @@ mod tests {
             }
             _ => panic!("expected hillstone-probe command"),
         }
+    }
+
+    #[test]
+    fn hillstone_probe_accepts_apply_routes_config_and_route_proxy() {
+        let command = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--apply-routes".to_string(),
+            "--config".to_string(),
+            "config.test.json".to_string(),
+            "--route-proxy".to_string(),
+            "127.0.0.1:18080".to_string(),
+        ])
+        .expect("hillstone-probe command parses");
+
+        match command {
+            CliCommand::HillstoneProbe {
+                route_config_path,
+                apply_routes,
+                route_proxy,
+                ..
+            } => {
+                assert_eq!(route_config_path, PathBuf::from("config.test.json"));
+                assert!(apply_routes);
+                assert_eq!(route_proxy.as_deref(), Some("127.0.0.1:18080"));
+            }
+            _ => panic!("expected hillstone-probe command"),
+        }
+    }
+
+    #[test]
+    fn hillstone_probe_apply_routes_requires_proxy() {
+        let error = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--apply-routes".to_string(),
+        ])
+        .expect_err("apply-routes without a route proxy should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--apply-routes requires --route-proxy <IP:PORT>")
+        );
+    }
+
+    #[test]
+    fn hillstone_route_accepts_config_output_target_and_proxy() {
+        let command = CliCommand::parse([
+            "hillstone-route".to_string(),
+            "--config".to_string(),
+            "config.json".to_string(),
+            "--output".to_string(),
+            "merged.json".to_string(),
+            "--target".to_string(),
+            "10.1.126.5".to_string(),
+            "--proxy".to_string(),
+            "127.0.0.1:18080".to_string(),
+        ])
+        .expect("hillstone-route command parses");
+
+        match command {
+            CliCommand::HillstoneRoute {
+                config_path,
+                output,
+                write,
+                target,
+                proxy,
+            } => {
+                assert_eq!(config_path, PathBuf::from("config.json"));
+                assert_eq!(output, Some(PathBuf::from("merged.json")));
+                assert!(!write);
+                assert_eq!(target, "10.1.126.5");
+                assert_eq!(proxy, "127.0.0.1:18080");
+            }
+            _ => panic!("expected hillstone-route command"),
+        }
+    }
+
+    #[test]
+    fn hillstone_route_requires_output_or_write() {
+        let error = CliCommand::parse([
+            "hillstone-route".to_string(),
+            "--target".to_string(),
+            "10.1.126.5:10011".to_string(),
+            "--proxy".to_string(),
+            "127.0.0.1:18080".to_string(),
+        ])
+        .expect_err("hillstone-route without write target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hillstone-route requires either --output <FILE> or --write")
+        );
     }
 
     #[test]

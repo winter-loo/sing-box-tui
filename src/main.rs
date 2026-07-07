@@ -1,4 +1,5 @@
 use std::env;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::{Context, Result, bail};
 
@@ -16,6 +17,7 @@ mod tui;
 mod tui_state;
 
 use cli::CliCommand;
+use config::{HillstoneRouteOptions, run_hillstone_route_config};
 use controller::{
     BenchmarkOptions, SelectorsOptions, StatusOptions, VerificationTarget, run_benchmark,
     run_selectors, run_status,
@@ -183,6 +185,9 @@ fn main() -> Result<()> {
             udp_http_get,
             udp_http_proxy,
             udp_http_target,
+            route_config_path,
+            apply_routes,
+            route_proxy,
         } => run_hillstone_probe(HillstoneProbeOptions {
             server,
             port,
@@ -200,8 +205,45 @@ fn main() -> Result<()> {
             udp_http_get,
             udp_http_proxy,
             udp_http_target,
+            route_config_path,
+            apply_routes,
+            route_proxy: route_proxy
+                .as_deref()
+                .map(|value| {
+                    value
+                        .parse()
+                        .with_context(|| format!("invalid --route-proxy IPv4:PORT: {value}"))
+                })
+                .transpose()?,
         }),
+        CliCommand::HillstoneRoute {
+            config_path,
+            output,
+            write,
+            target,
+            proxy,
+        } => run_hillstone_route_config(
+            &config_path,
+            output.as_ref(),
+            write,
+            HillstoneRouteOptions {
+                target: parse_hillstone_route_target(&target)?,
+                proxy: proxy
+                    .parse()
+                    .with_context(|| format!("invalid --proxy IPv4:PORT: {proxy}"))?,
+            },
+        ),
     }
+}
+
+fn parse_hillstone_route_target(target: &str) -> Result<Ipv4Addr> {
+    if let Ok(ip) = target.parse::<Ipv4Addr>() {
+        return Ok(ip);
+    }
+    target
+        .parse::<SocketAddrV4>()
+        .map(|address| *address.ip())
+        .with_context(|| format!("invalid --target IPv4 or IPv4:PORT: {target}"))
 }
 
 fn verification_targets_from_specs(specs: &[String]) -> Result<Vec<VerificationTarget>> {
@@ -241,4 +283,23 @@ fn verification_target_from_spec(spec: &str) -> Result<VerificationTarget> {
         name: name.to_string(),
         url: url.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hillstone_route_target_accepts_host_or_legacy_host_port() {
+        assert_eq!(
+            super::parse_hillstone_route_target("10.1.126.5")
+                .expect("host target parses")
+                .to_string(),
+            "10.1.126.5"
+        );
+        assert_eq!(
+            super::parse_hillstone_route_target("10.1.126.5:10011")
+                .expect("legacy host:port target parses")
+                .to_string(),
+            "10.1.126.5"
+        );
+    }
 }

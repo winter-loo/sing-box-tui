@@ -58,28 +58,11 @@ const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &[
-    "localhost",
-    "127.*",
-    "10.*",
-    "172.16.*",
-    "172.17.*",
-    "172.18.*",
-    "172.19.*",
-    "172.20.*",
-    "172.21.*",
-    "172.22.*",
-    "172.23.*",
-    "172.24.*",
-    "172.25.*",
-    "172.26.*",
-    "172.27.*",
-    "172.28.*",
-    "172.29.*",
-    "172.30.*",
-    "172.31.*",
-    "192.168.*",
-];
+// Keep RFC1918 ranges out of the OS-level bypass list. The Hillstone bridge
+// problem showed why this matters: if macOS bypasses 10.* before traffic reaches
+// sing-box, sing-box cannot apply its route override to the local ESP bridge.
+// Private/LAN destinations should enter sing-box first and then use direct rules.
+const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &["localhost", "127.*"];
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
@@ -4135,6 +4118,17 @@ mod tests {
         assert!(entries.contains(&"*.github.com".to_string()));
         assert!(entries.contains(&"10.0.0.0/8".to_string()));
         assert!(entries.contains(&"1.1.1.1".to_string()));
+    }
+
+    #[test]
+    fn system_proxy_bypass_entries_do_not_bypass_private_ranges_by_default() {
+        let entries = system_proxy_bypass_entries(&[]);
+
+        assert!(entries.contains(&"localhost".to_string()));
+        assert!(entries.contains(&"127.*".to_string()));
+        assert!(!entries.contains(&"10.*".to_string()));
+        assert!(!entries.contains(&"172.16.*".to_string()));
+        assert!(!entries.contains(&"192.168.*".to_string()));
     }
 
     #[test]
