@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod controller;
 mod defaults;
+mod hillstone;
 mod import;
 mod provider;
 mod storage;
@@ -20,6 +21,7 @@ use controller::{
     run_selectors, run_status,
 };
 use defaults::DEFAULT_VERIFICATION_TARGETS;
+use hillstone::{HillstoneProbeOptions, run_hillstone_probe};
 use import::{run_import, run_subscribe_import};
 use provider::run_provider_sync;
 use subscriptions::run_subscription_refresh;
@@ -164,6 +166,41 @@ fn main() -> Result<()> {
             include_tun_mode,
             write,
         ),
+        CliCommand::HillstoneProbe {
+            server,
+            port,
+            username,
+            password_env,
+            password_stdin,
+            host_id,
+            host_name,
+            client_version,
+            timeout_secs,
+            verify_server_cert,
+            stop_before_new_key,
+            udp_icmp_probe,
+            udp_tcp_probe,
+            udp_http_get,
+            udp_http_proxy,
+            udp_http_target,
+        } => run_hillstone_probe(HillstoneProbeOptions {
+            server,
+            port,
+            username,
+            password_env,
+            password_stdin,
+            host_id,
+            host_name,
+            client_version,
+            timeout_secs,
+            verify_server_cert,
+            stop_before_new_key,
+            udp_icmp_probe,
+            udp_tcp_probe,
+            udp_http_get,
+            udp_http_proxy,
+            udp_http_target,
+        }),
     }
 }
 

@@ -87,6 +87,24 @@ pub(crate) enum CliCommand {
         verify: bool,
         verify_urls: Vec<String>,
     },
+    HillstoneProbe {
+        server: String,
+        port: u16,
+        username: String,
+        password_env: Option<String>,
+        password_stdin: bool,
+        host_id: Option<String>,
+        host_name: Option<String>,
+        client_version: String,
+        timeout_secs: u64,
+        verify_server_cert: bool,
+        stop_before_new_key: bool,
+        udp_icmp_probe: bool,
+        udp_tcp_probe: Option<String>,
+        udp_http_get: Option<String>,
+        udp_http_proxy: Option<String>,
+        udp_http_target: Option<String>,
+    },
 }
 
 impl CliCommand {
@@ -119,6 +137,7 @@ impl CliCommand {
             "subscriptions" | "refresh-subscriptions" => Self::parse_subscriptions(&args[1..]),
             "sync" => Self::parse_sync_provider(&args[1..]),
             "benchmark" => Self::parse_benchmark(&args[1..]),
+            "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -687,6 +706,179 @@ impl CliCommand {
             verify_urls,
         })
     }
+
+    fn parse_hillstone_probe(args: &[String]) -> Result<Self> {
+        let mut server = None;
+        let mut port = 4433_u16;
+        let mut username = None;
+        let mut password_env = None;
+        let mut password_stdin = false;
+        let mut host_id = None;
+        let mut host_name = None;
+        let mut client_version = String::from("5.7.1.12488");
+        let mut timeout_secs = 10_u64;
+        let mut verify_server_cert = false;
+        let mut stop_before_new_key = false;
+        let mut udp_icmp_probe = false;
+        let mut udp_tcp_probe = None;
+        let mut udp_http_get = None;
+        let mut udp_http_proxy = None;
+        let mut udp_http_target = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--server" => {
+                    i += 1;
+                    server = Some(args.get(i).context("--server requires a value")?.clone());
+                }
+                "--port" => {
+                    i += 1;
+                    port = args
+                        .get(i)
+                        .context("--port requires a value")?
+                        .parse()
+                        .context("--port must be an integer from 1 to 65535")?;
+                }
+                "--username" => {
+                    i += 1;
+                    username = Some(args.get(i).context("--username requires a value")?.clone());
+                }
+                "--password-env" => {
+                    i += 1;
+                    password_env = Some(
+                        args.get(i)
+                            .context("--password-env requires an environment variable name")?
+                            .clone(),
+                    );
+                }
+                "--password-stdin" => {
+                    password_stdin = true;
+                }
+                "--host-id" => {
+                    i += 1;
+                    host_id = Some(args.get(i).context("--host-id requires a value")?.clone());
+                }
+                "--host-name" => {
+                    i += 1;
+                    host_name = Some(args.get(i).context("--host-name requires a value")?.clone());
+                }
+                "--client-version" => {
+                    i += 1;
+                    client_version = args
+                        .get(i)
+                        .context("--client-version requires a value")?
+                        .clone();
+                }
+                "--timeout-secs" => {
+                    i += 1;
+                    timeout_secs = args
+                        .get(i)
+                        .context("--timeout-secs requires a value")?
+                        .parse()
+                        .context("--timeout-secs must be a positive integer")?;
+                    if timeout_secs == 0 {
+                        bail!("--timeout-secs must be greater than 0");
+                    }
+                }
+                "--verify-server-cert" => {
+                    verify_server_cert = true;
+                }
+                "--stop-before-new-key" => {
+                    stop_before_new_key = true;
+                }
+                "--udp-icmp-probe" => {
+                    udp_icmp_probe = true;
+                }
+                "--udp-tcp-probe" => {
+                    i += 1;
+                    udp_tcp_probe = Some(
+                        args.get(i)
+                            .context("--udp-tcp-probe requires an IPv4:PORT target")?
+                            .clone(),
+                    );
+                }
+                "--udp-http-get" => {
+                    i += 1;
+                    udp_http_get = Some(
+                        args.get(i)
+                            .context("--udp-http-get requires an http:// URL")?
+                            .clone(),
+                    );
+                }
+                "--udp-http-proxy" => {
+                    i += 1;
+                    udp_http_proxy = Some(
+                        args.get(i)
+                            .context("--udp-http-proxy requires an IPv4:PORT listen address")?
+                            .clone(),
+                    );
+                }
+                "--udp-http-target" => {
+                    i += 1;
+                    udp_http_target = Some(
+                        args.get(i)
+                            .context("--udp-http-target requires an IPv4:PORT target")?
+                            .clone(),
+                    );
+                }
+                "--help" | "-h" => {
+                    print_hillstone_probe_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for hillstone-probe: {value}")
+                }
+                value => {
+                    if server.is_none() {
+                        server = Some(value.to_string());
+                    } else if username.is_none() {
+                        username = Some(value.to_string());
+                    } else {
+                        bail!("unexpected positional argument for hillstone-probe: {value}");
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if password_env.is_some() && password_stdin {
+            bail!("use either --password-env or --password-stdin, not both");
+        }
+        let udp_probe_modes = usize::from(udp_icmp_probe)
+            + usize::from(udp_tcp_probe.is_some())
+            + usize::from(udp_http_get.is_some())
+            + usize::from(udp_http_proxy.is_some());
+        if udp_probe_modes > 1 {
+            bail!(
+                "use only one of --udp-icmp-probe, --udp-tcp-probe, --udp-http-get, or --udp-http-proxy"
+            );
+        }
+        if udp_http_proxy.is_some() && udp_http_target.is_none() {
+            bail!("--udp-http-proxy requires --udp-http-target <IP:PORT>");
+        }
+        if udp_http_proxy.is_none() && udp_http_target.is_some() {
+            bail!("--udp-http-target is only valid with --udp-http-proxy");
+        }
+
+        Ok(Self::HillstoneProbe {
+            server: server.context("hillstone-probe requires --server <HOST>")?,
+            port,
+            username: username.context("hillstone-probe requires --username <USER>")?,
+            password_env,
+            password_stdin,
+            host_id,
+            host_name,
+            client_version,
+            timeout_secs,
+            verify_server_cert,
+            stop_before_new_key,
+            udp_icmp_probe,
+            udp_tcp_probe,
+            udp_http_get,
+            udp_http_proxy,
+            udp_http_target,
+        })
+    }
 }
 
 fn parse_max_concurrency(value: Option<&String>, flag: &str) -> Result<usize> {
@@ -720,6 +912,7 @@ fn print_usage() {
         "  sync            Log into a provider site, fetch the sing-box subscription, and merge it"
     );
     println!("  benchmark       Benchmark selector candidates and optionally switch");
+    println!("  hillstone-probe Probe Hillstone SSL VPN control-plane compatibility");
 }
 
 fn print_run_usage() {
@@ -909,6 +1102,46 @@ fn print_benchmark_usage() {
     println!(
         "      --verify-url <NAME=URL>   Add a target to the default verification list; repeatable"
     );
+}
+
+fn print_hillstone_probe_usage() {
+    println!("Usage: sing-box-tui hillstone-probe --server <HOST> --username <USER> [OPTIONS]");
+    println!();
+    println!("Options:");
+    println!("      --server <HOST>              Hillstone gateway host");
+    println!("      --port <PORT>                Hillstone gateway port (default: 4433)");
+    println!("      --username <USER>            VPN username");
+    println!(
+        "      --password-env <NAME>        Read password from environment variable instead of stdin"
+    );
+    println!("      --password-stdin             Read one password line from stdin");
+    println!(
+        "      --host-id <ID>               Client host identifier (default: local machine id)"
+    );
+    println!("      --host-name <NAME>           Client host name (default: local hostname)");
+    println!(
+        "      --client-version <VERSION>   Client version sent in AUTH (default: 5.7.1.12488)"
+    );
+    println!("      --timeout-secs <N>           Socket read/write timeout (default: 10)");
+    println!("      --verify-server-cert         Verify the gateway TLS certificate");
+    println!("      --stop-before-new-key        Stop after SET_IP/SET_ROUTE/KEY_DONE discovery");
+    println!(
+        "      --udp-icmp-probe             Send one ESP-wrapped ICMP echo over UDP after NEW_KEY"
+    );
+    println!("      --udp-tcp-probe <IP:PORT>    Send one ESP-wrapped TCP SYN probe after NEW_KEY");
+    println!(
+        "      --udp-http-get <URL>         Fetch one http:// IPv4 URL over ESP after NEW_KEY"
+    );
+    println!(
+        "      --udp-http-proxy <IP:PORT>   Listen locally and reverse-proxy browser HTTP over ESP"
+    );
+    println!(
+        "                                   Can also be used as a browser HTTP proxy to keep target IP URLs"
+    );
+    println!("      --udp-http-target <IP:PORT>  Internal HTTP target for --udp-http-proxy");
+    println!();
+    println!("By default the probe accepts the gateway's self-signed certificate and reads");
+    println!("the password from HILLSTONE_PASSWORD unless --password-stdin is supplied.");
 }
 
 #[cfg(test)]
@@ -1368,6 +1601,130 @@ mod tests {
         match command {
             CliCommand::SyncProvider { write, .. } => assert!(write),
             _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn hillstone_probe_parses_required_arguments() {
+        let command = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--port".to_string(),
+            "4433".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--password-env".to_string(),
+            "VPN_PASSWORD".to_string(),
+            "--host-id".to_string(),
+            "host-id".to_string(),
+            "--host-name".to_string(),
+            "workstation".to_string(),
+            "--stop-before-new-key".to_string(),
+            "--udp-tcp-probe".to_string(),
+            "10.1.126.5:10011".to_string(),
+        ])
+        .expect("hillstone-probe command parses");
+
+        match command {
+            CliCommand::HillstoneProbe {
+                server,
+                port,
+                username,
+                password_env,
+                password_stdin,
+                host_id,
+                host_name,
+                stop_before_new_key,
+                udp_icmp_probe,
+                udp_tcp_probe,
+                udp_http_get,
+                ..
+            } => {
+                assert_eq!(server, "sslvpn.example.com");
+                assert_eq!(port, 4433);
+                assert_eq!(username, "alice");
+                assert_eq!(password_env.as_deref(), Some("VPN_PASSWORD"));
+                assert!(!password_stdin);
+                assert_eq!(host_id.as_deref(), Some("host-id"));
+                assert_eq!(host_name.as_deref(), Some("workstation"));
+                assert!(stop_before_new_key);
+                assert!(!udp_icmp_probe);
+                assert_eq!(udp_tcp_probe.as_deref(), Some("10.1.126.5:10011"));
+                assert!(udp_http_get.is_none());
+            }
+            _ => panic!("expected hillstone-probe command"),
+        }
+    }
+
+    #[test]
+    fn hillstone_probe_rejects_multiple_udp_probe_modes() {
+        let error = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--udp-icmp-probe".to_string(),
+            "--udp-tcp-probe".to_string(),
+            "10.1.126.5:10011".to_string(),
+        ])
+        .expect_err("multiple UDP probe modes should fail");
+
+        assert!(error.to_string().contains(
+            "use only one of --udp-icmp-probe, --udp-tcp-probe, --udp-http-get, or --udp-http-proxy"
+        ));
+    }
+
+    #[test]
+    fn hillstone_probe_accepts_udp_http_get() {
+        let command = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--udp-http-get".to_string(),
+            "http://10.1.126.5:10011/path".to_string(),
+        ])
+        .expect("hillstone-probe command parses");
+
+        match command {
+            CliCommand::HillstoneProbe { udp_http_get, .. } => {
+                assert_eq!(
+                    udp_http_get.as_deref(),
+                    Some("http://10.1.126.5:10011/path")
+                );
+            }
+            _ => panic!("expected hillstone-probe command"),
+        }
+    }
+
+    #[test]
+    fn hillstone_probe_accepts_udp_http_proxy() {
+        let command = CliCommand::parse([
+            "hillstone-probe".to_string(),
+            "--server".to_string(),
+            "sslvpn.example.com".to_string(),
+            "--username".to_string(),
+            "alice".to_string(),
+            "--udp-http-proxy".to_string(),
+            "127.0.0.1:18080".to_string(),
+            "--udp-http-target".to_string(),
+            "10.1.126.5:10011".to_string(),
+        ])
+        .expect("hillstone-probe command parses");
+
+        match command {
+            CliCommand::HillstoneProbe {
+                udp_http_proxy,
+                udp_http_target,
+                ..
+            } => {
+                assert_eq!(udp_http_proxy.as_deref(), Some("127.0.0.1:18080"));
+                assert_eq!(udp_http_target.as_deref(), Some("10.1.126.5:10011"));
+            }
+            _ => panic!("expected hillstone-probe command"),
         }
     }
 
