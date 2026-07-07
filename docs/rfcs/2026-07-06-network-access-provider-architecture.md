@@ -15,6 +15,8 @@ The core decision is:
 - Keep `sing-box` as the unified traffic entry point.
 - Treat enterprise intranet access as a separate `Remote Access` capability.
 - Run each remote-access implementation as an external provider process.
+- Let providers start a narrow privileged helper only when a packet TUN data
+  plane needs OS network configuration.
 - Let the TUI orchestrate provider lifecycle, route installation, status, and
   errors.
 - Avoid presenting the Hillstone protocol as a generic SSL VPN standard.
@@ -98,6 +100,8 @@ and identifiers where ambiguity matters.
   password config, keep it marked sensitive and out of logs.
 - Keep provider crashes isolated from the TUI process.
 - Make route changes explicit, inspectable, and reversible.
+- Keep privileged code narrow: TUN helpers own local interface/route state, not
+  provider authentication or VPN session keys.
 
 ## Non-Goals
 
@@ -107,6 +111,8 @@ and identifiers where ambiguity matters.
 - Do not control or depend on the official Hillstone client.
 - Do not add a second browser proxy setup path.
 - Do not require plaintext passwords in project config.
+- Do not run the whole TUI as root just because one remote-access provider needs
+  a TUN interface.
 
 ## Current Hillstone Behavior
 
@@ -194,6 +200,7 @@ Manifest example:
     "graceful_disconnect": true
   },
   "config_schema": {
+    "mode": { "type": "string", "enum": ["bridge", "tun"], "default": "bridge" },
     "server": { "type": "string", "required": true },
     "port": { "type": "integer", "default": 4433 },
     "username": { "type": "string", "required": true },
@@ -213,6 +220,7 @@ Runtime profile example:
     {
       "id": "office",
       "manifest_path": null,
+      "mode": "bridge",
       "server": "sslvpn.example.com",
       "port": 4433,
       "username": "user",
@@ -224,6 +232,7 @@ Runtime profile example:
     {
       "id": "custom-provider",
       "manifest_path": "./providers/custom-remote-access.json",
+      "mode": "bridge",
       "server": "vpn.example.com",
       "port": 443,
       "username": "user",
@@ -254,6 +263,7 @@ Command envelope:
   "provider": "hillstone",
   "config": {
     "server": "sslvpn.example.com",
+    "mode": "bridge",
     "port": 4433,
     "username": "user",
     "password": "optional-plaintext-password",

@@ -33,7 +33,7 @@ pub(crate) struct HillstoneRouteTableOptions {
 pub(crate) struct RemoteAccessRouteTableOptions {
     pub(crate) provider_id: String,
     pub(crate) cidrs: Vec<String>,
-    pub(crate) proxy: SocketAddrV4,
+    pub(crate) proxy: Option<SocketAddrV4>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -225,7 +225,7 @@ pub(crate) fn run_hillstone_route_table_config(
         RemoteAccessRouteTableOptions {
             provider_id: "hillstone".to_string(),
             cidrs: options.cidrs,
-            proxy: options.proxy,
+            proxy: Some(options.proxy),
         },
     )
 }
@@ -265,7 +265,7 @@ pub(crate) fn ensure_hillstone_route_table(
         RemoteAccessRouteTableOptions {
             provider_id: "hillstone".to_string(),
             cidrs: options.cidrs,
-            proxy: options.proxy,
+            proxy: Some(options.proxy),
         },
     )
 }
@@ -305,24 +305,34 @@ pub(crate) fn ensure_remote_access_route_table(
     let route = route_value
         .as_object_mut()
         .context("existing config route must be an object")?;
+    if options.proxy.is_none() {
+        // Remote Access TUN mode relies on the OS route table to send pushed intranet CIDRs into
+        // the helper-owned utun interface. sing-box's auto_detect_interface pins direct dials to
+        // the default physical interface, which bypasses that utun route and causes 502 timeouts
+        // for browser traffic entering through the mixed/system proxy inbound.
+        route.insert("auto_detect_interface".to_string(), Value::Bool(false));
+    }
     let rules_value = route
         .entry("rules")
         .or_insert_with(|| Value::Array(Vec::new()));
     let rules = rules_value
         .as_array_mut()
         .context("existing config route.rules must be an array")?;
-    rules.retain(|rule| !rule_matches_hillstone_route_targets(rule, &target_cidrs));
+    rules
+        .retain(|rule| !rule_matches_remote_access_route_targets(rule, &target_cidrs, &direct_tag));
 
     // Provider-owned route metadata cannot be written into sing-box route rules because sing-box
     // may reject unknown fields. Ownership is tracked by the TUI/provider session; the config rule
     // itself stays valid sing-box JSON and intentionally has no port matcher.
-    let rule = json!({
+    let mut rule = json!({
         "action": "route",
         "ip_cidr": target_cidrs.iter().map(Ipv4Cidr::to_string).collect::<Vec<_>>(),
         "outbound": direct_tag,
-        "override_address": options.proxy.ip().to_string(),
-        "override_port": options.proxy.port(),
     });
+    if let Some(proxy) = options.proxy {
+        rule["override_address"] = Value::String(proxy.ip().to_string());
+        rule["override_port"] = Value::from(proxy.port());
+    }
     let index = hillstone_route_insert_index(rules);
     rules.insert(index, rule);
     Ok(())
@@ -1402,11 +1412,18 @@ fn normalize_ipv4_cidrs(values: &[String]) -> Result<Vec<Ipv4Cidr>> {
     Ok(cidrs)
 }
 
-fn rule_matches_hillstone_route_targets(rule: &Value, target_cidrs: &[Ipv4Cidr]) -> bool {
+fn rule_matches_remote_access_route_targets(
+    rule: &Value,
+    target_cidrs: &[Ipv4Cidr],
+    direct_tag: &str,
+) -> bool {
     if rule.get("action").and_then(Value::as_str) != Some("route") {
         return false;
     }
-    if !(rule.get("override_address").is_some() || rule.get("override_port").is_some()) {
+    if !(rule.get("override_address").is_some()
+        || rule.get("override_port").is_some()
+        || rule.get("outbound").and_then(Value::as_str) == Some(direct_tag))
+    {
         return false;
     }
     rule_ip_cidrs(rule).into_iter().any(|rule_cidr| {
@@ -1883,7 +1900,7 @@ mod tests {
             RemoteAccessRouteTableOptions {
                 provider_id: "hillstone".to_string(),
                 cidrs: vec!["10.1.0.0/16".to_string()],
-                proxy: "127.0.0.1:18080".parse().expect("proxy parses"),
+                proxy: Some("127.0.0.1:18080".parse().expect("proxy parses")),
             },
         )
         .expect("remote access route is inserted");
@@ -1897,6 +1914,58 @@ mod tests {
         assert!(rule.get("port").is_none());
         assert_eq!(rule["override_address"], "127.0.0.1");
         assert_eq!(rule["override_port"], 18080);
+    }
+
+    #[test]
+    fn remote_access_tun_route_replaces_bridge_override_with_direct_route() {
+        let mut config = json!({
+            "outbounds": [{
+                "type": "direct",
+                "tag": "direct"
+            }],
+            "route": {
+                "rules": [{
+                    "action": "route",
+                    "ip_cidr": ["10.1.0.0/16", "10.255.0.0/24"],
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }, {
+                    "ip_is_private": true,
+                    "outbound": "direct"
+                }]
+            }
+        });
+
+        ensure_remote_access_route_table(
+            &mut config,
+            RemoteAccessRouteTableOptions {
+                provider_id: "hillstone".to_string(),
+                cidrs: vec![
+                    "10.1.0.0/16".to_string(),
+                    "10.255.0.0/24".to_string(),
+                    "10.253.0.0/24".to_string(),
+                ],
+                proxy: None,
+            },
+        )
+        .expect("TUN direct route is inserted");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let remote_access_rules = rules
+            .iter()
+            .filter(|rule| rule["ip_cidr"].is_array())
+            .collect::<Vec<_>>();
+        assert_eq!(remote_access_rules.len(), 1);
+        assert_eq!(config["route"]["auto_detect_interface"], false);
+        let rule = remote_access_rules[0];
+        assert_eq!(
+            rule["ip_cidr"],
+            json!(["10.1.0.0/16", "10.255.0.0/24", "10.253.0.0/24"])
+        );
+        assert_eq!(rule["outbound"], "direct");
+        assert!(rule.get("override_address").is_none());
+        assert!(rule.get("override_port").is_none());
     }
 
     #[test]

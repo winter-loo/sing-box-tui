@@ -15,28 +15,34 @@ use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
 const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteAccessProviderRuntimeState {
     #[serde(default)]
     pub(crate) id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) server: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) port: Option<u16>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) username: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) password: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) password_env: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bridge_listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tun_helper: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) tls_verify: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) benchmark_filter: String,
@@ -48,21 +54,21 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) bypass_entries: Vec<String>,
     #[serde(default)]
     pub(crate) onboarding_complete: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_request_timeout: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_max_concurrency: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verify_targets: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_select_threshold_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_select_interval_secs: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_proxy_server: Option<String>,
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
@@ -212,7 +218,7 @@ fn is_ip_entry(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::TuiRuntimeState;
+    use super::{RemoteAccessProviderRuntimeState, TuiRuntimeState};
 
     #[test]
     fn state_without_remote_access_providers_uses_empty_provider_list() {
@@ -234,5 +240,54 @@ mod tests {
         .expect("state parses");
 
         assert!(state.remote_access_providers.is_empty());
+    }
+
+    #[test]
+    fn save_shape_omits_empty_remote_access_provider_options() {
+        let state = TuiRuntimeState {
+            remote_access_providers: vec![RemoteAccessProviderRuntimeState {
+                id: "hillstone".to_string(),
+                password_env: Some("HILLSTONE_PASSWORD".to_string()),
+                ..RemoteAccessProviderRuntimeState::default()
+            }],
+            ..TuiRuntimeState::default()
+        };
+
+        let value = serde_json::to_value(&state).expect("serializes");
+        let provider = &value["remote_access_providers"][0];
+
+        assert_eq!(provider["id"], "hillstone");
+        assert_eq!(provider["password_env"], "HILLSTONE_PASSWORD");
+        assert!(provider.get("server").is_none());
+        assert!(provider.get("username").is_none());
+        assert!(provider.get("password").is_none());
+    }
+
+    #[test]
+    fn unknown_global_tui_state_fields_are_rejected() {
+        let error = serde_json::from_str::<TuiRuntimeState>(
+            r#"{
+              "legacy_global": null,
+              "remote_access_providers": []
+            }"#,
+        )
+        .expect_err("unknown global TUI state settings must be rejected");
+
+        assert!(error.to_string().contains("legacy_global"));
+    }
+
+    #[test]
+    fn unknown_remote_access_provider_fields_are_rejected() {
+        let error = serde_json::from_str::<TuiRuntimeState>(
+            r#"{
+              "remote_access_providers": [{
+                "id": "hillstone",
+                "legacy_provider": null
+              }]
+            }"#,
+        )
+        .expect_err("unknown remote access provider settings must be rejected");
+
+        assert!(error.to_string().contains("legacy_provider"));
     }
 }

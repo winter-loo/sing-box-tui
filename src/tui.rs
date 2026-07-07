@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -84,6 +84,7 @@ const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::SystemProxyServer,
     SettingsField::RemoteAccessProvider,
     SettingsField::RemoteAccessManifestPath,
+    SettingsField::RemoteAccessMode,
     SettingsField::RemoteAccessServer,
     SettingsField::RemoteAccessPort,
     SettingsField::RemoteAccessUsername,
@@ -108,6 +109,7 @@ pub(crate) struct TuiSubscriptionRefreshOptions {
 pub(crate) fn run_tui(
     controller: Option<String>,
     max_concurrency: Option<usize>,
+    keep_sing_box_running: bool,
     subscription_refresh: TuiSubscriptionRefreshOptions,
 ) -> Result<()> {
     let controller = controller
@@ -122,11 +124,13 @@ pub(crate) fn run_tui(
         ApiClient::new(controller, secret)?,
         max_concurrency.unwrap_or(DEFAULT_BENCHMARK_MAX_CONCURRENCY),
         subscription_refresh,
+        keep_sing_box_running,
     )?;
     let terminal = setup_terminal()?;
     let result = run_app(terminal, &mut app);
-    restore_terminal()?;
-    result
+    let restore_result = restore_terminal();
+    let shutdown_result = app.shutdown_managed_sing_box();
+    result.and(restore_result).and(shutdown_result)
 }
 
 fn setup_terminal() -> Result<DefaultTerminal> {
@@ -164,7 +168,11 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if !app.handle_key(key.code)? {
+                if matches!(key.code, KeyCode::Char('V'))
+                    && app.remote_access_connect_needs_terminal_prompt()
+                {
+                    connect_remote_access_with_terminal_prompt(&mut terminal, app)?;
+                } else if !app.handle_key(key.code)? {
                     return Ok(());
                 }
             }
@@ -175,9 +183,61 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     }
 }
 
+fn suspend_terminal_for_prompt(terminal: &mut DefaultTerminal) -> Result<()> {
+    terminal.show_cursor()?;
+    restore_terminal()?;
+    println!();
+    println!("Remote Access TUN helper may ask for your macOS sudo password below.");
+    println!(
+        "Complete the prompt in this terminal; the TUI will return after the helper is ready or fails."
+    );
+    println!();
+    Ok(())
+}
+
+fn resume_terminal_after_prompt(terminal: &mut DefaultTerminal) -> Result<()> {
+    enable_raw_mode().context("failed to re-enable raw mode")?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to re-enter alternate screen")?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn connect_remote_access_with_terminal_prompt(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+) -> Result<()> {
+    app.open_remote_access_progress();
+    app.push_remote_access_progress(
+        RemoteAccessProgressTone::Info,
+        "正在连接内网服务器...".to_string(),
+    );
+    app.push_remote_access_progress(
+        RemoteAccessProgressTone::Info,
+        "需要 sudo 密码创建 TUN 接口，正在切换到终端提示...".to_string(),
+    );
+    terminal.draw(|frame| draw(frame, app))?;
+    suspend_terminal_for_prompt(terminal)?;
+    let result = (|| -> Result<()> {
+        app.toggle_remote_access()?;
+        loop {
+            app.poll_remote_access_updates()?;
+            let state = app.remote_access.focused().state.clone();
+            if !matches!(state, RemoteAccessState::Connecting) {
+                println!();
+                println!("Remote Access {}: {}", state.label(), app.status);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    })();
+    let resume_result = resume_terminal_after_prompt(terminal);
+    result.and(resume_result)
+}
+
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(9)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(10), Constraint::Length(10)]).areas(frame.area());
     let implicit_root_mode = app.implicit_root_mode();
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
@@ -410,6 +470,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Line::from(benchmark_hint),
         Line::from(app.connections_summary_line()),
         Line::from(app.subscription_summary_line()),
+        Line::from(app.sing_box_summary_line()),
         app.remote_access.summary_line(),
         bottom_line,
     ])
@@ -440,13 +501,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.onboarding.is_some() {
         draw_onboarding_panel(frame, app);
     }
+    if let Some(progress) = app.remote_access_progress.as_ref() {
+        draw_remote_access_progress_panel(frame, progress);
+    }
     if let Some(input) = app.filter_input.as_deref() {
         let cursor_x = status_area
             .x
             .saturating_add(1)
             .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
             .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
-        let cursor_y = status_area.y.saturating_add(7);
+        let cursor_y = status_area.y.saturating_add(8);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -733,6 +797,24 @@ fn draw_settings_panel(frame: &mut Frame, app: &App) {
             Span::raw(edit.input.as_str()),
         ]));
     }
+    let settings_error = app
+        .settings_edit
+        .as_ref()
+        .and_then(|edit| edit.error.as_deref())
+        .or(app.settings_error.as_deref());
+    if let Some(error) = settings_error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Error: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_for_width(error, area.width.saturating_sub(12) as usize),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -776,6 +858,56 @@ fn draw_onboarding_panel(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_remote_access_progress_panel(frame: &mut Frame, progress: &RemoteAccessProgressModal) {
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(6).min(88).max(56);
+    let height = (progress.entries.len() as u16 + 4)
+        .min(frame_area.height.saturating_sub(4))
+        .max(8);
+    let area = centered_rect(width, height, frame_area);
+    frame.render_widget(Clear, area);
+
+    let max_entries = area.height.saturating_sub(4) as usize;
+    let start = progress.entries.len().saturating_sub(max_entries);
+    let mut lines = progress
+        .entries
+        .iter()
+        .skip(start)
+        .map(|entry| {
+            Line::from(vec![
+                Span::styled(entry.tone.prefix(), entry.tone.style()),
+                Span::raw(truncate_for_width(
+                    &entry.text,
+                    area.width.saturating_sub(8) as usize,
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if progress.done {
+            "Enter/Esc close"
+        } else {
+            "Remote Access is running..."
+        },
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(progress.title.clone())
+                .borders(Borders::ALL)
+                .border_style(if progress.done {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                }),
+        ),
+        area,
+    );
+}
+
 fn settings_field_label(field: SettingsField) -> &'static str {
     match field {
         SettingsField::BenchmarkUrl => "Benchmark URL",
@@ -788,6 +920,7 @@ fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::SystemProxyServer => "System proxy server",
         SettingsField::RemoteAccessProvider => "Remote access provider",
         SettingsField::RemoteAccessManifestPath => "Remote access manifest path",
+        SettingsField::RemoteAccessMode => "Remote access mode",
         SettingsField::RemoteAccessServer => "Remote access server",
         SettingsField::RemoteAccessPort => "Remote access port",
         SettingsField::RemoteAccessUsername => "Remote access username",
@@ -815,6 +948,7 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
             .manifest_path
             .clone()
             .unwrap_or_default(),
+        SettingsField::RemoteAccessMode => app.remote_access.focused().mode.as_str().to_string(),
         SettingsField::RemoteAccessServer => app.remote_access.focused().server.clone(),
         SettingsField::RemoteAccessPort => app.remote_access.focused().port.to_string(),
         SettingsField::RemoteAccessUsername => app.remote_access.focused().username.clone(),
@@ -1655,6 +1789,252 @@ fn run_system_proxy_update(
     bail!("system proxy toggle is only available on Windows, macOS, and Linux")
 }
 
+struct SingBoxRestartResult {
+    restarted_pids: Vec<u32>,
+    started_pid: u32,
+    child: Child,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SingBoxRestartSummary {
+    restarted_pids: Vec<u32>,
+    started_pid: u32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResult> {
+    let pids = find_sing_box_run_pids_for_config(config_path)?;
+    for pid in &pids {
+        stop_sing_box_pid(*pid)
+            .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
+    }
+
+    let log_path = sing_box_process_log_path(config_path);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open sing-box process log {}", log_path.display()))?;
+    let stderr = log.try_clone().with_context(|| {
+        format!(
+            "failed to clone sing-box process log {}",
+            log_path.display()
+        )
+    })?;
+    let mut child = Command::new("sing-box")
+        .arg("run")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to start sing-box run --config {}",
+                config_path.display()
+            )
+        })?;
+    let started_pid = child.id();
+    std::thread::sleep(Duration::from_millis(500));
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to inspect restarted sing-box process")?
+    {
+        bail!(
+            "sing-box exited immediately with {status}; see {}",
+            log_path.display()
+        );
+    }
+    Ok(SingBoxRestartResult {
+        restarted_pids: pids,
+        started_pid,
+        child,
+    })
+}
+
+#[cfg(windows)]
+fn restart_sing_box_for_config(_config_path: &Path) -> Result<SingBoxRestartResult> {
+    bail!("automatic sing-box restart is not implemented on Windows yet")
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn restart_sing_box_for_config(_config_path: &Path) -> Result<SingBoxRestartResult> {
+    bail!("automatic sing-box restart is only available on macOS and Linux")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("failed to list processes with ps")?;
+    if !output.status.success() {
+        bail!("ps exited with {}", output.status);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((pid, command)) = parse_ps_pid_command(line) else {
+            continue;
+        };
+        if command_matches_sing_box_run_for_config(command, config_path) {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_ps_pid_command(line: &str) -> Option<(u32, &str)> {
+    let mut parts = line.trim().splitn(2, char::is_whitespace);
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let command = parts.next()?.trim();
+    Some((pid, command))
+}
+
+fn command_matches_sing_box_run_for_config(command: &str, config_path: &Path) -> bool {
+    let args = command.split_whitespace().collect::<Vec<_>>();
+    if args.len() < 3 {
+        return false;
+    }
+    let program_is_sing_box = args
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        == Some("sing-box");
+    if !program_is_sing_box || !args.iter().any(|arg| *arg == "run") {
+        return false;
+    }
+    let config_values = sing_box_config_args(&args);
+    !config_values.is_empty()
+        && config_values
+            .iter()
+            .any(|value| config_arg_matches_path(value, config_path))
+}
+
+fn sing_box_config_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--config" | "-c" => {
+                if let Some(value) = args.get(i + 1) {
+                    values.push(*value);
+                    i += 1;
+                }
+            }
+            value if value.starts_with("--config=") => {
+                values.push(value.trim_start_matches("--config="));
+            }
+            value if value.starts_with("-c=") => {
+                values.push(value.trim_start_matches("-c="));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    values
+}
+
+fn config_arg_matches_path(value: &str, config_path: &Path) -> bool {
+    let value_path = Path::new(value);
+    if value_path == config_path {
+        return true;
+    }
+    if let Ok(canonical_config) = config_path.canonicalize()
+        && let Ok(canonical_value) = value_path.canonicalize()
+        && canonical_value == canonical_config
+    {
+        return true;
+    }
+    config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|file_name| value == file_name || value == format!("./{file_name}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if pids.iter().all(|pid| !process_exists(*pid)) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("timed out waiting for sing-box process(es) to exit: {pids:?}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_sing_box_pid(pid: u32) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to stop sing-box process {pid}"))?;
+    if !status.success() {
+        bail!("failed to stop sing-box process {pid}: kill exited with {status}");
+    }
+    if wait_for_processes_to_exit(&[pid]).is_ok() {
+        return Ok(());
+    }
+    let status = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to force stop sing-box process {pid}"))?;
+    if !status.success() {
+        bail!("failed to force stop sing-box process {pid}: kill -9 exited with {status}");
+    }
+    wait_for_processes_to_exit(&[pid])
+}
+
+#[cfg(windows)]
+fn stop_sing_box_pid(_pid: u32) -> Result<()> {
+    bail!("managed sing-box shutdown is not implemented on Windows yet")
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn stop_sing_box_pid(_pid: u32) -> Result<()> {
+    bail!("managed sing-box shutdown is only available on macOS and Linux")
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn stop_sing_box_child(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("failed to inspect managed sing-box process")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    child
+        .kill()
+        .context("failed to kill managed sing-box process")?;
+    child
+        .wait()
+        .context("failed to reap managed sing-box process")?;
+    Ok(())
+}
+
+fn sing_box_process_log_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("sing-box.log")
+}
+
 #[cfg(windows)]
 fn system_proxy_matches(server: &str) -> bool {
     let output = Command::new("reg.exe")
@@ -1944,6 +2324,7 @@ enum SettingsField {
     SystemProxyServer,
     RemoteAccessProvider,
     RemoteAccessManifestPath,
+    RemoteAccessMode,
     RemoteAccessServer,
     RemoteAccessPort,
     RemoteAccessUsername,
@@ -1953,9 +2334,50 @@ enum SettingsField {
     RemoteAccessTlsVerify,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteAccessMode {
+    Bridge,
+    Tun,
+}
+
+impl RemoteAccessMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bridge => "bridge",
+            Self::Tun => "tun",
+        }
+    }
+}
+
+fn parse_remote_access_mode(value: &str) -> Result<RemoteAccessMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "bridge" | "http_bridge" | "http-bridge" => Ok(RemoteAccessMode::Bridge),
+        "tun" => Ok(RemoteAccessMode::Tun),
+        _ => bail!("remote access mode must be bridge or tun"),
+    }
+}
+
+fn helper_command_uses_interactive_sudo(command: &[String]) -> bool {
+    command.first().is_some_and(|program| program == "sudo")
+        && !command.iter().skip(1).any(|arg| arg == "-n")
+}
+
+fn default_interactive_tun_helper_command() -> Vec<String> {
+    let exe = env::current_exe()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "sing-box-tui".to_string());
+    vec![
+        "sudo".to_string(),
+        exe,
+        "remote-access-tun-helper".to_string(),
+        "--stdio".to_string(),
+    ]
+}
+
 struct SettingsEditState {
     field: SettingsField,
     input: String,
+    error: Option<String>,
 }
 
 struct App {
@@ -2001,6 +2423,7 @@ struct App {
     show_settings: bool,
     settings_index: usize,
     settings_edit: Option<SettingsEditState>,
+    settings_error: Option<String>,
     subscription_refresh: Option<SubscriptionRefreshState>,
     system_proxy_config_path: PathBuf,
     system_proxy_server: String,
@@ -2009,7 +2432,9 @@ struct App {
     system_proxy_job: Option<SystemProxyJob>,
     last_system_proxy_status_refresh: Instant,
     verify_job: Option<VerifyJob>,
+    sing_box: SingBoxProcessRuntime,
     remote_access: RemoteAccessRuntime,
+    remote_access_progress: Option<RemoteAccessProgressModal>,
 }
 
 struct SubscriptionRefreshState {
@@ -2042,9 +2467,66 @@ struct VerifyJob {
     worker: JoinHandle<()>,
 }
 
+struct SingBoxProcessRuntime {
+    managed_pid: Option<u32>,
+    managed_child: Option<Child>,
+    keep_running: bool,
+}
+
+impl SingBoxProcessRuntime {
+    fn new(keep_running: bool) -> Self {
+        Self {
+            managed_pid: None,
+            managed_child: None,
+            keep_running,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RemoteAccessProgressModal {
+    title: String,
+    entries: Vec<RemoteAccessProgressEntry>,
+    done: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteAccessProgressEntry {
+    tone: RemoteAccessProgressTone,
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAccessProgressTone {
+    Info,
+    Success,
+    Error,
+}
+
+impl RemoteAccessProgressTone {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Info => "[..] ",
+            Self::Success => "[OK] ",
+            Self::Error => "[ERR] ",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::Info => Style::default().fg(Color::Cyan),
+            Self::Success => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
 struct RemoteAccessProfileRuntime {
     id: String,
     manifest_path: Option<String>,
+    mode: RemoteAccessMode,
     manifest: RemoteAccessProviderManifest,
     process: Option<ExternalRemoteAccessProvider>,
     state: RemoteAccessState,
@@ -2054,11 +2536,13 @@ struct RemoteAccessProfileRuntime {
     password: String,
     password_env: String,
     bridge_listen: String,
+    tun_helper: Vec<String>,
     tls_verify: bool,
     routes: Vec<RemoteAccessRoute>,
     dns: Vec<String>,
     bridge: Option<RemoteAccessBridge>,
     last_error: Option<String>,
+    integration_failed: bool,
 }
 
 impl RemoteAccessProfileRuntime {
@@ -2071,6 +2555,7 @@ impl RemoteAccessProfileRuntime {
         Ok(Self {
             id: "hillstone".to_string(),
             manifest_path,
+            mode: RemoteAccessMode::Bridge,
             manifest,
             process: None,
             state: RemoteAccessState::Disconnected,
@@ -2080,11 +2565,13 @@ impl RemoteAccessProfileRuntime {
             password: String::new(),
             password_env: "HILLSTONE_PASSWORD".to_string(),
             bridge_listen: "127.0.0.1:16780".to_string(),
+            tun_helper: Vec::new(),
             tls_verify: false,
             routes: Vec::new(),
             dns: Vec::new(),
             bridge: None,
             last_error: None,
+            integration_failed: false,
         })
     }
 
@@ -2096,6 +2583,7 @@ impl RemoteAccessProfileRuntime {
         let mut profile = Self {
             id,
             manifest_path,
+            mode: RemoteAccessMode::Bridge,
             manifest,
             process: None,
             state: RemoteAccessState::Disconnected,
@@ -2105,17 +2593,22 @@ impl RemoteAccessProfileRuntime {
             password: String::new(),
             password_env: String::new(),
             bridge_listen: "127.0.0.1:16780".to_string(),
+            tun_helper: Vec::new(),
             tls_verify: false,
             routes: Vec::new(),
             dns: Vec::new(),
             bridge: None,
             last_error: None,
+            integration_failed: false,
         };
-        profile.apply_state(state);
+        profile.apply_state(state)?;
         Ok(profile)
     }
 
-    fn apply_state(&mut self, state: RemoteAccessProviderRuntimeState) {
+    fn apply_state(&mut self, state: RemoteAccessProviderRuntimeState) -> Result<()> {
+        if let Some(value) = normalize_optional_setting(state.mode) {
+            self.mode = parse_remote_access_mode(&value)?;
+        }
         if let Some(value) = normalize_optional_setting(state.server) {
             self.server = value;
         }
@@ -2134,19 +2627,32 @@ impl RemoteAccessProfileRuntime {
         if let Some(value) = normalize_optional_setting(state.bridge_listen) {
             self.bridge_listen = value;
         }
+        if let Some(values) = state.tun_helper {
+            self.tun_helper = values
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect();
+        }
         self.tls_verify = state.tls_verify;
+        Ok(())
     }
 
     fn runtime_state(&self) -> RemoteAccessProviderRuntimeState {
         RemoteAccessProviderRuntimeState {
             id: self.id.clone(),
             manifest_path: self.manifest_path.clone(),
+            mode: Some(self.mode.as_str().to_string()),
             server: normalize_optional_setting(Some(self.server.clone())),
             port: Some(self.port),
             username: normalize_optional_setting(Some(self.username.clone())),
             password: normalize_optional_setting(Some(self.password.clone())),
             password_env: normalize_optional_setting(Some(self.password_env.clone())),
             bridge_listen: normalize_optional_setting(Some(self.bridge_listen.clone())),
+            tun_helper: if self.tun_helper.is_empty() {
+                None
+            } else {
+                Some(self.tun_helper.clone())
+            },
             tls_verify: self.tls_verify,
         }
     }
@@ -2229,19 +2735,33 @@ impl RemoteAccessRuntime {
                 Style::default().fg(Color::Cyan),
             ));
         }
-        let bridge = focused
-            .bridge
-            .as_ref()
-            .map(|bridge| bridge.listen.as_str())
-            .unwrap_or(focused.bridge_listen.as_str());
+        spans.push(Span::styled(
+            format!(" mode={}", focused.mode.as_str()),
+            Style::default().fg(Color::DarkGray),
+        ));
         if matches!(
             focused.state,
             RemoteAccessState::Connected | RemoteAccessState::Connecting
         ) {
-            spans.push(Span::styled(
-                format!(" bridge={bridge}"),
-                Style::default().fg(Color::DarkGray),
-            ));
+            match focused.mode {
+                RemoteAccessMode::Bridge => {
+                    let bridge = focused
+                        .bridge
+                        .as_ref()
+                        .map(|bridge| bridge.listen.as_str())
+                        .unwrap_or(focused.bridge_listen.as_str());
+                    spans.push(Span::styled(
+                        format!(" bridge={bridge}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                RemoteAccessMode::Tun => {
+                    spans.push(Span::styled(
+                        " data=tun",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
         }
         if let Some(error) = focused.last_error.as_ref() {
             spans.push(Span::raw(" error="));
@@ -2306,6 +2826,99 @@ fn remote_access_state_style(state: &RemoteAccessState) -> Style {
     }
 }
 
+fn should_apply_remote_access_state_after_integration(
+    profile: &RemoteAccessProfileRuntime,
+    state: &RemoteAccessState,
+) -> bool {
+    !profile.integration_failed
+        || matches!(
+            state,
+            RemoteAccessState::Error
+                | RemoteAccessState::Disconnecting
+                | RemoteAccessState::Disconnected
+        )
+}
+
+fn remote_access_profile_settings_locked(profile: &RemoteAccessProfileRuntime) -> bool {
+    profile.process.is_some()
+        || matches!(
+            profile.state,
+            RemoteAccessState::Connecting
+                | RemoteAccessState::Connected
+                | RemoteAccessState::Disconnecting
+        )
+}
+
+fn remote_access_progress_for_state(
+    state: &RemoteAccessState,
+    message: &str,
+) -> Option<(RemoteAccessProgressTone, String, bool)> {
+    let normalized = message.to_ascii_lowercase();
+    // Provider events are intentionally low-level, so the TUI maps them into user-facing
+    // milestones. This keeps the V flow readable without leaking protocol logs into the UI.
+    match state {
+        RemoteAccessState::Connecting => {
+            if normalized.contains("authentication accepted")
+                || normalized.contains("auth accepted")
+            {
+                Some((
+                    RemoteAccessProgressTone::Success,
+                    "认证成功".to_string(),
+                    false,
+                ))
+            } else if normalized.contains("data tunnel") || normalized.contains("tun data plane") {
+                Some((
+                    RemoteAccessProgressTone::Success,
+                    user_remote_access_message(message, "数据通道已建立"),
+                    false,
+                ))
+            } else if normalized.contains("gateway") || normalized.contains("connecting") {
+                Some((
+                    RemoteAccessProgressTone::Info,
+                    "正在连接内网服务器...".to_string(),
+                    false,
+                ))
+            } else {
+                Some((
+                    RemoteAccessProgressTone::Info,
+                    user_remote_access_message(message, "正在连接内网服务器..."),
+                    false,
+                ))
+            }
+        }
+        RemoteAccessState::Connected => Some((
+            RemoteAccessProgressTone::Success,
+            user_remote_access_message(message, "连接成功"),
+            false,
+        )),
+        RemoteAccessState::Disconnecting => Some((
+            RemoteAccessProgressTone::Info,
+            "正在断开内网连接...".to_string(),
+            false,
+        )),
+        RemoteAccessState::Disconnected => Some((
+            RemoteAccessProgressTone::Success,
+            "内网连接已断开".to_string(),
+            true,
+        )),
+        RemoteAccessState::Error => Some((
+            RemoteAccessProgressTone::Error,
+            user_remote_access_message(message, "连接失败"),
+            true,
+        )),
+        RemoteAccessState::Disabled => None,
+    }
+}
+
+fn user_remote_access_message(message: &str, fallback: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        fallback.to_string()
+    } else {
+        message.to_string()
+    }
+}
+
 fn load_remote_access_manifest_for_profile(
     profile_id: &str,
     manifest_path: Option<&str>,
@@ -2361,6 +2974,7 @@ impl App {
         client: ApiClient,
         benchmark_max_concurrency: usize,
         subscription_refresh_options: TuiSubscriptionRefreshOptions,
+        keep_sing_box_running: bool,
     ) -> Result<Self> {
         let state_store = TuiStateStore::new(default_tui_state_path());
         let existing_state_file = state_store.exists();
@@ -2418,6 +3032,7 @@ impl App {
             show_settings: false,
             settings_index: 0,
             settings_edit: None,
+            settings_error: None,
             subscription_refresh,
             system_proxy_config_path,
             system_proxy_server,
@@ -2426,10 +3041,20 @@ impl App {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
+            sing_box: SingBoxProcessRuntime::new(keep_sing_box_running),
             remote_access: RemoteAccessRuntime::new()?,
+            remote_access_progress: None,
         };
+        app.start_managed_sing_box()?;
+        if let Err(error) = app.wait_for_controller_ready() {
+            let _ = app.shutdown_managed_sing_box();
+            return Err(error);
+        }
         app.apply_runtime_state(runtime_state.clone())?;
-        app.refresh()?;
+        if let Err(error) = app.refresh() {
+            let _ = app.shutdown_managed_sing_box();
+            return Err(error);
+        }
         app.restore_persisted_selections(&runtime_state)?;
         app.apply_runtime_state(runtime_state)?;
         app.save_bypass_rule_set()?;
@@ -2779,6 +3404,15 @@ impl App {
         self.status.clone()
     }
 
+    fn sing_box_summary_line(&self) -> String {
+        match (self.sing_box.managed_pid, self.sing_box.keep_running) {
+            (Some(pid), true) => format!("sing-box: managed pid={pid} exit=keep-background"),
+            (Some(pid), false) => format!("sing-box: managed pid={pid} exit=stop"),
+            (None, true) => "sing-box: not managed exit=keep-background".to_string(),
+            (None, false) => "sing-box: not managed exit=stop".to_string(),
+        }
+    }
+
     fn connections_summary_line(&self) -> String {
         if let Some(error) = &self.connection_error {
             return format!("connections unavailable: {}", truncate_for_width(error, 80));
@@ -2968,6 +3602,14 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.remote_access_progress.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => self.remote_access_progress = None,
+                KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+            return Ok(true);
+        }
         if self.onboarding.is_some() {
             return self.handle_onboarding_key(code);
         }
@@ -3055,7 +3697,7 @@ impl App {
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.start_verify(),
-            KeyCode::Char('V') => self.toggle_remote_access()?,
+            KeyCode::Char('V') => self.toggle_remote_access_with_progress()?,
             KeyCode::Char('o') => self.open_settings_panel(),
             KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
@@ -3178,20 +3820,25 @@ impl App {
         match code {
             KeyCode::Esc | KeyCode::Char('o') => {
                 self.show_settings = false;
+                self.settings_error = None;
                 self.set_status_only("Settings closed");
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_error = None;
                 self.settings_index =
                     (self.settings_index + 1).min(SETTINGS_FIELDS.len().saturating_sub(1));
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_error = None;
                 self.settings_index = self.settings_index.saturating_sub(1);
             }
             KeyCode::Enter => {
                 let field = SETTINGS_FIELDS[self.settings_index];
+                self.settings_error = None;
                 self.settings_edit = Some(SettingsEditState {
                     field,
                     input: settings_field_value(self, field),
+                    error: None,
                 });
             }
             KeyCode::Char('q') => return Ok(false),
@@ -3207,16 +3854,25 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.settings_edit = None;
+                self.settings_error = None;
             }
             KeyCode::Enter => {
                 let edit = self.settings_edit.take().expect("settings edit exists");
-                self.apply_settings_value(edit.field, edit.input)?;
+                if let Err(error) = self.apply_settings_value(edit.field, edit.input.clone()) {
+                    let message = error.to_string();
+                    self.settings_edit = Some(SettingsEditState {
+                        error: Some(message),
+                        ..edit
+                    });
+                }
             }
             KeyCode::Backspace => {
                 edit.input.pop();
+                edit.error = None;
             }
             KeyCode::Char(ch) => {
                 edit.input.push(ch);
+                edit.error = None;
             }
             _ => {}
         }
@@ -3268,7 +3924,7 @@ impl App {
                 self.remote_access.set_focus_by_id(value)?;
             }
             SettingsField::RemoteAccessManifestPath => {
-                if self.remote_access.focused().process.is_some() {
+                if remote_access_profile_settings_locked(self.remote_access.focused()) {
                     bail!("disconnect Remote Access before changing provider manifest");
                 }
                 let profile_id = self.remote_access.focused().id.clone();
@@ -3278,6 +3934,12 @@ impl App {
                 let focused = self.remote_access.focused_mut();
                 focused.manifest_path = manifest_path;
                 focused.manifest = manifest;
+            }
+            SettingsField::RemoteAccessMode => {
+                if remote_access_profile_settings_locked(self.remote_access.focused()) {
+                    bail!("disconnect Remote Access before changing data plane mode");
+                }
+                self.remote_access.focused_mut().mode = parse_remote_access_mode(value)?;
             }
             SettingsField::RemoteAccessServer => {
                 self.remote_access.focused_mut().server = value.to_string();
@@ -4112,6 +4774,170 @@ impl App {
         self.set_status_with_flash(result.summary_line());
     }
 
+    fn remote_access_connect_needs_terminal_prompt(&self) -> bool {
+        let profile = self.remote_access.focused();
+        matches!(
+            profile.state,
+            RemoteAccessState::Disabled
+                | RemoteAccessState::Disconnected
+                | RemoteAccessState::Error
+        ) && matches!(profile.mode, RemoteAccessMode::Tun)
+            && self
+                .remote_access_tun_helper_for_connect(profile)
+                .is_some_and(|command| helper_command_uses_interactive_sudo(&command))
+    }
+
+    fn remote_access_tun_helper_for_connect(
+        &self,
+        profile: &RemoteAccessProfileRuntime,
+    ) -> Option<Vec<String>> {
+        if !matches!(profile.mode, RemoteAccessMode::Tun) {
+            return None;
+        }
+        if !profile.tun_helper.is_empty() {
+            return Some(profile.tun_helper.clone());
+        }
+        // TUN device setup needs a privileged helper on macOS. The TUI injects an interactive
+        // sudo helper only for the live connect command, so the user gets a clear password prompt
+        // without persisting machine-specific helper paths into sing-box-tui.json.
+        Some(default_interactive_tun_helper_command())
+    }
+
+    fn start_managed_sing_box(&mut self) -> Result<()> {
+        let result = self.restart_managed_sing_box()?;
+        if result.restarted_pids.is_empty() {
+            self.status = format!("Started managed sing-box pid {}", result.started_pid);
+        } else {
+            self.status = format!(
+                "Restarted managed sing-box pid(s) {:?} -> {}",
+                result.restarted_pids, result.started_pid
+            );
+        }
+        Ok(())
+    }
+
+    fn restart_managed_sing_box(&mut self) -> Result<SingBoxRestartSummary> {
+        self.stop_managed_sing_box_process()?;
+        let result = restart_sing_box_for_config(&self.system_proxy_config_path)?;
+        let summary = SingBoxRestartSummary {
+            restarted_pids: result.restarted_pids,
+            started_pid: result.started_pid,
+        };
+        self.sing_box.managed_pid = Some(result.started_pid);
+        self.sing_box.managed_child = Some(result.child);
+        Ok(summary)
+    }
+
+    fn wait_for_controller_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last_error = None;
+        while Instant::now() < deadline {
+            match self.client.fetch_config() {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        match last_error {
+            Some(error) => {
+                Err(error).context("sing-box started but controller API did not become ready")
+            }
+            None => bail!("sing-box started but controller API did not become ready"),
+        }
+    }
+
+    fn shutdown_managed_sing_box(&mut self) -> Result<()> {
+        if self.sing_box.keep_running {
+            return Ok(());
+        }
+        self.stop_managed_sing_box_process().map(|_| ())
+    }
+
+    fn stop_managed_sing_box_process(&mut self) -> Result<Option<u32>> {
+        let pid = self.sing_box.managed_pid.take();
+        if let Some(mut child) = self.sing_box.managed_child.take() {
+            let child_pid = child.id();
+            stop_sing_box_child(&mut child)
+                .with_context(|| format!("failed to stop managed sing-box pid {child_pid}"))?;
+            return Ok(Some(child_pid));
+        }
+        if let Some(pid) = pid {
+            stop_sing_box_pid(pid)
+                .with_context(|| format!("failed to stop managed sing-box pid {pid}"))?;
+            return Ok(Some(pid));
+        }
+        Ok(None)
+    }
+
+    fn open_remote_access_progress(&mut self) {
+        let profile = self.remote_access.focused();
+        self.remote_access_progress = Some(RemoteAccessProgressModal {
+            title: format!("Remote Access - {} ({})", profile.id, profile.mode.as_str()),
+            entries: Vec::new(),
+            done: false,
+        });
+        self.flash = None;
+    }
+
+    fn push_remote_access_progress(&mut self, tone: RemoteAccessProgressTone, text: String) {
+        if self.remote_access_progress.is_none() {
+            self.open_remote_access_progress();
+        }
+        let Some(progress) = self.remote_access_progress.as_mut() else {
+            return;
+        };
+        if progress
+            .entries
+            .last()
+            .is_some_and(|entry| entry.tone == tone && entry.text == text)
+        {
+            return;
+        }
+        progress
+            .entries
+            .push(RemoteAccessProgressEntry { tone, text });
+    }
+
+    fn finish_remote_access_progress(&mut self) {
+        if let Some(progress) = self.remote_access_progress.as_mut() {
+            progress.done = true;
+        }
+    }
+
+    fn fail_remote_access_progress(&mut self, message: String) {
+        self.push_remote_access_progress(RemoteAccessProgressTone::Error, message);
+        self.finish_remote_access_progress();
+    }
+
+    fn toggle_remote_access_with_progress(&mut self) -> Result<()> {
+        self.open_remote_access_progress();
+        match self.remote_access.focused().state {
+            RemoteAccessState::Connected | RemoteAccessState::Connecting => {
+                self.push_remote_access_progress(
+                    RemoteAccessProgressTone::Info,
+                    "正在断开内网连接...".to_string(),
+                );
+            }
+            RemoteAccessState::Disconnecting => {
+                self.push_remote_access_progress(
+                    RemoteAccessProgressTone::Info,
+                    "正在等待断开完成...".to_string(),
+                );
+            }
+            RemoteAccessState::Disabled
+            | RemoteAccessState::Disconnected
+            | RemoteAccessState::Error => {
+                self.push_remote_access_progress(
+                    RemoteAccessProgressTone::Info,
+                    "正在连接内网服务器...".to_string(),
+                );
+            }
+        }
+        self.toggle_remote_access()
+    }
+
     fn toggle_remote_access(&mut self) -> Result<()> {
         match self.remote_access.focused().state {
             RemoteAccessState::Connected | RemoteAccessState::Connecting => {
@@ -4129,21 +4955,29 @@ impl App {
 
     fn connect_remote_access(&mut self) -> Result<()> {
         if self.remote_access.focused().server.trim().is_empty() {
-            self.set_status_only("Configure Remote access server in settings first");
+            let message = "请先在 settings 中配置 Remote access server".to_string();
+            self.fail_remote_access_progress(message.clone());
+            self.set_status_only(message);
             return Ok(());
         }
         if self.remote_access.focused().username.trim().is_empty() {
-            self.set_status_only("Configure Remote access username in settings first");
+            let message = "请先在 settings 中配置 Remote access username".to_string();
+            self.fail_remote_access_progress(message.clone());
+            self.set_status_only(message);
             return Ok(());
         }
-        if let Err(error) = self
-            .remote_access
-            .focused()
-            .bridge_listen
-            .parse::<SocketAddrV4>()
-        {
-            self.set_status_only(format!("Remote access bridge listen invalid: {error}"));
-            return Ok(());
+        if matches!(self.remote_access.focused().mode, RemoteAccessMode::Bridge) {
+            if let Err(error) = self
+                .remote_access
+                .focused()
+                .bridge_listen
+                .parse::<SocketAddrV4>()
+            {
+                let message = format!("Remote access bridge listen 无效: {error}");
+                self.fail_remote_access_progress(message.clone());
+                self.set_status_only(message);
+                return Ok(());
+            }
         }
 
         if self.remote_access.focused().process.is_none() {
@@ -4155,9 +4989,9 @@ impl App {
                 Err(error) => {
                     self.remote_access.focused_mut().state = RemoteAccessState::Error;
                     self.remote_access.focused_mut().last_error = Some(error.to_string());
-                    self.set_status_with_flash(format!(
-                        "Remote Access failed to start provider: {error}"
-                    ));
+                    let message = format!("启动 Remote Access provider 失败: {error}");
+                    self.fail_remote_access_progress(message.clone());
+                    self.set_status_only(message);
                     return Ok(());
                 }
             }
@@ -4168,6 +5002,7 @@ impl App {
             normalize_optional_setting(Some(self.remote_access.focused().password.clone()));
         let password_env =
             normalize_optional_setting(Some(self.remote_access.focused().password_env.clone()));
+        let tun_helper = self.remote_access_tun_helper_for_connect(self.remote_access.focused());
         // Direct passwords are deliberately supported for a simpler local workflow. The value is
         // sent only to the provider process; the settings list masks it unless the field is edited.
         let command = RemoteAccessCommand::Connect {
@@ -4175,11 +5010,13 @@ impl App {
             provider: provider.clone(),
             config: serde_json::json!({
                 "server": self.remote_access.focused().server,
+                "mode": self.remote_access.focused().mode.as_str(),
                 "port": self.remote_access.focused().port,
                 "username": self.remote_access.focused().username,
                 "password": password,
                 "password_env": password_env,
                 "bridge_listen": self.remote_access.focused().bridge_listen,
+                "tun_helper": tun_helper,
                 "tls_verify": self.remote_access.focused().tls_verify,
             }),
         };
@@ -4187,14 +5024,15 @@ impl App {
             if let Err(error) = process.send(&command) {
                 self.remote_access.focused_mut().state = RemoteAccessState::Error;
                 self.remote_access.focused_mut().last_error = Some(error.to_string());
-                self.set_status_with_flash(format!(
-                    "Remote Access failed to send connect command: {error}"
-                ));
+                let message = format!("发送 Remote Access 连接命令失败: {error}");
+                self.fail_remote_access_progress(message.clone());
+                self.set_status_only(message);
                 return Ok(());
             }
         }
         self.remote_access.focused_mut().state = RemoteAccessState::Connecting;
         self.remote_access.focused_mut().last_error = None;
+        self.remote_access.focused_mut().integration_failed = false;
         self.set_status_only(format!(
             "Remote Access {profile_id} ({provider}) connecting..."
         ));
@@ -4205,6 +5043,11 @@ impl App {
     fn disconnect_remote_access(&mut self) -> Result<()> {
         let Some(process) = self.remote_access.focused_mut().process.as_mut() else {
             self.remote_access.focused_mut().state = RemoteAccessState::Disconnected;
+            self.push_remote_access_progress(
+                RemoteAccessProgressTone::Success,
+                "内网连接已断开".to_string(),
+            );
+            self.finish_remote_access_progress();
             self.set_status_only("Remote Access is already disconnected");
             return Ok(());
         };
@@ -4216,9 +5059,9 @@ impl App {
         }) {
             self.remote_access.focused_mut().state = RemoteAccessState::Error;
             self.remote_access.focused_mut().last_error = Some(error.to_string());
-            self.set_status_with_flash(format!(
-                "Remote Access failed to send disconnect command: {error}"
-            ));
+            let message = format!("发送 Remote Access 断开命令失败: {error}");
+            self.fail_remote_access_progress(message.clone());
+            self.set_status_only(message);
             return Ok(());
         }
         self.remote_access.focused_mut().state = RemoteAccessState::Disconnecting;
@@ -4258,12 +5101,26 @@ impl App {
                         state,
                         message,
                     } => {
+                        if !should_apply_remote_access_state_after_integration(
+                            &self.remote_access.profiles[profile_index],
+                            &state,
+                        ) {
+                            continue;
+                        }
                         self.remote_access.profiles[profile_index].state = state.clone();
                         if matches!(state, RemoteAccessState::Disconnected) {
                             stop_process = true;
                         }
+                        if let Some((tone, text, done)) =
+                            remote_access_progress_for_state(&state, &message)
+                        {
+                            self.push_remote_access_progress(tone, text);
+                            if done {
+                                self.finish_remote_access_progress();
+                            }
+                        }
                         self.set_status_only(format!(
-                            "Remote Access {profile_id} ({provider}) {}: {message}",
+                            "Remote Access {profile_id} ({provider}) {}",
                             state.label()
                         ));
                     }
@@ -4274,33 +5131,114 @@ impl App {
                         bridge,
                         ..
                     } => {
+                        self.push_remote_access_progress(
+                            RemoteAccessProgressTone::Info,
+                            format!("收到内网路由: {} 条", routes.len()),
+                        );
+                        self.push_remote_access_progress(
+                            RemoteAccessProgressTone::Info,
+                            "修改 config.json 中...".to_string(),
+                        );
                         self.remote_access.profiles[profile_index].routes = routes.clone();
                         self.remote_access.profiles[profile_index].dns = dns;
-                        self.remote_access.profiles[profile_index].bridge = bridge.clone();
-                        let fallback_listen = self.remote_access.profiles[profile_index]
-                            .bridge_listen
-                            .clone();
-                        match self.apply_remote_access_routes(
-                            &profile_id,
-                            &routes,
-                            bridge,
-                            &fallback_listen,
+                        if matches!(
+                            self.remote_access.profiles[profile_index].mode,
+                            RemoteAccessMode::Bridge
                         ) {
-                            Ok(true) => {
-                                self.set_status_only(format!(
-                                    "Remote Access {profile_id} ({provider}) applied {} route(s); reload/restart sing-box to apply",
-                                    routes.len()
-                                ));
+                            self.remote_access.profiles[profile_index].bridge = bridge.clone();
+                            let fallback_listen = self.remote_access.profiles[profile_index]
+                                .bridge_listen
+                                .clone();
+                            match self.apply_remote_access_routes(
+                                &profile_id,
+                                &routes,
+                                bridge,
+                                &fallback_listen,
+                            ) {
+                                Ok(true) => {
+                                    self.push_remote_access_progress(
+                                        RemoteAccessProgressTone::Success,
+                                        "config.json 已更新".to_string(),
+                                    );
+                                    match self.restart_sing_box_for_remote_access_progress() {
+                                        Ok(restart) => {
+                                            self.set_status_only(format!(
+                                                "Remote Access {profile_id} ({provider}) applied {} bridge route(s); {restart}",
+                                                routes.len()
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let message = format!(
+                                                "sing-box 重启失败，Remote Access 不可用: {error:#}"
+                                            );
+                                            self.mark_remote_access_integration_failed(
+                                                profile_index,
+                                                message.clone(),
+                                            );
+                                            self.set_status_only(message);
+                                            stop_process = true;
+                                        }
+                                    }
+                                }
+                                Ok(false) => {
+                                    self.push_remote_access_progress(
+                                        RemoteAccessProgressTone::Info,
+                                        "没有需要写入的内网路由".to_string(),
+                                    );
+                                }
+                                Err(error) => {
+                                    self.remote_access.profiles[profile_index].last_error =
+                                        Some(error.to_string());
+                                    self.remote_access.profiles[profile_index].state =
+                                        RemoteAccessState::Error;
+                                    let message = format!("修改 config.json 失败: {error}");
+                                    self.fail_remote_access_progress(message.clone());
+                                    self.set_status_only(message);
+                                }
                             }
-                            Ok(false) => {}
-                            Err(error) => {
-                                self.remote_access.profiles[profile_index].last_error =
-                                    Some(error.to_string());
-                                self.remote_access.profiles[profile_index].state =
-                                    RemoteAccessState::Error;
-                                self.set_status_with_flash(format!(
-                                    "Remote Access route application failed: {error}"
-                                ));
+                        } else {
+                            self.remote_access.profiles[profile_index].bridge = None;
+                            match self.apply_remote_access_tun_routes(&profile_id, &routes) {
+                                Ok(true) => {
+                                    self.push_remote_access_progress(
+                                        RemoteAccessProgressTone::Success,
+                                        "config.json 已更新".to_string(),
+                                    );
+                                    match self.restart_sing_box_for_remote_access_progress() {
+                                        Ok(restart) => {
+                                            self.set_status_only(format!(
+                                                "Remote Access {profile_id} ({provider}) applied {} TUN direct route(s); {restart}",
+                                                routes.len()
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let message = format!(
+                                                "sing-box 重启失败，Remote Access 不可用: {error:#}"
+                                            );
+                                            self.mark_remote_access_integration_failed(
+                                                profile_index,
+                                                message.clone(),
+                                            );
+                                            self.set_status_only(message);
+                                            stop_process = true;
+                                        }
+                                    }
+                                }
+                                Ok(false) => {
+                                    self.push_remote_access_progress(
+                                        RemoteAccessProgressTone::Info,
+                                        "没有需要写入的内网路由".to_string(),
+                                    );
+                                }
+                                Err(error) => {
+                                    self.remote_access.profiles[profile_index].last_error =
+                                        Some(error.to_string());
+                                    self.remote_access.profiles[profile_index].state =
+                                        RemoteAccessState::Error;
+                                    let message = format!("修改 config.json 失败: {error}");
+                                    self.fail_remote_access_progress(message.clone());
+                                    self.set_status_only(message);
+                                }
                             }
                         }
                     }
@@ -4312,15 +5250,17 @@ impl App {
                         let error = format!("{code}: {message}");
                         self.remote_access.profiles[profile_index].last_error = Some(error.clone());
                         self.remote_access.profiles[profile_index].state = RemoteAccessState::Error;
-                        self.set_status_with_flash(format!(
-                            "Remote Access {profile_id} ({provider}) error: {error}"
+                        self.fail_remote_access_progress(format!("连接失败: {error}"));
+                        self.set_status_only(format!(
+                            "Remote Access {profile_id} ({provider}) error"
                         ));
                         stop_process = true;
                     }
-                    RemoteAccessEvent::Log { provider, message } => {
-                        self.set_status_only(format!(
-                            "Remote Access {profile_id} ({provider}): {message}"
-                        ));
+                    RemoteAccessEvent::Log {
+                        provider: _,
+                        message: _,
+                    } => {
+                        // Low-level provider logs are intentionally not surfaced in the TUI flow.
                     }
                 }
             }
@@ -4360,10 +5300,70 @@ impl App {
             RemoteAccessRouteTableOptions {
                 provider_id: provider.to_string(),
                 cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
-                proxy,
+                proxy: Some(proxy),
             },
         )?;
         Ok(true)
+    }
+
+    fn apply_remote_access_tun_routes(
+        &self,
+        provider: &str,
+        routes: &[RemoteAccessRoute],
+    ) -> Result<bool> {
+        if routes.is_empty() {
+            return Ok(false);
+        }
+        // In TUN mode the kernel route points pushed intranet CIDRs at the helper-owned utun
+        // interface. Browsers may still enter through sing-box's system proxy, so sing-box must
+        // route those CIDRs to its direct outbound instead of the old local HTTP bridge override.
+        run_remote_access_route_table_config(
+            &self.system_proxy_config_path,
+            None,
+            true,
+            RemoteAccessRouteTableOptions {
+                provider_id: provider.to_string(),
+                cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
+                proxy: None,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn mark_remote_access_integration_failed(&mut self, profile_index: usize, message: String) {
+        let profile = &mut self.remote_access.profiles[profile_index];
+        profile.integration_failed = true;
+        profile.state = RemoteAccessState::Error;
+        profile.last_error = Some(message.clone());
+        self.fail_remote_access_progress(message);
+    }
+
+    fn restart_sing_box_for_remote_access_progress(&mut self) -> Result<String> {
+        self.push_remote_access_progress(
+            RemoteAccessProgressTone::Info,
+            "重启 sing-box 中...".to_string(),
+        );
+        match self.restart_managed_sing_box() {
+            Ok(result) if result.restarted_pids.is_empty() => {
+                let message = format!("sing-box 启动成功: pid {}", result.started_pid);
+                self.push_remote_access_progress(RemoteAccessProgressTone::Success, message);
+                self.finish_remote_access_progress();
+                Ok(format!("started sing-box pid {}", result.started_pid))
+            }
+            Ok(result) => {
+                let message = format!(
+                    "sing-box 重启成功: pid(s) {:?} -> {}",
+                    result.restarted_pids, result.started_pid
+                );
+                self.push_remote_access_progress(RemoteAccessProgressTone::Success, message);
+                self.finish_remote_access_progress();
+                Ok(format!(
+                    "restarted sing-box pid(s) {:?} -> {}",
+                    result.restarted_pids, result.started_pid
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn set_system_proxy(&mut self) {
@@ -4541,19 +5541,27 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        let _ = self.shutdown_managed_sing_box();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         App, AutoSelectSwitchPlan, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
         GLOBAL_CLASH_MODE, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE, RemoteAccessRuntime,
-        RemoteAccessState, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, SettingsField,
-        connection_is_direct, format_bytes, format_connection_line, format_duration_badge,
-        latency_chart_segments, latency_chart_threshold_line, latency_chart_time_unit,
-        latency_chart_windowed_samples, latency_chart_y_bounds, latency_chart_zoom_in,
-        latency_chart_zoom_out, next_clash_mode, settings_field_display_value,
-        settings_field_value, subscription_report_badge, system_proxy_bypass_entries,
-        truncate_for_width,
+        LatencyChartState, LatencyChartTimeUnit, RULE_CLASH_MODE, RemoteAccessMode,
+        RemoteAccessRuntime, RemoteAccessState, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+        SettingsEditState, SettingsField, SingBoxProcessRuntime,
+        command_matches_sing_box_run_for_config, config_arg_matches_path, connection_is_direct,
+        format_bytes, format_connection_line, format_duration_badge, latency_chart_segments,
+        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
+        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        settings_field_display_value, settings_field_value,
+        should_apply_remote_access_state_after_integration, sing_box_config_args,
+        subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -4677,6 +5685,7 @@ mod tests {
             show_settings: false,
             settings_index: 0,
             settings_edit: None,
+            settings_error: None,
             subscription_refresh: None,
             system_proxy_config_path: PathBuf::from("config.json"),
             system_proxy_server: "127.0.0.1:6780".to_string(),
@@ -4685,7 +5694,9 @@ mod tests {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
+            sing_box: SingBoxProcessRuntime::new(false),
             remote_access: RemoteAccessRuntime::new().expect("remote access runtime"),
+            remote_access_progress: None,
         }
     }
 
@@ -4694,6 +5705,20 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn remote_access_progress_text(app: &App) -> String {
+        app.remote_access_progress
+            .as_ref()
+            .map(|progress| {
+                progress
+                    .entries
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     }
 
     fn provider_app() -> App {
@@ -4814,6 +5839,58 @@ mod tests {
         assert!(entries.contains(&"100.121.*".to_string()));
         assert!(entries.contains(&"100.127.*".to_string()));
         assert!(!entries.contains(&"100.128.*".to_string()));
+    }
+
+    #[test]
+    fn sing_box_process_matcher_accepts_run_command_for_config() {
+        let config = PathBuf::from("config.json");
+
+        assert!(command_matches_sing_box_run_for_config(
+            "sing-box run --config ./config.json",
+            &config
+        ));
+        assert!(command_matches_sing_box_run_for_config(
+            "/usr/local/bin/sing-box run -c config.json",
+            &config
+        ));
+        assert!(command_matches_sing_box_run_for_config(
+            "sing-box run --config=/Users/ldd/proj/rust/sing-box-tui/config.json",
+            &config
+        ));
+    }
+
+    #[test]
+    fn sing_box_process_matcher_rejects_non_matching_commands() {
+        let config = PathBuf::from("config.json");
+
+        assert!(!command_matches_sing_box_run_for_config(
+            "sing-box version",
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
+            "target/debug/sing-box-tui",
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
+            "sing-box run --config ./other.json",
+            &config
+        ));
+    }
+
+    #[test]
+    fn sing_box_config_args_support_common_forms() {
+        assert_eq!(
+            sing_box_config_args(&["sing-box", "run", "--config", "./config.json"]),
+            vec!["./config.json"]
+        );
+        assert_eq!(
+            sing_box_config_args(&["sing-box", "run", "-c=config.json"]),
+            vec!["config.json"]
+        );
+        assert!(config_arg_matches_path(
+            "./config.json",
+            &PathBuf::from("config.json")
+        ));
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
@@ -4991,7 +6068,7 @@ mod tests {
     }
 
     #[test]
-    fn pressing_uppercase_v_without_remote_access_settings_updates_status() {
+    fn pressing_uppercase_v_without_remote_access_settings_opens_progress_modal() {
         let mut app = test_app();
         app.remote_access.focused_mut().server.clear();
         app.remote_access.focused_mut().username.clear();
@@ -4999,9 +6076,14 @@ mod tests {
         app.handle_key(KeyCode::Char('V'))
             .expect("remote access missing settings is handled");
 
-        assert_eq!(
-            app.status,
-            "Configure Remote access server in settings first"
+        assert!(
+            remote_access_progress_text(&app)
+                .contains("请先在 settings 中配置 Remote access server")
+        );
+        assert!(
+            app.remote_access_progress
+                .as_ref()
+                .is_some_and(|progress| progress.done)
         );
         assert!(app.remote_access.focused().process.is_none());
     }
@@ -5019,7 +6101,38 @@ mod tests {
 
         assert_eq!(app.remote_access.focused().state, RemoteAccessState::Error);
         assert!(app.remote_access.focused().process.is_none());
-        assert!(app.status.contains("failed to start provider"));
+        assert!(remote_access_progress_text(&app).contains("启动 Remote Access provider 失败"));
+        assert!(
+            app.remote_access_progress
+                .as_ref()
+                .is_some_and(|progress| progress.done)
+        );
+    }
+
+    #[test]
+    fn remote_access_integration_failure_blocks_late_success_state() {
+        let mut app = test_app();
+        let profile = app.remote_access.focused_mut();
+        profile.integration_failed = true;
+        profile.state = RemoteAccessState::Error;
+        profile.last_error = Some("sing-box restart failed".to_string());
+
+        assert!(!should_apply_remote_access_state_after_integration(
+            app.remote_access.focused(),
+            &RemoteAccessState::Connected
+        ));
+        assert!(!should_apply_remote_access_state_after_integration(
+            app.remote_access.focused(),
+            &RemoteAccessState::Connecting
+        ));
+        assert!(should_apply_remote_access_state_after_integration(
+            app.remote_access.focused(),
+            &RemoteAccessState::Error
+        ));
+        assert!(should_apply_remote_access_state_after_integration(
+            app.remote_access.focused(),
+            &RemoteAccessState::Disconnected
+        ));
     }
 
     #[test]
@@ -5120,6 +6233,62 @@ mod tests {
     }
 
     #[test]
+    fn remote_access_tun_route_application_removes_bridge_override() {
+        let app = test_app();
+        let config_path = test_state_path();
+        let config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {
+                "rules": [{
+                    "action": "route",
+                    "ip_cidr": ["10.1.0.0/16", "10.255.0.0/24"],
+                    "outbound": "direct",
+                    "override_address": "127.0.0.1",
+                    "override_port": 18080
+                }]
+            }
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut app = app;
+        app.system_proxy_config_path = config_path.clone();
+
+        app.apply_remote_access_tun_routes(
+            "hillstone",
+            &[
+                RemoteAccessRoute {
+                    cidr: "10.1.0.0/16".to_string(),
+                },
+                RemoteAccessRoute {
+                    cidr: "10.255.0.0/24".to_string(),
+                },
+                RemoteAccessRoute {
+                    cidr: "10.253.0.0/24".to_string(),
+                },
+            ],
+        )
+        .expect("TUN routes apply");
+
+        let text = std::fs::read_to_string(&config_path).expect("config reads");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
+        assert_eq!(config["route"]["auto_detect_interface"], false);
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let rule = rules
+            .iter()
+            .find(|rule| {
+                rule["ip_cidr"] == json!(["10.1.0.0/16", "10.255.0.0/24", "10.253.0.0/24"])
+            })
+            .expect("remote access TUN direct rule exists");
+        assert_eq!(rule["outbound"], "direct");
+        assert!(rule.get("override_address").is_none());
+        assert!(rule.get("override_port").is_none());
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
     fn remote_access_summary_shows_explicit_state_and_details() {
         let mut app = test_app();
         let focused = app.remote_access.focused_mut();
@@ -5135,6 +6304,7 @@ mod tests {
         let connected = line_text(app.remote_access.summary_line());
         assert!(connected.contains("[>hillstone CONNECTED]"));
         assert!(connected.contains("routes=1"));
+        assert!(connected.contains("mode=bridge"));
         assert!(connected.contains("bridge=127.0.0.1:16780"));
 
         let focused = app.remote_access.focused_mut();
@@ -5144,6 +6314,70 @@ mod tests {
         let errored = line_text(app.remote_access.summary_line());
         assert!(errored.contains("[>hillstone ERROR]"));
         assert!(errored.contains("error=session_failed: auth rejected"));
+    }
+
+    #[test]
+    fn remote_access_tun_summary_does_not_show_bridge_listener() {
+        let mut app = test_app();
+        let focused = app.remote_access.focused_mut();
+        focused.mode = RemoteAccessMode::Tun;
+        focused.state = RemoteAccessState::Connected;
+        focused.routes = vec![RemoteAccessRoute {
+            cidr: "10.1.0.0/16".to_string(),
+        }];
+
+        let summary = line_text(app.remote_access.summary_line());
+
+        assert!(summary.contains("mode=tun"));
+        assert!(summary.contains("data=tun"));
+        assert!(!summary.contains("bridge=127.0.0.1:16780"));
+    }
+
+    #[test]
+    fn remote_access_mode_persists_and_can_switch_to_tun() {
+        let mut app = test_app();
+
+        app.apply_settings_value(SettingsField::RemoteAccessMode, "tun".to_string())
+            .expect("mode applies");
+
+        assert_eq!(
+            settings_field_value(&app, SettingsField::RemoteAccessMode),
+            "tun"
+        );
+        assert_eq!(
+            app.runtime_state().remote_access_providers[0]
+                .mode
+                .as_deref(),
+            Some("tun")
+        );
+        let summary = line_text(app.remote_access.summary_line());
+        assert!(summary.contains("mode=tun"));
+    }
+
+    #[test]
+    fn remote_access_mode_change_while_connected_stays_in_settings() {
+        let mut app = test_app();
+        app.show_settings = true;
+        app.remote_access.focused_mut().state = RemoteAccessState::Connected;
+        app.settings_edit = Some(SettingsEditState {
+            field: SettingsField::RemoteAccessMode,
+            input: "tun".to_string(),
+            error: None,
+        });
+
+        assert!(
+            app.handle_key(KeyCode::Enter)
+                .expect("settings error is handled inside TUI")
+        );
+
+        assert!(app.show_settings);
+        let error = app
+            .settings_edit
+            .as_ref()
+            .and_then(|edit| edit.error.as_deref())
+            .expect("settings error is shown inside settings panel");
+        assert_eq!(app.remote_access.focused().mode, RemoteAccessMode::Bridge);
+        assert!(error.contains("disconnect Remote Access before changing data plane mode"));
     }
 
     #[test]
@@ -5177,7 +6411,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_password_persists_but_settings_display_masks_it() {
+    fn provider_password_persists_but_settings_display_masks_it() {
         let mut app = test_app();
         app.remote_access.focused_mut().password = "plain-secret".to_string();
 
@@ -5193,6 +6427,90 @@ mod tests {
         assert_eq!(
             settings_field_display_value(&app, SettingsField::RemoteAccessPassword),
             "<set>"
+        );
+    }
+
+    #[test]
+    fn remote_access_tun_helper_persists_from_json_state() {
+        let mut app = test_app();
+        let state = TuiRuntimeState {
+            remote_access_providers: vec![RemoteAccessProviderRuntimeState {
+                id: "office-tun".to_string(),
+                mode: Some("tun".to_string()),
+                server: Some("sslvpn.example.com".to_string()),
+                username: Some("alice".to_string()),
+                tun_helper: Some(vec![
+                    "sudo".to_string(),
+                    "-n".to_string(),
+                    "/opt/sing-box-tui".to_string(),
+                    "remote-access-tun-helper".to_string(),
+                    "--stdio".to_string(),
+                ]),
+                ..RemoteAccessProviderRuntimeState::default()
+            }],
+            ..TuiRuntimeState::default()
+        };
+
+        app.apply_runtime_state(state).expect("state applies");
+        let saved = app.runtime_state();
+
+        assert_eq!(
+            saved.remote_access_providers[0]
+                .tun_helper
+                .as_ref()
+                .unwrap(),
+            &[
+                "sudo",
+                "-n",
+                "/opt/sing-box-tui",
+                "remote-access-tun-helper",
+                "--stdio"
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_sudo_tun_helper_needs_terminal_prompt() {
+        let mut app = test_app();
+        app.remote_access.focused_mut().mode = RemoteAccessMode::Tun;
+        app.remote_access.focused_mut().tun_helper = vec![
+            "sudo".to_string(),
+            "target/debug/sing-box-tui".to_string(),
+            "remote-access-tun-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+
+        assert!(app.remote_access_connect_needs_terminal_prompt());
+
+        app.remote_access.focused_mut().tun_helper = vec![
+            "sudo".to_string(),
+            "-n".to_string(),
+            "target/debug/sing-box-tui".to_string(),
+            "remote-access-tun-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+
+        assert!(!app.remote_access_connect_needs_terminal_prompt());
+    }
+
+    #[test]
+    fn tun_mode_without_persisted_helper_uses_interactive_tui_helper() {
+        let mut app = test_app();
+        app.remote_access.focused_mut().mode = RemoteAccessMode::Tun;
+        app.remote_access.focused_mut().tun_helper.clear();
+
+        assert!(app.remote_access_connect_needs_terminal_prompt());
+        let command = app
+            .remote_access_tun_helper_for_connect(app.remote_access.focused())
+            .expect("tun helper command");
+        assert_eq!(command.first().map(String::as_str), Some("sudo"));
+        assert!(!command.iter().any(|arg| arg == "-n"));
+        assert!(command.iter().any(|arg| arg == "remote-access-tun-helper"));
+        assert!(command.iter().any(|arg| arg == "--stdio"));
+        assert!(
+            app.runtime_state().remote_access_providers[0]
+                .tun_helper
+                .is_none()
         );
     }
 

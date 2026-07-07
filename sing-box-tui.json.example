@@ -20,6 +20,7 @@
     {
       "id": "office",
       "manifest_path": null,
+      "mode": "bridge",
       "server": "sslvpn.example.com",
       "port": 4433,
       "username": "your-username",
@@ -31,17 +32,25 @@
     {
       "id": "backup-office",
       "manifest_path": null,
+      "mode": "tun",
       "server": "backup-sslvpn.example.com",
       "port": 4433,
       "username": "your-backup-username",
       "password": "",
       "password_env": "BACKUP_HILLSTONE_PASSWORD",
-      "bridge_listen": "127.0.0.1:18081",
+      "tun_helper": [
+        "sudo",
+        "-n",
+        "/path/to/sing-box-tui",
+        "remote-access-tun-helper",
+        "--stdio"
+      ],
       "tls_verify": false
     },
     {
       "id": "custom-provider",
       "manifest_path": "./providers/custom-remote-access.json",
+      "mode": "bridge",
       "server": "vpn.example.com",
       "port": 443,
       "username": "your-custom-username",

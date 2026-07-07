@@ -25,6 +25,7 @@ pub(crate) enum CliCommand {
         include_geosite_rules: bool,
         include_tun_mode: bool,
         subscription_interval_days: u64,
+        keep_sing_box_running: bool,
     },
     Selectors {
         controller: Option<String>,
@@ -118,6 +119,9 @@ pub(crate) enum CliCommand {
         provider: String,
         stdio: bool,
     },
+    RemoteAccessTunHelper {
+        stdio: bool,
+    },
 }
 
 impl CliCommand {
@@ -138,6 +142,7 @@ impl CliCommand {
                 include_geosite_rules: false,
                 include_tun_mode: false,
                 subscription_interval_days: DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
+                keep_sing_box_running: false,
             });
         }
 
@@ -153,6 +158,7 @@ impl CliCommand {
             "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
             "remote-access-provider" => Self::parse_remote_access_provider(&args[1..]),
+            "remote-access-tun-helper" => Self::parse_remote_access_tun_helper(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -173,6 +179,7 @@ impl CliCommand {
         let mut include_geosite_rules = false;
         let mut include_tun_mode = false;
         let mut subscription_interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
+        let mut keep_sing_box_running = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -230,6 +237,9 @@ impl CliCommand {
                 "--no-subscription-refresh" => {
                     subscription_refresh_disabled = true;
                 }
+                "--background" | "--keep-sing-box-running" => {
+                    keep_sing_box_running = true;
+                }
                 "--help" | "-h" => {
                     print_run_usage();
                     std::process::exit(0);
@@ -250,6 +260,7 @@ impl CliCommand {
             include_geosite_rules,
             include_tun_mode,
             subscription_interval_days,
+            keep_sing_box_running,
         })
     }
 
@@ -997,6 +1008,28 @@ impl CliCommand {
             stdio,
         })
     }
+
+    fn parse_remote_access_tun_helper(args: &[String]) -> Result<Self> {
+        let mut stdio = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--stdio" => stdio = true,
+                "--help" | "-h" => {
+                    print_remote_access_tun_helper_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for remote-access-tun-helper: {value}")
+                }
+                value => {
+                    bail!("unexpected positional argument for remote-access-tun-helper: {value}")
+                }
+            }
+            i += 1;
+        }
+        Ok(Self::RemoteAccessTunHelper { stdio })
+    }
 }
 
 fn parse_max_concurrency(value: Option<&String>, flag: &str) -> Result<usize> {
@@ -1064,6 +1097,9 @@ fn print_run_usage() {
         "      --include-tun-mode              Include a TUN inbound when creating a default config"
     );
     println!("      --no-subscription-refresh       Disable TUI background subscription refresh");
+    println!(
+        "      --background                    Keep the managed sing-box process running after TUI exits"
+    );
 }
 
 fn print_selectors_usage() {
@@ -1291,6 +1327,12 @@ fn print_remote_access_provider_usage() {
     println!("Internal command used by the TUI to run a remote-access provider process.");
 }
 
+fn print_remote_access_tun_helper_usage() {
+    println!("Usage: sing-box-tui remote-access-tun-helper --stdio");
+    println!();
+    println!("Internal privileged helper used by remote-access providers for TUN interfaces.");
+}
+
 #[cfg(test)]
 mod tests {
     use super::CliCommand;
@@ -1400,6 +1442,20 @@ mod tests {
                 subscription_refresh_disabled,
                 ..
             } => assert!(subscription_refresh_disabled),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_command_can_keep_managed_sing_box_running() {
+        let command = CliCommand::parse(["run".to_string(), "--background".to_string()])
+            .expect("run command parses");
+
+        match command {
+            CliCommand::Run {
+                keep_sing_box_running,
+                ..
+            } => assert!(keep_sing_box_running),
             _ => panic!("expected run command"),
         }
     }
@@ -1990,6 +2046,20 @@ mod tests {
                 assert!(stdio);
             }
             _ => panic!("expected remote access provider command"),
+        }
+    }
+
+    #[test]
+    fn remote_access_tun_helper_parses_hidden_stdio_command() {
+        let command = CliCommand::parse([
+            "remote-access-tun-helper".to_string(),
+            "--stdio".to_string(),
+        ])
+        .expect("remote access TUN helper command parses");
+
+        match command {
+            CliCommand::RemoteAccessTunHelper { stdio } => assert!(stdio),
+            _ => panic!("expected remote access TUN helper command"),
         }
     }
 
