@@ -13,16 +13,26 @@ Install the latest prebuilt Windows release:
 try { irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 -ErrorAction Stop } catch { irm https://deeloo.cn/anywhere/https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 } | iex
 ```
 
-The installer downloads the latest `sing-box-tui` Windows x64 release from
-GitHub directly when possible, falls back to the `https://deeloo.cn/anywhere`
-proxy when GitHub is not reachable, installs it under
-`%LOCALAPPDATA%\sing-box-tui`, adds that directory to the user `PATH`, and
-installs `sing-box` from the configured GitHub release when it is missing.
+The installer downloads the latest `sing-box-tui` Windows x64 release with
+multi-part parallel downloads when the server supports byte ranges. It installs
+under `%LOCALAPPDATA%\sing-box-tui`, adds that directory to the user `PATH`, and
+installs `sing-box` from the configured GitHub release when it is missing. If a
+direct GitHub download fails, the installer retries through the configured
+`https://deeloo.cn/anywhere` proxy.
 
 From a local checkout, you can run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -AddToPath
+```
+
+Use `-DownloadParts 1` to disable parallel downloading. Disable the GitHub
+proxy fallback with `-GitHubProxy ""`, or override it with another prefix URL:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -DownloadParts 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy ""
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy "https://example.com/anywhere"
 ```
 
 Start the TUI:
