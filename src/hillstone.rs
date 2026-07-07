@@ -7,6 +7,10 @@ use std::net::{
     Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use aes::Aes128;
@@ -16,6 +20,8 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use native_tls::{TlsConnector, TlsStream};
 use sha1::{Digest, Sha1};
+
+use crate::config::{HillstoneRouteTableOptions, run_hillstone_route_table_config};
 
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
@@ -39,6 +45,9 @@ pub(crate) struct HillstoneProbeOptions {
     pub(crate) udp_http_get: Option<String>,
     pub(crate) udp_http_proxy: Option<String>,
     pub(crate) udp_http_target: Option<String>,
+    pub(crate) route_config_path: PathBuf,
+    pub(crate) apply_routes: bool,
+    pub(crate) route_proxy: Option<SocketAddrV4>,
 }
 
 pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> {
@@ -101,6 +110,7 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
             println!("  route_ipv4: {route}");
         }
     }
+    let routes_applied = apply_pushed_routes_to_config(&options, &network)?;
 
     if options.stop_before_new_key {
         send_logout(&mut stream)?;
@@ -129,6 +139,11 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         println!("  session_id: <redacted>");
     }
 
+    let shutdown = if options.udp_http_proxy.is_some() {
+        Some(install_shutdown_handler()?)
+    } else {
+        None
+    };
     let probe_result = if options.udp_icmp_probe {
         run_udp_icmp_probe(&options, &network, &key_summary)
     } else if let Some(target) = &options.udp_tcp_probe {
@@ -137,7 +152,14 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         run_udp_http_get(&options, &network, &key_summary, url)
     } else if let (Some(listen), Some(target)) = (&options.udp_http_proxy, &options.udp_http_target)
     {
-        run_udp_http_proxy(&options, &network, &key_summary, listen, target)
+        run_udp_http_proxy(
+            &options,
+            &network,
+            &key_summary,
+            listen,
+            target,
+            shutdown.expect("UDP HTTP proxy shutdown flag is installed"),
+        )
     } else {
         Ok(())
     };
@@ -152,18 +174,87 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         return Err(error);
     }
     logout_result?;
-    if options.udp_icmp_probe {
-        println!("Probe complete; one UDP ESP ICMP probe was attempted and no routes were changed");
-    } else if options.udp_tcp_probe.is_some() {
-        println!("Probe complete; one UDP ESP TCP SYN probe succeeded and no routes were changed");
-    } else if options.udp_http_get.is_some() {
-        println!("Probe complete; one UDP ESP HTTP GET succeeded and no routes were changed");
-    } else if options.udp_http_proxy.is_some() {
-        println!("Probe complete; UDP ESP HTTP proxy exited and no routes were changed");
+    let route_status = if routes_applied {
+        "routes were applied to config"
     } else {
-        println!("Probe complete; no UDP data tunnel was opened and no routes were changed");
+        "no routes were changed"
+    };
+    if options.udp_icmp_probe {
+        println!("Probe complete; one UDP ESP ICMP probe was attempted and {route_status}");
+    } else if options.udp_tcp_probe.is_some() {
+        println!("Probe complete; one UDP ESP TCP SYN probe succeeded and {route_status}");
+    } else if options.udp_http_get.is_some() {
+        println!("Probe complete; one UDP ESP HTTP GET succeeded and {route_status}");
+    } else if options.udp_http_proxy.is_some() {
+        println!("Probe complete; UDP ESP HTTP proxy exited and {route_status}");
+    } else {
+        println!("Probe complete; no UDP data tunnel was opened and {route_status}");
     }
     Ok(())
+}
+
+fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handler_shutdown = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        handler_shutdown.store(true, Ordering::SeqCst);
+        eprintln!("Shutdown requested; closing Hillstone SSL VPN connection...");
+    })
+    .context("failed to install shutdown handler")?;
+    Ok(shutdown)
+}
+
+fn apply_pushed_routes_to_config(
+    options: &HillstoneProbeOptions,
+    network: &NetworkSetup,
+) -> Result<bool> {
+    if !options.apply_routes && options.udp_http_proxy.is_none() {
+        return Ok(false);
+    }
+
+    let cidrs = decode_ipv4_route_cidrs(&network.route_ipv4);
+    if cidrs.is_empty() {
+        println!("No parsable Hillstone route table was pushed; config not changed");
+        return Ok(false);
+    }
+    let proxy = hillstone_route_proxy(options)?.context(
+        "Hillstone route application requires --route-proxy <IP:PORT> or --udp-http-proxy <IP:PORT>",
+    )?;
+
+    // The gateway pushes SET_ROUTE before the ESP data tunnel starts. Writing those CIDRs
+    // here lets sing-box keep its normal mixed/system-proxy entry point while each matched
+    // intranet destination is internally rewritten to the local Hillstone HTTP bridge.
+    run_hillstone_route_table_config(
+        &options.route_config_path,
+        None,
+        true,
+        HillstoneRouteTableOptions {
+            cidrs: cidrs.clone(),
+            proxy,
+        },
+    )?;
+    println!(
+        "Applied Hillstone route table to {} via {}: {}",
+        options.route_config_path.display(),
+        proxy,
+        cidrs.join(", ")
+    );
+    Ok(true)
+}
+
+fn hillstone_route_proxy(options: &HillstoneProbeOptions) -> Result<Option<SocketAddrV4>> {
+    if let Some(proxy) = options.route_proxy {
+        return Ok(Some(proxy));
+    }
+    options
+        .udp_http_proxy
+        .as_deref()
+        .map(|value| {
+            value.parse::<SocketAddrV4>().with_context(|| {
+                format!("--udp-http-proxy listen address must be IPv4:PORT, got {value}")
+            })
+        })
+        .transpose()
 }
 
 fn connect_tls(options: &HillstoneProbeOptions) -> Result<TlsStream<TcpStream>> {
@@ -540,6 +631,7 @@ fn run_udp_http_proxy(
     key_summary: &NewKeySummary,
     listen: &str,
     target: &str,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let listen = listen.parse::<SocketAddrV4>().with_context(|| {
         format!("--udp-http-proxy listen address must be IPv4:PORT, got {listen}")
@@ -576,7 +668,7 @@ fn run_udp_http_proxy(
 
     let mut source_ports = SourcePortAllocator::new();
     let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut client, _)) => {
                 // The keepalive loop needs a nonblocking listener, but macOS can hand accepted
@@ -624,6 +716,11 @@ fn run_udp_http_proxy(
             }
         }
     }
+    // Ctrl-C used to kill the process while the Hillstone control channel was still open, leaving
+    // the gateway to expire the session on its own. Returning here lets run_hillstone_probe send a
+    // CLIENT_LOGOUT frame and release the local bridge port as our own client exits.
+    println!("UDP ESP HTTP proxy stopped by local shutdown request");
+    Ok(())
 }
 
 fn send_proxy_keepalive(
@@ -654,10 +751,11 @@ fn handle_http_proxy_client(
     timeout: Duration,
 ) -> Result<()> {
     let browser_request = read_http_request(client, timeout)?;
+    let target = resolve_http_proxy_target(&browser_request, listen, target)?;
     let proxy_request = build_upstream_http_request(&browser_request, listen, target)?;
     println!(
-        "  browser_request: {} {}",
-        proxy_request.method, proxy_request.path
+        "  browser_request: {} {} -> {}",
+        proxy_request.method, proxy_request.path, target
     );
     let response = http_request_over_esp_from_source_port(
         socket,
@@ -1660,6 +1758,67 @@ struct UpstreamHttpRequest {
     browser_base: String,
 }
 
+fn resolve_http_proxy_target(
+    browser_request: &[u8],
+    listen: SocketAddrV4,
+    fallback_target: SocketAddrV4,
+) -> Result<SocketAddrV4> {
+    // Sing-box override_address keeps one system-proxy entry point, but the bridge only sees
+    // the rewritten TCP peer (127.0.0.1:18080). The original intranet IP:port survives in the
+    // HTTP request line/Host header, so derive the ESP target per request and keep the configured
+    // target only as the localhost testing fallback.
+    let header_end = find_http_header_end(browser_request).context("missing HTTP header end")?;
+    let headers = std::str::from_utf8(&browser_request[..header_end])
+        .context("browser request headers are not valid UTF-8")?;
+    let request_line = headers.lines().next().context("browser request is empty")?;
+    let uri = request_line
+        .split_whitespace()
+        .nth(1)
+        .context("browser request line is missing URI")?;
+    if let Some(target) = http_uri_target(uri, listen) {
+        return Ok(target);
+    }
+    if let Some(target) = request_host_target(headers, listen) {
+        return Ok(target);
+    }
+    Ok(fallback_target)
+}
+
+fn http_uri_target(uri: &str, listen: SocketAddrV4) -> Option<SocketAddrV4> {
+    let rest = uri.strip_prefix("http://")?;
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    parse_http_authority_target(authority, listen, 80)
+}
+
+fn request_host_target(headers: &str, listen: SocketAddrV4) -> Option<SocketAddrV4> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("host") {
+            parse_http_authority_target(value, listen, 80)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_http_authority_target(
+    authority: &str,
+    listen: SocketAddrV4,
+    default_port: u16,
+) -> Option<SocketAddrV4> {
+    let authority = authority.trim().rsplit('@').next()?.trim();
+    let target = authority.parse::<SocketAddrV4>().ok().or_else(|| {
+        authority
+            .parse::<Ipv4Addr>()
+            .ok()
+            .map(|ip| SocketAddrV4::new(ip, default_port))
+    })?;
+    if target == listen { None } else { Some(target) }
+}
+
 fn browser_base_for_request(headers: &str, listen: SocketAddrV4, target: SocketAddrV4) -> String {
     let target_host = host_header_for_socket(target);
     let listen_host = host_header_for_socket(listen);
@@ -2357,27 +2516,81 @@ fn decode_ipv4_list(bytes: &[u8]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-fn decode_ipv4_routes(bytes: &[u8]) -> Vec<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Ipv4RouteEntry {
+    destination: Ipv4Addr,
+    prefix_len: u32,
+    metric: Option<u32>,
+}
+
+impl Ipv4RouteEntry {
+    fn cidr(&self) -> String {
+        format!("{}/{}", self.destination, self.prefix_len)
+    }
+}
+
+impl std::fmt::Display for Ipv4RouteEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(metric) = self.metric {
+            write!(
+                formatter,
+                "{}/{} metric {metric}",
+                self.destination, self.prefix_len
+            )
+        } else {
+            write!(formatter, "{}/{}", self.destination, self.prefix_len)
+        }
+    }
+}
+
+fn decode_ipv4_route_entries(bytes: &[u8]) -> Option<Vec<Ipv4RouteEntry>> {
     if bytes.len() % 12 == 0 {
-        return bytes
-            .chunks_exact(12)
-            .map(|chunk| {
-                let destination = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                let mask = Ipv4Addr::new(chunk[4], chunk[5], chunk[6], chunk[7]);
-                let metric = u32::from_be_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
-                format!("{destination}/{} metric {metric}", netmask_prefix_len(mask))
-            })
-            .collect();
+        return Some(
+            bytes
+                .chunks_exact(12)
+                .map(|chunk| {
+                    let destination = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                    let mask = Ipv4Addr::new(chunk[4], chunk[5], chunk[6], chunk[7]);
+                    let metric = u32::from_be_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+                    Ipv4RouteEntry {
+                        destination,
+                        prefix_len: netmask_prefix_len(mask),
+                        metric: Some(metric),
+                    }
+                })
+                .collect(),
+        );
     }
     if bytes.len() % 8 == 0 {
-        return bytes
-            .chunks_exact(8)
-            .map(|chunk| {
-                let destination = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                let mask = Ipv4Addr::new(chunk[4], chunk[5], chunk[6], chunk[7]);
-                format!("{destination}/{}", netmask_prefix_len(mask))
-            })
-            .collect();
+        return Some(
+            bytes
+                .chunks_exact(8)
+                .map(|chunk| {
+                    let destination = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                    let mask = Ipv4Addr::new(chunk[4], chunk[5], chunk[6], chunk[7]);
+                    Ipv4RouteEntry {
+                        destination,
+                        prefix_len: netmask_prefix_len(mask),
+                        metric: None,
+                    }
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+fn decode_ipv4_route_cidrs(bytes: &[u8]) -> Vec<String> {
+    decode_ipv4_route_entries(bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|route| route.cidr())
+        .collect()
+}
+
+fn decode_ipv4_routes(bytes: &[u8]) -> Vec<String> {
+    if let Some(routes) = decode_ipv4_route_entries(bytes) {
+        return routes.into_iter().map(|route| route.to_string()).collect();
     }
     vec![format!("unparsed hex {}", short_hex(bytes))]
 }
@@ -2479,8 +2692,9 @@ mod tests {
     use super::{
         AES_BLOCK_SIZE, EspSession, IPPROTO_ICMP, IPPROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_SYN,
         TcpProbeOutcome, TcpSegmentSpec, build_icmp_echo_request, build_ipv4_packet,
-        build_tcp_segment, build_upstream_http_request, decode_ipv4_routes, describe_ipv4_packet,
-        http_response_has_complete_body, http_status_line, internet_checksum, parse_http_get_url,
+        build_tcp_segment, build_upstream_http_request, decode_ipv4_route_cidrs,
+        decode_ipv4_routes, describe_ipv4_packet, http_response_has_complete_body,
+        http_status_line, internet_checksum, parse_http_get_url, resolve_http_proxy_target,
         rewrite_http_response_for_proxy, tcp_probe_outcome,
     };
 
@@ -2498,6 +2712,19 @@ mod tests {
                 "10.255.0.0/24 metric 35",
                 "10.253.0.0/24 metric 35"
             ]
+        );
+    }
+
+    #[test]
+    fn decodes_ipv4_route_cidrs_for_config_application() {
+        let bytes = [
+            10, 1, 0, 0, 255, 255, 0, 0, 0, 0, 0, 35, 10, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 35,
+            10, 253, 0, 0, 255, 255, 255, 0, 0, 0, 0, 35,
+        ];
+
+        assert_eq!(
+            decode_ipv4_route_cidrs(&bytes),
+            ["10.1.0.0/16", "10.255.0.0/24", "10.253.0.0/24"]
         );
     }
 
@@ -2683,6 +2910,59 @@ mod tests {
         assert!(upstream.contains("\r\nReferer: http://10.1.126.5:10011/bug-browse.html\r\n"));
         assert!(!upstream.contains("127.0.0.1:18080"));
         assert!(!upstream.contains("Proxy-Connection"));
+    }
+
+    #[test]
+    fn resolves_proxy_target_from_internal_host_header() {
+        let browser_request =
+            b"GET / HTTP/1.1\r\nHost: 10.1.126.5:8099\r\nUser-Agent: test\r\n\r\n";
+
+        let target = resolve_http_proxy_target(
+            browser_request,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
+        )
+        .expect("target resolves");
+
+        assert_eq!(
+            target,
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 8099)
+        );
+    }
+
+    #[test]
+    fn resolves_proxy_target_from_absolute_uri() {
+        let browser_request = b"GET http://10.1.126.5:8099/index.html HTTP/1.1\r\nHost: 10.1.126.5:10011\r\nUser-Agent: test\r\n\r\n";
+
+        let target = resolve_http_proxy_target(
+            browser_request,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
+        )
+        .expect("target resolves");
+
+        assert_eq!(
+            target,
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 8099)
+        );
+    }
+
+    #[test]
+    fn resolves_proxy_target_to_fallback_for_local_listener() {
+        let browser_request =
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUser-Agent: test\r\n\r\n";
+
+        let target = resolve_http_proxy_target(
+            browser_request,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011),
+        )
+        .expect("target resolves");
+
+        assert_eq!(
+            target,
+            SocketAddrV4::new(Ipv4Addr::new(10, 1, 126, 5), 10011)
+        );
     }
 
     #[test]
