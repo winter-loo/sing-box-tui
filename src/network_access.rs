@@ -295,12 +295,14 @@ pub(crate) fn default_hillstone_manifest() -> Result<RemoteAccessProviderManifes
             graceful_disconnect: true,
         },
         config_schema: json!({
+            "mode": { "type": "string", "enum": ["bridge", "tun"], "default": "bridge" },
             "server": { "type": "string", "required": true },
             "port": { "type": "integer", "default": 4433 },
             "username": { "type": "string", "required": true },
             "password": { "type": "string", "required": false, "sensitive": true },
             "password_env": { "type": "string", "required": false },
             "bridge_listen": { "type": "string", "default": "127.0.0.1:16780" },
+            "tun_helper": { "type": "array", "items": { "type": "string" }, "required": false },
             "tls_verify": { "type": "boolean", "default": true }
         }),
     })
@@ -308,6 +310,8 @@ pub(crate) fn default_hillstone_manifest() -> Result<RemoteAccessProviderManifes
 
 #[derive(Clone, Debug, Deserialize)]
 struct HillstoneProviderConfig {
+    #[serde(default = "default_hillstone_provider_mode")]
+    mode: HillstoneProviderMode,
     server: String,
     #[serde(default = "default_hillstone_port")]
     port: u16,
@@ -318,6 +322,8 @@ struct HillstoneProviderConfig {
     #[serde(default = "default_hillstone_bridge_listen")]
     bridge_listen: String,
     #[serde(default)]
+    tun_helper: Option<Vec<String>>,
+    #[serde(default)]
     tls_verify: bool,
     host_id: Option<String>,
     host_name: Option<String>,
@@ -325,6 +331,17 @@ struct HillstoneProviderConfig {
     client_version: String,
     #[serde(default = "default_hillstone_timeout_secs")]
     timeout_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum HillstoneProviderMode {
+    Bridge,
+    Tun,
+}
+
+fn default_hillstone_provider_mode() -> HillstoneProviderMode {
+    HillstoneProviderMode::Bridge
 }
 
 fn default_hillstone_port() -> u16 {
@@ -426,39 +443,84 @@ fn start_hillstone_provider_session(
         "starting Hillstone provider session",
     )?;
     let worker = thread::spawn(move || {
-        let result = run_hillstone_probe(HillstoneProbeOptions {
-            server: config.server,
-            port: config.port,
-            username: config.username,
-            password: config.password,
-            password_env: config.password_env,
-            password_stdin: false,
-            host_id: config.host_id,
-            host_name: config.host_name,
-            client_version: config.client_version,
-            timeout_secs: config.timeout_secs,
-            verify_server_cert: config.tls_verify,
-            stop_before_new_key: false,
-            udp_icmp_probe: false,
-            udp_tcp_probe: None,
-            udp_http_get: None,
-            udp_http_proxy: Some(config.bridge_listen),
-            route_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
-            apply_routes: false,
-            // In provider mode the child process only reports pushed routes. The TUI applies
-            // provider-owned sing-box rules so route ownership, errors, and reload prompts stay
-            // in the single user-facing control surface.
-            apply_routes_for_proxy: false,
-            route_proxy: None,
-            event_sink: Some(worker_sink.clone()),
-            shutdown: Some(worker_shutdown),
-        });
+        let result = match config.mode {
+            HillstoneProviderMode::Bridge => run_hillstone_probe(HillstoneProbeOptions {
+                server: config.server,
+                port: config.port,
+                username: config.username,
+                password: config.password,
+                password_env: config.password_env,
+                password_stdin: false,
+                host_id: config.host_id,
+                host_name: config.host_name,
+                client_version: config.client_version,
+                timeout_secs: config.timeout_secs,
+                verify_server_cert: config.tls_verify,
+                stop_before_new_key: false,
+                udp_icmp_probe: false,
+                udp_tcp_probe: None,
+                udp_http_get: None,
+                udp_http_proxy: Some(config.bridge_listen),
+                tun_data_plane: false,
+                tun_helper_command: None,
+                route_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                apply_routes: false,
+                // In provider mode the child process only reports pushed routes. The TUI applies
+                // provider-owned sing-box rules so route ownership, errors, and reload prompts stay
+                // in the single user-facing control surface.
+                apply_routes_for_proxy: false,
+                route_proxy: None,
+                event_sink: Some(worker_sink.clone()),
+                shutdown: Some(worker_shutdown),
+            }),
+            HillstoneProviderMode::Tun => run_hillstone_probe(HillstoneProbeOptions {
+                server: config.server,
+                port: config.port,
+                username: config.username,
+                password: config.password,
+                password_env: config.password_env,
+                password_stdin: false,
+                host_id: config.host_id,
+                host_name: config.host_name,
+                client_version: config.client_version,
+                timeout_secs: config.timeout_secs,
+                verify_server_cert: config.tls_verify,
+                stop_before_new_key: false,
+                udp_icmp_probe: false,
+                udp_tcp_probe: None,
+                udp_http_get: None,
+                udp_http_proxy: None,
+                tun_data_plane: true,
+                tun_helper_command: normalize_tun_helper_command(config.tun_helper),
+                route_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                apply_routes: false,
+                apply_routes_for_proxy: false,
+                route_proxy: None,
+                event_sink: Some(worker_sink.clone()),
+                shutdown: Some(worker_shutdown),
+            }),
+        };
         if let Err(error) = result {
-            let _ = worker_sink.error("session_failed", &error.to_string());
+            let _ = worker_sink.error("session_failed", &format!("{error:#}"));
             let _ = worker_sink.state(RemoteAccessState::Error, "provider session failed");
         }
     });
     Ok(RemoteAccessProviderSession { shutdown, worker })
+}
+
+fn normalize_tun_helper_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
+    command.and_then(|command| {
+        let command = command
+            .into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
+    })
 }
 
 fn emit_provider_error(
@@ -585,10 +647,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ExternalRemoteAccessProvider, HillstoneProviderConfig, RemoteAccessCommand,
-        RemoteAccessEvent, RemoteAccessEventEnvelope, RemoteAccessProviderCapabilities,
-        RemoteAccessProviderManifest, RemoteAccessRoute, RemoteAccessState,
-        default_hillstone_manifest,
+        ExternalRemoteAccessProvider, HillstoneProviderConfig, HillstoneProviderMode,
+        RemoteAccessCommand, RemoteAccessEvent, RemoteAccessEventEnvelope,
+        RemoteAccessProviderCapabilities, RemoteAccessProviderManifest, RemoteAccessRoute,
+        RemoteAccessState, default_hillstone_manifest, normalize_tun_helper_command,
     };
     use serde_json::json;
 
@@ -645,6 +707,7 @@ mod tests {
                 .any(|arg| arg == "remote-access-provider")
         );
         assert_eq!(manifest.config_schema["password"]["sensitive"], true);
+        assert_eq!(manifest.config_schema["mode"]["default"], "bridge");
         assert_eq!(
             manifest.config_schema["bridge_listen"]["default"],
             "127.0.0.1:16780"
@@ -660,8 +723,49 @@ mod tests {
         }))
         .expect("config parses");
 
+        assert_eq!(config.mode, HillstoneProviderMode::Bridge);
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.password_env, None);
+    }
+
+    #[test]
+    fn hillstone_provider_config_accepts_tun_mode() {
+        let config: HillstoneProviderConfig = serde_json::from_value(json!({
+            "mode": "tun",
+            "server": "sslvpn.example.com",
+            "username": "user"
+        }))
+        .expect("config parses");
+
+        assert_eq!(config.mode, HillstoneProviderMode::Tun);
+    }
+
+    #[test]
+    fn empty_tun_helper_command_is_treated_as_default_helper() {
+        assert_eq!(normalize_tun_helper_command(None), None);
+        assert_eq!(normalize_tun_helper_command(Some(vec![])), None);
+        assert_eq!(
+            normalize_tun_helper_command(Some(vec![
+                " ".to_string(),
+                "\t".to_string(),
+                "".to_string()
+            ])),
+            None
+        );
+        assert_eq!(
+            normalize_tun_helper_command(Some(vec![
+                " sudo ".to_string(),
+                " sing-box-tui ".to_string(),
+                " remote-access-tun-helper ".to_string(),
+                " --stdio ".to_string()
+            ])),
+            Some(vec![
+                "sudo".to_string(),
+                "sing-box-tui".to_string(),
+                "remote-access-tun-helper".to_string(),
+                "--stdio".to_string()
+            ])
+        );
     }
 
     #[test]

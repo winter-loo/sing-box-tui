@@ -23,6 +23,7 @@ Open settings with `o` and configure:
 - `Remote access username`
 - `Remote access password`
 - `Remote access password env`
+- `Remote access mode`
 - `Remote access bridge listen`
 - `Remote access TLS verify`
 
@@ -47,7 +48,8 @@ sing-box-tui run --config ./config.json
 
 ## Traffic Flow
 
-Remote Access does not require a second browser proxy. The intended path is:
+Remote Access does not require a second browser proxy. In `bridge` mode, the
+intended path is:
 
 ```text
 browser or app
@@ -63,6 +65,22 @@ When a provider pushes route CIDRs, the TUI writes provider-owned sing-box route
 rules without port restrictions. If `office` pushes `10.1.0.0/16` and `lab`
 pushes `10.2.0.0/16`, traffic to `10.1.x.x` goes to the `office` bridge and
 traffic to `10.2.x.x` goes to the `lab` bridge.
+
+In `tun` mode, the provider starts a small privileged helper and exchanges raw
+IPv4 packets with it:
+
+```text
+browser, git, curl, ssh, or app
+  -> OS pushed route
+  -> helper-owned TUN interface
+  -> provider process
+  -> provider tunnel
+  -> intranet service
+```
+
+The helper is intentionally generic: it owns TUN creation and OS route cleanup,
+while the provider owns protocol-specific authentication, encryption, and
+gateway packet transport.
 
 ## Provider Process
 
@@ -86,6 +104,7 @@ multiple Hillstone accounts or gateways without duplicating manifest files.
     {
       "id": "office",
       "manifest_path": null,
+      "mode": "bridge",
       "server": "sslvpn.example.com",
       "port": 4433,
       "username": "user",
@@ -95,8 +114,26 @@ multiple Hillstone accounts or gateways without duplicating manifest files.
       "tls_verify": false
     },
     {
+      "id": "office-tun",
+      "manifest_path": null,
+      "mode": "tun",
+      "server": "sslvpn.example.com",
+      "port": 4433,
+      "username": "user",
+      "password_env": "HILLSTONE_PASSWORD",
+      "tun_helper": [
+        "sudo",
+        "-n",
+        "/path/to/sing-box-tui",
+        "remote-access-tun-helper",
+        "--stdio"
+      ],
+      "tls_verify": false
+    },
+    {
       "id": "custom-provider",
       "manifest_path": "./providers/custom-remote-access.json",
+      "mode": "bridge",
       "server": "vpn.example.com",
       "port": 443,
       "username": "user",
@@ -122,6 +159,12 @@ If no manifest is configured, the built-in Hillstone manifest starts the current
 `sing-box-tui` executable with the internal `remote-access-provider hillstone
 --stdio` command.
 
+In `mode=tun`, the built-in provider starts the current executable with the
+hidden `remote-access-tun-helper --stdio` command. When the provider is not
+already running as root, the default command is wrapped as `sudo -n ...` so the
+TUI never blocks on a password prompt. A product installer can replace this with
+a LaunchDaemon or other pre-authorized helper by setting `tun_helper`.
+
 Provider profile `id` is the user-facing connection slot and route ownership
 key. The manifest `id` is the protocol implementation id used inside provider
 commands. Route rules are owned by the profile id, so two profiles that both use
@@ -135,5 +178,8 @@ Hillstone can keep their route rules separate.
   still point sing-box at a closed bridge.
 - Intranet IP does not route through the bridge: confirm pushed CIDRs were
   applied to `config.json` and reload or restart sing-box.
+- `TUN helper failed before ready`: confirm the helper command has privilege to
+  create a TUN interface and add OS routes. With the default `sudo -n` command,
+  sudo credentials must already be cached or configured for non-interactive use.
 - TLS verification disabled: acceptable for exploratory testing only; enable it
   when the gateway certificate chain can be verified.

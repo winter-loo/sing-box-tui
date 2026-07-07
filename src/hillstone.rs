@@ -22,6 +22,7 @@ use native_tls::{TlsConnector, TlsStream};
 use sha1::{Digest, Sha1};
 
 use crate::config::{HillstoneRouteTableOptions, run_hillstone_route_table_config};
+use crate::tun::{TunHelperClient, TunHelperStartConfig};
 
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
@@ -44,6 +45,8 @@ pub(crate) struct HillstoneProbeOptions {
     pub(crate) udp_tcp_probe: Option<String>,
     pub(crate) udp_http_get: Option<String>,
     pub(crate) udp_http_proxy: Option<String>,
+    pub(crate) tun_data_plane: bool,
+    pub(crate) tun_helper_command: Option<Vec<String>>,
     pub(crate) route_config_path: PathBuf,
     pub(crate) apply_routes: bool,
     pub(crate) apply_routes_for_proxy: bool,
@@ -160,9 +163,11 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
     if key_summary.session_id_present {
         eprintln!("  session_id: <redacted>");
     }
-    emit_hillstone_state(&options, "connected", "data tunnel ready")?;
+    if !options.tun_data_plane {
+        emit_hillstone_state(&options, "connected", "data tunnel ready")?;
+    }
 
-    let shutdown = if options.udp_http_proxy.is_some() {
+    let shutdown = if options.udp_http_proxy.is_some() || options.tun_data_plane {
         Some(match &options.shutdown {
             Some(shutdown) => Arc::clone(shutdown),
             None => install_shutdown_handler()?,
@@ -183,6 +188,13 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
             &key_summary,
             listen,
             shutdown.expect("UDP HTTP proxy shutdown flag is installed"),
+        )
+    } else if options.tun_data_plane {
+        run_tun_data_plane(
+            &options,
+            &network,
+            &key_summary,
+            shutdown.expect("TUN data plane shutdown flag is installed"),
         )
     } else {
         Ok(())
@@ -212,6 +224,8 @@ pub(crate) fn run_hillstone_probe(options: HillstoneProbeOptions) -> Result<()> 
         eprintln!("Probe complete; one UDP ESP HTTP GET succeeded and {route_status}");
     } else if options.udp_http_proxy.is_some() {
         eprintln!("Probe complete; UDP ESP HTTP proxy exited and {route_status}");
+    } else if options.tun_data_plane {
+        eprintln!("Probe complete; TUN data plane exited and {route_status}");
     } else {
         eprintln!("Probe complete; no UDP data tunnel was opened and {route_status}");
     }
@@ -773,6 +787,124 @@ fn run_udp_http_proxy(
     Ok(())
 }
 
+fn run_tun_data_plane(
+    options: &HillstoneProbeOptions,
+    network: &NetworkSetup,
+    key_summary: &NewKeySummary,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let client_ip = network
+        .client_private_ipv4
+        .context("TUN mode requires SET_IP client private IPv4")?;
+    let gateway_ip = network
+        .server_private_ipv4
+        .context("TUN mode requires SET_IP server private IPv4")?;
+    let prefix_len = network.prefix_len.unwrap_or(32);
+    let server_udp_port = network
+        .server_udp_port
+        .context("TUN mode requires SET_IP server UDP port")?;
+    let server_ip = resolve_ipv4(&options.server)?;
+    let mut esp = EspSession::from_new_key(key_summary)?;
+    let route_cidrs = decode_ipv4_route_cidrs(&network.route_ipv4);
+    // TUN mode is deliberately entered only after AUTH, SET_ROUTE, and NEW_KEY have succeeded.
+    // The helper split keeps the normal TUI/provider unprivileged while a tiny child owns the
+    // kernel-facing TUN interface and pushed OS routes.
+    let mut tun = TunHelperClient::spawn(
+        options.tun_helper_command.clone(),
+        TunHelperStartConfig {
+            client_ipv4: client_ip,
+            gateway_ipv4: gateway_ip,
+            prefix_len,
+            route_cidrs: route_cidrs.clone(),
+        },
+    )?;
+    eprintln!("TUN data plane:");
+    eprintln!("  helper_interface: {}", tun.interface());
+    eprintln!("  client_ipv4: {client_ip}/{prefix_len}");
+    eprintln!("  esp_gateway: {server_ip}:{server_udp_port}");
+    eprintln!(
+        "  installed_routes: {}",
+        if route_cidrs.is_empty() {
+            "<none>".to_string()
+        } else {
+            route_cidrs.join(", ")
+        }
+    );
+    emit_hillstone_state(
+        options,
+        "connected",
+        &format!("TUN data plane running on {}", tun.interface()),
+    )?;
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("failed to bind local UDP socket for Hillstone TUN data plane")?;
+    socket
+        .connect((server_ip, server_udp_port))
+        .context("failed to connect Hillstone UDP ESP socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to set Hillstone UDP ESP socket nonblocking")?;
+
+    let mut udp_buffer = vec![0_u8; 65535];
+    let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
+    let mut tun_to_udp_packets = 0_u64;
+    let mut udp_to_tun_packets = 0_u64;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let mut made_progress = false;
+
+        while let Some(packet) = tun.try_recv_ipv4()? {
+            let esp_packet = esp.encap_ipv4(&packet)?;
+            match socket.send(&esp_packet) {
+                Ok(_) => {
+                    tun_to_udp_packets += 1;
+                    made_progress = true;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error).context("failed to send TUN packet over UDP ESP"),
+            }
+        }
+
+        loop {
+            let size = match socket.recv(&mut udp_buffer) {
+                Ok(size) => size,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error).context("failed to receive UDP ESP packet"),
+            };
+            match esp.decap_ipv4(&udp_buffer[..size]) {
+                Ok(inner_packet) => {
+                    if tun
+                        .send_ipv4(&inner_packet)
+                        .context("failed to write decapsulated IPv4 packet to TUN")?
+                    {
+                        udp_to_tun_packets += 1;
+                        made_progress = true;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: dropped undecodable UDP ESP packet: {error:#}");
+                }
+            }
+        }
+
+        if Instant::now() >= next_keepalive {
+            send_connected_keepalive(&socket, &mut esp, client_ip, gateway_ip)?;
+            next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
+        }
+
+        if !made_progress {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    eprintln!(
+        "TUN data plane stopped by local shutdown request; packets tun->udp={tun_to_udp_packets} udp->tun={udp_to_tun_packets}"
+    );
+    tun.stop()
+        .context("failed to stop Remote Access TUN helper")?;
+    Ok(())
+}
+
 fn send_proxy_keepalive(
     socket: &UdpSocket,
     esp: &mut EspSession,
@@ -780,13 +912,37 @@ fn send_proxy_keepalive(
     client_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
 ) -> Result<()> {
-    let echo_request = build_icmp_echo_request(random_u16(), 0, b"sing-box-tui keepalive");
-    let inner_packet = build_ipv4_packet(client_ip, gateway_ip, IPPROTO_ICMP, &echo_request)?;
-    let esp_packet = esp.encap_ipv4(&inner_packet)?;
+    let esp_packet = build_esp_keepalive(esp, client_ip, gateway_ip)?;
     socket
         .send_to(&esp_packet, server_endpoint)
         .context("failed to send Hillstone ESP keepalive")?;
     Ok(())
+}
+
+fn send_connected_keepalive(
+    socket: &UdpSocket,
+    esp: &mut EspSession,
+    client_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+) -> Result<()> {
+    let esp_packet = build_esp_keepalive(esp, client_ip, gateway_ip)?;
+    // TUN mode connects the UDP socket so the kernel filters ESP packets to the gateway. The
+    // bridge keepalive helper uses send_to(), but doing that on an already connected UDP socket
+    // fails on macOS; use send() here to match the rest of the TUN packet path.
+    socket
+        .send(&esp_packet)
+        .context("failed to send Hillstone ESP keepalive")?;
+    Ok(())
+}
+
+fn build_esp_keepalive(
+    esp: &mut EspSession,
+    client_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+) -> Result<Vec<u8>> {
+    let echo_request = build_icmp_echo_request(random_u16(), 0, b"sing-box-tui keepalive");
+    let inner_packet = build_ipv4_packet(client_ip, gateway_ip, IPPROTO_ICMP, &echo_request)?;
+    esp.encap_ipv4(&inner_packet)
 }
 
 fn handle_http_proxy_client(
@@ -2735,7 +2891,8 @@ fn short_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+    use std::time::Duration;
 
     use super::{
         AES_BLOCK_SIZE, EspSession, IPPROTO_ICMP, IPPROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_SYN,
@@ -2743,7 +2900,7 @@ mod tests {
         build_tcp_segment, build_upstream_http_request, decode_ipv4_route_cidrs,
         decode_ipv4_routes, describe_ipv4_packet, http_response_has_complete_body,
         http_status_line, internet_checksum, parse_http_get_url, resolve_http_proxy_target,
-        rewrite_http_response_for_proxy, tcp_probe_outcome,
+        rewrite_http_response_for_proxy, send_connected_keepalive, tcp_probe_outcome,
     };
 
     #[test]
@@ -2816,6 +2973,33 @@ mod tests {
             .decap_ipv4(&esp)
             .expect_err("tampered packet should fail authentication");
         assert!(error.to_string().contains("authentication check failed"));
+    }
+
+    #[test]
+    fn connected_tun_keepalive_uses_connected_udp_send_path() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP server binds");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout applies");
+        let server_addr = server.local_addr().expect("server address");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP client binds");
+        client.connect(server_addr).expect("UDP client connects");
+        let mut session = test_esp_session();
+
+        send_connected_keepalive(
+            &client,
+            &mut session,
+            Ipv4Addr::new(10, 250, 252, 93),
+            Ipv4Addr::new(10, 250, 252, 1),
+        )
+        .expect("connected keepalive sends");
+
+        let mut buffer = [0_u8; 2048];
+        let (size, _) = server
+            .recv_from(&mut buffer)
+            .expect("server receives ESP packet");
+        assert!(size > 0);
+        assert_eq!(&buffer[..4], &0x1020_3040_u32.to_be_bytes());
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod storage;
 mod subscriptions;
 mod tui;
 mod tui_state;
+mod tun;
 
 use cli::CliCommand;
 use config::{HillstoneRouteOptions, run_hillstone_route_config};
@@ -30,6 +31,7 @@ use network_access::run_remote_access_provider_stdio;
 use provider::run_provider_sync;
 use subscriptions::run_subscription_refresh;
 use tui::{TuiSubscriptionRefreshOptions, run_tui};
+use tun::run_remote_access_tun_helper_stdio;
 
 fn main() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
@@ -44,9 +46,11 @@ fn main() -> Result<()> {
             include_geosite_rules,
             include_tun_mode,
             subscription_interval_days,
+            keep_sing_box_running,
         } => run_tui(
             controller,
             max_concurrency,
+            keep_sing_box_running,
             TuiSubscriptionRefreshOptions {
                 input: subscription_input,
                 cache_path: subscription_cache,
@@ -206,6 +210,8 @@ fn main() -> Result<()> {
             udp_tcp_probe,
             udp_http_get,
             udp_http_proxy,
+            tun_data_plane: false,
+            tun_helper_command: None,
             route_config_path,
             apply_routes,
             apply_routes_for_proxy: true,
@@ -240,6 +246,7 @@ fn main() -> Result<()> {
         CliCommand::RemoteAccessProvider { provider, stdio } => {
             run_remote_access_provider_stdio(&provider, stdio)
         }
+        CliCommand::RemoteAccessTunHelper { stdio } => run_remote_access_tun_helper_stdio(stdio),
     }
 }
 
