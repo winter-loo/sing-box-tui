@@ -398,7 +398,11 @@ fn refresh_provider_node_outbounds_only(
             &node_tags,
         );
         upsert_node_outbounds(outbounds, provider.nodes)?;
-        upsert_provider_selector(outbounds, &provider.provider_name, &node_tags);
+        if node_tags.is_empty() {
+            remove_provider_selector(outbounds, &provider.provider_name);
+        } else {
+            upsert_provider_selector(outbounds, &provider.provider_name, &node_tags);
+        }
     }
     Ok(())
 }
@@ -513,6 +517,13 @@ fn upsert_provider_selector(outbounds: &mut Vec<Value>, provider_name: &str, nod
     }));
 }
 
+fn remove_provider_selector(outbounds: &mut Vec<Value>, provider_name: &str) {
+    outbounds.retain(|outbound| {
+        !(outbound.get("type").and_then(Value::as_str) == Some("selector")
+            && outbound.get("tag").and_then(Value::as_str) == Some(provider_name))
+    });
+}
+
 fn update_root_selector_for_provider(
     outbounds: &mut [Value],
     provider_name: &str,
@@ -558,10 +569,16 @@ fn update_root_selector_for_provider(
         }
         next_members.push(member.clone());
     }
+    if node_tags.is_empty() {
+        *members = next_members;
+        ensure_selector_default_is_member(selector);
+        return;
+    }
     let index =
         insert_index.unwrap_or_else(|| provider_insert_index(&next_members, &selector_tags));
     next_members.insert(index, Value::String(provider_name.to_string()));
     *members = next_members;
+    ensure_selector_default_is_member(selector);
 }
 
 fn find_root_selector_index(outbounds: &[Value]) -> Option<usize> {
@@ -600,6 +617,31 @@ fn set_selector_members(selector: &mut Value, node_tags: &[String]) {
         return;
     }
     if let Some(first) = node_tags.first() {
+        object.insert("default".to_string(), Value::String(first.clone()));
+    } else {
+        object.remove("default");
+    }
+}
+
+fn ensure_selector_default_is_member(selector: &mut Value) {
+    let Some(object) = selector.as_object_mut() else {
+        return;
+    };
+    let member_tags = object
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if let Some(default) = object.get("default").and_then(Value::as_str)
+        && member_tags.iter().any(|tag| tag == default)
+    {
+        return;
+    }
+    if let Some(first) = member_tags.first() {
         object.insert("default".to_string(), Value::String(first.clone()));
     } else {
         object.remove("default");
@@ -982,6 +1024,7 @@ mod tests {
         subscription_source_requires_direct_fetch, subscription_source_strips_flag_emoji,
     };
     use crate::defaults::default_clash_api_external_controller;
+    use serde_json::Value;
     use std::fs;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1338,6 +1381,71 @@ mod tests {
                 .expect("other provider flat node is preserved"),
             &original["outbounds"][3]
         );
+    }
+
+    #[test]
+    fn subscription_refresh_drops_empty_provider_selector() {
+        let mut config = serde_json::json!({
+            "outbounds": [{
+                "type": "selector",
+                "tag": "手动选择",
+                "outbounds": ["自动选择", "airtcp", "local-node"],
+                "default": "手ZZ动选择"
+            }, {
+                "type": "urltest",
+                "tag": "自动选择",
+                "outbounds": ["airtcp-old", "local-node"]
+            }, {
+                "type": "selector",
+                "tag": "airtcp",
+                "outbounds": ["airtcp-old"],
+                "default": "airtcp-old"
+            }, {
+                "type": "trojan",
+                "tag": "airtcp-old",
+                "server": "old-airtcp.example",
+                "server_port": 443,
+                "password": "old"
+            }, {
+                "type": "trojan",
+                "tag": "local-node",
+                "server": "local.example",
+                "server_port": 443,
+                "password": "local"
+            }]
+        });
+
+        refresh_provider_node_outbounds_only(
+            &mut config,
+            vec![ProviderNodeRefresh {
+                provider_name: "airtcp".to_string(),
+                nodes: Vec::new(),
+            }],
+            false,
+        )
+        .expect("provider refresh succeeds");
+
+        let outbounds = config["outbounds"].as_array().expect("outbounds");
+        assert!(!outbounds.iter().any(|outbound| outbound["tag"] == "airtcp"));
+        assert!(
+            !outbounds
+                .iter()
+                .any(|outbound| outbound["tag"] == "airtcp-old")
+        );
+        assert!(
+            outbounds
+                .iter()
+                .any(|outbound| outbound["tag"] == "local-node")
+        );
+
+        let root = outbounds
+            .iter()
+            .find(|outbound| outbound["tag"] == "手动选择")
+            .expect("root selector");
+        let root_members = root["outbounds"].as_array().expect("root members");
+        assert!(!root_members.contains(&Value::String("airtcp".to_string())));
+        assert!(!root_members.contains(&Value::String("airtcp-old".to_string())));
+        assert_eq!(root["default"], "自动选择");
     }
 
     #[test]
