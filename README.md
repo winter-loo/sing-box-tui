@@ -10,7 +10,13 @@ refresh, bypass rules, and OS system proxy settings.
 Install the latest prebuilt Windows release:
 
 ```powershell
-try { irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 -ErrorAction Stop } catch { irm https://deeloo.cn/anywhere/https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 } | iex
+irm https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 | iex
+```
+
+If raw GitHub access is blocked, fetch the installer through the proxy URL:
+
+```powershell
+irm https://deeloo.cn/anywhere/https://raw.githubusercontent.com/winter-loo/sing-box-tui/main/scripts/windows/install.ps1 | iex
 ```
 
 The installer downloads the latest `sing-box-tui` Windows x64 release with
