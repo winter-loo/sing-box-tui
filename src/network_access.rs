@@ -58,6 +58,11 @@ pub(crate) enum RemoteAccessCommand {
         provider: String,
         session_id: Option<String>,
     },
+    Detach {
+        id: String,
+        provider: String,
+        session_id: Option<String>,
+    },
     Status {
         id: String,
         provider: String,
@@ -235,6 +240,10 @@ impl ExternalRemoteAccessProvider {
         &self.manifest.id
     }
 
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub(crate) fn send(&mut self, command: &RemoteAccessCommand) -> Result<()> {
         let line =
             serde_json::to_string(command).context("failed to encode remote access command")?;
@@ -243,6 +252,15 @@ impl ExternalRemoteAccessProvider {
             .flush()
             .context("failed to flush remote access command")?;
         Ok(())
+    }
+
+    pub(crate) fn detach(&mut self) -> Result<()> {
+        let provider = self.provider_id().to_string();
+        self.send(&RemoteAccessCommand::Detach {
+            id: "tui-background".to_string(),
+            provider,
+            session_id: None,
+        })
     }
 
     pub(crate) fn try_recv(&self) -> Result<Option<RemoteAccessEventEnvelope>, String> {
@@ -371,7 +389,12 @@ pub(crate) fn run_remote_access_provider_stdio(provider: &str, stdio: bool) -> R
 }
 
 fn run_hillstone_remote_access_provider_stdio() -> Result<()> {
-    let sink = Arc::new(JsonLineEventSink::new("hillstone", io::stdout()));
+    let detached = Arc::new(AtomicBool::new(false));
+    let sink = Arc::new(JsonLineEventSink::new(
+        "hillstone",
+        io::stdout(),
+        Arc::clone(&detached),
+    ));
     let mut session: Option<RemoteAccessProviderSession> = None;
     for line in io::stdin().lock().lines() {
         let line = line.context("failed to read remote access provider command")?;
@@ -409,6 +432,19 @@ fn run_hillstone_remote_access_provider_stdio() -> Result<()> {
                     sink.state(RemoteAccessState::Disconnected, "no active session")?;
                 }
             }
+            RemoteAccessCommand::Detach { provider, .. } => {
+                if provider != "hillstone" {
+                    emit_provider_error(&sink, "invalid_provider", "command provider mismatch")?;
+                    continue;
+                }
+                detached.store(true, Ordering::SeqCst);
+                let state = if session.is_some() {
+                    RemoteAccessState::Connected
+                } else {
+                    RemoteAccessState::Disconnected
+                };
+                sink.state(state, "provider detached from TUI")?;
+            }
             RemoteAccessCommand::Status { .. } => {
                 let state = if session.is_some() {
                     RemoteAccessState::Connected
@@ -420,7 +456,9 @@ fn run_hillstone_remote_access_provider_stdio() -> Result<()> {
         }
     }
     if let Some(session) = session.take() {
-        session.shutdown.store(true, Ordering::SeqCst);
+        if !detached.load(Ordering::SeqCst) {
+            session.shutdown.store(true, Ordering::SeqCst);
+        }
         let _ = session.worker.join();
     }
     Ok(())
@@ -535,13 +573,15 @@ fn emit_provider_error(
 struct JsonLineEventSink<W: Write + Send + 'static> {
     provider: String,
     writer: Mutex<W>,
+    detached: Arc<AtomicBool>,
 }
 
 impl<W: Write + Send + 'static> JsonLineEventSink<W> {
-    fn new(provider: &str, writer: W) -> Self {
+    fn new(provider: &str, writer: W, detached: Arc<AtomicBool>) -> Self {
         Self {
             provider: provider.to_string(),
             writer: Mutex::new(writer),
+            detached,
         }
     }
 
@@ -553,10 +593,18 @@ impl<W: Write + Send + 'static> JsonLineEventSink<W> {
             .writer
             .lock()
             .map_err(|_| anyhow::anyhow!("remote access event writer mutex poisoned"))?;
-        writeln!(writer, "{line}").context("failed to write remote access event")?;
-        writer
-            .flush()
-            .context("failed to flush remote access event")?;
+        if let Err(error) = writeln!(writer, "{line}") {
+            if self.detached.load(Ordering::SeqCst) && error.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error).context("failed to write remote access event");
+        }
+        if let Err(error) = writer.flush() {
+            if self.detached.load(Ordering::SeqCst) && error.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error).context("failed to flush remote access event");
+        }
         Ok(())
     }
 
@@ -644,11 +692,13 @@ fn resolve_manifest_executable(manifest: &RemoteAccessProviderManifest) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+    use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
 
     use super::{
         ExternalRemoteAccessProvider, HillstoneProviderConfig, HillstoneProviderMode,
-        RemoteAccessCommand, RemoteAccessEvent, RemoteAccessEventEnvelope,
+        JsonLineEventSink, RemoteAccessCommand, RemoteAccessEvent, RemoteAccessEventEnvelope,
         RemoteAccessProviderCapabilities, RemoteAccessProviderManifest, RemoteAccessRoute,
         RemoteAccessState, default_hillstone_manifest, normalize_tun_helper_command,
     };
@@ -669,6 +719,20 @@ mod tests {
         assert_eq!(value["type"], "connect");
         assert_eq!(value["provider"], "hillstone");
         assert_eq!(value["config"]["server"], "sslvpn.example.com");
+    }
+
+    #[test]
+    fn remote_access_detach_command_serializes_as_json_line_protocol() {
+        let command = RemoteAccessCommand::Detach {
+            id: "cmd-2".to_string(),
+            provider: "hillstone".to_string(),
+            session_id: None,
+        };
+
+        let value = serde_json::to_value(command).expect("command serializes");
+        assert_eq!(value["type"], "detach");
+        assert_eq!(value["provider"], "hillstone");
+        assert!(value["session_id"].is_null());
     }
 
     #[test]
@@ -693,6 +757,41 @@ mod tests {
     fn remote_access_state_labels_are_user_facing() {
         assert_eq!(RemoteAccessState::Connected.label(), "connected");
         assert_eq!(RemoteAccessState::Disconnected.label(), "disconnected");
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn detached_provider_event_sink_ignores_broken_pipe() {
+        let detached = Arc::new(AtomicBool::new(true));
+        let sink = JsonLineEventSink::new("hillstone", BrokenPipeWriter, detached);
+
+        sink.state(RemoteAccessState::Connected, "still connected")
+            .expect("detached broken pipe should be ignored");
+    }
+
+    #[test]
+    fn attached_provider_event_sink_reports_broken_pipe() {
+        let detached = Arc::new(AtomicBool::new(false));
+        let sink = JsonLineEventSink::new("hillstone", BrokenPipeWriter, detached);
+
+        let error = sink
+            .state(RemoteAccessState::Connected, "still connected")
+            .expect_err("attached broken pipe should fail");
+        assert!(
+            format!("{error:#}").contains("failed to write remote access event"),
+            "{error:#}"
+        );
     }
 
     #[test]

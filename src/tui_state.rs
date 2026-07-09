@@ -39,6 +39,8 @@ pub(crate) struct RemoteAccessProviderRuntimeState {
     pub(crate) tun_helper: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) tls_verify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) background_pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -48,6 +50,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) benchmark_filter: String,
     #[serde(default)]
     pub(crate) auto_pick_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_pick_selector: Option<String>,
     #[serde(default)]
     pub(crate) current_selected_nodes: BTreeMap<String, String>,
     #[serde(default)]

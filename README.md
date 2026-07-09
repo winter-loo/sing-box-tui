@@ -1,6 +1,6 @@
 # sing-box-tui
 
-Terminal UI for managing sing-box selector nodes, benchmarks, subscription
+Terminal UI for managing sing-box selector nodes, latency tests, subscription
 refresh, bypass rules, and OS system proxy settings.
 
 ![Main screen](docs/assets/main-screen.svg)
@@ -269,11 +269,15 @@ Or point it at a different controller:
 cargo run -- run --controller http://127.0.0.1:9992
 ```
 
-Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Prefix a filter term with `!` or `-` to exclude matching nodes, for example `美国,!倍率` keeps US nodes except names containing `倍率`, and `!香港` keeps all nodes except names containing `香港`. Auto-pick benchmarks the filtered nodes every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
+Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group. Prefix a filter term with `!` or `-` to exclude matching nodes, for example `美国,!倍率` keeps US nodes except names containing `倍率`, and `!香港` keeps all nodes except names containing `香港`. Auto-pick always runs in a background worker controlled by the TUI over TCP JSON lines. The worker tests latency every 30 seconds and switches to the best healthy node only when the current node is outside the filter, fails, or is above 600ms. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
 
-TUI benchmark results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and benchmark kind (`group`, `single`, or `auto`).
+TUI latency results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and test kind (`group`, `single`, or `auto`).
 
-TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last benchmark filter, whether auto-pick is enabled, and the current selected node for each selector group. On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
+TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last latency filter, whether auto-pick is enabled, the auto-pick target selector, and the current selected node for each selector group. On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
+
+When auto-pick is enabled, the worker pid, TCP address, and token are recorded so `sing-box-tui background status` can query it and `sing-box-tui background stop` can stop it. Live TUI-to-worker interaction uses TCP while the registry file is only discovery data, not the live communication channel. Pressing `q` stops the worker together with the managed sing-box process; pressing `B` leaves sing-box, the worker, and active Remote Access sessions running with their last applied settings. Starting the TUI again reconnects to the existing TCP-managed worker when auto-pick is enabled. Remote Access sessions left by `B` are shown as `BACKGROUND` while the recorded provider pid is still alive.
+
+The background control listener binds to `127.0.0.1:0` by default. Set `SING_BOX_TUI_BACKGROUND_BIND=HOST:PORT` to choose an address. Non-loopback addresses are rejected unless `SING_BOX_TUI_BACKGROUND_ALLOW_REMOTE=1` is also set, because the registry contains the control token.
 
 TUI bypass entries are stored in that same state file and written to a sing-box source rule-set at `./sing-box-tui-bypass.json` by default. Set `SING_BOX_TUI_BYPASS_RULE_SET=/path/to/sing-box-tui-bypass.json` to use a different file. Generated and merged configs reference this local rule-set near the top of `route.rules`, routing matched domains/IPs/CIDRs to `direct` / `国内直连`. If an older live config does not yet reference the rule-set, regenerate/merge the config and restart or reload sing-box once; after that, the local rule-set file can be edited by the TUI and sing-box will reload it.
 
@@ -416,7 +420,7 @@ sing-box check -c ./config.json
 sudo systemctl restart sing-box
 ```
 
-After the config references the local rule-set, press `B` in the TUI to edit bypass entries. The TUI writes `sing-box-tui-bypass.json`; new or retried connections use the updated direct-bypass rules.
+After the config references the local rule-set, press `b` in the TUI to edit bypass entries. The TUI writes `sing-box-tui-bypass.json`; new or retried connections use the updated direct-bypass rules.
 
 ## Benchmark Nodes
 
@@ -439,7 +443,7 @@ cargo run -- benchmark --match 美国 --switch --verify --verify-url NAME=URL
 cargo run -- run --max-concurrency 8
 ```
 
-If `--match` is omitted, benchmarking runs without a substring filter. `--match` accepts the same comma-separated include/exclude syntax as the TUI filter, such as `美国,!倍率` or `!香港`. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group benchmarks started with `b`.
+If `--match` is omitted, benchmarking runs without a substring filter. `--match` accepts the same comma-separated include/exclude syntax as the TUI filter, such as `美国,!倍率` or `!香港`. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group latency tests started with `T`.
 
 JSON output includes:
 
@@ -453,34 +457,40 @@ JSON output includes:
 
 ## Clash API Inspection
 
-Two read-only controller commands are available in addition to the TUI and benchmarking flow:
+Two read-only controller commands are available in addition to the TUI latency flow:
 
 - `selectors`: returns JSON for all selector groups, or one group with `--selector NAME`
 - `status`: returns controller version, current traffic counters, aggregate connection totals, and active connection metadata
+
+Detached auto-pick worker commands are available separately:
+
+- `background status`: returns JSON for the live detached headless auto-pick worker
+- `background stop`: stops that detached worker and disables saved auto-pick
 
 ## Keys
 
 - `Up` / `Down` or `j` / `k`: move
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
-- `B`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
+- `b`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
+- `B`: exit the TUI while keeping the managed sing-box process, auto-pick background worker, and active Remote Access sessions running
 - `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
 - `Enter`: unused for selection
-- `b`: asynchronously benchmark all nodes in the current selector/group using the current filter
-- `t`: asynchronously benchmark only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
+- `T`: asynchronously test latency for all nodes in the current selector/group using the current filter
+- `t`: asynchronously test latency for only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
 - `s`: toggle node sort order between `SELECTOR ORDER` and `LATENCY ORDER`; latency order hides failed-tested nodes and sorts successful tested nodes by ascending latency
-- `a`: toggle runtime auto-pick using the current filter; it benchmarks every 30 seconds and switches only when current latency is above 600ms, failed, or outside the filter
-- `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed benchmark records are treated as gaps, so no point is drawn and the line breaks there.
+- `a`: toggle auto-pick for the selected selector using the current filter; the background worker tests latency every 30 seconds and switches only when current latency is above 600ms, failed, or outside the filter
+- `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed latency records are treated as gaps, so no point is drawn and the line breaks there.
 - `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
 - `v`: immediately start configured background verification checks
-- `o`: open TUI settings for benchmark, auto-pick, and system proxy values
-- `/`: change the benchmark substring filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
+- `o`: open TUI settings for latency, auto-pick, and system proxy values
+- `/`: change the latency substring filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
 - `r`: refresh groups
 - `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
 - `q`: quit
 
-During async benchmarks, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.
+During async latency tests, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.
 
 ## System Proxy
 
