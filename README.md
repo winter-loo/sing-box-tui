@@ -59,9 +59,9 @@ Tagged releases build these archives automatically:
 - macOS Apple Silicon: `sing-box-tui-<version>-aarch64-apple-darwin.tar.gz`
 - macOS Intel: `sing-box-tui-<version>-x86_64-apple-darwin.tar.gz`
 
-## Provider sync
+## Internet Route Source Sync
 
-`sync` logs into a provider website, downloads the sing-box subscription JSON, and merges provider nodes into your local sing-box config.
+`sync` logs into an Internet Route source website, downloads the sing-box subscription JSON, and merges route nodes into your local sing-box config.
 
 Example:
 
@@ -97,7 +97,7 @@ cargo run -- subscribe \
   --replace-nodes
 ```
 
-`subscribe` fetches the URL with a `sing-box` user agent, extracts real node outbounds from the subscription JSON, filters provider metadata entries, and merges the nodes into the selector/urltest groups from the template config.
+`subscribe` fetches the URL with a `sing-box` user agent, extracts real node outbounds from the subscription JSON, filters source metadata entries, and merges the nodes into the selector/urltest groups from the template config.
 
 Generated default configs omit remote `geoip-cn`, `geosite-*`, and
 `AdGuardSDNSFilter` rule-sets by default so startup does not depend on fetching
@@ -108,9 +108,9 @@ config. Add `--include-tun-mode` if you explicitly want a TUN inbound in a newly
 created default config. Existing configs keep whatever rule-sets and inbounds
 they already contain.
 
-To import one or more provider subscription URLs, copy the sing-box subscription
-URL from the provider website and save it in a local `.suburl` file. Each line
-uses `provider name = subscription url`:
+To import one or more Internet Route source subscription URLs, copy the sing-box subscription
+URL from the source website and save it in a local `.suburl` file. Each line
+uses `source name = subscription url`:
 
 ```text
 baobeiyun = https://example.com/api/subscribe?token=REDACTED
@@ -127,10 +127,10 @@ cargo run -- subscriptions \
   --output ./output/refreshed-config.json
 ```
 
-Keep `.suburl` private because provider subscription URLs usually contain
+Keep `.suburl` private because source subscription URLs usually contain
 account tokens.
 
-Provider helper scripts under `scripts/` can extract subscription URLs from an
+Source helper scripts under `scripts/` can extract subscription URLs from an
 already-authenticated Chrome tab through CDP. When Chrome runs on Windows and
 the script runs inside WSL, start a separate Windows Chrome profile with CDP
 enabled:
@@ -174,7 +174,7 @@ Set `WSL_CDP_LOG=1` to print CDP helper diagnostics such as host resolution,
 URL rewrites, and relay start/stop events.
 
 For scheduled or repeated refreshes, use the same `subscriptions` command. It
-refreshes providers at most once per day by default and updates only server node
+refreshes sources at most once per day by default and updates only server node
 outbounds in an existing config:
 
 ```bash
@@ -185,7 +185,7 @@ cargo run -- subscriptions \
   --output ./output/refreshed-config.json
 ```
 
-Use `--write` instead of `--output` to overwrite `--config` in place, and `--force` to fetch even when the cached subscription payload is still fresh. The command stores downloaded subscription JSON in `.suburl.cache.json` so skipped daily runs can still refresh node outbound definitions from cached provider configs. DNS, inbounds, routes, selectors, experimental settings, and other non-node config sections are preserved.
+Use `--write` instead of `--output` to overwrite `--config` in place, and `--force` to fetch even when the cached subscription payload is still fresh. The command stores downloaded subscription JSON in `.suburl.cache.json` so skipped daily runs can still refresh node outbound definitions from cached source configs. DNS, inbounds, routes, selectors, experimental settings, and other non-node config sections are preserved.
 
 When the TUI is running, it also starts a background subscription refresh worker if `.suburl` exists. The worker runs once on startup, then checks again every day. It refreshes node outbounds in the configured sing-box config path and keeps the TUI responsive while network fetches are running:
 
@@ -215,13 +215,13 @@ your-password
 
 Small terminal UI for switching `sing-box` selector outbounds through the Clash-compatible controller API.
 
-The TUI keeps the original two-column layout when the selected selector has zero or one nested provider selector. When the selected selector contains multiple child selector groups, it switches to a three-column layout:
+The TUI keeps the original two-column layout when the selected selector has zero or one nested Internet Route selector. When the selected selector contains multiple child selector groups, it switches to a three-column layout:
 
 ```text
-Selector Groups | Providers | Nodes
+Selector Groups | Internet Routes | Nodes
 ```
 
-Selecting a node inside a provider group updates that provider selector and then points the parent selector at the provider. This supports configs shaped like `手动选择 -> 宝贝云 -> node`.
+Selecting a node inside an Internet Route group updates that child selector and then points the parent selector at that route group. This supports configs shaped like `手动选择 -> 宝贝云 -> node`.
 
 ## Onboarding
 
@@ -293,7 +293,7 @@ TUI latency results are written to SQLite at `./singbox.sqlite3` by default. Set
 
 TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last latency filter, whether auto-pick is enabled, the auto-pick target selector, and the current selected node for each selector group. On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
 
-When auto-pick is enabled, the worker pid, TCP address, and token are recorded so `sing-box-tui background status` can query it and `sing-box-tui background stop` can stop it. Live TUI-to-worker interaction uses TCP while the registry file is only discovery data, not the live communication channel. Pressing `q` stops the worker together with the managed sing-box process; pressing `B` leaves sing-box, the worker, and active Remote Access sessions running with their last applied settings. Starting the TUI again reconnects to the existing TCP-managed worker when auto-pick is enabled. Remote Access sessions left by `B` are shown as `BACKGROUND` while the recorded provider pid is still alive.
+When auto-pick is enabled, the worker pid, TCP address, and token are recorded so `sing-box-tui background status` can query it and `sing-box-tui background stop` can stop it. Live TUI-to-worker interaction uses TCP while the registry file is only discovery data, not the live communication channel. Pressing `q` stops the worker together with the managed sing-box process; pressing `B` leaves sing-box, the worker, and active Private Access sessions running with their last applied settings. Starting the TUI again reconnects to the existing TCP-managed worker when auto-pick is enabled. Private Access sessions left by `B` are shown as `BACKGROUND` while the recorded profile pid is still alive.
 
 The background control listener binds to `127.0.0.1:0` by default. Set `SING_BOX_TUI_BACKGROUND_BIND=HOST:PORT` to choose an address. Non-loopback addresses are rejected unless `SING_BOX_TUI_BACKGROUND_ALLOW_REMOTE=1` is also set, because the registry contains the control token.
 
@@ -444,11 +444,11 @@ After the config references the local rule-set, press `b` in the TUI to edit byp
 
 The former Python skill script is now built into the Rust app.
 
-For a manual provider-subscription workflow, including fetching a sing-box subscription JSON, converting legacy config syntax for local testing, benchmarking every node through the Clash API, and verifying real traffic, see [docs/subscription-benchmark.md](docs/subscription-benchmark.md).
+For a manual Internet Route source subscription workflow, including fetching a sing-box subscription JSON, converting legacy config syntax for local testing, benchmarking every node through the Clash API, and verifying real traffic, see [docs/subscription-benchmark.md](docs/subscription-benchmark.md).
 
-For enterprise intranet access through an external Remote Access provider process,
-including the Hillstone provider, TUI settings, and troubleshooting, see
-[docs/remote-access-provider.md](docs/remote-access-provider.md).
+For enterprise intranet access through an external Private Access service process,
+including the Hillstone service, TUI settings, and troubleshooting, see
+[docs/private-access-service.md](docs/private-access-service.md).
 
 CLI examples:
 
@@ -491,7 +491,7 @@ Detached auto-pick worker commands are available separately:
 - `Tab`, `h`, `l`, `Left`, `Right`: switch pane
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `b`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
-- `B`: exit the TUI while keeping the managed sing-box process, auto-pick background worker, and active Remote Access sessions running
+- `B`: exit the TUI while keeping the managed sing-box process, auto-pick background worker, and active Private Access sessions running
 - `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
 - `Enter`: unused for selection
 - `T`: asynchronously test latency for all nodes in the current selector/group using the current filter

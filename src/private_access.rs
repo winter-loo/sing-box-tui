@@ -18,7 +18,7 @@ use crate::hillstone::{
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct RemoteAccessProviderManifest {
+pub(crate) struct PrivateAccessServiceManifest {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) kind: String,
@@ -28,13 +28,13 @@ pub(crate) struct RemoteAccessProviderManifest {
     pub(crate) args: Vec<String>,
     pub(crate) version: String,
     #[serde(default)]
-    pub(crate) capabilities: RemoteAccessProviderCapabilities,
+    pub(crate) capabilities: PrivateAccessServiceCapabilities,
     #[serde(default)]
     pub(crate) config_schema: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct RemoteAccessProviderCapabilities {
+pub(crate) struct PrivateAccessServiceCapabilities {
     #[serde(default)]
     pub(crate) pushed_routes: bool,
     #[serde(default)]
@@ -47,31 +47,31 @@ pub(crate) struct RemoteAccessProviderCapabilities {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum RemoteAccessCommand {
+pub(crate) enum PrivateAccessCommand {
     Connect {
         id: String,
-        provider: String,
+        service: String,
         config: Value,
     },
     Disconnect {
         id: String,
-        provider: String,
+        service: String,
         session_id: Option<String>,
     },
     Detach {
         id: String,
-        provider: String,
+        service: String,
         session_id: Option<String>,
     },
     Status {
         id: String,
-        provider: String,
+        service: String,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RemoteAccessState {
+pub(crate) enum PrivateAccessState {
     Disabled,
     Disconnected,
     Connecting,
@@ -80,7 +80,7 @@ pub(crate) enum RemoteAccessState {
     Error,
 }
 
-impl RemoteAccessState {
+impl PrivateAccessState {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -94,52 +94,52 @@ impl RemoteAccessState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct RemoteAccessRoute {
+pub(crate) struct PrivateAccessRoute {
     pub(crate) cidr: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct RemoteAccessBridge {
+pub(crate) struct PrivateAccessBridge {
     pub(crate) kind: String,
     pub(crate) listen: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
-pub(crate) enum RemoteAccessEvent {
+pub(crate) enum PrivateAccessEvent {
     StateChanged {
-        provider: String,
-        state: RemoteAccessState,
+        service: String,
+        state: PrivateAccessState,
         message: String,
     },
     RoutesPushed {
-        provider: String,
+        service: String,
         session_id: Option<String>,
-        routes: Vec<RemoteAccessRoute>,
+        routes: Vec<PrivateAccessRoute>,
         dns: Vec<String>,
-        bridge: Option<RemoteAccessBridge>,
+        bridge: Option<PrivateAccessBridge>,
     },
     Error {
-        provider: String,
+        service: String,
         code: String,
         message: String,
     },
     Log {
-        provider: String,
+        service: String,
         message: String,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct RemoteAccessEventEnvelope {
+pub(crate) struct PrivateAccessEventEnvelope {
     #[serde(rename = "type")]
     pub(crate) message_type: String,
     #[serde(flatten)]
-    pub(crate) event: RemoteAccessEvent,
+    pub(crate) event: PrivateAccessEvent,
 }
 
-impl RemoteAccessEventEnvelope {
-    pub(crate) fn new(event: RemoteAccessEvent) -> Self {
+impl PrivateAccessEventEnvelope {
+    pub(crate) fn new(event: PrivateAccessEvent) -> Self {
         Self {
             message_type: "event".to_string(),
             event,
@@ -147,18 +147,18 @@ impl RemoteAccessEventEnvelope {
     }
 }
 
-pub(crate) struct ExternalRemoteAccessProvider {
-    manifest: RemoteAccessProviderManifest,
+pub(crate) struct ExternalPrivateAccessService {
+    manifest: PrivateAccessServiceManifest,
     child: Child,
     stdin: ChildStdin,
-    event_rx: Receiver<Result<RemoteAccessEventEnvelope, String>>,
+    event_rx: Receiver<Result<PrivateAccessEventEnvelope, String>>,
     stdout_worker: Option<JoinHandle<()>>,
     stderr_worker: Option<JoinHandle<()>>,
 }
 
-impl ExternalRemoteAccessProvider {
-    pub(crate) fn spawn(manifest: RemoteAccessProviderManifest) -> Result<Self> {
-        validate_remote_access_manifest(&manifest)?;
+impl ExternalPrivateAccessService {
+    pub(crate) fn spawn(manifest: PrivateAccessServiceManifest) -> Result<Self> {
+        validate_private_access_manifest(&manifest)?;
         let executable = resolve_manifest_executable(&manifest)?;
         let mut command = Command::new(executable);
         command.args(&manifest.args);
@@ -168,58 +168,58 @@ impl ExternalRemoteAccessProvider {
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
-            .with_context(|| format!("failed to spawn remote access provider {}", manifest.id))?;
-        let stdin = child.stdin.take().context("provider stdin was not piped")?;
+            .with_context(|| format!("failed to spawn private access service {}", manifest.id))?;
+        let stdin = child.stdin.take().context("service stdin was not piped")?;
         let stdout = child
             .stdout
             .take()
-            .context("provider stdout was not piped")?;
+            .context("service stdout was not piped")?;
         let stderr = child
             .stderr
             .take()
-            .context("provider stderr was not piped")?;
+            .context("service stderr was not piped")?;
         let (tx, rx) = mpsc::channel();
-        let provider_id = manifest.id.clone();
+        let service_id = manifest.id.clone();
         let stdout_tx = tx.clone();
         let stdout_worker = thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 match line {
                     Ok(line) if line.trim().is_empty() => {}
                     Ok(line) => {
-                        let event = serde_json::from_str::<RemoteAccessEventEnvelope>(&line)
+                        let event = serde_json::from_str::<PrivateAccessEventEnvelope>(&line)
                             .map_err(|error| {
-                                format!("failed to parse provider event JSON: {error}; line={line}")
+                                format!("failed to parse service event JSON: {error}; line={line}")
                             });
                         let _ = stdout_tx.send(event);
                     }
                     Err(error) => {
                         let _ = stdout_tx.send(Err(format!(
-                            "failed to read provider stdout for {provider_id}: {error}"
+                            "failed to read service stdout for {service_id}: {error}"
                         )));
                         break;
                     }
                 }
             }
         });
-        let stderr_provider_id = manifest.id.clone();
+        let stderr_service_id = manifest.id.clone();
         let stderr_tx = tx.clone();
         let stderr_worker = thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 match line {
                     Ok(line) if line.trim().is_empty() => {}
                     Ok(line) => {
-                        // Provider diagnostics used to be mirrored with eprintln!, which broke
+                        // Service diagnostics used to be mirrored with eprintln!, which broke
                         // the TUI alternate screen when a protocol session became chatty. Keep
-                        // stderr useful by translating it into regular provider log events.
-                        let event = RemoteAccessEventEnvelope::new(RemoteAccessEvent::Log {
-                            provider: stderr_provider_id.clone(),
+                        // stderr useful by translating it into regular service log events.
+                        let event = PrivateAccessEventEnvelope::new(PrivateAccessEvent::Log {
+                            service: stderr_service_id.clone(),
                             message: line,
                         });
                         let _ = stderr_tx.send(Ok(event));
                     }
                     Err(error) => {
                         let _ = stderr_tx.send(Err(format!(
-                            "failed to read provider stderr for {stderr_provider_id}: {error}"
+                            "failed to read service stderr for {stderr_service_id}: {error}"
                         )));
                         break;
                     }
@@ -236,7 +236,7 @@ impl ExternalRemoteAccessProvider {
         })
     }
 
-    pub(crate) fn provider_id(&self) -> &str {
+    pub(crate) fn service_id(&self) -> &str {
         &self.manifest.id
     }
 
@@ -244,31 +244,31 @@ impl ExternalRemoteAccessProvider {
         self.child.id()
     }
 
-    pub(crate) fn send(&mut self, command: &RemoteAccessCommand) -> Result<()> {
+    pub(crate) fn send(&mut self, command: &PrivateAccessCommand) -> Result<()> {
         let line =
-            serde_json::to_string(command).context("failed to encode remote access command")?;
-        writeln!(self.stdin, "{line}").context("failed to write remote access command")?;
+            serde_json::to_string(command).context("failed to encode private access command")?;
+        writeln!(self.stdin, "{line}").context("failed to write private access command")?;
         self.stdin
             .flush()
-            .context("failed to flush remote access command")?;
+            .context("failed to flush private access command")?;
         Ok(())
     }
 
     pub(crate) fn detach(&mut self) -> Result<()> {
-        let provider = self.provider_id().to_string();
-        self.send(&RemoteAccessCommand::Detach {
+        let service = self.service_id().to_string();
+        self.send(&PrivateAccessCommand::Detach {
             id: "tui-background".to_string(),
-            provider,
+            service,
             session_id: None,
         })
     }
 
-    pub(crate) fn try_recv(&self) -> Result<Option<RemoteAccessEventEnvelope>, String> {
+    pub(crate) fn try_recv(&self) -> Result<Option<PrivateAccessEventEnvelope>, String> {
         match self.event_rx.try_recv() {
             Ok(Ok(event)) => Ok(Some(event)),
             Ok(Err(error)) => Err(error),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err("provider event stream closed".to_string()),
+            Err(TryRecvError::Disconnected) => Err("service event stream closed".to_string()),
         }
     }
 
@@ -285,28 +285,28 @@ impl ExternalRemoteAccessProvider {
     }
 }
 
-pub(crate) fn load_remote_access_manifest(path: &Path) -> Result<RemoteAccessProviderManifest> {
+pub(crate) fn load_private_access_manifest(path: &Path) -> Result<PrivateAccessServiceManifest> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read remote access manifest {}", path.display()))?;
+        .with_context(|| format!("failed to read private access manifest {}", path.display()))?;
     serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse remote access manifest {}", path.display()))
+        .with_context(|| format!("failed to parse private access manifest {}", path.display()))
 }
 
-pub(crate) fn default_hillstone_manifest() -> Result<RemoteAccessProviderManifest> {
+pub(crate) fn default_hillstone_manifest() -> Result<PrivateAccessServiceManifest> {
     let exe = std::env::current_exe().context("failed to locate current executable")?;
-    Ok(RemoteAccessProviderManifest {
+    Ok(PrivateAccessServiceManifest {
         id: "hillstone".to_string(),
         name: "Hillstone Secure Connect".to_string(),
-        kind: "remote_access".to_string(),
+        kind: "private_access".to_string(),
         protocol: "hillstone-secure-connect".to_string(),
         executable: exe.to_string_lossy().to_string(),
         args: vec![
-            "remote-access-provider".to_string(),
+            "private-access-service".to_string(),
             "hillstone".to_string(),
             "--stdio".to_string(),
         ],
         version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: RemoteAccessProviderCapabilities {
+        capabilities: PrivateAccessServiceCapabilities {
             pushed_routes: true,
             pushed_dns: true,
             local_http_bridge: true,
@@ -327,9 +327,9 @@ pub(crate) fn default_hillstone_manifest() -> Result<RemoteAccessProviderManifes
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct HillstoneProviderConfig {
-    #[serde(default = "default_hillstone_provider_mode")]
-    mode: HillstoneProviderMode,
+struct HillstoneServiceConfig {
+    #[serde(default = "default_hillstone_service_mode")]
+    mode: HillstoneServiceMode,
     server: String,
     #[serde(default = "default_hillstone_port")]
     port: u16,
@@ -353,13 +353,13 @@ struct HillstoneProviderConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum HillstoneProviderMode {
+enum HillstoneServiceMode {
     Bridge,
     Tun,
 }
 
-fn default_hillstone_provider_mode() -> HillstoneProviderMode {
-    HillstoneProviderMode::Bridge
+fn default_hillstone_service_mode() -> HillstoneServiceMode {
+    HillstoneServiceMode::Bridge
 }
 
 fn default_hillstone_port() -> u16 {
@@ -378,78 +378,78 @@ fn default_hillstone_timeout_secs() -> u64 {
     10
 }
 
-pub(crate) fn run_remote_access_provider_stdio(provider: &str, stdio: bool) -> Result<()> {
+pub(crate) fn run_private_access_service_stdio(service: &str, stdio: bool) -> Result<()> {
     if !stdio {
-        bail!("remote-access-provider currently requires --stdio");
+        bail!("private-access-service currently requires --stdio");
     }
-    match provider {
-        "hillstone" => run_hillstone_remote_access_provider_stdio(),
-        value => bail!("unsupported remote access provider: {value}"),
+    match service {
+        "hillstone" => run_hillstone_private_access_service_stdio(),
+        value => bail!("unsupported private access service: {value}"),
     }
 }
 
-fn run_hillstone_remote_access_provider_stdio() -> Result<()> {
+fn run_hillstone_private_access_service_stdio() -> Result<()> {
     let detached = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(JsonLineEventSink::new(
         "hillstone",
         io::stdout(),
         Arc::clone(&detached),
     ));
-    let mut session: Option<RemoteAccessProviderSession> = None;
+    let mut session: Option<PrivateAccessServiceSession> = None;
     for line in io::stdin().lock().lines() {
-        let line = line.context("failed to read remote access provider command")?;
+        let line = line.context("failed to read private access service command")?;
         if line.trim().is_empty() {
             continue;
         }
-        let command: RemoteAccessCommand =
-            serde_json::from_str(&line).context("failed to parse remote access command JSON")?;
+        let command: PrivateAccessCommand =
+            serde_json::from_str(&line).context("failed to parse private access command JSON")?;
         match command {
-            RemoteAccessCommand::Connect {
-                provider, config, ..
+            PrivateAccessCommand::Connect {
+                service, config, ..
             } => {
-                if provider != "hillstone" {
-                    emit_provider_error(&sink, "invalid_provider", "command provider mismatch")?;
+                if service != "hillstone" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
                     continue;
                 }
                 if session.is_some() {
-                    emit_provider_error(
+                    emit_service_error(
                         &sink,
                         "already_connected",
-                        "provider session already exists",
+                        "service session already exists",
                     )?;
                     continue;
                 }
-                let config: HillstoneProviderConfig = serde_json::from_value(config)
-                    .context("failed to parse Hillstone remote access config")?;
-                session = Some(start_hillstone_provider_session(config, Arc::clone(&sink))?);
+                let config: HillstoneServiceConfig = serde_json::from_value(config)
+                    .context("failed to parse Hillstone private access config")?;
+                session = Some(start_hillstone_service_session(config, Arc::clone(&sink))?);
             }
-            RemoteAccessCommand::Disconnect { .. } => {
+            PrivateAccessCommand::Disconnect { .. } => {
                 if let Some(session) = session.take() {
-                    sink.state(RemoteAccessState::Disconnecting, "disconnect requested")?;
+                    sink.state(PrivateAccessState::Disconnecting, "disconnect requested")?;
                     session.shutdown.store(true, Ordering::SeqCst);
                     let _ = session.worker.join();
                 } else {
-                    sink.state(RemoteAccessState::Disconnected, "no active session")?;
+                    sink.state(PrivateAccessState::Disconnected, "no active session")?;
                 }
             }
-            RemoteAccessCommand::Detach { provider, .. } => {
-                if provider != "hillstone" {
-                    emit_provider_error(&sink, "invalid_provider", "command provider mismatch")?;
+            PrivateAccessCommand::Detach { service, .. } => {
+                if service != "hillstone" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
                     continue;
                 }
                 detached.store(true, Ordering::SeqCst);
                 let state = if session.is_some() {
-                    RemoteAccessState::Connected
+                    PrivateAccessState::Connected
                 } else {
-                    RemoteAccessState::Disconnected
+                    PrivateAccessState::Disconnected
                 };
-                sink.state(state, "provider detached from TUI")?;
+                sink.state(state, "service detached from TUI")?;
             }
-            RemoteAccessCommand::Status { .. } => {
+            PrivateAccessCommand::Status { .. } => {
                 let state = if session.is_some() {
-                    RemoteAccessState::Connected
+                    PrivateAccessState::Connected
                 } else {
-                    RemoteAccessState::Disconnected
+                    PrivateAccessState::Disconnected
                 };
                 sink.state(state, "status requested")?;
             }
@@ -464,25 +464,25 @@ fn run_hillstone_remote_access_provider_stdio() -> Result<()> {
     Ok(())
 }
 
-struct RemoteAccessProviderSession {
+struct PrivateAccessServiceSession {
     shutdown: Arc<AtomicBool>,
     worker: JoinHandle<()>,
 }
 
-fn start_hillstone_provider_session(
-    config: HillstoneProviderConfig,
+fn start_hillstone_service_session(
+    config: HillstoneServiceConfig,
     sink: Arc<JsonLineEventSink<io::Stdout>>,
-) -> Result<RemoteAccessProviderSession> {
+) -> Result<PrivateAccessServiceSession> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_sink = Arc::clone(&sink);
     sink.state(
-        RemoteAccessState::Connecting,
-        "starting Hillstone provider session",
+        PrivateAccessState::Connecting,
+        "starting Hillstone service session",
     )?;
     let worker = thread::spawn(move || {
         let result = match config.mode {
-            HillstoneProviderMode::Bridge => run_hillstone_probe(HillstoneProbeOptions {
+            HillstoneServiceMode::Bridge => run_hillstone_probe(HillstoneProbeOptions {
                 server: config.server,
                 port: config.port,
                 username: config.username,
@@ -503,15 +503,15 @@ fn start_hillstone_provider_session(
                 tun_helper_command: None,
                 route_config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
                 apply_routes: false,
-                // In provider mode the child process only reports pushed routes. The TUI applies
-                // provider-owned sing-box rules so route ownership, errors, and reload prompts stay
+                // In service mode the child process only reports pushed routes. The TUI applies
+                // service-owned sing-box rules so route ownership, errors, and reload prompts stay
                 // in the single user-facing control surface.
                 apply_routes_for_proxy: false,
                 route_proxy: None,
                 event_sink: Some(worker_sink.clone()),
                 shutdown: Some(worker_shutdown),
             }),
-            HillstoneProviderMode::Tun => run_hillstone_probe(HillstoneProbeOptions {
+            HillstoneServiceMode::Tun => run_hillstone_probe(HillstoneProbeOptions {
                 server: config.server,
                 port: config.port,
                 username: config.username,
@@ -540,10 +540,10 @@ fn start_hillstone_provider_session(
         };
         if let Err(error) = result {
             let _ = worker_sink.error("session_failed", &format!("{error:#}"));
-            let _ = worker_sink.state(RemoteAccessState::Error, "provider session failed");
+            let _ = worker_sink.state(PrivateAccessState::Error, "service session failed");
         }
     });
-    Ok(RemoteAccessProviderSession { shutdown, worker })
+    Ok(PrivateAccessServiceSession { shutdown, worker })
 }
 
 fn normalize_tun_helper_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
@@ -561,64 +561,64 @@ fn normalize_tun_helper_command(command: Option<Vec<String>>) -> Option<Vec<Stri
     })
 }
 
-fn emit_provider_error(
+fn emit_service_error(
     sink: &JsonLineEventSink<io::Stdout>,
     code: &str,
     message: &str,
 ) -> Result<()> {
     sink.error(code, message)?;
-    sink.state(RemoteAccessState::Error, message)
+    sink.state(PrivateAccessState::Error, message)
 }
 
 struct JsonLineEventSink<W: Write + Send + 'static> {
-    provider: String,
+    service: String,
     writer: Mutex<W>,
     detached: Arc<AtomicBool>,
 }
 
 impl<W: Write + Send + 'static> JsonLineEventSink<W> {
-    fn new(provider: &str, writer: W, detached: Arc<AtomicBool>) -> Self {
+    fn new(service: &str, writer: W, detached: Arc<AtomicBool>) -> Self {
         Self {
-            provider: provider.to_string(),
+            service: service.to_string(),
             writer: Mutex::new(writer),
             detached,
         }
     }
 
-    fn emit(&self, event: RemoteAccessEvent) -> Result<()> {
-        let envelope = RemoteAccessEventEnvelope::new(event);
+    fn emit(&self, event: PrivateAccessEvent) -> Result<()> {
+        let envelope = PrivateAccessEventEnvelope::new(event);
         let line =
-            serde_json::to_string(&envelope).context("failed to encode remote access event")?;
+            serde_json::to_string(&envelope).context("failed to encode private access event")?;
         let mut writer = self
             .writer
             .lock()
-            .map_err(|_| anyhow::anyhow!("remote access event writer mutex poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("private access event writer mutex poisoned"))?;
         if let Err(error) = writeln!(writer, "{line}") {
             if self.detached.load(Ordering::SeqCst) && error.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
-            return Err(error).context("failed to write remote access event");
+            return Err(error).context("failed to write private access event");
         }
         if let Err(error) = writer.flush() {
             if self.detached.load(Ordering::SeqCst) && error.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
-            return Err(error).context("failed to flush remote access event");
+            return Err(error).context("failed to flush private access event");
         }
         Ok(())
     }
 
-    fn state(&self, state: RemoteAccessState, message: &str) -> Result<()> {
-        self.emit(RemoteAccessEvent::StateChanged {
-            provider: self.provider.clone(),
+    fn state(&self, state: PrivateAccessState, message: &str) -> Result<()> {
+        self.emit(PrivateAccessEvent::StateChanged {
+            service: self.service.clone(),
             state,
             message: message.to_string(),
         })
     }
 
     fn error(&self, code: &str, message: &str) -> Result<()> {
-        self.emit(RemoteAccessEvent::Error {
-            provider: self.provider.clone(),
+        self.emit(PrivateAccessEvent::Error {
+            service: self.service.clone(),
             code: code.to_string(),
             message: message.to_string(),
         })
@@ -628,28 +628,28 @@ impl<W: Write + Send + 'static> JsonLineEventSink<W> {
 impl<W: Write + Send + 'static> HillstoneEventSink for JsonLineEventSink<W> {
     fn state_changed(&self, state: &str, message: &str) -> Result<()> {
         let state = match state {
-            "connecting" => RemoteAccessState::Connecting,
-            "connected" => RemoteAccessState::Connected,
-            "disconnecting" => RemoteAccessState::Disconnecting,
-            "disconnected" => RemoteAccessState::Disconnected,
-            "error" => RemoteAccessState::Error,
-            _ => RemoteAccessState::Error,
+            "connecting" => PrivateAccessState::Connecting,
+            "connected" => PrivateAccessState::Connected,
+            "disconnecting" => PrivateAccessState::Disconnecting,
+            "disconnected" => PrivateAccessState::Disconnected,
+            "error" => PrivateAccessState::Error,
+            _ => PrivateAccessState::Error,
         };
         self.state(state, message)
     }
 
     fn routes_pushed(&self, info: &HillstoneNetworkInfo) -> Result<()> {
-        self.emit(RemoteAccessEvent::RoutesPushed {
-            provider: self.provider.clone(),
+        self.emit(PrivateAccessEvent::RoutesPushed {
+            service: self.service.clone(),
             session_id: None,
             routes: info
                 .route_cidrs
                 .iter()
                 .cloned()
-                .map(|cidr| RemoteAccessRoute { cidr })
+                .map(|cidr| PrivateAccessRoute { cidr })
                 .collect(),
             dns: info.dns_ipv4.iter().map(ToString::to_string).collect(),
-            bridge: info.bridge_listen.map(|listen| RemoteAccessBridge {
+            bridge: info.bridge_listen.map(|listen| PrivateAccessBridge {
                 kind: "http".to_string(),
                 listen: listen.to_string(),
             }),
@@ -657,27 +657,27 @@ impl<W: Write + Send + 'static> HillstoneEventSink for JsonLineEventSink<W> {
     }
 }
 
-fn validate_remote_access_manifest(manifest: &RemoteAccessProviderManifest) -> Result<()> {
+fn validate_private_access_manifest(manifest: &PrivateAccessServiceManifest) -> Result<()> {
     if manifest.id.trim().is_empty() {
-        bail!("remote access provider manifest id cannot be empty");
+        bail!("private access service manifest id cannot be empty");
     }
-    if manifest.kind != "remote_access" {
+    if manifest.kind != "private_access" {
         bail!(
-            "remote access provider {} has unsupported kind {}",
+            "private access service {} has unsupported kind {}",
             manifest.id,
             manifest.kind
         );
     }
     if manifest.executable.trim().is_empty() {
         bail!(
-            "remote access provider {} executable cannot be empty",
+            "private access service {} executable cannot be empty",
             manifest.id
         );
     }
     Ok(())
 }
 
-fn resolve_manifest_executable(manifest: &RemoteAccessProviderManifest) -> Result<PathBuf> {
+fn resolve_manifest_executable(manifest: &PrivateAccessServiceManifest) -> Result<PathBuf> {
     let path = PathBuf::from(&manifest.executable);
     if path.is_absolute() {
         return Ok(path);
@@ -686,7 +686,7 @@ fn resolve_manifest_executable(manifest: &RemoteAccessProviderManifest) -> Resul
     // manifest or a manifest-local relative path. Resolving relative paths up front keeps
     // process spawning deterministic and avoids depending on whatever CWD the TUI has.
     Ok(std::env::current_dir()
-        .context("failed to resolve current directory for provider executable")?
+        .context("failed to resolve current directory for service executable")?
         .join(path))
 }
 
@@ -697,18 +697,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ExternalRemoteAccessProvider, HillstoneProviderConfig, HillstoneProviderMode,
-        JsonLineEventSink, RemoteAccessCommand, RemoteAccessEvent, RemoteAccessEventEnvelope,
-        RemoteAccessProviderCapabilities, RemoteAccessProviderManifest, RemoteAccessRoute,
-        RemoteAccessState, default_hillstone_manifest, normalize_tun_helper_command,
+        ExternalPrivateAccessService, HillstoneServiceConfig, HillstoneServiceMode,
+        JsonLineEventSink, PrivateAccessCommand, PrivateAccessEvent, PrivateAccessEventEnvelope,
+        PrivateAccessRoute, PrivateAccessServiceCapabilities, PrivateAccessServiceManifest,
+        PrivateAccessState, default_hillstone_manifest, normalize_tun_helper_command,
     };
     use serde_json::json;
 
     #[test]
-    fn remote_access_command_serializes_as_json_line_protocol() {
-        let command = RemoteAccessCommand::Connect {
+    fn private_access_command_serializes_as_json_line_protocol() {
+        let command = PrivateAccessCommand::Connect {
             id: "cmd-1".to_string(),
-            provider: "hillstone".to_string(),
+            service: "hillstone".to_string(),
             config: json!({
                 "server": "sslvpn.example.com",
                 "username": "user",
@@ -717,30 +717,30 @@ mod tests {
 
         let value = serde_json::to_value(command).expect("command serializes");
         assert_eq!(value["type"], "connect");
-        assert_eq!(value["provider"], "hillstone");
+        assert_eq!(value["service"], "hillstone");
         assert_eq!(value["config"]["server"], "sslvpn.example.com");
     }
 
     #[test]
-    fn remote_access_detach_command_serializes_as_json_line_protocol() {
-        let command = RemoteAccessCommand::Detach {
+    fn private_access_detach_command_serializes_as_json_line_protocol() {
+        let command = PrivateAccessCommand::Detach {
             id: "cmd-2".to_string(),
-            provider: "hillstone".to_string(),
+            service: "hillstone".to_string(),
             session_id: None,
         };
 
         let value = serde_json::to_value(command).expect("command serializes");
         assert_eq!(value["type"], "detach");
-        assert_eq!(value["provider"], "hillstone");
+        assert_eq!(value["service"], "hillstone");
         assert!(value["session_id"].is_null());
     }
 
     #[test]
-    fn remote_access_event_matches_rfc_envelope_shape() {
-        let event = RemoteAccessEventEnvelope::new(RemoteAccessEvent::RoutesPushed {
-            provider: "hillstone".to_string(),
+    fn private_access_event_matches_rfc_envelope_shape() {
+        let event = PrivateAccessEventEnvelope::new(PrivateAccessEvent::RoutesPushed {
+            service: "hillstone".to_string(),
             session_id: Some("local".to_string()),
-            routes: vec![RemoteAccessRoute {
+            routes: vec![PrivateAccessRoute {
                 cidr: "10.1.0.0/16".to_string(),
             }],
             dns: vec!["10.1.252.10".to_string()],
@@ -754,9 +754,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_state_labels_are_user_facing() {
-        assert_eq!(RemoteAccessState::Connected.label(), "connected");
-        assert_eq!(RemoteAccessState::Disconnected.label(), "disconnected");
+    fn private_access_state_labels_are_user_facing() {
+        assert_eq!(PrivateAccessState::Connected.label(), "connected");
+        assert_eq!(PrivateAccessState::Disconnected.label(), "disconnected");
     }
 
     struct BrokenPipeWriter;
@@ -772,38 +772,38 @@ mod tests {
     }
 
     #[test]
-    fn detached_provider_event_sink_ignores_broken_pipe() {
+    fn detached_service_event_sink_ignores_broken_pipe() {
         let detached = Arc::new(AtomicBool::new(true));
         let sink = JsonLineEventSink::new("hillstone", BrokenPipeWriter, detached);
 
-        sink.state(RemoteAccessState::Connected, "still connected")
+        sink.state(PrivateAccessState::Connected, "still connected")
             .expect("detached broken pipe should be ignored");
     }
 
     #[test]
-    fn attached_provider_event_sink_reports_broken_pipe() {
+    fn attached_service_event_sink_reports_broken_pipe() {
         let detached = Arc::new(AtomicBool::new(false));
         let sink = JsonLineEventSink::new("hillstone", BrokenPipeWriter, detached);
 
         let error = sink
-            .state(RemoteAccessState::Connected, "still connected")
+            .state(PrivateAccessState::Connected, "still connected")
             .expect_err("attached broken pipe should fail");
         assert!(
-            format!("{error:#}").contains("failed to write remote access event"),
+            format!("{error:#}").contains("failed to write private access event"),
             "{error:#}"
         );
     }
 
     #[test]
-    fn built_in_hillstone_manifest_uses_remote_access_provider_subcommand() {
+    fn built_in_hillstone_manifest_uses_private_access_service_subcommand() {
         let manifest = default_hillstone_manifest().expect("manifest builds");
         assert_eq!(manifest.id, "hillstone");
-        assert_eq!(manifest.kind, "remote_access");
+        assert_eq!(manifest.kind, "private_access");
         assert!(
             manifest
                 .args
                 .iter()
-                .any(|arg| arg == "remote-access-provider")
+                .any(|arg| arg == "private-access-service")
         );
         assert_eq!(manifest.config_schema["password"]["sensitive"], true);
         assert_eq!(manifest.config_schema["mode"]["default"], "bridge");
@@ -814,29 +814,29 @@ mod tests {
     }
 
     #[test]
-    fn hillstone_provider_config_accepts_direct_password() {
-        let config: HillstoneProviderConfig = serde_json::from_value(json!({
+    fn hillstone_service_config_accepts_direct_password() {
+        let config: HillstoneServiceConfig = serde_json::from_value(json!({
             "server": "sslvpn.example.com",
             "username": "user",
             "password": "secret"
         }))
         .expect("config parses");
 
-        assert_eq!(config.mode, HillstoneProviderMode::Bridge);
+        assert_eq!(config.mode, HillstoneServiceMode::Bridge);
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.password_env, None);
     }
 
     #[test]
-    fn hillstone_provider_config_accepts_tun_mode() {
-        let config: HillstoneProviderConfig = serde_json::from_value(json!({
+    fn hillstone_service_config_accepts_tun_mode() {
+        let config: HillstoneServiceConfig = serde_json::from_value(json!({
             "mode": "tun",
             "server": "sslvpn.example.com",
             "username": "user"
         }))
         .expect("config parses");
 
-        assert_eq!(config.mode, HillstoneProviderMode::Tun);
+        assert_eq!(config.mode, HillstoneServiceMode::Tun);
     }
 
     #[test]
@@ -855,55 +855,55 @@ mod tests {
             normalize_tun_helper_command(Some(vec![
                 " sudo ".to_string(),
                 " sing-box-tui ".to_string(),
-                " remote-access-tun-helper ".to_string(),
+                " private-access-tun-helper ".to_string(),
                 " --stdio ".to_string()
             ])),
             Some(vec![
                 "sudo".to_string(),
                 "sing-box-tui".to_string(),
-                "remote-access-tun-helper".to_string(),
+                "private-access-tun-helper".to_string(),
                 "--stdio".to_string()
             ])
         );
     }
 
     #[test]
-    fn provider_stderr_is_reported_as_log_event() {
-        let manifest = RemoteAccessProviderManifest {
+    fn service_stderr_is_reported_as_log_event() {
+        let manifest = PrivateAccessServiceManifest {
             id: "fake".to_string(),
-            name: "Fake Provider".to_string(),
-            kind: "remote_access".to_string(),
+            name: "Fake Service".to_string(),
+            kind: "private_access".to_string(),
             protocol: "test".to_string(),
             executable: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "echo provider diagnostic >&2; sleep 0.2".to_string(),
+                "echo service diagnostic >&2; sleep 0.2".to_string(),
             ],
             version: "0.0.0".to_string(),
-            capabilities: RemoteAccessProviderCapabilities::default(),
+            capabilities: PrivateAccessServiceCapabilities::default(),
             config_schema: json!({}),
         };
-        let provider = ExternalRemoteAccessProvider::spawn(manifest).expect("fake provider spawns");
+        let service = ExternalPrivateAccessService::spawn(manifest).expect("fake service spawns");
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_log = false;
 
         while Instant::now() < deadline {
-            match provider.try_recv() {
+            match service.try_recv() {
                 Ok(Some(event)) => {
-                    if let RemoteAccessEvent::Log { provider, message } = event.event {
-                        assert_eq!(provider, "fake");
-                        assert_eq!(message, "provider diagnostic");
+                    if let PrivateAccessEvent::Log { service, message } = event.event {
+                        assert_eq!(service, "fake");
+                        assert_eq!(message, "service diagnostic");
                         saw_log = true;
                         break;
                     }
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(error) if error == "provider event stream closed" => break,
-                Err(error) => panic!("unexpected provider error: {error}"),
+                Err(error) if error == "service event stream closed" => break,
+                Err(error) => panic!("unexpected service error: {error}"),
             }
         }
 
-        provider.stop().expect("fake provider stops");
-        assert!(saw_log, "provider stderr should become a log event");
+        service.stop().expect("fake service stops");
+        assert!(saw_log, "service stderr should become a log event");
     }
 }

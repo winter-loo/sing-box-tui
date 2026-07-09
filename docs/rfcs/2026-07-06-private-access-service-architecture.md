@@ -1,11 +1,11 @@
-# RFC: Network Access Provider Architecture
+# RFC: Private Access Service Architecture
 
 Status: Draft
 Date: 2026-07-06
 
 ## Summary
 
-This RFC defines how `sing-box-tui` should integrate enterprise remote-access
+This RFC defines how `sing-box-tui` should integrate enterprise private-access
 VPN capabilities, starting with the current Hillstone SSL VPN implementation,
 without forcing users to configure a second browser proxy or run a separate
 official client.
@@ -13,11 +13,11 @@ official client.
 The core decision is:
 
 - Keep `sing-box` as the unified traffic entry point.
-- Treat enterprise intranet access as a separate `Remote Access` capability.
-- Run each remote-access implementation as an external provider process.
-- Let providers start a narrow privileged helper only when a packet TUN data
+- Treat enterprise intranet access as a separate `Private Access` capability.
+- Run each private-access implementation as an external service process.
+- Let services start a narrow privileged helper only when a packet TUN data
   plane needs OS network configuration.
-- Let the TUI orchestrate provider lifecycle, route installation, status, and
+- Let the TUI orchestrate service lifecycle, route installation, status, and
   errors.
 - Avoid presenting the Hillstone protocol as a generic SSL VPN standard.
 
@@ -59,32 +59,32 @@ Use these terms:
   selector outbounds, subscription nodes, and system proxy integration.
 - `TUN`: a sing-box traffic capture mode that may feel like a VPN to users, but
   is still a sing-box inbound mode.
-- `Remote Access`: enterprise intranet access that obtains private routes, DNS,
-  and a remote-access tunnel from a gateway.
-- `Remote Access VPN`: user-facing wording for technologies such as Hillstone,
+- `Private Access`: enterprise intranet access that obtains private routes, DNS,
+  and a private-access tunnel from a gateway.
+- `Private Access VPN`: user-facing wording for technologies such as Hillstone,
   AnyConnect, GlobalProtect, FortiGate SSL VPN, OpenVPN, or WireGuard when they
   are used to reach private networks.
 - `Network Access`: the top-level product area that contains proxy, TUN, system
-  proxy, bypass, and remote-access capabilities.
+  proxy, bypass, and private-access capabilities.
 
 Avoid these terms:
 
-- `intranet SVN provider`: incorrect terminology.
-- `GenericSslVpnProvider`: misleading because SSL VPN is not one interoperable
+- `intranet SVN service`: incorrect terminology.
+- `GenericSslVpnService`: misleading because SSL VPN is not one interoperable
   protocol.
-- `VpnProvider` as the top-level abstraction: too broad and confusing because
+- `VpnService` as the top-level abstraction: too broad and confusing because
   sing-box TUN can also be described as VPN-like.
 
 Recommended code naming:
 
-- Module area: `network_access`
-- Remote-access trait: `RemoteAccessProvider`
-- External process adapter: `ExternalRemoteAccessProvider`
+- Module area: `private_access`
+- Private Access trait: `PrivateAccessService`
+- External process adapter: `ExternalPrivateAccessService`
 - Current implementation id: `hillstone`
-- UI label: `Remote Access` / `内网接入`
+- UI label: `Private Access` / `内网接入`
 
-The existing project also uses `provider` for subscription node providers. New
-remote-access code should use the full phrase `remote access provider` in docs
+The existing project also uses `service` for subscription node services. New
+private-access code should use the full phrase `private access service` in docs
 and identifiers where ambiguity matters.
 
 ## Goals
@@ -92,32 +92,32 @@ and identifiers where ambiguity matters.
 - Provide one user-facing entry point in the TUI.
 - Let users keep using the same system proxy or sing-box TUN entry point.
 - Do not require the browser to manually use a second proxy.
-- Support provider-specific remote-access protocols without coupling them to
+- Support service-specific private-access protocols without coupling them to
   the TUI.
-- Allow future providers to be added, upgraded, disabled, or removed without
+- Allow future services to be added, upgraded, disabled, or removed without
   rewriting the TUI.
 - Do not require secrets in config files; if a user explicitly chooses direct
   password config, keep it marked sensitive and out of logs.
-- Keep provider crashes isolated from the TUI process.
+- Keep service crashes isolated from the TUI process.
 - Make route changes explicit, inspectable, and reversible.
 - Keep privileged code narrow: TUN helpers own local interface/route state, not
-  provider authentication or VPN session keys.
+  service authentication or VPN session keys.
 
 ## Non-Goals
 
 - Do not claim Hillstone is a generic SSL VPN protocol.
 - Do not replace sing-box's proxy core.
-- Do not require sing-box to implement every remote-access protocol natively.
+- Do not require sing-box to implement every private-access protocol natively.
 - Do not control or depend on the official Hillstone client.
 - Do not add a second browser proxy setup path.
 - Do not require plaintext passwords in project config.
-- Do not run the whole TUI as root just because one remote-access provider needs
+- Do not run the whole TUI as root just because one private-access service needs
   a TUN interface.
 
 ## Current Hillstone Behavior
 
-The current Hillstone implementation is provider-specific. It should be treated
-as a reverse-engineered client for one remote-access protocol family, not as a
+The current Hillstone implementation is service-specific. It should be treated
+as a reverse-engineered client for one private-access protocol family, not as a
 standard SSL VPN implementation.
 
 Observed phases:
@@ -139,11 +139,11 @@ Observed phases:
 
 Current sing-box integration strategy:
 
-1. Provider receives pushed intranet CIDRs.
+1. Service receives pushed intranet CIDRs.
 2. TUI/config layer writes route rules into `config.json`.
 3. The route rules match destination CIDRs only; they must not restrict ports.
 4. Matched traffic is routed direct with `override_address` and `override_port`
-   pointing to the local remote-access bridge.
+   pointing to the local private-access bridge.
 5. Browser and user applications continue using the normal sing-box entry point.
 
 This avoids asking users to configure a separate proxy such as
@@ -153,16 +153,16 @@ This avoids asking users to configure a separate proxy such as
 
 ### Process Model
 
-Each remote-access implementation runs as a child process:
+Each private-access implementation runs as a child process:
 
 ```text
 sing-box-tui
   ├─ manages TUI, state, config, sing-box route updates, and system proxy
-  ├─ spawns provider process
+  ├─ spawns service process
   ├─ sends JSON commands over stdio
   └─ reads JSON events over stdio
 
-rap-hillstone
+pas-hillstone
   ├─ implements Hillstone protocol
   ├─ authenticates to the gateway
   ├─ receives pushed routes and DNS
@@ -170,17 +170,17 @@ rap-hillstone
   └─ disconnects cleanly when asked
 ```
 
-The provider process owns protocol details. The TUI owns product integration.
+The service process owns protocol details. The TUI owns product integration.
 
-### Provider Discovery
+### Service Discovery
 
-Providers are discovered from a configured directory, for example:
+Internet Routes are discovered from a configured directory, for example:
 
 ```text
-providers/
+services/
   hillstone/
-    provider.json
-    rap-hillstone
+    service.json
+    pas-hillstone
 ```
 
 Manifest example:
@@ -189,9 +189,9 @@ Manifest example:
 {
   "id": "hillstone",
   "name": "Hillstone Secure Connect",
-  "kind": "remote_access",
+  "kind": "private_access",
   "protocol": "hillstone-secure-connect",
-  "executable": "./rap-hillstone",
+  "executable": "./pas-hillstone",
   "version": "0.1.0",
   "capabilities": {
     "pushed_routes": true,
@@ -216,7 +216,7 @@ Runtime profile example:
 
 ```json
 {
-  "remote_access_providers": [
+  "private_access_profiles": [
     {
       "id": "office",
       "manifest_path": null,
@@ -225,18 +225,18 @@ Runtime profile example:
       "port": 4433,
       "username": "user",
       "password": "optional-plaintext-password",
-      "password_env": "SING_BOX_TUI_REMOTE_ACCESS_PASSWORD",
+      "password_env": "SING_BOX_TUI_PRIVATE_ACCESS_PASSWORD",
       "bridge_listen": "127.0.0.1:16780",
       "tls_verify": false
     },
     {
-      "id": "custom-provider",
-      "manifest_path": "./providers/custom-remote-access.json",
+      "id": "custom-service",
+      "manifest_path": "./services/custom-private-access.json",
       "mode": "bridge",
       "server": "vpn.example.com",
       "port": 443,
       "username": "user",
-      "password_env": "CUSTOM_REMOTE_ACCESS_PASSWORD",
+      "password_env": "CUSTOM_PRIVATE_ACCESS_PASSWORD",
       "bridge_listen": "127.0.0.1:18081",
       "tls_verify": true
     }
@@ -245,14 +245,14 @@ Runtime profile example:
 ```
 
 Profile order has no routing meaning. The profile `id` is a user-facing
-connection slot and route ownership key. The manifest `id` is the provider
+connection slot and route ownership key. The manifest `id` is the service
 protocol implementation id used in stdio commands. Multiple profiles can share
 the same manifest.
 
-### Provider Protocol
+### Service Protocol
 
 Use newline-delimited JSON over stdio for the first implementation. It is easy
-to debug, language-neutral, and works for Rust and non-Rust providers.
+to debug, language-neutral, and works for Rust and non-Rust services.
 
 Command envelope:
 
@@ -260,14 +260,14 @@ Command envelope:
 {
   "id": "cmd-1",
   "type": "connect",
-  "provider": "hillstone",
+  "service": "hillstone",
   "config": {
     "server": "sslvpn.example.com",
     "mode": "bridge",
     "port": 4433,
     "username": "user",
     "password": "optional-plaintext-password",
-    "password_env": "SING_BOX_TUI_REMOTE_ACCESS_PASSWORD",
+    "password_env": "SING_BOX_TUI_PRIVATE_ACCESS_PASSWORD",
     "bridge_listen": "127.0.0.1:16780",
     "tls_verify": false
   }
@@ -280,7 +280,7 @@ Event envelope:
 {
   "type": "event",
   "event": "routes_pushed",
-  "provider": "hillstone",
+  "service": "hillstone",
   "session_id": "local-session-id",
   "routes": [
     { "cidr": "10.1.0.0/16" },
@@ -301,7 +301,7 @@ Status event:
 {
   "type": "event",
   "event": "state_changed",
-  "provider": "hillstone",
+  "service": "hillstone",
   "state": "connected",
   "message": "connected, routes pushed"
 }
@@ -313,7 +313,7 @@ Disconnect command:
 {
   "id": "cmd-2",
   "type": "disconnect",
-  "provider": "hillstone",
+  "service": "hillstone",
   "session_id": "local-session-id"
 }
 ```
@@ -324,7 +324,7 @@ Disconnect event:
 {
   "type": "event",
   "event": "state_changed",
-  "provider": "hillstone",
+  "service": "hillstone",
   "state": "disconnected",
   "message": "logout sent"
 }
@@ -336,7 +336,7 @@ Error event:
 {
   "type": "event",
   "event": "error",
-  "provider": "hillstone",
+  "service": "hillstone",
   "code": "auth_failed",
   "message": "authentication failed"
 }
@@ -344,7 +344,7 @@ Error event:
 
 ### State Model
 
-Provider state should be represented independently from protocol details:
+Service state should be represented independently from protocol details:
 
 ```text
 Disabled
@@ -357,7 +357,7 @@ Error
 
 `Connected` should include:
 
-- provider id
+- service id
 - gateway address
 - assigned client address when available
 - pushed routes
@@ -368,20 +368,20 @@ Error
 
 ### Route Ownership
 
-Routes installed by a remote-access provider must be tagged as owned by that
-provider.
+Routes installed by a private-access service must be tagged as owned by that
+service.
 
 Route metadata should include:
 
-- provider id
+- service id
 - session id or generation id
 - route CIDRs
 - local bridge address
 - insertion timestamp
 
-For `config.json`, provider-owned route rules should be inserted before broad
+For `config.json`, profile-owned route rules should be inserted before broad
 private/direct rules and before generic proxy routing. They should not match a
-specific port unless the provider explicitly reports a port-limited service.
+specific port unless the service explicitly reports a port-limited service.
 
 Current Hillstone route shape:
 
@@ -397,9 +397,9 @@ Current Hillstone route shape:
 
 The important behavior is destination-based routing. A request to
 `10.1.126.5:8099` and a request to `10.1.126.5:10011` must both match the same
-provider-pushed `10.1.0.0/16` route.
+service-pushed `10.1.0.0/16` route.
 
-On disconnect, the TUI should stop the provider process and mark the route set
+On disconnect, the TUI should stop the service process and mark the route set
 inactive. Whether it removes the rules from `config.json` immediately or leaves
 them for the next connection should be a product choice:
 
@@ -414,34 +414,34 @@ action.
 
 ### TUI Integration
 
-Add a `Remote Access` area to the existing TUI instead of creating a separate
+Add a `Private Access` area to the existing TUI instead of creating a separate
 client UI.
 
 Recommended status line examples:
 
 ```text
-Proxy: sing-box running  System Proxy: enabled  Remote Access: disconnected
-Proxy: sing-box running  System Proxy: enabled  Remote Access: Hillstone connecting
-Proxy: sing-box running  System Proxy: enabled  Remote Access: Hillstone connected routes=3 bridge=127.0.0.1:16780
-Proxy: sing-box running  System Proxy: enabled  Remote Access: Hillstone error auth_failed
+Proxy: sing-box running  System Proxy: enabled  Private Access: disconnected
+Proxy: sing-box running  System Proxy: enabled  Private Access: Hillstone connecting
+Proxy: sing-box running  System Proxy: enabled  Private Access: Hillstone connected routes=3 bridge=127.0.0.1:16780
+Proxy: sing-box running  System Proxy: enabled  Private Access: Hillstone error auth_failed
 ```
 
 Recommended actions:
 
-- Open Remote Access panel.
-- Select configured remote-access provider.
-- Switch between configured provider profiles.
+- Open Private Access panel.
+- Select configured private-access service.
+- Switch between configured Private Access profiles.
 - Connect.
 - Disconnect.
 - Show pushed routes.
 - Apply routes to config.
-- Clear provider-owned routes.
+- Clear profile-owned routes.
 - Show bridge listen address.
-- Show last provider logs without secrets.
+- Show last service logs without secrets.
 
 Recommended settings:
 
-- provider id
+- service id
 - gateway host and port
 - username
 - password source
@@ -461,10 +461,10 @@ The intended user flow:
 1. User starts `sing-box-tui`.
 2. TUI starts or controls sing-box as it does today.
 3. User enables system proxy or TUN once.
-4. User connects `Remote Access`.
-5. Provider authenticates and starts a local bridge.
-6. Provider sends pushed routes to the TUI.
-7. TUI applies provider-owned route rules to sing-box config.
+4. User connects `Private Access`.
+5. Service authenticates and starts a local bridge.
+6. Service sends pushed routes to the TUI.
+7. TUI applies profile-owned route rules to sing-box config.
 8. User opens intranet sites normally in the browser.
 
 No browser-specific proxy should be required.
@@ -475,9 +475,9 @@ Traffic path for an intranet HTTP request:
 browser
   -> OS system proxy or sing-box TUN
   -> sing-box mixed inbound / route engine
-  -> provider-owned intranet CIDR route
-  -> local remote-access bridge
-  -> provider UDP data channel
+  -> profile-owned intranet CIDR route
+  -> local private-access bridge
+  -> service UDP data channel
   -> enterprise intranet service
 ```
 
@@ -492,12 +492,12 @@ browser
 
 ## Extensibility
 
-The external-process model is intentionally provider-agnostic.
+The external-process model is intentionally service-agnostic.
 
-Future providers can implement the same stdio protocol:
+Future services can implement the same stdio protocol:
 
 - Hillstone Secure Connect
-- Cisco AnyConnect-compatible remote access
+- Cisco AnyConnect-compatible private access
 - Palo Alto GlobalProtect
 - Fortinet SSL VPN
 - OpenVPN
@@ -505,7 +505,7 @@ Future providers can implement the same stdio protocol:
 - SSH-based internal forwarding
 - Custom enterprise gateway protocols
 
-Provider differences are isolated behind capabilities:
+Service differences are isolated behind capabilities:
 
 - pushed routes or static routes
 - pushed DNS or static DNS
@@ -522,62 +522,62 @@ packet details.
 - Direct password config is allowed for local usability, but env/keychain based
   sources should remain available for users who do not want plaintext state.
 - Redact session identifiers unless required for local debugging.
-- Validate provider manifests before spawning executables.
+- Validate service manifests before spawning executables.
 - Prefer absolute executable paths after manifest resolution.
-- Treat provider processes as less trusted than the main TUI.
-- Restrict route application to CIDRs supplied by the provider session that
+- Treat service processes as less trusted than the main TUI.
+- Restrict route application to CIDRs supplied by the service session that
   owns the local bridge for that profile.
 - Show route changes before applying them when possible.
 - Do not silently disable TLS verification; if verification is disabled, surface
   that state in the UI.
-- Do not automatically start remote access on boot until password storage and
+- Do not automatically start private access on boot until password storage and
   stale route cleanup are designed.
 
 ## Implementation Plan
 
 ### Phase 1: Internal Abstractions
 
-- Add a `network_access` module.
-- Define remote-access state, route, DNS, bridge, command, and event types.
+- Add a `private_access` module.
+- Define private-access state, route, DNS, bridge, command, and event types.
 - Add unit tests for JSON serialization and state transitions.
 - Keep the current Hillstone CLI behavior working.
 
-### Phase 2: External Provider Protocol
+### Phase 2: External Service Protocol
 
-- Add provider manifest parsing.
-- Add an external provider process adapter.
+- Add service manifest parsing.
+- Add an external service process adapter.
 - Implement JSON-line command and event transport over stdio.
-- Add tests with a fake provider process.
+- Add tests with a fake service process.
 
-### Phase 3: Hillstone Provider Process
+### Phase 3: Hillstone Service Process
 
 - Move reusable Hillstone code into library modules if needed.
-- Add a `rap-hillstone` binary.
-- Make it speak the remote-access provider protocol.
-- Keep provider-specific protocol comments near the hard-won packet and route
+- Add a `pas-hillstone` binary.
+- Make it speak the private-access service protocol.
+- Keep service-specific protocol comments near the hard-won packet and route
   handling code.
 - Ensure disconnect sends the Hillstone logout and stops the bridge.
 
 ### Phase 4: Route Management
 
-- Convert pushed routes into provider-owned sing-box route rules.
+- Convert pushed routes into profile-owned sing-box route rules.
 - Preserve existing route ordering and direct-bypass behavior.
 - Avoid port restrictions for pushed route CIDRs.
-- Add `Clear routes` support for provider-owned routes.
+- Add `Clear routes` support for profile-owned routes.
 - Validate generated config with `sing-box check` where available.
 
 ### Phase 5: TUI Integration
 
-- Add a Remote Access panel.
+- Add a Private Access panel.
 - Add connect/disconnect actions.
-- Show provider state, pushed routes, bridge address, and last error.
+- Show service state, pushed routes, bridge address, and last error.
 - Keep system proxy and sing-box selector workflows unchanged.
 - Make stale bridge failures visible with actionable status text.
 
 ### Phase 6: Documentation
 
 - Document user-facing terminology.
-- Document provider manifest format.
+- Document service manifest format.
 - Document password handling.
 - Document troubleshooting for:
   - auth failure
@@ -588,28 +588,28 @@ packet details.
 
 ## Open Questions
 
-- Should provider-owned routes be removed from `config.json` on disconnect by
+- Should profile-owned routes be removed from `config.json` on disconnect by
   default, or only marked inactive in TUI state?
 - Should route application require an explicit confirmation the first time a new
   CIDR is pushed?
-- Should provider logs be stored on disk or kept in memory only?
-- Should DNS pushed by remote access be applied to sing-box DNS rules, system
+- Should service logs be stored on disk or kept in memory only?
+- Should DNS pushed by private access be applied to sing-box DNS rules, system
   DNS, or displayed only in the first version?
-- Should the first provider protocol support MFA/browser SSO, or should that be
+- Should the first service protocol support MFA/browser SSO, or should that be
   added after password-based Hillstone is stable?
-- Should a shorter `vpn-provider-hillstone` compatibility alias be provided for
+- Should a shorter `vpn-service-hillstone` compatibility alias be provided for
   users who expect the VPN term?
 
 ## Acceptance Criteria
 
-- A user can connect and disconnect Hillstone remote access from the TUI.
+- A user can connect and disconnect Hillstone private access from the TUI.
 - The TUI does not rely on the official Hillstone client.
 - Browser traffic uses the same sing-box entry point as normal proxy traffic.
 - Pushed intranet route CIDRs are applied without port restrictions.
-- `10.1.126.5:8099`-style intranet targets route through the remote-access
-  bridge when the provider is connected.
-- Disconnect stops the local bridge and sends provider logout when supported.
-- Provider-specific protocol failures do not crash the TUI.
+- `10.1.126.5:8099`-style intranet targets route through the private-access
+  bridge when the service is connected.
+- Disconnect stops the local bridge and sends service logout when supported.
+- Service-specific protocol failures do not crash the TUI.
 - Secrets are redacted from logs and UI output.
-- The architecture can add a second provider by implementing the same manifest
+- The architecture can add a second service by implementing the same manifest
   and JSON-line process protocol.

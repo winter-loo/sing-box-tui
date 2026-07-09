@@ -119,11 +119,11 @@ pub(crate) enum CliCommand {
         target: String,
         proxy: String,
     },
-    RemoteAccessProvider {
-        provider: String,
+    PrivateAccessService {
+        service: String,
         stdio: bool,
     },
-    RemoteAccessTunHelper {
+    PrivateAccessTunHelper {
         stdio: bool,
     },
 }
@@ -169,8 +169,8 @@ impl CliCommand {
             "benchmark" => Self::parse_benchmark(&args[1..]),
             "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
-            "remote-access-provider" => Self::parse_remote_access_provider(&args[1..]),
-            "remote-access-tun-helper" => Self::parse_remote_access_tun_helper(&args[1..]),
+            "private-access-service" => Self::parse_private_access_service(&args[1..]),
+            "private-access-tun-helper" => Self::parse_private_access_tun_helper(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1023,56 +1023,56 @@ impl CliCommand {
         })
     }
 
-    fn parse_remote_access_provider(args: &[String]) -> Result<Self> {
-        let mut provider = None;
+    fn parse_private_access_service(args: &[String]) -> Result<Self> {
+        let mut service = None;
         let mut stdio = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--stdio" => stdio = true,
                 "--help" | "-h" => {
-                    print_remote_access_provider_usage();
+                    print_private_access_service_usage();
                     std::process::exit(0);
                 }
                 value if value.starts_with('-') => {
-                    bail!("unknown flag for remote-access-provider: {value}")
+                    bail!("unknown flag for private-access-service: {value}")
                 }
                 value => {
-                    if provider.is_none() {
-                        provider = Some(value.to_string());
+                    if service.is_none() {
+                        service = Some(value.to_string());
                     } else {
-                        bail!("unexpected positional argument for remote-access-provider: {value}");
+                        bail!("unexpected positional argument for private-access-service: {value}");
                     }
                 }
             }
             i += 1;
         }
-        Ok(Self::RemoteAccessProvider {
-            provider: provider.context("remote-access-provider requires <PROVIDER>")?,
+        Ok(Self::PrivateAccessService {
+            service: service.context("private-access-service requires <SERVICE>")?,
             stdio,
         })
     }
 
-    fn parse_remote_access_tun_helper(args: &[String]) -> Result<Self> {
+    fn parse_private_access_tun_helper(args: &[String]) -> Result<Self> {
         let mut stdio = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--stdio" => stdio = true,
                 "--help" | "-h" => {
-                    print_remote_access_tun_helper_usage();
+                    print_private_access_tun_helper_usage();
                     std::process::exit(0);
                 }
                 value if value.starts_with('-') => {
-                    bail!("unknown flag for remote-access-tun-helper: {value}")
+                    bail!("unknown flag for private-access-tun-helper: {value}")
                 }
                 value => {
-                    bail!("unexpected positional argument for remote-access-tun-helper: {value}")
+                    bail!("unexpected positional argument for private-access-tun-helper: {value}")
                 }
             }
             i += 1;
         }
-        Ok(Self::RemoteAccessTunHelper { stdio })
+        Ok(Self::PrivateAccessTunHelper { stdio })
     }
 }
 
@@ -1374,16 +1374,16 @@ fn print_hillstone_route_usage() {
     println!("only the matched internal service to the local Hillstone bridge.");
 }
 
-fn print_remote_access_provider_usage() {
-    println!("Usage: sing-box-tui remote-access-provider <PROVIDER> --stdio");
+fn print_private_access_service_usage() {
+    println!("Usage: sing-box-tui private-access-service <SERVICE> --stdio");
     println!();
-    println!("Internal command used by the TUI to run a remote-access provider process.");
+    println!("Internal command used by the TUI to run a Private Access service process.");
 }
 
-fn print_remote_access_tun_helper_usage() {
-    println!("Usage: sing-box-tui remote-access-tun-helper --stdio");
+fn print_private_access_tun_helper_usage() {
+    println!("Usage: sing-box-tui private-access-tun-helper --stdio");
     println!();
-    println!("Internal privileged helper used by remote-access providers for TUN interfaces.");
+    println!("Internal privileged helper used by Private Access services for TUN interfaces.");
 }
 
 #[cfg(test)]
@@ -2127,34 +2127,34 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_provider_parses_hidden_stdio_command() {
+    fn private_access_service_parses_hidden_stdio_command() {
         let command = CliCommand::parse([
-            "remote-access-provider".to_string(),
+            "private-access-service".to_string(),
             "hillstone".to_string(),
             "--stdio".to_string(),
         ])
-        .expect("remote access provider command parses");
+        .expect("private access service command parses");
 
         match command {
-            CliCommand::RemoteAccessProvider { provider, stdio } => {
-                assert_eq!(provider, "hillstone");
+            CliCommand::PrivateAccessService { service, stdio } => {
+                assert_eq!(service, "hillstone");
                 assert!(stdio);
             }
-            _ => panic!("expected remote access provider command"),
+            _ => panic!("expected private access service command"),
         }
     }
 
     #[test]
-    fn remote_access_tun_helper_parses_hidden_stdio_command() {
+    fn private_access_tun_helper_parses_hidden_stdio_command() {
         let command = CliCommand::parse([
-            "remote-access-tun-helper".to_string(),
+            "private-access-tun-helper".to_string(),
             "--stdio".to_string(),
         ])
-        .expect("remote access TUN helper command parses");
+        .expect("private access TUN helper command parses");
 
         match command {
-            CliCommand::RemoteAccessTunHelper { stdio } => assert!(stdio),
-            _ => panic!("expected remote access TUN helper command"),
+            CliCommand::PrivateAccessTunHelper { stdio } => assert!(stdio),
+            _ => panic!("expected private access TUN helper command"),
         }
     }
 
