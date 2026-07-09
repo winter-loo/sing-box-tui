@@ -18,7 +18,7 @@ mod tui;
 mod tui_state;
 mod tun;
 
-use cli::CliCommand;
+use cli::{BackgroundAction, CliCommand};
 use config::{HillstoneRouteOptions, run_hillstone_route_config};
 use controller::{
     BenchmarkOptions, SelectorsOptions, StatusOptions, VerificationTarget, run_benchmark,
@@ -30,7 +30,10 @@ use import::{run_import, run_subscribe_import};
 use network_access::run_remote_access_provider_stdio;
 use provider::run_provider_sync;
 use subscriptions::run_subscription_refresh;
-use tui::{TuiSubscriptionRefreshOptions, run_tui};
+use tui::{
+    TuiSubscriptionRefreshOptions, run_background_status, run_background_stop,
+    run_headless_auto_pick, run_tui,
+};
 use tun::run_remote_access_tun_helper_stdio;
 
 fn main() -> Result<()> {
@@ -47,11 +50,9 @@ fn main() -> Result<()> {
             include_tun_mode,
             subscription_interval_days,
             keep_sing_box_running,
-        } => run_tui(
-            controller,
-            max_concurrency,
-            keep_sing_box_running,
-            TuiSubscriptionRefreshOptions {
+            headless_auto_pick,
+        } => {
+            let subscription_options = TuiSubscriptionRefreshOptions {
                 input: subscription_input,
                 cache_path: subscription_cache,
                 config_path: subscription_config_path,
@@ -60,8 +61,18 @@ fn main() -> Result<()> {
                 include_geosite_rules,
                 include_tun_mode,
                 interval_days: subscription_interval_days,
-            },
-        ),
+            };
+            if headless_auto_pick {
+                run_headless_auto_pick(controller, max_concurrency, subscription_options)
+            } else {
+                run_tui(
+                    controller,
+                    max_concurrency,
+                    keep_sing_box_running,
+                    subscription_options,
+                )
+            }
+        }
         CliCommand::Selectors {
             controller,
             selector,
@@ -70,6 +81,10 @@ fn main() -> Result<()> {
             selector,
         }),
         CliCommand::Status { controller } => run_status(StatusOptions { controller }),
+        CliCommand::Background { action } => match action {
+            BackgroundAction::Status => run_background_status(),
+            BackgroundAction::Stop => run_background_stop(),
+        },
         CliCommand::Import {
             input,
             output,

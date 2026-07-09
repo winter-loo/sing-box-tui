@@ -26,6 +26,7 @@ pub(crate) enum CliCommand {
         include_tun_mode: bool,
         subscription_interval_days: u64,
         keep_sing_box_running: bool,
+        headless_auto_pick: bool,
     },
     Selectors {
         controller: Option<String>,
@@ -33,6 +34,9 @@ pub(crate) enum CliCommand {
     },
     Status {
         controller: Option<String>,
+    },
+    Background {
+        action: BackgroundAction,
     },
     Import {
         input: PathBuf,
@@ -124,6 +128,12 @@ pub(crate) enum CliCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackgroundAction {
+    Status,
+    Stop,
+}
+
 impl CliCommand {
     pub(crate) fn parse<I>(args: I) -> Result<Self>
     where
@@ -143,6 +153,7 @@ impl CliCommand {
                 include_tun_mode: false,
                 subscription_interval_days: DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
                 keep_sing_box_running: false,
+                headless_auto_pick: false,
             });
         }
 
@@ -150,6 +161,7 @@ impl CliCommand {
             "run" => Self::parse_run(&args[1..]),
             "selectors" => Self::parse_selectors(&args[1..]),
             "status" => Self::parse_status(&args[1..]),
+            "background" => Self::parse_background(&args[1..]),
             "import" => Self::parse_import(&args[1..]),
             "subscribe" => Self::parse_subscribe(&args[1..]),
             "subscriptions" | "refresh-subscriptions" => Self::parse_subscriptions(&args[1..]),
@@ -180,6 +192,7 @@ impl CliCommand {
         let mut include_tun_mode = false;
         let mut subscription_interval_days = DEFAULT_SUBSCRIPTION_INTERVAL_DAYS;
         let mut keep_sing_box_running = false;
+        let mut headless_auto_pick = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -240,6 +253,11 @@ impl CliCommand {
                 "--background" | "--keep-sing-box-running" => {
                     keep_sing_box_running = true;
                 }
+                "--headless-auto-pick" => {
+                    headless_auto_pick = true;
+                    keep_sing_box_running = true;
+                    subscription_refresh_disabled = true;
+                }
                 "--help" | "-h" => {
                     print_run_usage();
                     std::process::exit(0);
@@ -261,6 +279,7 @@ impl CliCommand {
             include_tun_mode,
             subscription_interval_days,
             keep_sing_box_running,
+            headless_auto_pick,
         })
     }
 
@@ -315,6 +334,31 @@ impl CliCommand {
             i += 1;
         }
         Ok(Self::Status { controller })
+    }
+
+    fn parse_background(args: &[String]) -> Result<Self> {
+        if args.is_empty() {
+            return Ok(Self::Background {
+                action: BackgroundAction::Status,
+            });
+        }
+        if args.len() != 1 {
+            bail!("background accepts exactly one action: status or stop");
+        }
+        match args[0].as_str() {
+            "status" => Ok(Self::Background {
+                action: BackgroundAction::Status,
+            }),
+            "stop" => Ok(Self::Background {
+                action: BackgroundAction::Stop,
+            }),
+            "--help" | "-h" | "help" => {
+                print_background_usage();
+                std::process::exit(0);
+            }
+            value if value.starts_with('-') => bail!("unknown flag for background: {value}"),
+            value => bail!("unknown background action: {value}"),
+        }
     }
 
     fn parse_import(args: &[String]) -> Result<Self> {
@@ -1056,6 +1100,7 @@ fn print_usage() {
     println!("  run             Start the TUI");
     println!("  selectors       Show Clash selector groups");
     println!("  status          Show Clash controller status");
+    println!("  background      Show or stop the detached TUI background worker");
     println!("  import          Import Clash YAML into a full sing-box config");
     println!("  subscribe       Fetch a sing-box subscription URL and merge nodes");
     println!("  subscriptions   Refresh provider subscription URLs once per day");
@@ -1065,6 +1110,14 @@ fn print_usage() {
     println!("  benchmark       Benchmark selector candidates and optionally switch");
     println!("  hillstone-probe Probe Hillstone SSL VPN control-plane compatibility");
     println!("  hillstone-route Add a sing-box route to reach an internal Hillstone HTTP service");
+}
+
+fn print_background_usage() {
+    println!("Usage: sing-box-tui background [status|stop]");
+    println!();
+    println!("Actions:");
+    println!("  status    Show the detached auto-pick worker status (default)");
+    println!("  stop      Stop the detached auto-pick worker");
 }
 
 fn print_run_usage() {
@@ -1335,7 +1388,7 @@ fn print_remote_access_tun_helper_usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::CliCommand;
+    use super::{BackgroundAction, CliCommand};
     use crate::defaults::{
         DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER,
     };
@@ -1457,6 +1510,48 @@ mod tests {
                 ..
             } => assert!(keep_sing_box_running),
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_command_accepts_hidden_headless_auto_pick() {
+        let command = CliCommand::parse(["run".to_string(), "--headless-auto-pick".to_string()])
+            .expect("run command parses");
+
+        match command {
+            CliCommand::Run {
+                headless_auto_pick,
+                keep_sing_box_running,
+                subscription_refresh_disabled,
+                ..
+            } => {
+                assert!(headless_auto_pick);
+                assert!(keep_sing_box_running);
+                assert!(subscription_refresh_disabled);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn background_command_defaults_to_status() {
+        let command =
+            CliCommand::parse(["background".to_string()]).expect("background command parses");
+
+        match command {
+            CliCommand::Background { action } => assert_eq!(action, BackgroundAction::Status),
+            _ => panic!("expected background command"),
+        }
+    }
+
+    #[test]
+    fn background_command_accepts_stop() {
+        let command = CliCommand::parse(["background".to_string(), "stop".to_string()])
+            .expect("background stop parses");
+
+        match command {
+            CliCommand::Background { action } => assert_eq!(action, BackgroundAction::Stop),
+            _ => panic!("expected background command"),
         }
     }
 

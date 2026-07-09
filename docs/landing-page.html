@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="sing-box-tui is a terminal UI for managing sing-box nodes, benchmarks, subscriptions, bypass rules, active connections, and OS system proxy settings.">
+  <meta name="description" content="sing-box-tui is a terminal UI for managing sing-box nodes, latency tests, subscriptions, bypass rules, active connections, and OS system proxy settings.">
   <title>sing-box-tui — Terminal-native sing-box control</title>
   <style>
     :root {
@@ -699,7 +699,7 @@
         <p class="kicker">terminal-native control plane for sing-box</p>
         <h1>Manage <span class="glow">sing-box</span> from the terminal.</h1>
         <p class="lead">
-          A geek-grade terminal UI for sing-box selector nodes, live latency benchmarks,
+          A geek-grade terminal UI for sing-box selector nodes, live latency tests,
           subscription refresh, direct-bypass rules, connection inspection, and one-key
           OS system proxy control.
         </p>
@@ -745,9 +745,10 @@
               <span><span class="tui-key">Tab/h/l</span> switch pane</span>
               <span><span class="tui-key">Space</span> select</span>
               <span><span class="tui-key">m</span> clash mode</span>
-              <span><span class="tui-key">B</span> bypass</span>
+              <span><span class="tui-key">b</span> bypass</span>
+              <span><span class="tui-key">B</span> background</span>
               <span><span class="tui-key">p</span> <span class="tui-on">system proxy</span></span>
-              <span><span class="tui-key">b/t</span> benchmark</span>
+              <span><span class="tui-key">T/t</span> latency</span>
               <span><span class="tui-key">s</span> sort order</span>
             </div>
             <div class="tui-status-line"><span class="tui-muted">Controller:</span> http://127.0.0.1:9992</div>
@@ -760,7 +761,7 @@
 
     <div class="wrap metrics" aria-label="Product highlights">
       <div class="metric"><strong>TUI</strong><span class="metric-label">keyboard-first selector control</span></div>
-      <div class="metric"><strong>30s</strong><span class="metric-label">auto-pick benchmark loop</span></div>
+      <div class="metric"><strong>30s</strong><span class="metric-label">auto-pick latency loop</span></div>
       <div class="metric"><strong>SQLite</strong><span class="metric-label">latency history and charts</span></div>
       <div class="metric"><strong>Win/mac/Linux</strong><span class="metric-label">system proxy toggles</span></div>
     </div>
@@ -786,13 +787,13 @@
           </article>
           <article class="feature-card" data-index="02">
             <span class="icon">ms</span>
-            <h3>Async benchmarking + latency sorting</h3>
-            <p>Benchmark an entire selector or a single highlighted node. Sort healthy results by latency, hide failed probes, and keep the TUI responsive while checks run.</p>
+            <h3>Async latency testing + sorting</h3>
+            <p>Test an entire selector or a single highlighted node. Sort healthy results by latency, hide failed probes, and keep the TUI responsive while checks run.</p>
           </article>
           <article class="feature-card" data-index="03">
             <span class="icon">ap</span>
             <h3>Runtime auto-pick</h3>
-            <p>Apply include/exclude filters like <code>美国,!倍率</code>, then let auto-pick benchmark every 30 seconds and switch only when the current node is slow, failed, or outside policy.</p>
+            <p>Apply include/exclude filters like <code>美国,!倍率</code>, then let auto-pick test latency every 30 seconds and switch only when the current node is slow, failed, or outside policy.</p>
           </article>
           <article class="feature-card" data-index="04">
             <span class="icon">sub</span>
@@ -820,7 +821,7 @@
           <h2>From subscription URL to healthy route in a few keystrokes.</h2>
           <p class="section-copy">
             Install the binary, launch the TUI, paste a sing-box subscription URL on first run,
-            then control nodes, filters, benchmarks, and proxy state from one cockpit.
+            then control nodes, filters, latency tests, and proxy state from one cockpit.
           </p>
         </div>
         <div class="steps">
@@ -834,7 +835,7 @@
           </article>
           <article class="step">
             <span class="step-num">3</span>
-            <div><h3>Benchmark</h3><p>Press <code>b</code> for group probes or <code>t</code> for the highlighted node. Results are stored in SQLite for charts and history.</p></div>
+            <div><h3>Latency</h3><p>Press <code>T</code> for group probes or <code>t</code> for the highlighted node. Results are stored in SQLite for charts and history.</p></div>
           </article>
           <article class="step">
             <span class="step-num">4</span>
