@@ -16,7 +16,7 @@ const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RemoteAccessProviderRuntimeState {
+pub(crate) struct PrivateAccessProfileState {
     #[serde(default)]
     pub(crate) id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,8 +76,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) system_proxy_server: Option<String>,
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
-    #[serde(default)]
-    pub(crate) remote_access_providers: Vec<RemoteAccessProviderRuntimeState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) private_access_profiles: Vec<PrivateAccessProfileState>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,10 +222,10 @@ fn is_ip_entry(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteAccessProviderRuntimeState, TuiRuntimeState};
+    use super::{PrivateAccessProfileState, TuiRuntimeState};
 
     #[test]
-    fn state_without_remote_access_providers_uses_empty_provider_list() {
+    fn state_without_private_access_profiles_uses_empty_profile_list() {
         let state: TuiRuntimeState = serde_json::from_str(
             r#"{
               "benchmark_filter": "",
@@ -243,28 +243,28 @@ mod tests {
         )
         .expect("state parses");
 
-        assert!(state.remote_access_providers.is_empty());
+        assert!(state.private_access_profiles.is_empty());
     }
 
     #[test]
-    fn save_shape_omits_empty_remote_access_provider_options() {
+    fn save_shape_omits_empty_private_access_service_options() {
         let state = TuiRuntimeState {
-            remote_access_providers: vec![RemoteAccessProviderRuntimeState {
+            private_access_profiles: vec![PrivateAccessProfileState {
                 id: "hillstone".to_string(),
                 password_env: Some("HILLSTONE_PASSWORD".to_string()),
-                ..RemoteAccessProviderRuntimeState::default()
+                ..PrivateAccessProfileState::default()
             }],
             ..TuiRuntimeState::default()
         };
 
         let value = serde_json::to_value(&state).expect("serializes");
-        let provider = &value["remote_access_providers"][0];
+        let profile = &value["private_access_profiles"][0];
 
-        assert_eq!(provider["id"], "hillstone");
-        assert_eq!(provider["password_env"], "HILLSTONE_PASSWORD");
-        assert!(provider.get("server").is_none());
-        assert!(provider.get("username").is_none());
-        assert!(provider.get("password").is_none());
+        assert_eq!(profile["id"], "hillstone");
+        assert_eq!(profile["password_env"], "HILLSTONE_PASSWORD");
+        assert!(profile.get("server").is_none());
+        assert!(profile.get("username").is_none());
+        assert!(profile.get("password").is_none());
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
         let error = serde_json::from_str::<TuiRuntimeState>(
             r#"{
               "legacy_global": null,
-              "remote_access_providers": []
+              "private_access_profiles": []
             }"#,
         )
         .expect_err("unknown global TUI state settings must be rejected");
@@ -281,17 +281,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_remote_access_provider_fields_are_rejected() {
+    fn unknown_private_access_service_fields_are_rejected() {
         let error = serde_json::from_str::<TuiRuntimeState>(
             r#"{
-              "remote_access_providers": [{
+              "private_access_profiles": [{
                 "id": "hillstone",
-                "legacy_provider": null
+                "legacy_profile": null
               }]
             }"#,
         )
-        .expect_err("unknown remote access provider settings must be rejected");
+        .expect_err("unknown private access profile settings must be rejected");
 
-        assert!(error.to_string().contains("legacy_provider"));
+        assert!(error.to_string().contains("legacy_profile"));
     }
 }

@@ -295,7 +295,7 @@
       padding: 13px 4px 8px;
     }
 
-    .tui-providers {
+    .tui-internet-routes {
       border-color: #00b800;
     }
 
@@ -311,8 +311,8 @@
       white-space: nowrap;
     }
 
-    .tui-providers .tui-title,
-    .tui-provider-name,
+    .tui-internet-routes .tui-title,
+    .tui-route-name,
     .tui-node-current {
       color: #00c800;
     }
@@ -338,7 +338,7 @@
       padding-left: 1.4em;
     }
 
-    .tui-provider-tag {
+    .tui-route-tag {
       color: #c5a600;
     }
 
@@ -714,13 +714,13 @@
       </div>
 
       <aside class="hero-card" aria-label="Actual sing-box-tui terminal preview">
-        <img class="terminal-shot" src="assets/sing-box-tui-terminal-real.png" alt="sing-box-tui terminal UI showing Providers, Candidates for 宝贝云 in latency order, and Status panels">
+        <img class="terminal-shot" src="assets/sing-box-tui-terminal-real.png" alt="sing-box-tui terminal UI showing Internet Routes, Candidates for 宝贝云 in latency order, and Status panels">
         <div class="mock-tui">
           <div class="tui-main">
-            <div class="tui-pane tui-providers">
-              <div class="tui-title">Providers</div>
+            <div class="tui-pane tui-internet-routes">
+              <div class="tui-title">Internet Routes</div>
               <div class="tui-row selected"><span>&gt;</span><span>宝贝云 [L1|新加坡06|...]</span><span>*</span></div>
-              <div class="tui-row tui-secondary"><span>白嫖机场</span><span class="tui-provider-tag">[马来西亚Troja...]</span></div>
+              <div class="tui-row tui-secondary"><span>白嫖机场</span><span class="tui-route-tag">[马来西亚Troja...]</span></div>
             </div>
             <div class="tui-pane">
               <div class="tui-title">Candidates for 宝贝云 [LATENCY ORDER]</div>
@@ -782,8 +782,8 @@
         <div class="feature-grid">
           <article class="feature-card" data-index="01">
             <span class="icon">↯</span>
-            <h3>Selector switching that understands providers</h3>
-            <p>Navigate selector groups, provider groups, and nodes in two- or three-column layouts. Selecting a node can update the child provider selector and point the parent selector at it.</p>
+            <h3>Selector switching that understands Internet Routes</h3>
+            <p>Navigate selector groups, Internet Route groups, and nodes in two- or three-column layouts. Selecting a node can update the child Internet Route selector and point the parent selector at it.</p>
           </article>
           <article class="feature-card" data-index="02">
             <span class="icon">ms</span>
@@ -798,7 +798,7 @@
           <article class="feature-card" data-index="04">
             <span class="icon">sub</span>
             <h3>Subscription refresh without config drift</h3>
-            <p>Refresh provider subscriptions from <code>.suburl</code>, cache payloads, update only server node outbounds, preserve DNS/routes/inbounds, and keep a fixed backup before writes.</p>
+            <p>Refresh Internet Route source subscriptions from <code>.suburl</code>, cache payloads, update only server node outbounds, preserve DNS/routes/inbounds, and keep a fixed backup before writes.</p>
           </article>
           <article class="feature-card" data-index="05">
             <span class="icon">B</span>
@@ -831,7 +831,7 @@
           </article>
           <article class="step">
             <span class="step-num">2</span>
-            <div><h3>Filter</h3><p>Press <code>/</code> and type include/exclude rules. Use regional, provider, or pricing hints already encoded in node names.</p></div>
+            <div><h3>Filter</h3><p>Press <code>/</code> and type include/exclude rules. Use regional, region, source, or pricing hints already encoded in node names.</p></div>
           </article>
           <article class="step">
             <span class="step-num">3</span>

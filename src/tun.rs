@@ -71,7 +71,7 @@ impl TunHelperClient {
             .stderr(Stdio::piped());
         let mut child = process.spawn().with_context(|| {
             format!(
-                "failed to spawn Remote Access TUN helper command: {}",
+                "failed to spawn Private Access TUN helper command: {}",
                 command.join(" ")
             )
         })?;
@@ -331,7 +331,7 @@ fn default_tun_helper_command() -> Vec<String> {
         .unwrap_or_else(|_| "sing-box-tui".to_string());
     let helper_args = vec![
         exe,
-        "remote-access-tun-helper".to_string(),
+        "private-access-tun-helper".to_string(),
         "--stdio".to_string(),
     ];
     if effective_uid_is_root() {
@@ -353,9 +353,9 @@ fn effective_uid_is_root() -> bool {
     false
 }
 
-pub(crate) fn run_remote_access_tun_helper_stdio(stdio: bool) -> Result<()> {
+pub(crate) fn run_private_access_tun_helper_stdio(stdio: bool) -> Result<()> {
     if !stdio {
-        bail!("remote-access-tun-helper currently requires --stdio");
+        bail!("private-access-tun-helper currently requires --stdio");
     }
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
     let mut context: Option<TunHelperContext> = None;
@@ -484,8 +484,8 @@ impl TunHelperContext {
                 config.prefix_len
             );
         }
-        // The provider process owns Hillstone session keys; the helper owns only the privileged
-        // kernel-facing TUN state. This split was added after direct provider-side TUN setup made
+        // The service process owns Hillstone session keys; the helper owns only the privileged
+        // kernel-facing TUN state. This split was added after direct service-side TUN setup made
         // the normal TUI binary require root privileges.
         let device = tun_rs::DeviceBuilder::new()
             .ipv4(
@@ -596,11 +596,11 @@ struct TunHelperContext;
 )))]
 impl TunHelperContext {
     fn start(_config: TunHelperStartConfig, _stdout: Arc<Mutex<std::io::Stdout>>) -> Result<Self> {
-        bail!("Remote Access TUN helper is not supported on this platform")
+        bail!("Private Access TUN helper is not supported on this platform")
     }
 
     fn write_ipv4(&self, _packet: &[u8]) -> Result<()> {
-        bail!("Remote Access TUN helper is not supported on this platform")
+        bail!("Private Access TUN helper is not supported on this platform")
     }
 
     fn stop(self) {}
@@ -650,7 +650,7 @@ pub(crate) struct TunRouteGuard;
 #[cfg(not(target_os = "macos"))]
 impl TunRouteGuard {
     pub(crate) fn install_routes(_interface: &str, _route_cidrs: &[String]) -> Result<Self> {
-        bail!("Remote Access pushed route installation currently supports macOS only")
+        bail!("Private Access pushed route installation currently supports macOS only")
     }
 }
 
@@ -748,12 +748,12 @@ mod tests {
             "sudo".to_string(),
             "-n".to_string(),
             "/opt/sing-box-tui".to_string(),
-            "remote-access-tun-helper".to_string(),
+            "private-access-tun-helper".to_string(),
             "--stdio".to_string(),
         ]));
         assert!(!is_noninteractive_sudo_command(&[
             "/opt/sing-box-tui".to_string(),
-            "remote-access-tun-helper".to_string(),
+            "private-access-tun-helper".to_string(),
             "--stdio".to_string(),
         ]));
     }
@@ -764,7 +764,7 @@ mod tests {
             "sudo".to_string(),
             "-n".to_string(),
             "/opt/sing-box-tui".to_string(),
-            "remote-access-tun-helper".to_string(),
+            "private-access-tun-helper".to_string(),
             "--stdio".to_string(),
         ];
 

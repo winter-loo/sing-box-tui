@@ -246,7 +246,7 @@ fn emit_hillstone_routes(options: &HillstoneProbeOptions, network: &NetworkSetup
     let bridge_listen = hillstone_route_proxy(options)?;
     // SET_ROUTE is the only authoritative source we currently have for the intranet ranges.
     // Emitting it before local route application lets the TUI own sing-box config changes while
-    // the Hillstone provider process stays focused on protocol/session handling.
+    // the Hillstone service process stays focused on protocol/session handling.
     sink.routes_pushed(&HillstoneNetworkInfo {
         client_ipv4: network.client_private_ipv4,
         prefix_len: network.prefix_len,
@@ -807,7 +807,7 @@ fn run_tun_data_plane(
     let mut esp = EspSession::from_new_key(key_summary)?;
     let route_cidrs = decode_ipv4_route_cidrs(&network.route_ipv4);
     // TUN mode is deliberately entered only after AUTH, SET_ROUTE, and NEW_KEY have succeeded.
-    // The helper split keeps the normal TUI/provider unprivileged while a tiny child owns the
+    // The helper split keeps the normal TUI/service unprivileged while a tiny child owns the
     // kernel-facing TUN interface and pushed OS routes.
     let mut tun = TunHelperClient::spawn(
         options.tun_helper_command.clone(),
@@ -901,7 +901,7 @@ fn run_tun_data_plane(
         "TUN data plane stopped by local shutdown request; packets tun->udp={tun_to_udp_packets} udp->tun={udp_to_tun_packets}"
     );
     tun.stop()
-        .context("failed to stop Remote Access TUN helper")?;
+        .context("failed to stop Private Access TUN helper")?;
     Ok(())
 }
 

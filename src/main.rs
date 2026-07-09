@@ -10,7 +10,7 @@ mod controller;
 mod defaults;
 mod hillstone;
 mod import;
-mod network_access;
+mod private_access;
 mod provider;
 mod storage;
 mod subscriptions;
@@ -27,14 +27,14 @@ use controller::{
 use defaults::DEFAULT_VERIFICATION_TARGETS;
 use hillstone::{HillstoneProbeOptions, run_hillstone_probe};
 use import::{run_import, run_subscribe_import};
-use network_access::run_remote_access_provider_stdio;
+use private_access::run_private_access_service_stdio;
 use provider::run_provider_sync;
 use subscriptions::run_subscription_refresh;
 use tui::{
     TuiSubscriptionRefreshOptions, run_background_status, run_background_stop,
     run_headless_auto_pick, run_tui,
 };
-use tun::run_remote_access_tun_helper_stdio;
+use tun::run_private_access_tun_helper_stdio;
 
 fn main() -> Result<()> {
     match CliCommand::parse(env::args().skip(1))? {
@@ -258,10 +258,10 @@ fn main() -> Result<()> {
                     .with_context(|| format!("invalid --proxy IPv4:PORT: {proxy}"))?,
             },
         ),
-        CliCommand::RemoteAccessProvider { provider, stdio } => {
-            run_remote_access_provider_stdio(&provider, stdio)
+        CliCommand::PrivateAccessService { service, stdio } => {
+            run_private_access_service_stdio(&service, stdio)
         }
-        CliCommand::RemoteAccessTunHelper { stdio } => run_remote_access_tun_helper_stdio(stdio),
+        CliCommand::PrivateAccessTunHelper { stdio } => run_private_access_tun_helper_stdio(stdio),
     }
 }
 

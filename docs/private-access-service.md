@@ -1,9 +1,9 @@
-# Remote Access Providers
+# Private Access Services
 
-`sing-box-tui` can run enterprise remote-access providers as external processes
+`sing-box-tui` can run enterprise private-access services as external processes
 and keep sing-box as the single user-facing traffic entry point.
 
-The first provider is Hillstone Secure Connect. It is provider-specific and
+The first service is Hillstone Secure Connect. It is service-specific and
 should not be treated as a generic SSL VPN implementation.
 
 ## TUI Usage
@@ -16,29 +16,29 @@ sing-box-tui run --config ./config.json
 
 Open settings with `o` and configure:
 
-- `Remote access provider`
-- `Remote access manifest path`
-- `Remote access server`
-- `Remote access port`
-- `Remote access username`
-- `Remote access password`
-- `Remote access password env`
-- `Remote access mode`
-- `Remote access bridge listen`
-- `Remote access TLS verify`
+- `Private Access service`
+- `Private Access manifest path`
+- `Private Access server`
+- `Private Access port`
+- `Private Access username`
+- `Private Access password`
+- `Private Access password env`
+- `Private Access mode`
+- `Private Access bridge listen`
+- `Private Access TLS verify`
 
-Press `V` to connect or disconnect Remote Access.
+Press `V` to connect or disconnect Private Access.
 
-`Remote access provider` is only the focused profile for editing and for the
+`Private Access service` is only the focused profile for editing and for the
 next connect/disconnect action. It is not a routing selector. Multiple profiles
 can be connected at the same time, and sing-box route rules decide which
-provider bridge receives a given intranet destination.
+service bridge receives a given intranet destination.
 
-`Remote access password` can also be stored directly in `sing-box-tui.json` for
+`Private Access password` can also be stored directly in `sing-box-tui.json` for
 a simpler local workflow. The settings list masks the value as `<set>`, but the
 file still contains plaintext, so use this only on a trusted machine.
 
-If `Remote access password` is empty, the provider falls back to the configured
+If `Private Access password` is empty, the service falls back to the configured
 environment variable. For example:
 
 ```bash
@@ -48,59 +48,59 @@ sing-box-tui run --config ./config.json
 
 ## Traffic Flow
 
-Remote Access does not require a second browser proxy. In `bridge` mode, the
+Private Access does not require a second browser proxy. In `bridge` mode, the
 intended path is:
 
 ```text
 browser or app
   -> OS system proxy or sing-box TUN
   -> sing-box route engine
-  -> provider-owned intranet CIDR rule
-  -> local remote-access bridge
-  -> provider tunnel
+  -> profile-owned intranet CIDR rule
+  -> local private-access bridge
+  -> service tunnel
   -> intranet service
 ```
 
-When a provider pushes route CIDRs, the TUI writes provider-owned sing-box route
+When a service pushes route CIDRs, the TUI writes profile-owned sing-box route
 rules without port restrictions. If `office` pushes `10.1.0.0/16` and `lab`
 pushes `10.2.0.0/16`, traffic to `10.1.x.x` goes to the `office` bridge and
 traffic to `10.2.x.x` goes to the `lab` bridge.
 
-In `tun` mode, the provider starts a small privileged helper and exchanges raw
+In `tun` mode, the service starts a small privileged helper and exchanges raw
 IPv4 packets with it:
 
 ```text
 browser, git, curl, ssh, or app
   -> OS pushed route
   -> helper-owned TUN interface
-  -> provider process
-  -> provider tunnel
+  -> service process
+  -> service tunnel
   -> intranet service
 ```
 
 The helper is intentionally generic: it owns TUN creation and OS route cleanup,
-while the provider owns protocol-specific authentication, encryption, and
+while the service owns protocol-specific authentication, encryption, and
 gateway packet transport.
 
-## Provider Process
+## Service Process
 
-The Hillstone provider can be launched directly for protocol smoke tests:
+The Hillstone service can be launched directly for protocol smoke tests:
 
 ```bash
-printf '%s\n' '{"type":"status","id":"smoke","provider":"hillstone"}' \
-  | rap-hillstone
+printf '%s\n' '{"type":"status","id":"smoke","service":"hillstone"}' \
+  | pas-hillstone
 ```
 
-The provider uses newline-delimited JSON over stdio. Human diagnostic logs are
+The service uses newline-delimited JSON over stdio. Human diagnostic logs are
 written to stderr so stdout stays parseable by the TUI.
 
-Each provider profile can point at a provider manifest. If `manifest_path` is
-empty or `null`, the profile uses the built-in Hillstone provider. This allows
+Each Private Access profile can point at a service manifest. If `manifest_path` is
+empty or `null`, the profile uses the built-in Hillstone service. This allows
 multiple Hillstone accounts or gateways without duplicating manifest files.
 
 ```json
 {
-  "remote_access_providers": [
+  "private_access_profiles": [
     {
       "id": "office",
       "manifest_path": null,
@@ -125,19 +125,19 @@ multiple Hillstone accounts or gateways without duplicating manifest files.
         "sudo",
         "-n",
         "/path/to/sing-box-tui",
-        "remote-access-tun-helper",
+        "private-access-tun-helper",
         "--stdio"
       ],
       "tls_verify": false
     },
     {
-      "id": "custom-provider",
-      "manifest_path": "./providers/custom-remote-access.json",
+      "id": "custom-service",
+      "manifest_path": "./services/custom-private-access.json",
       "mode": "bridge",
       "server": "vpn.example.com",
       "port": 443,
       "username": "user",
-      "password_env": "CUSTOM_REMOTE_ACCESS_PASSWORD",
+      "password_env": "CUSTOM_PRIVATE_ACCESS_PASSWORD",
       "bridge_listen": "127.0.0.1:18081",
       "tls_verify": true
     }
@@ -146,27 +146,27 @@ multiple Hillstone accounts or gateways without duplicating manifest files.
 ```
 
 Profile order has no routing meaning. The first item is only the initial TUI
-focus when the app starts. `remote_access_providers` is the only supported
-Remote Access configuration surface.
+focus when the app starts. `private_access_profiles` is the only supported
+Private Access configuration surface.
 
-For temporary testing, the TUI can also load one provider manifest from:
+For temporary testing, the TUI can also load one service manifest from:
 
 ```bash
-export SING_BOX_TUI_REMOTE_ACCESS_MANIFEST=/path/to/provider.json
+export SING_BOX_TUI_PRIVATE_ACCESS_MANIFEST=/path/to/service.json
 ```
 
 If no manifest is configured, the built-in Hillstone manifest starts the current
-`sing-box-tui` executable with the internal `remote-access-provider hillstone
+`sing-box-tui` executable with the internal `private-access-service hillstone
 --stdio` command.
 
-In `mode=tun`, the built-in provider starts the current executable with the
-hidden `remote-access-tun-helper --stdio` command. When the provider is not
+In `mode=tun`, the built-in service starts the current executable with the
+hidden `private-access-tun-helper --stdio` command. When the service is not
 already running as root, the default command is wrapped as `sudo -n ...` so the
 TUI never blocks on a password prompt. A product installer can replace this with
 a LaunchDaemon or other pre-authorized helper by setting `tun_helper`.
 
-Provider profile `id` is the user-facing connection slot and route ownership
-key. The manifest `id` is the protocol implementation id used inside provider
+Private Access profile `id` is the user-facing connection slot and route ownership
+key. The manifest `id` is the protocol implementation id used inside service
 commands. Route rules are owned by the profile id, so two profiles that both use
 Hillstone can keep their route rules separate.
 

@@ -1,20 +1,20 @@
-# RFC: Remote Access TUN Data Plane
+# RFC: Private Access TUN Data Plane
 
 Status: Draft
 Date: 2026-07-06
 
 ## Summary
 
-The current Remote Access implementation uses a local HTTP bridge. It is useful
+The current Private Access implementation uses a local HTTP bridge. It is useful
 for browser traffic that enters sing-box through the normal mixed inbound, but
 it cannot cover arbitrary command-line traffic such as `git pull` against an
 intranet HTTP Git server.
 
-This RFC proposes a provider-owned TUN data plane for Remote Access providers.
-The first target is the existing Hillstone provider. The goal is to make Remote
-Access behave like the official macOS client: the provider receives gateway
+This RFC proposes a profile-owned TUN data plane for Private Access services.
+The first target is the existing Hillstone service. The goal is to make Remote
+Access behave like the official macOS client: the service receives gateway
 pushed routes, creates a local tunnel interface, installs OS routes for those
-CIDRs, and forwards IP packets over the provider protocol.
+CIDRs, and forwards IP packets over the service protocol.
 
 ## Problem
 
@@ -32,40 +32,40 @@ This has important limits:
 - Non-HTTP protocols cannot be represented by the HTTP bridge.
 - Requests with only `Host: 127.0.0.1:16780` do not contain the original
   intranet target, so the bridge cannot infer where to forward them.
-- The Remote Access provider cannot act like a real intranet interface.
+- The Private Access service cannot act like a real intranet interface.
 
 We need a packet data plane:
 
 ```text
-app -> OS route -> utun -> Remote Access provider -> gateway UDP/ESP -> intranet
+app -> OS route -> utun -> Private Access service -> gateway UDP/ESP -> intranet
 ```
 
 ## Goals
 
 - Keep the existing bridge mode working.
-- Add a provider data-plane mode: `bridge` or `tun`.
-- Let each provider profile select its data plane independently.
+- Add a service data-plane mode: `bridge` or `tun`.
+- Let each Private Access profile select its data plane independently.
 - Make the TUI status show which mode is active.
 - Use gateway-pushed CIDRs as the source of truth for intranet routes.
 - Support arbitrary TCP/UDP/ICMP traffic once TUN mode is complete.
 - Disconnect cleanly and remove OS routes/interface state.
-- Keep protocol-specific packet handling inside the provider process.
+- Keep protocol-specific packet handling inside the service process.
 
 ## Non-Goals
 
 - Do not force all users onto TUN immediately.
 - Do not remove the HTTP bridge until TUN is stable.
-- Do not merge provider protocol internals into the TUI.
+- Do not merge service protocol internals into the TUI.
 - Do not claim Hillstone is a generic SSL VPN protocol.
 - Do not make sing-box implement Hillstone ESP directly.
 
 ## Configuration
 
-Each Remote Access profile gains a `mode` field:
+Each Private Access profile gains a `mode` field:
 
 ```json
 {
-  "remote_access_providers": [
+  "private_access_profiles": [
     {
       "id": "office",
       "manifest_path": null,
@@ -85,7 +85,7 @@ Each Remote Access profile gains a `mode` field:
 `bridge` is the default because it is the only fully implemented data plane
 today. `tun` is the target mode for full intranet access.
 
-Provider manifests should advertise the accepted values:
+Service manifests should advertise the accepted values:
 
 ```json
 {
@@ -108,20 +108,20 @@ TUN mode can also accept an optional helper command:
     "sudo",
     "-n",
     "/path/to/sing-box-tui",
-    "remote-access-tun-helper",
+    "private-access-tun-helper",
     "--stdio"
   ]
 }
 ```
 
-If omitted, the built-in provider uses the current executable and wraps it with
-`sudo -n` when the provider process is not already privileged. The nonblocking
+If omitted, the built-in service uses the current executable and wraps it with
+`sudo -n` when the service process is not already privileged. The nonblocking
 sudo mode is intentional: the TUI should report a privilege/setup error instead
 of hanging inside a password prompt.
 
-## Provider Responsibilities
+## Service Responsibilities
 
-In `bridge` mode, the provider:
+In `bridge` mode, the service:
 
 1. Authenticates to the gateway.
 2. Receives routes, DNS, client IP, gateway IP, and session keys.
@@ -129,44 +129,44 @@ In `bridge` mode, the provider:
 4. Emits pushed routes and bridge details to the TUI.
 5. The TUI writes sing-box route override rules to `config.json`.
 
-In `tun` mode, the provider should:
+In `tun` mode, the service should:
 
 1. Authenticate and negotiate the same network setup.
 2. Create a macOS `utun` interface.
 3. Assign the pushed client IPv4 address and netmask.
 4. Install OS routes for the pushed intranet CIDRs through the utun interface.
-5. Forward packets read from utun into the provider data channel.
-6. Write inbound packets from the provider data channel back to utun.
+5. Forward packets read from utun into the service data channel.
+6. Write inbound packets from the service data channel back to utun.
 7. Remove routes and close utun on disconnect.
 
 The TUI should not parse or transform raw packets. It should only orchestrate
-provider lifecycle and display state.
+service lifecycle and display state.
 
 ## macOS TUN Design
 
-The provider starts a privileged TUN helper instead of opening utun directly.
+The service starts a privileged TUN helper instead of opening utun directly.
 The helper uses `tun-rs` to create/configure the interface and exchanges plain
-IPv4 packets with the provider over newline-delimited JSON. Packet payloads are
+IPv4 packets with the service over newline-delimited JSON. Packet payloads are
 base64 encoded so the stdio transport remains line oriented.
 
 The helper is deliberately protocol-neutral:
 
 ```text
-provider -> helper: start(client IP, gateway IP, prefix, pushed routes)
-helper   -> provider: ready(interface)
-helper   -> provider: packet(base64 IPv4)
-provider -> helper: packet(base64 IPv4)
-provider -> helper: stop
+service -> helper: start(client IP, gateway IP, prefix, pushed routes)
+helper   -> service: ready(interface)
+helper   -> service: packet(base64 IPv4)
+service -> helper: packet(base64 IPv4)
+service -> helper: stop
 ```
 
-The provider still owns Hillstone authentication, session keys, ESP
+The service still owns Hillstone authentication, session keys, ESP
 encapsulation, and gateway UDP transport. The helper owns only privileged local
 network state: TUN creation, pushed OS routes, route cleanup, and TUN packet
 read/write.
 
 Privilege model:
 
-- The TUI and provider process can remain unprivileged.
+- The TUI and service process can remain unprivileged.
 - The helper must have permission to create/configure TUN and add routes.
 - The default helper launch uses `sudo -n` when needed, which fails clearly if
   sudo is not already authorized.
@@ -205,28 +205,28 @@ being hardened.
 
 The TUI should expose these settings:
 
-- Remote Access provider profile
-- Remote Access data plane mode: `bridge` or `tun`
+- Private Access service profile
+- Private Access data plane mode: `bridge` or `tun`
 - Server, port, username, password/password env, TLS verification
 - Bridge listen address only matters in `bridge` mode
 
 The summary line should include the active mode:
 
 ```text
-remote access: [>office CONNECTED] mode=bridge routes=3 bridge=127.0.0.1:16780
-remote access: [>office CONNECTED] mode=tun routes=3
+private access: [>office CONNECTED] mode=bridge routes=3 bridge=127.0.0.1:16780
+private access: [>office CONNECTED] mode=tun routes=3
 ```
 
-When `tun` is selected before the implementation is complete, the provider must
+When `tun` is selected before the implementation is complete, the service must
 fail explicitly instead of silently falling back to bridge mode.
 
 ## Implementation Plan
 
-1. Add `mode` to profile state, TUI settings, provider command config, examples,
+1. Add `mode` to profile state, TUI settings, service command config, examples,
    and the built-in Hillstone manifest.
-2. Add a provider-side mode branch. `bridge` keeps the current behavior. `tun`
+2. Add a service-side mode branch. `bridge` keeps the current behavior. `tun`
    initially returns a clear `not_implemented` error.
-3. Introduce a small privileged TUN helper behind a provider-only module.
+3. Introduce a small privileged TUN helper behind a service-only module.
 4. Move Hillstone post-`NEW_KEY` session material into a reusable runtime state
    so both bridge and tun can use it.
 5. Implement outbound utun packet read and UDP/ESP encapsulation.
@@ -243,18 +243,18 @@ landing:
 - `mode=bridge` keeps the existing HTTP bridge path.
 - `mode=tun` runs the normal Hillstone control plane through AUTH, SET_ROUTE,
   KEY_DONE, and NEW_KEY.
-- After NEW_KEY, the provider validates ESP session material and starts the
-  hidden `remote-access-tun-helper --stdio` helper.
+- After NEW_KEY, the service validates ESP session material and starts the
+  hidden `private-access-tun-helper --stdio` helper.
 - The helper uses `tun-rs` to create/configure the TUN interface and install
   gateway-pushed intranet routes with a guard that removes them on exit.
-- The provider and helper exchange plain IPv4 packets over JSON-lines stdio.
-- The provider runs a nonblocking loop that reads helper-emitted IPv4 packets,
+- The service and helper exchange plain IPv4 packets over JSON-lines stdio.
+- The service runs a nonblocking loop that reads helper-emitted IPv4 packets,
   encapsulates them as Hillstone ESP over UDP, receives UDP ESP packets,
   decapsulates them, and sends IPv4 packets back to the helper.
 
 This placement matters: starting the helper before Hillstone authentication
 would test the wrong thing and could create local system state even when the
-remote-access gateway rejects the login. The current boundary proves both sides
+private-access gateway rejects the login. The current boundary proves both sides
 are ready before packet forwarding starts. The route guard also matters because
 any failed TUN experiment should not leave stale OS routes that blackhole
 intranet traffic.
@@ -262,9 +262,9 @@ intranet traffic.
 ## Open Questions
 
 - Whether DNS should be installed at OS scope in TUN mode or remain a displayed
-  provider detail first.
+  service detail first.
 - Whether route installation should move from shelling out to a structured
   route-management crate on macOS.
 - How to coordinate when sing-box itself is already running in TUN mode.
-- Whether multiple simultaneous TUN remote-access profiles should be allowed or
+- Whether multiple simultaneous TUN private-access profiles should be allowed or
   blocked until route conflict handling exists.
