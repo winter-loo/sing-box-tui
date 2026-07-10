@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -298,7 +298,7 @@ pub(crate) fn run_headless_auto_pick(
     app.run_headless_auto_pick_loop()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) fn run_background_status() -> Result<()> {
     let Some(state) = read_background_task_state()? else {
         print_json(serde_json::json!({
@@ -328,12 +328,12 @@ pub(crate) fn run_background_status() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub(crate) fn run_background_status() -> Result<()> {
-    bail!("background process status is only available on macOS and Linux")
+    bail!("background process status is only available on Windows, macOS, and Linux")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) fn run_background_stop() -> Result<()> {
     let Some(pid) = stop_registered_background_auto_pick_task()? else {
         disable_persisted_auto_pick()?;
@@ -350,9 +350,9 @@ pub(crate) fn run_background_stop() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub(crate) fn run_background_stop() -> Result<()> {
-    bail!("background process stop is only available on macOS and Linux")
+    bail!("background process stop is only available on Windows, macOS, and Linux")
 }
 
 fn disable_persisted_auto_pick() -> Result<()> {
@@ -370,6 +370,34 @@ fn background_task_state_path() -> PathBuf {
     env::var("SING_BOX_TUI_BACKGROUND")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(BACKGROUND_TASK_PATH))
+}
+
+fn background_task_log_path() -> PathBuf {
+    background_task_state_path().with_extension("log")
+}
+
+fn read_text_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    if length == 0 {
+        return None;
+    }
+    let read_len = length.min(max_bytes as u64) as usize;
+    file.seek(SeekFrom::Start(length.saturating_sub(read_len as u64)))
+        .ok()?;
+    let mut buffer = vec![0; read_len];
+    file.read_exact(&mut buffer).ok()?;
+    let text = String::from_utf8_lossy(&buffer).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn background_log_tail_context(log_path: &Path) -> String {
+    read_text_tail(log_path, 16 * 1024)
+        .map(|tail| format!("; background worker stderr tail: {tail}"))
+        .unwrap_or_default()
 }
 
 fn read_background_task_state() -> Result<Option<BackgroundTaskState>> {
@@ -650,7 +678,9 @@ fn send_background_control_request_to_state(
     send_background_control_request(&state.bind_addr, &state.token, command)
 }
 
-fn wait_for_background_registry(pid: u32) -> Result<BackgroundTaskState> {
+fn wait_for_background_registry(child: &mut Child, log_path: &Path) -> Result<BackgroundTaskState> {
+    let pid = child.id();
+    let state_path = background_task_state_path();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match read_background_task_state()? {
@@ -661,12 +691,29 @@ fn wait_for_background_registry(pid: u32) -> Result<BackgroundTaskState> {
             }
             Some(_) | None => {}
         }
-        if !process_exists(pid) {
-            bail!("background worker process exited before publishing TCP registry");
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                bail!(
+                    "background worker process {pid} exited with {status} before publishing TCP registry {}{}",
+                    state_path.display(),
+                    background_log_tail_context(log_path)
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to query background worker process {pid} status")
+                });
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    bail!("timed out waiting for background worker TCP registry")
+    let still_running = child.try_wait().ok().flatten().is_none();
+    bail!(
+        "timed out waiting for background worker process {pid} to publish TCP registry {} (still_running={still_running}){}",
+        state_path.display(),
+        background_log_tail_context(log_path)
+    )
 }
 
 fn setup_terminal() -> Result<DefaultTerminal> {
@@ -750,7 +797,7 @@ fn connect_private_access_with_terminal_prompt(
     );
     app.push_private_access_progress(
         PrivateAccessProgressTone::Info,
-        "需要 sudo 密码创建 TUN 接口，正在切换到终端提示...".to_string(),
+        "需要管理员权限创建 TUN 接口，正在切换到终端提示...".to_string(),
     );
     terminal.draw(|frame| draw(frame, app))?;
     suspend_terminal_for_prompt(terminal)?;
@@ -2475,13 +2522,60 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
 }
 
 #[cfg(windows)]
-fn restart_sing_box_for_config(_config_path: &Path) -> Result<SingBoxRestartResult> {
-    bail!("automatic sing-box restart is not implemented on Windows yet")
+fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResult> {
+    let pids = find_sing_box_run_pids_for_config(config_path)?;
+    for pid in &pids {
+        stop_sing_box_pid(*pid)
+            .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
+    }
+
+    let log_path = sing_box_process_log_path(config_path);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open sing-box process log {}", log_path.display()))?;
+    let stderr = log.try_clone().with_context(|| {
+        format!(
+            "failed to clone sing-box process log {}",
+            log_path.display()
+        )
+    })?;
+    let mut child = Command::new("sing-box")
+        .arg("run")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to start sing-box run --config {}",
+                config_path.display()
+            )
+        })?;
+    let started_pid = child.id();
+    std::thread::sleep(Duration::from_millis(500));
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to inspect restarted sing-box process")?
+    {
+        bail!(
+            "sing-box exited immediately with {status}; see {}",
+            log_path.display()
+        );
+    }
+    Ok(SingBoxRestartResult {
+        restarted_pids: pids,
+        started_pid,
+        child,
+    })
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn restart_sing_box_for_config(_config_path: &Path) -> Result<SingBoxRestartResult> {
-    bail!("automatic sing-box restart is only available on macOS and Linux")
+    bail!("automatic sing-box restart is only available on Windows, macOS, and Linux")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2507,6 +2601,28 @@ fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
+#[cfg(windows)]
+fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .output()
+        .context("failed to list sing-box processes with PowerShell")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "PowerShell process query exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    parse_windows_process_json(&String::from_utf8_lossy(&output.stdout), config_path)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_ps_pid_command(line: &str) -> Option<(u32, &str)> {
     let mut parts = line.trim().splitn(2, char::is_whitespace);
@@ -2515,20 +2631,81 @@ fn parse_ps_pid_command(line: &str) -> Option<(u32, &str)> {
     Some((pid, command))
 }
 
+#[cfg(windows)]
+fn parse_windows_process_json(text: &str, config_path: &Path) -> Result<Vec<u32>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value =
+        serde_json::from_str(text).context("failed to parse PowerShell process JSON")?;
+    let processes = match &value {
+        Value::Array(processes) => processes.iter().collect::<Vec<_>>(),
+        Value::Object(_) => vec![&value],
+        _ => bail!("PowerShell process JSON had unexpected shape"),
+    };
+    let mut pids = Vec::new();
+    for process in processes {
+        let command = process
+            .get("CommandLine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if command_matches_sing_box_run_for_config(command, config_path)
+            && let Some(pid) = process.get("ProcessId").and_then(Value::as_u64)
+        {
+            pids.push(pid as u32);
+        }
+    }
+    Ok(pids)
+}
+
+fn command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for character in command.chars() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            value if value.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            value => current.push(value),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn command_program_name_matches(program: &str, expected: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.eq_ignore_ascii_case(expected)
+                || name
+                    .strip_suffix(".exe")
+                    .is_some_and(|base| base.eq_ignore_ascii_case(expected))
+        })
+        .unwrap_or(false)
+}
+
 fn command_matches_sing_box_run_for_config(command: &str, config_path: &Path) -> bool {
-    let args = command.split_whitespace().collect::<Vec<_>>();
+    let args = command_tokens(command);
     if args.len() < 3 {
         return false;
     }
     let program_is_sing_box = args
         .first()
-        .and_then(|program| Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        == Some("sing-box");
-    if !program_is_sing_box || !args.iter().any(|arg| *arg == "run") {
+        .is_some_and(|program| command_program_name_matches(program, "sing-box"));
+    if !program_is_sing_box || !args.iter().any(|arg| arg == "run") {
         return false;
     }
-    let config_values = sing_box_config_args(&args);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let config_values = sing_box_config_args(&arg_refs);
     !config_values.is_empty()
         && config_values
             .iter()
@@ -2573,22 +2750,25 @@ fn config_arg_matches_path(value: &str, config_path: &Path) -> bool {
     config_path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|file_name| value == file_name || value == format!("./{file_name}"))
+        .is_some_and(|file_name| {
+            value == file_name
+                || value == format!("./{file_name}")
+                || value.rsplit(['/', '\\']).next() == Some(file_name)
+        })
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn command_matches_headless_auto_pick(command: &str) -> bool {
-    let args = command.split_whitespace().collect::<Vec<_>>();
+    let args = command_tokens(command);
     if args.len() < 3 {
         return false;
     }
     let program_is_sing_box_tui = args
         .first()
-        .and_then(|program| Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        == Some("sing-box-tui");
+        .is_some_and(|program| command_program_name_matches(program, "sing-box-tui"));
     program_is_sing_box_tui
-        && args.iter().any(|arg| *arg == "run")
-        && args.iter().any(|arg| *arg == "--headless-auto-pick")
+        && args.iter().any(|arg| arg == "run")
+        && args.iter().any(|arg| arg == "--headless-auto-pick")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2615,7 +2795,7 @@ fn ensure_background_pid_matches_worker(pid: u32) -> Result<()> {
     bail!("background pid {pid} is not a sing-box-tui headless auto-pick worker")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -2640,8 +2820,15 @@ fn wait_for_background_process_to_exit(pid: u32, timeout: Duration) -> Result<()
 }
 
 #[cfg(windows)]
-fn wait_for_background_process_to_exit(_pid: u32, _timeout: Duration) -> Result<()> {
-    bail!("background worker shutdown is not implemented on Windows yet")
+fn wait_for_background_process_to_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!("timed out waiting for background process {pid} to exit")
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -2678,8 +2865,18 @@ fn process_is_zombie(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_exists(_pid: u32) -> bool {
-    false
+fn process_exists(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.contains(&format!("\",\"{pid}\",\"")))
+        })
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -2712,8 +2909,17 @@ fn stop_background_pid(pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn stop_background_pid(_pid: u32) -> Result<()> {
-    bail!("background worker shutdown is not implemented on Windows yet")
+fn stop_background_pid(pid: u32) -> Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .with_context(|| format!("failed to force stop background process {pid}"))?;
+    if !status.success() && process_exists(pid) {
+        bail!("failed to force stop background process {pid}: taskkill exited with {status}");
+    }
+    wait_for_background_process_to_exit(pid, Duration::from_secs(3))
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -2745,8 +2951,22 @@ fn stop_sing_box_pid(pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn stop_sing_box_pid(_pid: u32) -> Result<()> {
-    bail!("managed sing-box shutdown is not implemented on Windows yet")
+fn stop_sing_box_pid(pid: u32) -> Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .status()
+        .with_context(|| format!("failed to stop sing-box process {pid}"))?;
+    if status.success() && wait_for_processes_to_exit(&[pid]).is_ok() {
+        return Ok(());
+    }
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .with_context(|| format!("failed to force stop sing-box process {pid}"))?;
+    if !status.success() {
+        bail!("failed to force stop sing-box process {pid}: taskkill exited with {status}");
+    }
+    wait_for_processes_to_exit(&[pid])
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -3107,16 +3327,32 @@ fn helper_command_uses_interactive_sudo(command: &[String]) -> bool {
         && !command.iter().skip(1).any(|arg| arg == "-n")
 }
 
-fn default_interactive_tun_helper_command() -> Vec<String> {
+fn default_tui_tun_helper_command() -> Vec<String> {
     let exe = env::current_exe()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|_| "sing-box-tui".to_string());
-    vec![
-        "sudo".to_string(),
+    let helper_args = vec![
         exe,
         "private-access-tun-helper".to_string(),
         "--stdio".to_string(),
-    ]
+    ];
+    if tun_helper_needs_sudo() {
+        let mut command = vec!["sudo".to_string()];
+        command.extend(helper_args);
+        command
+    } else {
+        helper_args
+    }
+}
+
+#[cfg(unix)]
+fn tun_helper_needs_sudo() -> bool {
+    unsafe { libc::geteuid() != 0 }
+}
+
+#[cfg(not(unix))]
+fn tun_helper_needs_sudo() -> bool {
+    false
 }
 
 struct SettingsEditState {
@@ -5833,10 +6069,10 @@ impl App {
         if !profile.tun_helper.is_empty() {
             return Some(profile.tun_helper.clone());
         }
-        // TUN device setup needs a privileged helper on macOS. The TUI injects an interactive
-        // sudo helper only for the live connect command, so the user gets a clear password prompt
-        // without persisting machine-specific helper paths into sing-box-tui.json.
-        Some(default_interactive_tun_helper_command())
+        // TUN device setup may need a privileged helper. The TUI injects it only for the live
+        // connect command, so the user gets a clear prompt without persisting machine-specific
+        // helper paths into sing-box-tui.json.
+        Some(default_tui_tun_helper_command())
     }
 
     fn start_managed_sing_box(&mut self) -> Result<()> {
@@ -6034,6 +6270,28 @@ impl App {
 
     fn spawn_headless_auto_pick_process(&mut self) -> Result<u32> {
         let exe = env::current_exe().context("failed to locate current executable")?;
+        let log_path = background_task_log_path();
+        if let Some(parent) = log_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create background worker log directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .with_context(|| {
+                format!(
+                    "failed to open background worker log {}",
+                    log_path.display()
+                )
+            })?;
         let mut command = Command::new(exe);
         command
             .arg("run")
@@ -6048,12 +6306,12 @@ impl App {
             .env("SING_BOX_TUI_BACKGROUND_TOKEN", random_background_token())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr));
         let mut child = command
             .spawn()
             .context("failed to spawn headless auto-pick process")?;
         let pid = child.id();
-        let state = match wait_for_background_registry(pid) {
+        let state = match wait_for_background_registry(&mut child, &log_path) {
             Ok(state) => state,
             Err(error) => {
                 let _ = child.kill();
@@ -6068,7 +6326,13 @@ impl App {
             BackgroundWorkerCommand::ApplyConfig {
                 config: self.background_auto_pick_config(),
             },
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "failed to apply initial background auto-pick config{}",
+                background_log_tail_context(&log_path)
+            )
+        })?;
         self.background_worker = Some(BackgroundWorkerRuntime {
             pid,
             bind_addr,
@@ -7324,6 +7588,12 @@ mod tests {
         assert!(command_matches_headless_auto_pick(
             "target/debug/sing-box-tui run --controller http://127.0.0.1:9992 --headless-auto-pick"
         ));
+        assert!(command_matches_headless_auto_pick(
+            r#""C:\Program Files\sing-box-tui\sing-box-tui.exe" run --headless-auto-pick --controller http://127.0.0.1:9992"#
+        ));
+        assert!(command_matches_headless_auto_pick(
+            r#"C:\tools\sing-box-tui.exe run --controller http://127.0.0.1:9992 --headless-auto-pick"#
+        ));
     }
 
     #[test]
@@ -7348,6 +7618,33 @@ mod tests {
             .expect_err("remote bind requires explicit allow");
         assert!(format!("{error:#}").contains("refusing non-loopback"));
         assert!(super::validate_background_bind_addr_with_remote("0.0.0.0:9999", true).is_ok());
+    }
+
+    #[test]
+    fn read_text_tail_handles_missing_empty_small_and_large_files() {
+        let missing = std::env::temp_dir().join(format!(
+            "sing-box-tui-missing-log-{}.log",
+            unique_test_suffix()
+        ));
+        assert_eq!(super::read_text_tail(&missing, 16), None);
+
+        let path = std::env::temp_dir().join(format!(
+            "sing-box-tui-tail-log-{}.log",
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, "").expect("empty log writes");
+        assert_eq!(super::read_text_tail(&path, 16), None);
+
+        std::fs::write(&path, "first\nsecond\n").expect("small log writes");
+        assert_eq!(
+            super::read_text_tail(&path, 1024),
+            Some("first\nsecond".to_string())
+        );
+
+        std::fs::write(&path, "0123456789abcdef").expect("large log writes");
+        assert_eq!(super::read_text_tail(&path, 6), Some("abcdef".to_string()));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]
@@ -8131,12 +8428,20 @@ mod tests {
         app.private_access.focused_mut().mode = PrivateAccessMode::Tun;
         app.private_access.focused_mut().tun_helper.clear();
 
-        assert!(app.private_access_connect_needs_terminal_prompt());
         let command = app
             .private_access_tun_helper_for_connect(app.private_access.focused())
             .expect("tun helper command");
-        assert_eq!(command.first().map(String::as_str), Some("sudo"));
-        assert!(!command.iter().any(|arg| arg == "-n"));
+        #[cfg(unix)]
+        {
+            assert!(app.private_access_connect_needs_terminal_prompt());
+            assert_eq!(command.first().map(String::as_str), Some("sudo"));
+            assert!(!command.iter().any(|arg| arg == "-n"));
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(!app.private_access_connect_needs_terminal_prompt());
+            assert_ne!(command.first().map(String::as_str), Some("sudo"));
+        }
         assert!(command.iter().any(|arg| arg == "private-access-tun-helper"));
         assert!(command.iter().any(|arg| arg == "--stdio"));
         assert!(

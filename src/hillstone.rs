@@ -806,6 +806,18 @@ fn run_tun_data_plane(
     let server_ip = resolve_ipv4(&options.server)?;
     let mut esp = EspSession::from_new_key(key_summary)?;
     let route_cidrs = decode_ipv4_route_cidrs(&network.route_ipv4);
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("failed to bind local UDP socket for Hillstone TUN data plane")?;
+    // Connect the UDP ESP socket before installing pushed TUN routes. Some gateways push broad
+    // routes that cover the gateway public IP; on Windows that can make a later UDP connect select
+    // the just-created TUN route and fail before the data plane has a chance to carry traffic.
+    socket
+        .connect((server_ip, server_udp_port))
+        .context("failed to connect Hillstone UDP ESP socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to set Hillstone UDP ESP socket nonblocking")?;
+
     // TUN mode is deliberately entered only after AUTH, SET_ROUTE, and NEW_KEY have succeeded.
     // The helper split keeps the normal TUI/service unprivileged while a tiny child owns the
     // kernel-facing TUN interface and pushed OS routes.
@@ -835,15 +847,6 @@ fn run_tun_data_plane(
         "connected",
         &format!("TUN data plane running on {}", tun.interface()),
     )?;
-
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .context("failed to bind local UDP socket for Hillstone TUN data plane")?;
-    socket
-        .connect((server_ip, server_udp_port))
-        .context("failed to connect Hillstone UDP ESP socket")?;
-    socket
-        .set_nonblocking(true)
-        .context("failed to set Hillstone UDP ESP socket nonblocking")?;
 
     let mut udp_buffer = vec![0_u8; 65535];
     let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;

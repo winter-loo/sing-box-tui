@@ -2398,6 +2398,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "urlencoding",
+ "windows",
 ]
 
 [[package]]
