@@ -869,16 +869,30 @@ mod tests {
 
     #[test]
     fn service_stderr_is_reported_as_log_event() {
+        #[cfg(windows)]
+        let (executable, args) = (
+            std::env::var("COMSPEC")
+                .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()),
+            vec![
+                "/C".to_string(),
+                "echo service diagnostic>&2& ping -n 2 127.0.0.1 >NUL".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "echo service diagnostic >&2; sleep 0.2".to_string(),
+            ],
+        );
         let manifest = PrivateAccessServiceManifest {
             id: "fake".to_string(),
             name: "Fake Service".to_string(),
             kind: "private_access".to_string(),
             protocol: "test".to_string(),
-            executable: "/bin/sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "echo service diagnostic >&2; sleep 0.2".to_string(),
-            ],
+            executable,
+            args,
             version: "0.0.0".to_string(),
             capabilities: PrivateAccessServiceCapabilities::default(),
             config_schema: json!({}),

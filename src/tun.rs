@@ -334,7 +334,7 @@ fn default_tun_helper_command() -> Vec<String> {
         "private-access-tun-helper".to_string(),
         "--stdio".to_string(),
     ];
-    if effective_uid_is_root() {
+    if tun_helper_can_run_directly() {
         helper_args
     } else {
         let mut command = vec!["sudo".to_string(), "-n".to_string()];
@@ -344,13 +344,13 @@ fn default_tun_helper_command() -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn effective_uid_is_root() -> bool {
+fn tun_helper_can_run_directly() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(not(unix))]
-fn effective_uid_is_root() -> bool {
-    false
+fn tun_helper_can_run_directly() -> bool {
+    true
 }
 
 pub(crate) fn run_private_access_tun_helper_stdio(stdio: bool) -> Result<()> {
@@ -493,10 +493,26 @@ impl TunHelperContext {
                 config.prefix_len as u8,
                 Some(config.gateway_ipv4),
             )
-            .associate_route(false)
-            .packet_information(false)
+            .with(|_builder| {
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd"
+                ))]
+                _builder.associate_route(false);
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd"
+                ))]
+                _builder.packet_information(false);
+            })
             .build_sync()
             .context("failed to create TUN device with tun-rs")?;
+        #[cfg(unix)]
         device
             .set_nonblocking(true)
             .context("failed to set TUN helper device nonblocking")?;
@@ -644,13 +660,182 @@ impl Drop for TunRouteGuard {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) struct TunRouteGuard {
+    interface: String,
+    routes: Vec<WindowsIpv4Route>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct WindowsIpv4Route {
+    destination: Ipv4Addr,
+    prefix_len: u8,
+}
+
+#[cfg(target_os = "windows")]
+impl TunRouteGuard {
+    pub(crate) fn install_routes(interface: &str, route_cidrs: &[String]) -> Result<Self> {
+        let mut guard = Self {
+            interface: interface.to_string(),
+            routes: Vec::new(),
+        };
+        for cidr in route_cidrs {
+            let (destination, prefix_len) = parse_ipv4_cidr(cidr).with_context(|| {
+                format!("invalid TUN route CIDR pushed by Private Access: {cidr}")
+            })?;
+            add_windows_ipv4_route(interface, destination, prefix_len)
+                .with_context(|| format!("failed to add TUN route {cidr} via {interface}"))?;
+            guard.routes.push(WindowsIpv4Route {
+                destination,
+                prefix_len,
+            });
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for TunRouteGuard {
+    fn drop(&mut self) {
+        for route in self.routes.iter().rev() {
+            if let Err(error) =
+                delete_windows_ipv4_route(&self.interface, route.destination, route.prefix_len)
+            {
+                eprintln!(
+                    "warning: failed to remove TUN route {}/{} from {}: {error:#}",
+                    route.destination, route.prefix_len, self.interface
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn add_windows_ipv4_route(interface: &str, destination: Ipv4Addr, prefix_len: u8) -> Result<()> {
+    let row = windows_ipv4_route_row(interface, destination, prefix_len)?;
+    win32_route_result(unsafe {
+        windows::Win32::NetworkManagement::IpHelper::CreateIpForwardEntry2(&row)
+    })
+    .context("CreateIpForwardEntry2 failed")
+}
+
+#[cfg(target_os = "windows")]
+fn delete_windows_ipv4_route(interface: &str, destination: Ipv4Addr, prefix_len: u8) -> Result<()> {
+    let row = windows_ipv4_route_row(interface, destination, prefix_len)?;
+    win32_route_result(unsafe {
+        windows::Win32::NetworkManagement::IpHelper::DeleteIpForwardEntry2(&row)
+    })
+    .context("DeleteIpForwardEntry2 failed")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ipv4_route_row(
+    interface: &str,
+    destination: Ipv4Addr,
+    prefix_len: u8,
+) -> Result<windows::Win32::NetworkManagement::IpHelper::MIB_IPFORWARD_ROW2> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+        MIB_IPFORWARD_ROW2,
+    };
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows::Win32::Networking::WinSock::{MIB_IPPROTO_NETMGMT, NlroManual};
+    use windows::core::PCWSTR;
+
+    let mut luid = NET_LUID_LH::default();
+    let interface_wide: Vec<u16> = interface.encode_utf16().chain(std::iter::once(0)).collect();
+    win32_route_result(unsafe {
+        ConvertInterfaceAliasToLuid(PCWSTR(interface_wide.as_ptr()), &mut luid)
+    })
+    .with_context(|| format!("failed to resolve Windows interface alias {interface}"))?;
+
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+    }
+    row.InterfaceLuid = luid;
+    row.InterfaceIndex = 0;
+    row.DestinationPrefix = IP_ADDRESS_PREFIX {
+        Prefix: windows_sockaddr_inet_v4(destination),
+        PrefixLength: prefix_len,
+    };
+    // 0.0.0.0 creates an on-link route bound directly to the TUN interface.
+    row.NextHop = windows_sockaddr_inet_v4(Ipv4Addr::UNSPECIFIED);
+    row.Metric = 1;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    row.Origin = NlroManual;
+    Ok(row)
+}
+
+#[cfg(target_os = "windows")]
+fn win32_route_result(error: windows::Win32::Foundation::WIN32_ERROR) -> Result<()> {
+    if error.0 == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(error.0 as i32))
+            .context(format!("Windows route API returned error {}", error.0))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sockaddr_inet_v4(addr: Ipv4Addr) -> windows::Win32::Networking::WinSock::SOCKADDR_INET {
+    use windows::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, SOCKADDR_IN, SOCKADDR_INET,
+    };
+
+    let [s_b1, s_b2, s_b3, s_b4] = addr.octets();
+    SOCKADDR_INET {
+        Ipv4: SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: 0,
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_un_b: IN_ADDR_0_0 {
+                        s_b1,
+                        s_b2,
+                        s_b3,
+                        s_b4,
+                    },
+                },
+            },
+            sin_zero: [0; 8],
+        },
+    }
+}
+
+fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
+    let (address, prefix_len) = cidr
+        .split_once('/')
+        .with_context(|| format!("CIDR {cidr} is missing '/'"))?;
+    let address: Ipv4Addr = address
+        .parse()
+        .with_context(|| format!("CIDR {cidr} has invalid IPv4 address"))?;
+    let prefix_len: u8 = prefix_len
+        .parse()
+        .with_context(|| format!("CIDR {cidr} has invalid prefix length"))?;
+    if prefix_len > 32 {
+        bail!("CIDR {cidr} has IPv4 prefix length greater than 32");
+    }
+    Ok((ipv4_network_address(address, prefix_len), prefix_len))
+}
+
+fn ipv4_network_address(address: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    };
+    Ipv4Addr::from(u32::from(address) & mask)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) struct TunRouteGuard;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl TunRouteGuard {
     pub(crate) fn install_routes(_interface: &str, _route_cidrs: &[String]) -> Result<Self> {
-        bail!("Private Access pushed route installation currently supports macOS only")
+        bail!("Private Access pushed route installation currently supports macOS and Windows only")
     }
 }
 
@@ -700,7 +885,8 @@ fn run_command(program: &str, args: &[String]) -> Result<()> {
 mod tests {
     use super::{
         TunHelperCommand, TunHelperEvent, TunHelperStartConfig, helper_log_suffix,
-        is_noninteractive_sudo_command, remember_helper_log, should_preflight_tun_helper_command,
+        is_noninteractive_sudo_command, parse_ipv4_cidr, remember_helper_log,
+        should_preflight_tun_helper_command,
     };
 
     #[cfg(target_os = "macos")]
@@ -783,6 +969,24 @@ mod tests {
         assert_eq!(
             helper_log_suffix(&logs),
             "; helper output: second | third | fourth"
+        );
+    }
+
+    #[test]
+    fn parses_ipv4_cidr_and_normalizes_network_address() {
+        let (address, prefix_len) = parse_ipv4_cidr("10.1.2.3/16").expect("parses CIDR");
+
+        assert_eq!(address, Ipv4Addr::new(10, 1, 0, 0));
+        assert_eq!(prefix_len, 16);
+    }
+
+    #[test]
+    fn rejects_invalid_ipv4_cidr_prefix_len() {
+        let error = parse_ipv4_cidr("10.1.2.3/33").expect_err("prefix should be rejected");
+
+        assert!(
+            format!("{error:#}").contains("prefix length greater than 32"),
+            "unexpected error: {error:#}"
         );
     }
 
