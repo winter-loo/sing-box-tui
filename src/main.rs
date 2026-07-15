@@ -12,6 +12,7 @@ mod hillstone;
 mod import;
 mod private_access;
 mod provider;
+mod sonicwall;
 mod storage;
 mod subscriptions;
 mod tui;

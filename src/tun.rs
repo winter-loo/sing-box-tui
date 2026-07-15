@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
@@ -18,9 +18,14 @@ const TUN_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct TunHelperStartConfig {
     pub(crate) client_ipv4: Ipv4Addr,
-    pub(crate) gateway_ipv4: Ipv4Addr,
+    #[serde(default)]
+    pub(crate) gateway_ipv4: Option<Ipv4Addr>,
     pub(crate) prefix_len: u32,
     pub(crate) route_cidrs: Vec<String>,
+    #[serde(default)]
+    pub(crate) dns_servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub(crate) mtu: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -491,8 +496,13 @@ impl TunHelperContext {
             .ipv4(
                 config.client_ipv4,
                 config.prefix_len as u8,
-                Some(config.gateway_ipv4),
+                config.gateway_ipv4,
             )
+            .with(|builder| {
+                if let Some(mtu) = config.mtu {
+                    builder.mtu_v4(mtu);
+                }
+            })
             .with(|_builder| {
                 #[cfg(any(
                     target_os = "macos",
@@ -512,6 +522,12 @@ impl TunHelperContext {
             })
             .build_sync()
             .context("failed to create TUN device with tun-rs")?;
+        #[cfg(windows)]
+        if !config.dns_servers.is_empty() {
+            device
+                .set_dns_servers(&config.dns_servers)
+                .context("failed to apply pushed DNS servers to TUN interface")?;
+        }
         #[cfg(unix)]
         device
             .set_nonblocking(true)
@@ -526,7 +542,11 @@ impl TunHelperContext {
         let reader = thread::spawn(move || {
             let mut buffer = vec![0_u8; 65535];
             while !reader_shutdown.load(Ordering::SeqCst) {
-                match reader_device.recv(&mut buffer) {
+                #[cfg(windows)]
+                let receive = reader_device.try_recv(&mut buffer);
+                #[cfg(not(windows))]
+                let receive = reader_device.recv(&mut buffer);
+                match receive {
                     Ok(size) => {
                         let packet = &buffer[..size];
                         if packet.first().map(|byte| byte >> 4) != Some(4) {
@@ -586,6 +606,8 @@ impl TunHelperContext {
 
     fn stop(mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        let _ = self.device.shutdown();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -891,16 +913,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::route_add_args;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn tun_helper_start_command_serializes_as_json_line_protocol() {
         let command = TunHelperCommand::Start {
             config: TunHelperStartConfig {
                 client_ipv4: Ipv4Addr::new(10, 250, 252, 93),
-                gateway_ipv4: Ipv4Addr::new(10, 250, 252, 1),
+                gateway_ipv4: Some(Ipv4Addr::new(10, 250, 252, 1)),
                 prefix_len: 22,
                 route_cidrs: vec!["10.1.0.0/16".to_string()],
+                dns_servers: vec![IpAddr::V4(Ipv4Addr::new(10, 1, 0, 53))],
+                mtu: Some(1428),
             },
         };
 
@@ -912,6 +936,8 @@ mod tests {
         assert_eq!(value["config"]["client_ipv4"], "10.250.252.93");
         assert_eq!(value["config"]["gateway_ipv4"], "10.250.252.1");
         assert_eq!(value["config"]["route_cidrs"][0], "10.1.0.0/16");
+        assert_eq!(value["config"]["dns_servers"][0], "10.1.0.53");
+        assert_eq!(value["config"]["mtu"], 1428);
     }
 
     #[test]

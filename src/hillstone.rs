@@ -4,7 +4,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 use std::net::{
-    Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+    IpAddr, Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
 use std::path::PathBuf;
 use std::sync::{
@@ -825,9 +825,11 @@ fn run_tun_data_plane(
         options.tun_helper_command.clone(),
         TunHelperStartConfig {
             client_ipv4: client_ip,
-            gateway_ipv4: gateway_ip,
+            gateway_ipv4: Some(gateway_ip),
             prefix_len,
             route_cidrs: route_cidrs.clone(),
+            dns_servers: network.dns_ipv4.iter().copied().map(IpAddr::V4).collect(),
+            mtu: None,
         },
     )?;
     eprintln!("TUN data plane:");
