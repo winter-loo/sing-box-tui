@@ -7,9 +7,9 @@ edition = "2024"
 anyhow = "1.0.102"
 crossterm = "0.29.0"
 ratatui = "0.30.0"
-reqwest = { version = "0.13.2", features = ["json", "rustls"] }
+reqwest = { version = "0.13.2", features = ["cookies", "json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.48.0", features = ["process", "rt-multi-thread", "time"] }
+tokio = { version = "1.48.0", features = ["macros", "process", "rt-multi-thread", "time"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
 unicode-segmentation = "1.12.0"
@@ -25,6 +25,8 @@ md-5 = "0.10.6"
 sha1 = "0.10.6"
 ctrlc = "3.5.1"
 libc = "0.2.186"
+lz4_flex = "0.11.5"
 tun-rs = "2.8.6"
 base64 = "0.22.1"
+zeroize = { version = "1.8.2", features = ["derive"] }
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

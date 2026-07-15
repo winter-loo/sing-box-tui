@@ -1,21 +1,247 @@
-use std::io::{self, BufRead, BufReader, Write};
+use std::collections::HashMap;
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, TryRecvError},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::defaults::DEFAULT_CONFIG_PATH;
 use crate::hillstone::{
     HillstoneEventSink, HillstoneNetworkInfo, HillstoneProbeOptions, run_hillstone_probe,
 };
+use crate::sonicwall::evpn::{
+    EstablishedEvpn, EvpnBootstrapOptions, MessageType, NetworkConfig as SonicwallNetworkConfig,
+    connect_and_bootstrap as connect_sonicwall_evpn, decode_data_packet as decode_sonicwall_packet,
+    encode_data_packet as encode_sonicwall_packet, encode_frame as encode_sonicwall_frame,
+};
+use crate::sonicwall::{
+    SonicwallAuthClient, SonicwallAuthStep, SonicwallLogonCapability,
+    default_agent_info as sonicwall_default_agent_info,
+};
+use crate::tun::{TunHelperClient, TunHelperStartConfig};
+
+const SONICWALL_DIAGNOSTIC_LOG: &str = "sonicwall-private-access.log";
+const SONICWALL_HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SonicwallTransport {
+    #[default]
+    Direct,
+    Proxy,
+}
+
+impl SonicwallTransport {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct SonicwallGatewayProfile {
+    transport: SonicwallTransport,
+    logon_capability: SonicwallLogonCapability,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct SonicwallGatewayProfileCache {
+    #[serde(skip)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    profiles: HashMap<String, SonicwallGatewayProfile>,
+}
+
+impl SonicwallGatewayProfileCache {
+    fn with_path(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            profiles: HashMap::new(),
+        }
+    }
+
+    fn load(path: PathBuf) -> Result<Self> {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::with_path(path));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read SonicWall gateway profile cache {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        let mut cache: Self = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse SonicWall gateway profile cache {}",
+                path.display()
+            )
+        })?;
+        cache.path = Some(path);
+        Ok(cache)
+    }
+
+    fn persist(&self) -> Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create SonicWall gateway profile cache directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let temp_path = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default()
+        ));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create SonicWall gateway profile cache {}",
+                    temp_path.display()
+                )
+            })?;
+        serde_json::to_writer_pretty(&mut file, self)
+            .context("failed to encode SonicWall gateway profile cache")?;
+        file.write_all(b"\n")
+            .context("failed to finish SonicWall gateway profile cache")?;
+        file.sync_all()
+            .context("failed to flush SonicWall gateway profile cache")?;
+        drop(file);
+        atomic_replace_sonicwall_gateway_profile_cache(&temp_path, path).with_context(|| {
+            format!(
+                "failed to replace SonicWall gateway profile cache {}",
+                path.display()
+            )
+        })
+    }
+
+    fn get(&self, gateway: &str) -> SonicwallGatewayProfile {
+        self.profiles
+            .get(&normalize_sonicwall_gateway_cache_key(gateway))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn update_transport(&mut self, gateway: &str, transport: SonicwallTransport) {
+        self.profiles
+            .entry(normalize_sonicwall_gateway_cache_key(gateway))
+            .or_default()
+            .transport = transport;
+    }
+
+    fn update_logon_capability(&mut self, gateway: &str, capability: SonicwallLogonCapability) {
+        self.profiles
+            .entry(normalize_sonicwall_gateway_cache_key(gateway))
+            .or_default()
+            .logon_capability = capability;
+    }
+}
+
+fn sonicwall_gateway_profile_cache_path() -> PathBuf {
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data)
+            .join("sing-box-tui")
+            .join("sonicwall-gateway-profiles.json");
+    }
+    if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(cache_home)
+            .join("sing-box-tui")
+            .join("sonicwall-gateway-profiles.json");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("sing-box-tui")
+            .join("sonicwall-gateway-profiles.json");
+    }
+    PathBuf::from("sonicwall-gateway-profiles.json")
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_sonicwall_gateway_profile_cache(
+    temp_path: &Path,
+    cache_path: &Path,
+) -> Result<()> {
+    fs::rename(temp_path, cache_path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_replace_sonicwall_gateway_profile_cache(
+    temp_path: &Path,
+    cache_path: &Path,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let old_path = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let new_path = cache_path
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            old_path.as_ptr(),
+            new_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn normalize_sonicwall_gateway_cache_key(gateway: &str) -> String {
+    gateway.trim().trim_end_matches('/').to_ascii_lowercase()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct PrivateAccessServiceManifest {
@@ -45,7 +271,7 @@ pub(crate) struct PrivateAccessServiceCapabilities {
     pub(crate) graceful_disconnect: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum PrivateAccessCommand {
     Connect {
@@ -67,6 +293,40 @@ pub(crate) enum PrivateAccessCommand {
         id: String,
         service: String,
     },
+    AuthReply {
+        id: String,
+        service: String,
+        session_id: String,
+        challenge_id: String,
+        button: String,
+        replies: Vec<PrivateAccessSecret>,
+    },
+    CancelAuth {
+        id: String,
+        service: String,
+        session_id: String,
+        challenge_id: String,
+    },
+}
+
+#[derive(Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub(crate) struct PrivateAccessSecret(String);
+
+impl PrivateAccessSecret {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PrivateAccessSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateAccessSecret([REDACTED])")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,6 +365,23 @@ pub(crate) struct PrivateAccessBridge {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PrivateAccessAuthOption {
+    pub(crate) value: String,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PrivateAccessAuthField {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) kind: String,
+    pub(crate) sensitive: bool,
+    pub(crate) required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) options: Vec<PrivateAccessAuthOption>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum PrivateAccessEvent {
     StateChanged {
@@ -117,7 +394,20 @@ pub(crate) enum PrivateAccessEvent {
         session_id: Option<String>,
         routes: Vec<PrivateAccessRoute>,
         dns: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        domains: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        domain_suffixes: Vec<String>,
         bridge: Option<PrivateAccessBridge>,
+    },
+    AuthChallenge {
+        service: String,
+        session_id: String,
+        challenge_id: String,
+        title: String,
+        message: String,
+        fields: Vec<PrivateAccessAuthField>,
+        buttons: Vec<String>,
     },
     Error {
         service: String,
@@ -326,6 +616,37 @@ pub(crate) fn default_hillstone_manifest() -> Result<PrivateAccessServiceManifes
     })
 }
 
+pub(crate) fn default_sonicwall_manifest() -> Result<PrivateAccessServiceManifest> {
+    let exe = std::env::current_exe().context("failed to locate current executable")?;
+    Ok(PrivateAccessServiceManifest {
+        id: "sonicwall".to_string(),
+        name: "SonicWall SMA 1000 (clean-room)".to_string(),
+        kind: "private_access".to_string(),
+        protocol: "sonicwall-sma1000-evpn".to_string(),
+        executable: exe.to_string_lossy().to_string(),
+        args: vec![
+            "private-access-service".to_string(),
+            "sonicwall".to_string(),
+            "--stdio".to_string(),
+        ],
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: PrivateAccessServiceCapabilities {
+            pushed_routes: true,
+            pushed_dns: true,
+            local_http_bridge: false,
+            graceful_disconnect: true,
+        },
+        config_schema: json!({
+            "mode": { "type": "string", "enum": ["tun"], "default": "tun" },
+            "server": { "type": "string", "required": true },
+            "realm": { "type": "string", "required": true, "default": "Hundsun" },
+            "tun_helper": { "type": "array", "items": { "type": "string" }, "required": false },
+            "http_connect_proxy": { "type": "string", "required": false },
+            "tls_verify": { "type": "boolean", "default": true }
+        }),
+    })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct HillstoneServiceConfig {
     #[serde(default = "default_hillstone_service_mode")]
@@ -349,6 +670,39 @@ struct HillstoneServiceConfig {
     client_version: String,
     #[serde(default = "default_hillstone_timeout_secs")]
     timeout_secs: u64,
+}
+
+#[derive(Deserialize)]
+struct SonicwallServiceConfig {
+    #[serde(default = "default_sonicwall_service_mode")]
+    mode: HillstoneServiceMode,
+    server: String,
+    #[serde(default = "default_sonicwall_realm")]
+    realm: String,
+    #[serde(default = "default_tls_verify")]
+    tls_verify: bool,
+    #[serde(default)]
+    tun_helper: Option<Vec<String>>,
+    #[serde(default)]
+    http_connect_proxy: Option<String>,
+    #[serde(default = "default_sonicwall_timeout_secs")]
+    timeout_secs: u64,
+}
+
+fn default_sonicwall_realm() -> String {
+    "Hundsun".to_string()
+}
+
+fn default_sonicwall_service_mode() -> HillstoneServiceMode {
+    HillstoneServiceMode::Tun
+}
+
+fn default_sonicwall_timeout_secs() -> u64 {
+    30
+}
+
+fn default_tls_verify() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -384,8 +738,1006 @@ pub(crate) fn run_private_access_service_stdio(service: &str, stdio: bool) -> Re
     }
     match service {
         "hillstone" => run_hillstone_private_access_service_stdio(),
+        "sonicwall" => run_sonicwall_private_access_service_stdio(),
         value => bail!("unsupported private access service: {value}"),
     }
+}
+
+enum SonicwallAuthInput {
+    Reply {
+        session_id: String,
+        challenge_id: String,
+        button: String,
+        replies: Vec<PrivateAccessSecret>,
+    },
+    Cancel,
+}
+
+struct SonicwallServiceSession {
+    shutdown: Arc<AtomicBool>,
+    auth_tx: Sender<SonicwallAuthInput>,
+    worker: JoinHandle<()>,
+}
+
+fn run_sonicwall_private_access_service_stdio() -> Result<()> {
+    let detached = Arc::new(AtomicBool::new(false));
+    let sink = Arc::new(JsonLineEventSink::new(
+        "sonicwall",
+        io::stdout(),
+        Arc::clone(&detached),
+    ));
+    let gateway_profile_path = sonicwall_gateway_profile_cache_path();
+    let gateway_profile_cache =
+        match SonicwallGatewayProfileCache::load(gateway_profile_path.clone()) {
+            Ok(cache) => cache,
+            Err(error) => {
+                append_sonicwall_diagnostic(
+                    "profile",
+                    &format!(
+                        "gateway profile cache could not be loaded and will be reset: {error:#}"
+                    ),
+                );
+                SonicwallGatewayProfileCache::with_path(gateway_profile_path)
+            }
+        };
+    let gateway_profiles = Arc::new(Mutex::new(gateway_profile_cache));
+    let mut session: Option<SonicwallServiceSession> = None;
+    for line in io::stdin().lock().lines() {
+        let line = line.context("failed to read private access service command")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let command: PrivateAccessCommand =
+            serde_json::from_str(&line).context("failed to parse private access command JSON")?;
+        match command {
+            PrivateAccessCommand::Connect {
+                service, config, ..
+            } => {
+                if service != "sonicwall" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
+                    continue;
+                }
+                if session.is_some() {
+                    emit_service_error(
+                        &sink,
+                        "already_connected",
+                        "service session already exists",
+                    )?;
+                    continue;
+                }
+                let config: SonicwallServiceConfig = serde_json::from_value(config)
+                    .context("failed to parse SonicWall private access config")?;
+                session = Some(start_sonicwall_service_session(
+                    config,
+                    Arc::clone(&sink),
+                    Arc::clone(&gateway_profiles),
+                )?);
+            }
+            PrivateAccessCommand::AuthReply {
+                service,
+                session_id,
+                challenge_id,
+                button,
+                replies,
+                ..
+            } => {
+                if service != "sonicwall" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
+                    continue;
+                }
+                let Some(active) = session.as_ref() else {
+                    emit_service_error(&sink, "no_session", "no authentication session exists")?;
+                    continue;
+                };
+                if active
+                    .auth_tx
+                    .send(SonicwallAuthInput::Reply {
+                        session_id,
+                        challenge_id,
+                        button,
+                        replies,
+                    })
+                    .is_err()
+                {
+                    emit_service_error(
+                        &sink,
+                        "auth_session_closed",
+                        "authentication session is no longer accepting replies",
+                    )?;
+                }
+            }
+            PrivateAccessCommand::CancelAuth { service, .. }
+            | PrivateAccessCommand::Disconnect { service, .. } => {
+                if service != "sonicwall" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
+                    continue;
+                }
+                stop_sonicwall_service_session(&sink, session.take())?;
+            }
+            PrivateAccessCommand::Detach { service, .. } => {
+                if service != "sonicwall" {
+                    emit_service_error(&sink, "invalid_service", "command service mismatch")?;
+                    continue;
+                }
+                detached.store(true, Ordering::SeqCst);
+                stop_sonicwall_service_session(&sink, session.take())?;
+            }
+            PrivateAccessCommand::Status { .. } => {
+                let state = if session.is_some() {
+                    PrivateAccessState::Connecting
+                } else {
+                    PrivateAccessState::Disconnected
+                };
+                sink.state(state, "status requested")?;
+            }
+        }
+    }
+    if let Some(active) = session.take() {
+        active.shutdown.store(true, Ordering::SeqCst);
+        let _ = active.auth_tx.send(SonicwallAuthInput::Cancel);
+        let _ = active.worker.join();
+    }
+    Ok(())
+}
+
+fn stop_sonicwall_service_session(
+    sink: &JsonLineEventSink<io::Stdout>,
+    session: Option<SonicwallServiceSession>,
+) -> Result<()> {
+    if let Some(active) = session {
+        sink.state(
+            PrivateAccessState::Disconnecting,
+            "authentication cancelled",
+        )?;
+        active.shutdown.store(true, Ordering::SeqCst);
+        let _ = active.auth_tx.send(SonicwallAuthInput::Cancel);
+        let _ = active.worker.join();
+    } else {
+        sink.state(PrivateAccessState::Disconnected, "no active session")?;
+    }
+    Ok(())
+}
+
+fn start_sonicwall_service_session(
+    config: SonicwallServiceConfig,
+    sink: Arc<JsonLineEventSink<io::Stdout>>,
+    gateway_profiles: Arc<Mutex<SonicwallGatewayProfileCache>>,
+) -> Result<SonicwallServiceSession> {
+    append_sonicwall_diagnostic("session", "starting authentication session");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_sink = Arc::clone(&sink);
+    let (auth_tx, auth_rx) = mpsc::channel();
+    sink.state(
+        PrivateAccessState::Connecting,
+        "discovering SonicWall authentication service",
+    )?;
+    let worker = thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = worker_sink.error("runtime_failed", &error.to_string());
+                let _ = worker_sink.state(PrivateAccessState::Error, "service runtime failed");
+                return;
+            }
+        };
+        let result = runtime.block_on(run_sonicwall_authentication(
+            config,
+            Arc::clone(&worker_sink),
+            auth_rx,
+            worker_shutdown,
+            gateway_profiles,
+        ));
+        if let Err(error) = result {
+            append_sonicwall_diagnostic("error", &format!("{error:#}"));
+            let _ = worker_sink.error("authentication_failed", &format!("{error:#}"));
+            let _ = worker_sink.state(PrivateAccessState::Error, "authentication failed");
+        }
+    });
+    Ok(SonicwallServiceSession {
+        shutdown,
+        auth_tx,
+        worker,
+    })
+}
+
+fn sonicwall_candidate_delays(preferred: SonicwallTransport) -> (Duration, Duration) {
+    match preferred {
+        SonicwallTransport::Direct => (Duration::ZERO, SONICWALL_HAPPY_EYEBALLS_DELAY),
+        SonicwallTransport::Proxy => (SONICWALL_HAPPY_EYEBALLS_DELAY, Duration::ZERO),
+    }
+}
+
+async fn discover_sonicwall_candidate(
+    server: &str,
+    tls_verify: bool,
+    proxy: Option<&str>,
+    transport: SonicwallTransport,
+    delay: Duration,
+) -> Result<(SonicwallAuthClient, Vec<crate::sonicwall::SonicwallRealm>)> {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    append_sonicwall_diagnostic(
+        "transport",
+        &format!("starting {} HTTPS discovery candidate", transport.label()),
+    );
+    let client = SonicwallAuthClient::new(server, tls_verify, proxy)?;
+    let realms = client.discover_realms().await?;
+    Ok((client, realms))
+}
+
+async fn discover_sonicwall_transport(
+    server: &str,
+    tls_verify: bool,
+    fallback_proxy: Option<&str>,
+    preferred: SonicwallTransport,
+) -> Result<(
+    SonicwallAuthClient,
+    Vec<crate::sonicwall::SonicwallRealm>,
+    SonicwallTransport,
+)> {
+    let Some(proxy) = fallback_proxy.filter(|proxy| !proxy.trim().is_empty()) else {
+        append_sonicwall_diagnostic(
+            "transport",
+            "HTTP CONNECT proxy unavailable; probing direct HTTPS only",
+        );
+        let (client, realms) = discover_sonicwall_candidate(
+            server,
+            tls_verify,
+            None,
+            SonicwallTransport::Direct,
+            Duration::ZERO,
+        )
+        .await
+        .context("direct SonicWall gateway discovery failed")?;
+        return Ok((client, realms, SonicwallTransport::Direct));
+    };
+
+    let (direct_delay, proxy_delay) = sonicwall_candidate_delays(preferred);
+    append_sonicwall_diagnostic(
+        "transport",
+        &format!(
+            "racing direct and proxy HTTPS candidates; preferred={}; alternate_delay_ms={}",
+            preferred.label(),
+            SONICWALL_HAPPY_EYEBALLS_DELAY.as_millis()
+        ),
+    );
+    let direct = discover_sonicwall_candidate(
+        server,
+        tls_verify,
+        None,
+        SonicwallTransport::Direct,
+        direct_delay,
+    );
+    let proxied = discover_sonicwall_candidate(
+        server,
+        tls_verify,
+        Some(proxy),
+        SonicwallTransport::Proxy,
+        proxy_delay,
+    );
+    tokio::pin!(direct);
+    tokio::pin!(proxied);
+
+    tokio::select! {
+        direct_result = &mut direct => match direct_result {
+            Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Direct)),
+            Err(direct_error) => {
+                append_sonicwall_diagnostic(
+                    "transport",
+                    &format!("direct discovery candidate failed: {direct_error:#}; waiting for proxy candidate"),
+                );
+                match proxied.await {
+                    Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Proxy)),
+                    Err(proxy_error) => Err(anyhow::anyhow!(
+                        "direct SonicWall gateway discovery failed ({direct_error:#}); HTTP CONNECT proxy discovery also failed ({proxy_error:#})"
+                    )),
+                }
+            }
+        },
+        proxy_result = &mut proxied => match proxy_result {
+            Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Proxy)),
+            Err(proxy_error) => {
+                append_sonicwall_diagnostic(
+                    "transport",
+                    &format!("proxy discovery candidate failed: {proxy_error:#}; waiting for direct candidate"),
+                );
+                match direct.await {
+                    Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Direct)),
+                    Err(direct_error) => Err(anyhow::anyhow!(
+                        "HTTP CONNECT proxy discovery failed ({proxy_error:#}); direct SonicWall gateway discovery also failed ({direct_error:#})"
+                    )),
+                }
+            }
+        },
+    }
+}
+
+async fn run_sonicwall_authentication(
+    config: SonicwallServiceConfig,
+    sink: Arc<JsonLineEventSink<io::Stdout>>,
+    auth_rx: Receiver<SonicwallAuthInput>,
+    shutdown: Arc<AtomicBool>,
+    gateway_profiles: Arc<Mutex<SonicwallGatewayProfileCache>>,
+) -> Result<()> {
+    let proxy_from_env = std::env::var("SONICWALL_EVPN_PROXY").ok();
+    let fallback_proxy = config
+        .http_connect_proxy
+        .as_deref()
+        .or(proxy_from_env.as_deref());
+    let cached_profile = gateway_profiles
+        .lock()
+        .map_err(|_| anyhow::anyhow!("SonicWall gateway profile cache lock was poisoned"))?
+        .get(&config.server);
+    append_sonicwall_diagnostic(
+        "profile",
+        &format!(
+            "gateway={} preferred_transport={} logon_capability={}",
+            normalize_sonicwall_gateway_cache_key(&config.server),
+            cached_profile.transport.label(),
+            cached_profile.logon_capability.label()
+        ),
+    );
+    let (client, realms, selected_transport) = discover_sonicwall_transport(
+        &config.server,
+        config.tls_verify,
+        fallback_proxy,
+        cached_profile.transport,
+    )
+    .await?;
+    {
+        let mut profiles = gateway_profiles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SonicWall gateway profile cache lock was poisoned"))?;
+        profiles.update_transport(&config.server, selected_transport);
+        if let Err(error) = profiles.persist() {
+            append_sonicwall_diagnostic(
+                "profile",
+                &format!("failed to persist transport preference: {error:#}"),
+            );
+        }
+    }
+    append_sonicwall_diagnostic(
+        "transport",
+        &format!(
+            "selected {} HTTPS transport via Happy Eyeballs",
+            selected_transport.label()
+        ),
+    );
+    let selected_proxy = (selected_transport == SonicwallTransport::Proxy)
+        .then_some(fallback_proxy)
+        .flatten();
+    if !realms.is_empty() && !realms.iter().any(|realm| realm.name == config.realm) {
+        let names = realms
+            .iter()
+            .map(|realm| realm.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "configured SonicWall LoginGroup {} was not advertised; available groups: {names}",
+            config.realm
+        );
+    }
+    if shutdown.load(Ordering::SeqCst) {
+        sink.state(PrivateAccessState::Disconnected, "authentication cancelled")?;
+        return Ok(());
+    }
+
+    let session = client
+        .start_logon(&config.realm, cached_profile.logon_capability)
+        .await?;
+    {
+        let mut profiles = gateway_profiles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SonicWall gateway profile cache lock was poisoned"))?;
+        profiles.update_logon_capability(&config.server, session.logon_capability());
+        if let Err(error) = profiles.persist() {
+            append_sonicwall_diagnostic(
+                "profile",
+                &format!("failed to persist logon capability: {error:#}"),
+            );
+        }
+    }
+    let official_status = session
+        .official_logon_status()
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "cached-skip".to_string());
+    append_sonicwall_diagnostic(
+        "authentication",
+        &format!(
+            "logon endpoint: {}; official_status={}",
+            session.logon_endpoint(),
+            official_status
+        ),
+    );
+    let evpn_fallback_proxy = selected_proxy.is_none().then_some(fallback_proxy).flatten();
+    let result = run_sonicwall_auth_dialog(
+        &session,
+        &config,
+        &sink,
+        &auth_rx,
+        &shutdown,
+        selected_proxy,
+        evpn_fallback_proxy,
+    )
+    .await;
+    let cancelled = shutdown.load(Ordering::SeqCst);
+    let cleanup = session.close().await;
+    match (result, cleanup) {
+        (_, _) if cancelled => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("authentication completed but cleanup failed")),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn run_sonicwall_auth_dialog(
+    session: &crate::sonicwall::SonicwallAuthSession,
+    config: &SonicwallServiceConfig,
+    sink: &JsonLineEventSink<io::Stdout>,
+    auth_rx: &Receiver<SonicwallAuthInput>,
+    shutdown: &AtomicBool,
+    evpn_primary_proxy: Option<&str>,
+    evpn_fallback_proxy: Option<&str>,
+) -> Result<()> {
+    let _micro_interrogation = session.get_agent_info().await?;
+    let micro_step = session
+        .post_agent_info(&sonicwall_default_agent_info())
+        .await?;
+    let initial_step = sonicwall_auth_step_name(&micro_step);
+    append_sonicwall_diagnostic(
+        "authentication",
+        &format!("micro interrogation endpoint: agentinfo; initial_step={initial_step}"),
+    );
+    let empty_replies = Vec::new();
+    let mut step = match micro_step {
+        SonicwallAuthStep::Continue => session.authenticate("ok", &empty_replies).await?,
+        step => step,
+    };
+    let session_id = format!("auth-{:016x}", rand::random::<u64>());
+    let mut challenge_sequence = 0_u64;
+
+    loop {
+        match step {
+            SonicwallAuthStep::Challenge(challenge) => {
+                append_sonicwall_diagnostic(
+                    "authentication",
+                    &format!(
+                        "received challenge with {} field(s)",
+                        challenge.fields.len()
+                    ),
+                );
+                challenge_sequence = challenge_sequence.saturating_add(1);
+                let challenge_id = format!("challenge-{challenge_sequence}");
+                sink.emit(PrivateAccessEvent::AuthChallenge {
+                    service: "sonicwall".to_string(),
+                    session_id: session_id.clone(),
+                    challenge_id: challenge_id.clone(),
+                    title: challenge.title,
+                    message: challenge.message,
+                    fields: challenge.fields,
+                    buttons: challenge.buttons,
+                })?;
+                let Some((button, replies)) =
+                    wait_for_sonicwall_auth_reply(auth_rx, shutdown, &session_id, &challenge_id)?
+                else {
+                    sink.state(PrivateAccessState::Disconnected, "authentication cancelled")?;
+                    return Ok(());
+                };
+                step = session.authenticate(&button, &replies).await?;
+            }
+            SonicwallAuthStep::Authenticated => {
+                append_sonicwall_diagnostic(
+                    "authentication",
+                    "credentials accepted; starting EVPN bootstrap",
+                );
+                match session.probe_system_interrogation().await {
+                    Ok(interrogation) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!(
+                            "system interrogation endpoint: {}; zone_count={:?}; zone_keys={}; unsupported_zone_keys={}; posted_minimal_response={}; is_ct_allow={:?}; zoneCommand={}; zoneType={}",
+                            interrogation.endpoint.unwrap_or("not found"),
+                            interrogation.zone_count,
+                            if interrogation.zone_keys.is_empty() {
+                                "none".to_string()
+                            } else {
+                                interrogation.zone_keys.join(",")
+                            },
+                            if interrogation.unsupported_zone_keys.is_empty() {
+                                "none".to_string()
+                            } else {
+                                interrogation.unsupported_zone_keys.join(",")
+                            },
+                            interrogation.posted_minimal_response,
+                            interrogation.is_ct_allow,
+                            interrogation.zone_command.as_deref().unwrap_or("unknown"),
+                            interrogation.zone_type.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
+                    Err(error) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!("system interrogation probe failed: {error:#}"),
+                    ),
+                }
+                match session.probe_license_state().await {
+                    Ok(license) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!(
+                            "license endpoint: {}; licensed={:?}; destroy_connections={:?}; status={}",
+                            license.endpoint.unwrap_or("not found"),
+                            license.licensed,
+                            license.destroy_connections,
+                            license.status.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
+                    Err(error) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!("license probe failed: {error:#}"),
+                    ),
+                }
+                match session.probe_connection_state().await {
+                    Ok(state) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!(
+                            "connection state endpoint: {}; ALPNSupported={:?}; tunnelProtocolNegotiation={:?}; zoneType={}",
+                            state.endpoint.unwrap_or("not found"),
+                            state.alpns_supported,
+                            state.tunnel_protocol_negotiation,
+                            state.zone_type.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
+                    Err(error) => append_sonicwall_diagnostic(
+                        "authentication",
+                        &format!("connection state probe failed: {error:#}"),
+                    ),
+                }
+                let agent_activation = session.activate_connect_tunnel_agent().await?;
+                append_sonicwall_diagnostic(
+                    "authentication",
+                    &format!(
+                        "ConnectTunnel agent activation endpoint: {}",
+                        agent_activation.endpoint.unwrap_or("not found")
+                    ),
+                );
+                sink.state(
+                    PrivateAccessState::Connecting,
+                    "SonicWall authentication complete; establishing EVPN tunnel",
+                )?;
+                if config.mode != HillstoneServiceMode::Tun {
+                    bail!("SonicWall clean-room client requires TUN mode");
+                }
+                let identity = session.evpn_identity()?;
+                append_sonicwall_diagnostic(
+                    "authentication",
+                    &format!(
+                        "using EVPN logon token after {} refresh(es), {} observation(s)",
+                        identity.logon_id_refresh_count, identity.logon_id_observation_count
+                    ),
+                );
+                let guid = rand::random::<[u8; 16]>();
+                let trace_evpn = |message: &str| append_sonicwall_diagnostic("evpn", message);
+                let connect_evpn = |http_connect_proxy| {
+                    connect_sonicwall_evpn(&EvpnBootstrapOptions {
+                        server: &identity.server,
+                        port: identity.port,
+                        http_connect_proxy,
+                        timeout: Duration::from_secs(config.timeout_secs),
+                        verify_server_cert: config.tls_verify,
+                        team_token: identity.team_token.expose(),
+                        guid,
+                        trace: Some(&trace_evpn),
+                    })
+                };
+                append_sonicwall_diagnostic(
+                    "transport",
+                    if evpn_primary_proxy.is_some() {
+                        "establishing EVPN through HTTP CONNECT proxy fallback"
+                    } else {
+                        "establishing EVPN directly"
+                    },
+                );
+                let established = match connect_evpn(evpn_primary_proxy) {
+                    Ok(established) => established,
+                    Err(direct_error)
+                        if evpn_primary_proxy.is_none() && evpn_fallback_proxy.is_some() =>
+                    {
+                        append_sonicwall_diagnostic(
+                            "transport",
+                            &format!(
+                                "direct EVPN bootstrap failed: {direct_error:#}; retrying through configured HTTP CONNECT proxy"
+                            ),
+                        );
+                        let proxy = evpn_fallback_proxy
+                            .expect("EVPN fallback proxy was checked as present");
+                        let established = connect_evpn(Some(proxy)).map_err(|proxy_error| {
+                            anyhow::anyhow!(
+                                "direct SonicWall EVPN bootstrap failed ({direct_error:#}); HTTP CONNECT proxy fallback also failed ({proxy_error:#})"
+                            )
+                        })?;
+                        append_sonicwall_diagnostic(
+                            "transport",
+                            "selected HTTP CONNECT proxy fallback for EVPN",
+                        );
+                        established
+                    }
+                    Err(error) => return Err(error),
+                };
+                return run_sonicwall_tun_data_plane(
+                    established,
+                    config.tun_helper.clone(),
+                    sink,
+                    shutdown,
+                    &session_id,
+                );
+            }
+            SonicwallAuthStep::Continue => {
+                bail!("SonicWall returned an unrecognized authentication response");
+            }
+        }
+    }
+}
+
+fn sonicwall_auth_step_name(step: &SonicwallAuthStep) -> &'static str {
+    match step {
+        SonicwallAuthStep::Challenge(_) => "challenge",
+        SonicwallAuthStep::Authenticated => "authenticated",
+        SonicwallAuthStep::Continue => "continue",
+    }
+}
+
+fn wait_for_sonicwall_auth_reply(
+    auth_rx: &Receiver<SonicwallAuthInput>,
+    shutdown: &AtomicBool,
+    expected_session_id: &str,
+    expected_challenge_id: &str,
+) -> Result<Option<(String, Vec<PrivateAccessSecret>)>> {
+    while !shutdown.load(Ordering::SeqCst) {
+        match auth_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(SonicwallAuthInput::Cancel) => return Ok(None),
+            Ok(SonicwallAuthInput::Reply {
+                session_id,
+                challenge_id,
+                button,
+                replies,
+            }) => {
+                if session_id != expected_session_id || challenge_id != expected_challenge_id {
+                    continue;
+                }
+                return Ok(Some((button, replies)));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn run_sonicwall_tun_data_plane(
+    mut evpn: EstablishedEvpn,
+    tun_helper: Option<Vec<String>>,
+    sink: &JsonLineEventSink<io::Stdout>,
+    shutdown: &AtomicBool,
+    session_id: &str,
+) -> Result<()> {
+    let assigned_ipv4 = evpn.config.assigned_ipv4;
+    if assigned_ipv4.is_unspecified() {
+        bail!("SonicWall EVPN gateway did not assign an IPv4 address");
+    }
+    let route_cidrs = sonicwall_route_cidrs(&evpn.config);
+    let dns_servers = evpn.config.dns.clone();
+    let domains = sonicwall_resource_domains(&evpn.config);
+    let domain_suffixes = sonicwall_domain_suffixes(&evpn.config);
+    let mtu = evpn.config.ssl_mtu.unwrap_or(1428).clamp(1200, 1500);
+    let mut tun = TunHelperClient::spawn(
+        tun_helper,
+        TunHelperStartConfig {
+            client_ipv4: assigned_ipv4,
+            gateway_ipv4: None,
+            prefix_len: u32::from(evpn.config.ipv4_prefix_len.clamp(1, 32)),
+            route_cidrs: route_cidrs.clone(),
+            dns_servers: dns_servers.clone(),
+            mtu: Some(mtu),
+        },
+    )?;
+    let interface = tun.interface().to_string();
+    sink.emit(PrivateAccessEvent::RoutesPushed {
+        service: "sonicwall".to_string(),
+        session_id: Some(session_id.to_string()),
+        routes: route_cidrs
+            .iter()
+            .cloned()
+            .map(|cidr| PrivateAccessRoute { cidr })
+            .collect(),
+        dns: dns_servers.iter().map(ToString::to_string).collect(),
+        domains,
+        domain_suffixes,
+        bridge: None,
+    })?;
+    sink.state(
+        PrivateAccessState::Connected,
+        &format!(
+            "SonicWall TUN data plane connected on {interface} as {assigned_ipv4} (tunnel {})",
+            evpn.tunnel_id
+        ),
+    )?;
+    append_sonicwall_diagnostic("tunnel", "TUN data plane connected");
+
+    evpn.stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .context("failed to configure SonicWall EVPN data-plane read timeout")?;
+    let loop_result = run_sonicwall_packet_loop(&mut evpn, &mut tun, shutdown, mtu);
+    let stop_result = tun.stop().context("failed to stop SonicWall TUN helper");
+    if shutdown.load(Ordering::SeqCst) {
+        append_sonicwall_diagnostic("tunnel", "session disconnected cleanly");
+        sink.state(
+            PrivateAccessState::Disconnected,
+            "SonicWall tunnel disconnected",
+        )?;
+        return stop_result;
+    }
+    loop_result.and(stop_result)
+}
+
+fn append_sonicwall_diagnostic(stage: &str, message: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let message = message
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(4096)
+        .collect::<String>();
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(SONICWALL_DIAGNOSTIC_LOG)
+    {
+        let _ = writeln!(log, "{timestamp} [{stage}] {message}");
+    }
+}
+
+fn run_sonicwall_packet_loop(
+    evpn: &mut EstablishedEvpn,
+    tun: &mut TunHelperClient,
+    shutdown: &AtomicBool,
+    mtu: u16,
+) -> Result<()> {
+    let mut read_buffer = vec![0_u8; 64 * 1024];
+    let mut next_keepalive = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let mut outbound_packets = 0_u64;
+    let mut inbound_frames = 0_u64;
+    while !shutdown.load(Ordering::SeqCst) {
+        let mut made_progress = false;
+        while let Some(packet) = tun.try_recv_ipv4()? {
+            outbound_packets += 1;
+            if outbound_packets <= 8 {
+                append_sonicwall_diagnostic(
+                    "tunnel",
+                    &format!(
+                        "outbound packet #{outbound_packets}: {}",
+                        describe_ipv4_packet(&packet)
+                    ),
+                );
+            }
+            evpn.stream
+                .write_all(&encode_sonicwall_packet(&packet)?)
+                .context("failed to send an IPv4 packet through SonicWall EVPN")?;
+            made_progress = true;
+        }
+
+        match evpn.stream.read(&mut read_buffer) {
+            Ok(0) => bail!("SonicWall EVPN gateway closed the data tunnel"),
+            Ok(length) => {
+                evpn.decoder.push(&read_buffer[..length]);
+                made_progress = true;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                append_sonicwall_diagnostic(
+                    "tunnel",
+                    &format!(
+                        "data tunnel read failed after {:.3}s; outbound_packets={outbound_packets}; inbound_frames={inbound_frames}; error={error}",
+                        started.elapsed().as_secs_f64()
+                    ),
+                );
+                return Err(error).context("failed to read SonicWall EVPN data tunnel");
+            }
+        }
+        while let Some(frame) = evpn.decoder.next_frame()? {
+            inbound_frames += 1;
+            if inbound_frames <= 8 {
+                append_sonicwall_diagnostic(
+                    "tunnel",
+                    &format!(
+                        "inbound frame #{inbound_frames}: {}({}) flags=0x{:02x} payload_len={}",
+                        frame.message_type.name(),
+                        frame.message_type.value(),
+                        frame.flags,
+                        frame.payload.len()
+                    ),
+                );
+            }
+            match frame.message_type {
+                MessageType::DATA => {
+                    let packet = decode_sonicwall_packet(&frame, usize::from(mtu))?;
+                    let _ = tun.send_ipv4(&packet)?;
+                }
+                MessageType::ECHO_REQ => evpn
+                    .stream
+                    .write_all(&encode_sonicwall_frame(
+                        MessageType::ECHO_RSP,
+                        0,
+                        &frame.payload,
+                    )?)
+                    .context("failed to answer SonicWall EVPN keepalive")?,
+                MessageType::SHUTDOWN | MessageType::ALERT => {
+                    bail!("SonicWall EVPN gateway terminated the data tunnel")
+                }
+                _ => {}
+            }
+            made_progress = true;
+        }
+
+        if Instant::now() >= next_keepalive {
+            evpn.stream
+                .write_all(&encode_sonicwall_frame(MessageType::ECHO_REQ, 0, &[])?)
+                .context("failed to send SonicWall EVPN keepalive")?;
+            next_keepalive = Instant::now() + Duration::from_secs(30);
+            made_progress = true;
+        }
+        if !made_progress {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    Ok(())
+}
+
+fn describe_ipv4_packet(packet: &[u8]) -> String {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return format!("len={} non-IPv4-or-truncated", packet.len());
+    }
+    let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    format!(
+        "len={} protocol={} source={} destination={}",
+        packet.len(),
+        packet[9],
+        source,
+        destination
+    )
+}
+
+fn sonicwall_route_cidrs(config: &SonicwallNetworkConfig) -> Vec<String> {
+    let mut routes = config
+        .resources
+        .iter()
+        .flat_map(|resource| extract_ipv4_cidrs(resource))
+        .collect::<Vec<_>>();
+    routes.sort();
+    routes.dedup();
+    if routes.is_empty() {
+        // Hundsun's observed assignment is 10.22.x. The broad private route is installed only on
+        // the ephemeral TUN interface and is removed with that interface on disconnect.
+        routes.push("10.0.0.0/8".to_string());
+    }
+    routes
+}
+
+fn sonicwall_resource_domains(config: &SonicwallNetworkConfig) -> Vec<String> {
+    let mut domains = config
+        .resources
+        .iter()
+        .filter_map(|resource| {
+            let resource = String::from_utf8_lossy(resource);
+            let (kind, value) = resource.split_once('=')?;
+            kind.eq_ignore_ascii_case("HOSTNAME")
+                .then(|| normalize_domain(value))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+fn sonicwall_domain_suffixes(config: &SonicwallNetworkConfig) -> Vec<String> {
+    let mut suffixes = config
+        .suffixes
+        .iter()
+        .filter_map(|suffix| normalize_domain(&String::from_utf8_lossy(suffix)))
+        .collect::<Vec<_>>();
+    suffixes.sort();
+    suffixes.dedup();
+    suffixes
+}
+
+fn normalize_domain(value: &str) -> Option<String> {
+    let value = value
+        .trim_matches(|character: char| character == '\0' || character.is_ascii_whitespace())
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 253
+        || value.parse::<IpAddr>().is_ok()
+        || value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn extract_ipv4_cidrs(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text =
+        text.trim_matches(|character: char| character == '\0' || character.is_ascii_whitespace());
+    if let Some((kind, value)) = text.split_once('=')
+        && kind.eq_ignore_ascii_case("RANGE")
+    {
+        return value
+            .split_once(',')
+            .and_then(|(start, end)| {
+                Some(ipv4_range_to_cidrs(
+                    start.trim().parse::<Ipv4Addr>().ok()?,
+                    end.trim().parse::<Ipv4Addr>().ok()?,
+                ))
+            })
+            .unwrap_or_default();
+    }
+
+    text.split(|character: char| {
+        !(character.is_ascii_digit() || character == '.' || character == '/')
+    })
+    .filter_map(normalize_ipv4_cidr)
+    .collect()
+}
+
+fn ipv4_range_to_cidrs(start: Ipv4Addr, end: Ipv4Addr) -> Vec<String> {
+    let mut current = u64::from(u32::from(start));
+    let end = u64::from(u32::from(end));
+    if current > end {
+        return Vec::new();
+    }
+
+    let mut cidrs = Vec::new();
+    while current <= end {
+        let address = current as u32;
+        let aligned_host_bits = address.trailing_zeros();
+        let remaining = end - current + 1;
+        let remaining_host_bits = 63 - remaining.leading_zeros();
+        let host_bits = aligned_host_bits.min(remaining_host_bits);
+        let prefix_len = 32 - host_bits;
+        cidrs.push(format!("{}/{}", Ipv4Addr::from(address), prefix_len));
+        current += 1_u64 << host_bits;
+    }
+    cidrs
+}
+
+fn normalize_ipv4_cidr(value: &str) -> Option<String> {
+    let (address, prefix) = value.split_once('/')?;
+    let address = address.parse::<Ipv4Addr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    (prefix <= 32).then(|| format!("{address}/{prefix}"))
 }
 
 fn run_hillstone_private_access_service_stdio() -> Result<()> {
@@ -452,6 +1804,13 @@ fn run_hillstone_private_access_service_stdio() -> Result<()> {
                     PrivateAccessState::Disconnected
                 };
                 sink.state(state, "status requested")?;
+            }
+            PrivateAccessCommand::AuthReply { .. } | PrivateAccessCommand::CancelAuth { .. } => {
+                emit_service_error(
+                    &sink,
+                    "unsupported_auth_command",
+                    "Hillstone service does not accept interactive authentication commands",
+                )?;
             }
         }
     }
@@ -649,6 +2008,8 @@ impl<W: Write + Send + 'static> HillstoneEventSink for JsonLineEventSink<W> {
                 .map(|cidr| PrivateAccessRoute { cidr })
                 .collect(),
             dns: info.dns_ipv4.iter().map(ToString::to_string).collect(),
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
             bridge: info.bridge_listen.map(|listen| PrivateAccessBridge {
                 kind: "http".to_string(),
                 listen: listen.to_string(),
@@ -694,14 +2055,20 @@ fn resolve_manifest_executable(manifest: &PrivateAccessServiceManifest) -> Resul
 mod tests {
     use std::io::{self, Write};
     use std::sync::{Arc, atomic::AtomicBool};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
         ExternalPrivateAccessService, HillstoneServiceConfig, HillstoneServiceMode,
-        JsonLineEventSink, PrivateAccessCommand, PrivateAccessEvent, PrivateAccessEventEnvelope,
-        PrivateAccessRoute, PrivateAccessServiceCapabilities, PrivateAccessServiceManifest,
-        PrivateAccessState, default_hillstone_manifest, normalize_tun_helper_command,
+        JsonLineEventSink, PrivateAccessAuthField, PrivateAccessCommand, PrivateAccessEvent,
+        PrivateAccessEventEnvelope, PrivateAccessRoute, PrivateAccessSecret,
+        PrivateAccessServiceCapabilities, PrivateAccessServiceManifest, PrivateAccessState,
+        SONICWALL_HAPPY_EYEBALLS_DELAY, SonicwallGatewayProfileCache, SonicwallTransport,
+        default_hillstone_manifest, default_sonicwall_manifest, describe_ipv4_packet,
+        extract_ipv4_cidrs, ipv4_range_to_cidrs, normalize_domain, normalize_ipv4_cidr,
+        normalize_sonicwall_gateway_cache_key, normalize_tun_helper_command,
+        sonicwall_candidate_delays,
     };
+    use crate::sonicwall::SonicwallLogonCapability;
     use serde_json::json;
 
     #[test]
@@ -722,6 +2089,142 @@ mod tests {
     }
 
     #[test]
+    fn sonicwall_gateway_profile_cache_is_normalized_and_gateway_scoped() {
+        let mut cache = SonicwallGatewayProfileCache::default();
+        cache.update_transport(" SSLVPN.HUNDSUN.COM/ ", SonicwallTransport::Proxy);
+        cache.update_logon_capability("sslvpn.hundsun.com", SonicwallLogonCapability::LegacyAdd);
+
+        let hundsun = cache.get("sslvpn.hundsun.com/");
+        assert_eq!(hundsun.transport, SonicwallTransport::Proxy);
+        assert_eq!(
+            hundsun.logon_capability,
+            SonicwallLogonCapability::LegacyAdd
+        );
+        assert_eq!(
+            cache.get("vpn.example.com").transport,
+            SonicwallTransport::Direct
+        );
+        assert_eq!(
+            normalize_sonicwall_gateway_cache_key(" HTTPS://VPN.Example.com/// "),
+            "https://vpn.example.com"
+        );
+    }
+
+    #[test]
+    fn sonicwall_happy_eyeballs_gives_cached_transport_a_head_start() {
+        assert_eq!(
+            sonicwall_candidate_delays(SonicwallTransport::Direct),
+            (Duration::ZERO, SONICWALL_HAPPY_EYEBALLS_DELAY)
+        );
+        assert_eq!(
+            sonicwall_candidate_delays(SonicwallTransport::Proxy),
+            (SONICWALL_HAPPY_EYEBALLS_DELAY, Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn sonicwall_gateway_profile_cache_survives_service_restart() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("sing-box-tui-sonicwall-profile-cache-{suffix}"));
+        let path = directory.join("gateway-profiles.json");
+        let mut cache = SonicwallGatewayProfileCache::with_path(path.clone());
+        cache.update_transport("sslvpn.hundsun.com", SonicwallTransport::Proxy);
+        cache.update_logon_capability("sslvpn.hundsun.com", SonicwallLogonCapability::LegacyAdd);
+        cache.persist().expect("profile cache persists");
+
+        let loaded = SonicwallGatewayProfileCache::load(path).expect("profile cache reloads");
+        let profile = loaded.get("SSLVPN.HUNDSUN.COM/");
+        assert_eq!(profile.transport, SonicwallTransport::Proxy);
+        assert_eq!(
+            profile.logon_capability,
+            SonicwallLogonCapability::LegacyAdd
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn sonicwall_resource_text_extracts_only_valid_ipv4_cidrs() {
+        let routes =
+            extract_ipv4_cidrs(b"resource=10.22.0.0/16, 192.168.50.7/24; invalid=10.1.1.1/77");
+        assert_eq!(routes, vec!["10.22.0.0/16", "192.168.50.7/24"]);
+        assert_eq!(
+            normalize_ipv4_cidr("172.16.0.0/12").as_deref(),
+            Some("172.16.0.0/12")
+        );
+        assert_eq!(normalize_ipv4_cidr("172.16.0.0/33"), None);
+    }
+
+    #[test]
+    fn sonicwall_range_resources_expand_to_minimal_cidrs() {
+        assert_eq!(
+            extract_ipv4_cidrs(b"RANGE=10.19.0.0,10.20.255.255\0"),
+            vec!["10.19.0.0/16", "10.20.0.0/16"]
+        );
+        assert_eq!(
+            extract_ipv4_cidrs(b"RANGE=10.28.6.0,10.28.7.255"),
+            vec!["10.28.6.0/23"]
+        );
+    }
+
+    #[test]
+    fn ipv4_range_conversion_handles_unaligned_single_and_invalid_ranges() {
+        assert_eq!(
+            ipv4_range_to_cidrs(
+                "10.30.0.1".parse().expect("start parses"),
+                "10.30.0.6".parse().expect("end parses"),
+            ),
+            vec![
+                "10.30.0.1/32",
+                "10.30.0.2/31",
+                "10.30.0.4/31",
+                "10.30.0.6/32"
+            ]
+        );
+        assert_eq!(
+            ipv4_range_to_cidrs(
+                "192.168.75.64".parse().expect("start parses"),
+                "192.168.75.64".parse().expect("end parses"),
+            ),
+            vec!["192.168.75.64/32"]
+        );
+        assert!(
+            ipv4_range_to_cidrs(
+                "10.0.0.2".parse().expect("start parses"),
+                "10.0.0.1".parse().expect("end parses"),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn sonicwall_domain_normalization_accepts_dns_names_and_rejects_ip_literals() {
+        assert_eq!(
+            normalize_domain("*.Hundsun.COM.\0").as_deref(),
+            Some("hundsun.com")
+        );
+        assert_eq!(normalize_domain("192.168.75.64"), None);
+        assert_eq!(normalize_domain("bad_label.hundsun.com"), None);
+        assert_eq!(normalize_domain("-bad.hundsun.com"), None);
+    }
+
+    #[test]
+    fn sonicwall_packet_diagnostic_reports_ipv4_endpoints() {
+        let mut packet = vec![0_u8; 20];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 22, 28, 34]);
+        packet[16..20].copy_from_slice(&[10, 17, 0, 8]);
+        assert_eq!(
+            describe_ipv4_packet(&packet),
+            "len=20 protocol=6 source=10.22.28.34 destination=10.17.0.8"
+        );
+    }
+
+    #[test]
     fn private_access_detach_command_serializes_as_json_line_protocol() {
         let command = PrivateAccessCommand::Detach {
             id: "cmd-2".to_string(),
@@ -736,6 +2239,50 @@ mod tests {
     }
 
     #[test]
+    fn private_access_auth_reply_serializes_without_debug_exposure() {
+        let command = PrivateAccessCommand::AuthReply {
+            id: "cmd-auth-1".to_string(),
+            service: "sonicwall".to_string(),
+            session_id: "session-1".to_string(),
+            challenge_id: "challenge-1".to_string(),
+            button: "ok".to_string(),
+            replies: vec![PrivateAccessSecret::new("one-time-secret")],
+        };
+
+        let value = serde_json::to_value(command).expect("command serializes");
+        assert_eq!(value["type"], "auth_reply");
+        assert_eq!(value["replies"][0], "one-time-secret");
+
+        let secret = PrivateAccessSecret::new("do-not-log-this");
+        assert_eq!(format!("{secret:?}"), "PrivateAccessSecret([REDACTED])");
+    }
+
+    #[test]
+    fn private_access_auth_challenge_matches_protocol_shape() {
+        let event = PrivateAccessEventEnvelope::new(PrivateAccessEvent::AuthChallenge {
+            service: "sonicwall".to_string(),
+            session_id: "session-1".to_string(),
+            challenge_id: "challenge-1".to_string(),
+            title: "Sign in".to_string(),
+            message: String::new(),
+            fields: vec![PrivateAccessAuthField {
+                id: "reply-0".to_string(),
+                label: "Dynamic code".to_string(),
+                kind: "password".to_string(),
+                sensitive: true,
+                required: true,
+                options: Vec::new(),
+            }],
+            buttons: vec!["ok".to_string(), "cancel".to_string()],
+        });
+
+        let value = serde_json::to_value(event).expect("event serializes");
+        assert_eq!(value["event"], "auth_challenge");
+        assert_eq!(value["fields"][0]["sensitive"], true);
+        assert_eq!(value["buttons"][0], "ok");
+    }
+
+    #[test]
     fn private_access_event_matches_rfc_envelope_shape() {
         let event = PrivateAccessEventEnvelope::new(PrivateAccessEvent::RoutesPushed {
             service: "hillstone".to_string(),
@@ -744,6 +2291,8 @@ mod tests {
                 cidr: "10.1.0.0/16".to_string(),
             }],
             dns: vec!["10.1.252.10".to_string()],
+            domains: vec!["service.hundsun.com".to_string()],
+            domain_suffixes: vec!["hundsun.com".to_string()],
             bridge: None,
         });
 
@@ -751,6 +2300,33 @@ mod tests {
         assert_eq!(value["type"], "event");
         assert_eq!(value["event"], "routes_pushed");
         assert_eq!(value["routes"][0]["cidr"], "10.1.0.0/16");
+        assert_eq!(value["domains"][0], "service.hundsun.com");
+        assert_eq!(value["domain_suffixes"][0], "hundsun.com");
+    }
+
+    #[test]
+    fn routes_pushed_event_accepts_legacy_payload_without_domains() {
+        let event: PrivateAccessEventEnvelope = serde_json::from_value(json!({
+            "type": "event",
+            "event": "routes_pushed",
+            "service": "hillstone",
+            "session_id": null,
+            "routes": [{ "cidr": "10.1.0.0/16" }],
+            "dns": [],
+            "bridge": null
+        }))
+        .expect("legacy routes event parses");
+        match event.event {
+            PrivateAccessEvent::RoutesPushed {
+                domains,
+                domain_suffixes,
+                ..
+            } => {
+                assert!(domains.is_empty());
+                assert!(domain_suffixes.is_empty());
+            }
+            _ => panic!("expected routes_pushed event"),
+        }
     }
 
     #[test]
@@ -811,6 +2387,16 @@ mod tests {
             manifest.config_schema["bridge_listen"]["default"],
             "127.0.0.1:16780"
         );
+    }
+
+    #[test]
+    fn built_in_sonicwall_manifest_uses_clean_room_service_subcommand() {
+        let manifest = default_sonicwall_manifest().expect("manifest builds");
+        assert_eq!(manifest.id, "sonicwall");
+        assert_eq!(manifest.protocol, "sonicwall-sma1000-evpn");
+        assert_eq!(manifest.args[0], "private-access-service");
+        assert_eq!(manifest.args[1], "sonicwall");
+        assert_eq!(manifest.config_schema["realm"]["default"], "Hundsun");
     }
 
     #[test]

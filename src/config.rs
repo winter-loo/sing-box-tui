@@ -16,6 +16,7 @@ use crate::defaults::{
 
 // Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
 const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
+const PRIVATE_ACCESS_SYSTEM_DNS_TAG: &str = "private-access-system";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HillstoneRouteOptions {
@@ -33,6 +34,9 @@ pub(crate) struct HillstoneRouteTableOptions {
 pub(crate) struct PrivateAccessRouteTableOptions {
     pub(crate) profile_id: String,
     pub(crate) cidrs: Vec<String>,
+    pub(crate) domains: Vec<String>,
+    pub(crate) domain_suffixes: Vec<String>,
+    pub(crate) carrier_domains: Vec<String>,
     pub(crate) proxy: Option<SocketAddrV4>,
 }
 
@@ -225,9 +229,13 @@ pub(crate) fn run_hillstone_route_table_config(
         PrivateAccessRouteTableOptions {
             profile_id: "hillstone".to_string(),
             cidrs: options.cidrs,
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
+            carrier_domains: Vec::new(),
             proxy: Some(options.proxy),
         },
     )
+    .map(|_| ())
 }
 
 pub(crate) fn run_private_access_route_table_config(
@@ -235,16 +243,18 @@ pub(crate) fn run_private_access_route_table_config(
     output: Option<&PathBuf>,
     write: bool,
     options: PrivateAccessRouteTableOptions,
-) -> Result<()> {
+) -> Result<bool> {
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let original = config.clone();
     ensure_private_access_route_table(&mut config, options)?;
+    let changed = config != original;
     let contents =
         serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
 
-    if write {
+    if write && changed {
         fs::write(config_path, format!("{contents}\n"))
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
@@ -252,7 +262,28 @@ pub(crate) fn run_private_access_route_table_config(
         fs::write(output, format!("{contents}\n"))
             .with_context(|| format!("failed to write {}", output.display()))?;
     }
-    Ok(())
+    Ok(changed)
+}
+
+pub(crate) fn run_private_access_carrier_route_config(
+    config_path: &PathBuf,
+    write: bool,
+    carrier_domains: &[String],
+) -> Result<bool> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let original = config.clone();
+    ensure_private_access_carrier_route(&mut config, carrier_domains)?;
+    let changed = config != original;
+    if write && changed {
+        let contents =
+            serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
+        fs::write(config_path, format!("{contents}\n"))
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -265,6 +296,9 @@ pub(crate) fn ensure_hillstone_route_table(
         PrivateAccessRouteTableOptions {
             profile_id: "hillstone".to_string(),
             cidrs: options.cidrs,
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
+            carrier_domains: Vec::new(),
             proxy: Some(options.proxy),
         },
     )
@@ -277,8 +311,11 @@ pub(crate) fn ensure_private_access_route_table(
     if options.profile_id.trim().is_empty() {
         anyhow::bail!("private access profile id cannot be empty");
     }
+    ensure_private_access_carrier_route(config, &options.carrier_domains)?;
     let target_cidrs = normalize_ipv4_cidrs(&options.cidrs)?;
-    if target_cidrs.is_empty() {
+    let target_domains = normalize_private_access_domains(&options.domains);
+    let target_domain_suffixes = normalize_private_access_domains(&options.domain_suffixes);
+    if target_cidrs.is_empty() && target_domains.is_empty() && target_domain_suffixes.is_empty() {
         return Ok(());
     }
 
@@ -301,6 +338,8 @@ pub(crate) fn ensure_private_access_route_table(
         },
     )?;
 
+    ensure_private_access_system_dns(root)?;
+
     let route_value = root.entry("route").or_insert_with(|| json!({}));
     let route = route_value
         .as_object_mut()
@@ -319,23 +358,62 @@ pub(crate) fn ensure_private_access_route_table(
         .as_array_mut()
         .context("existing config route.rules must be an array")?;
     rules.retain(|rule| {
-        !rule_matches_private_access_route_targets(rule, &target_cidrs, &direct_tag)
+        !rule_matches_private_access_route_targets(
+            rule,
+            &target_cidrs,
+            &target_domains,
+            &target_domain_suffixes,
+            &direct_tag,
+        )
     });
 
     // Profile-owned route metadata cannot be written into sing-box route rules because sing-box
     // may reject unknown fields. Ownership is tracked by the TUI/Private Access session; the config rule
     // itself stays valid sing-box JSON and intentionally has no port matcher.
-    let mut rule = json!({
-        "action": "route",
-        "ip_cidr": target_cidrs.iter().map(Ipv4Cidr::to_string).collect::<Vec<_>>(),
-        "outbound": direct_tag,
-    });
-    if let Some(proxy) = options.proxy {
-        rule["override_address"] = Value::String(proxy.ip().to_string());
-        rule["override_port"] = Value::from(proxy.port());
+    let mut index = hillstone_route_insert_index(rules);
+    if !target_domains.is_empty() || !target_domain_suffixes.is_empty() {
+        let mut resolve_rule = json!({
+            "action": "resolve",
+            "server": PRIVATE_ACCESS_SYSTEM_DNS_TAG,
+            "strategy": "ipv4_only",
+            "disable_cache": true,
+        });
+        set_private_access_domain_matchers(
+            &mut resolve_rule,
+            &target_domains,
+            &target_domain_suffixes,
+        );
+        rules.insert(index, resolve_rule);
+        index += 1;
+
+        let mut domain_rule = json!({
+            "action": "route",
+            "outbound": direct_tag,
+        });
+        set_private_access_domain_matchers(
+            &mut domain_rule,
+            &target_domains,
+            &target_domain_suffixes,
+        );
+        if let Some(proxy) = options.proxy {
+            domain_rule["override_address"] = Value::String(proxy.ip().to_string());
+            domain_rule["override_port"] = Value::from(proxy.port());
+        }
+        rules.insert(index, domain_rule);
+        index += 1;
     }
-    let index = hillstone_route_insert_index(rules);
-    rules.insert(index, rule);
+    if !target_cidrs.is_empty() {
+        let mut cidr_rule = json!({
+            "action": "route",
+            "ip_cidr": target_cidrs.iter().map(Ipv4Cidr::to_string).collect::<Vec<_>>(),
+            "outbound": direct_tag,
+        });
+        if let Some(proxy) = options.proxy {
+            cidr_rule["override_address"] = Value::String(proxy.ip().to_string());
+            cidr_rule["override_port"] = Value::from(proxy.port());
+        }
+        rules.insert(index, cidr_rule);
+    }
     Ok(())
 }
 
@@ -1413,11 +1491,68 @@ fn normalize_ipv4_cidrs(values: &[String]) -> Result<Vec<Ipv4Cidr>> {
     Ok(cidrs)
 }
 
+fn ensure_private_access_carrier_route(
+    config: &mut Value,
+    carrier_domains: &[String],
+) -> Result<()> {
+    let carrier_domains = normalize_private_access_domains(carrier_domains);
+    if carrier_domains.is_empty() {
+        return Ok(());
+    }
+
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .entry("outbounds")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config outbounds must be an array")?;
+    let selector_tag =
+        preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let carrier_rule = json!({
+        "action": "route",
+        "domain": carrier_domains,
+        "outbound": selector_tag,
+    });
+
+    let route = root
+        .entry("route")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    let rules = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    rules.retain(|rule| rule != &carrier_rule);
+    let index = rules
+        .iter()
+        .position(|rule| rule_references_rule_set(rule, DEFAULT_BYPASS_RULE_SET_TAG))
+        .or_else(|| {
+            rules
+                .iter()
+                .position(is_dns_hijack_rule)
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    rules.insert(index, carrier_rule);
+    Ok(())
+}
+
 fn rule_matches_private_access_route_targets(
     rule: &Value,
     target_cidrs: &[Ipv4Cidr],
+    target_domains: &[String],
+    target_domain_suffixes: &[String],
     direct_tag: &str,
 ) -> bool {
+    if rule.get("action").and_then(Value::as_str) == Some("resolve")
+        && rule.get("server").and_then(Value::as_str) == Some(PRIVATE_ACCESS_SYSTEM_DNS_TAG)
+    {
+        return true;
+    }
     if rule.get("action").and_then(Value::as_str) != Some("route") {
         return false;
     }
@@ -1431,7 +1566,97 @@ fn rule_matches_private_access_route_targets(
         target_cidrs
             .iter()
             .any(|target| rule_cidr.overlaps(*target))
-    })
+    }) || rule_string_values(rule, "domain")
+        .iter()
+        .any(|domain| target_domains.contains(domain))
+        || rule_string_values(rule, "domain_suffix")
+            .iter()
+            .any(|suffix| target_domain_suffixes.contains(suffix))
+}
+
+fn ensure_private_access_system_dns(root: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let dns = root
+        .entry("dns")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config dns must be an object")?;
+    let servers = dns
+        .entry("servers")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.servers must be an array")?;
+    if let Some(server) = servers.iter_mut().find(|server| {
+        server.get("tag").and_then(Value::as_str) == Some(PRIVATE_ACCESS_SYSTEM_DNS_TAG)
+    }) {
+        let server = server
+            .as_object_mut()
+            .context("private access DNS server must be an object")?;
+        server.insert("type".to_string(), Value::String("local".to_string()));
+    } else {
+        servers.push(json!({
+            "type": "local",
+            "tag": PRIVATE_ACCESS_SYSTEM_DNS_TAG,
+        }));
+    }
+    Ok(())
+}
+
+fn normalize_private_access_domains(values: &[String]) -> Vec<String> {
+    let mut domains = values
+        .iter()
+        .filter_map(|value| {
+            let value = value
+                .trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            (!value.is_empty()
+                && value.len() <= 253
+                && value.parse::<std::net::IpAddr>().is_err()
+                && value.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                }))
+            .then_some(value)
+        })
+        .collect::<Vec<_>>();
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+fn set_private_access_domain_matchers(
+    rule: &mut Value,
+    domains: &[String],
+    domain_suffixes: &[String],
+) {
+    let object = rule
+        .as_object_mut()
+        .expect("private access rule is a JSON object");
+    if !domains.is_empty() {
+        object.insert("domain".to_string(), json!(domains));
+    }
+    if !domain_suffixes.is_empty() {
+        object.insert("domain_suffix".to_string(), json!(domain_suffixes));
+    }
+}
+
+fn rule_string_values(rule: &Value, field: &str) -> Vec<String> {
+    match rule.get(field) {
+        Some(Value::String(value)) => vec![value.to_ascii_lowercase()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn rule_ip_cidrs(rule: &Value) -> Vec<Ipv4Cidr> {
@@ -1666,13 +1891,14 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultConfigOptions, HillstoneRouteTableOptions, PrivateAccessRouteTableOptions,
-        ProviderNodeSet, build_default_config, build_default_config_with_options,
-        build_full_config_with_provider_node_sets, ensure_bypass_rule_set_file_for_config,
-        ensure_hillstone_route_table, ensure_private_access_route_table,
-        merge_into_existing_config,
+        DefaultConfigOptions, HillstoneRouteTableOptions, PRIVATE_ACCESS_SYSTEM_DNS_TAG,
+        PrivateAccessRouteTableOptions, ProviderNodeSet, build_default_config,
+        build_default_config_with_options, build_full_config_with_provider_node_sets,
+        ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
+        ensure_private_access_route_table, merge_into_existing_config,
+        run_private_access_route_table_config,
     };
-    use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
+    use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1902,6 +2128,9 @@ mod tests {
             PrivateAccessRouteTableOptions {
                 profile_id: "hillstone".to_string(),
                 cidrs: vec!["10.1.0.0/16".to_string()],
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
                 proxy: Some("127.0.0.1:18080".parse().expect("proxy parses")),
             },
         )
@@ -1948,6 +2177,9 @@ mod tests {
                     "10.255.0.0/24".to_string(),
                     "10.253.0.0/24".to_string(),
                 ],
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
                 proxy: None,
             },
         )
@@ -1968,6 +2200,118 @@ mod tests {
         assert_eq!(rule["outbound"], "direct");
         assert!(rule.get("override_address").is_none());
         assert!(rule.get("override_port").is_none());
+    }
+
+    #[test]
+    fn private_access_domains_resolve_with_system_dns_before_direct_routing() {
+        let mut config = json!({
+            "dns": { "servers": [] },
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": {
+                "rules": [
+                    {
+                        "type": "logical",
+                        "mode": "or",
+                        "rules": [{ "protocol": "dns" }, { "port": 53 }],
+                        "action": "hijack-dns"
+                    },
+                    { "rule_set": DEFAULT_BYPASS_RULE_SET_TAG, "outbound": "direct" },
+                    { "ip_is_private": true, "outbound": "direct" }
+                ]
+            }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "sonicwall".to_string(),
+                cidrs: vec!["192.168.0.0/16".to_string()],
+                domains: vec!["Service.Hundsun.com".to_string()],
+                domain_suffixes: vec!["*.Hundsun.COM.".to_string()],
+                carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
+                proxy: None,
+            },
+        )
+        .expect("SonicWall domain routes are inserted");
+
+        let dns_servers = config["dns"]["servers"]
+            .as_array()
+            .expect("DNS servers array");
+        assert!(dns_servers.iter().any(|server| {
+            server["type"] == "local" && server["tag"] == PRIVATE_ACCESS_SYSTEM_DNS_TAG
+        }));
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let carrier_index = rules
+            .iter()
+            .position(|rule| rule["domain"] == json!(["sslvpn.hundsun.com"]))
+            .expect("SonicWall carrier route");
+        let bypass_index = rules
+            .iter()
+            .position(|rule| rule["rule_set"] == DEFAULT_BYPASS_RULE_SET_TAG)
+            .expect("generic bypass route");
+        let resolve_index = rules
+            .iter()
+            .position(|rule| rule["action"] == "resolve")
+            .expect("private access resolve rule");
+        let domain_index = rules
+            .iter()
+            .position(|rule| {
+                rule["action"] == "route" && rule["domain"] == json!(["service.hundsun.com"])
+            })
+            .expect("private access domain route");
+        let cidr_index = rules
+            .iter()
+            .position(|rule| rule["ip_cidr"] == json!(["192.168.0.0/16"]))
+            .expect("private access CIDR route");
+        assert!(carrier_index < bypass_index);
+        assert!(carrier_index < resolve_index);
+        assert_eq!(rules[carrier_index]["outbound"], "select");
+        assert!(resolve_index < domain_index);
+        assert!(domain_index < cidr_index);
+        assert_eq!(
+            rules[resolve_index]["server"],
+            PRIVATE_ACCESS_SYSTEM_DNS_TAG
+        );
+        assert_eq!(rules[resolve_index]["disable_cache"], true);
+        assert_eq!(
+            rules[resolve_index]["domain_suffix"],
+            json!(["hundsun.com"])
+        );
+        assert_eq!(rules[domain_index]["outbound"], "direct");
+        assert_eq!(config["route"]["auto_detect_interface"], false);
+    }
+
+    #[test]
+    fn private_access_route_config_reports_only_real_changes() {
+        let path = temp_config_path("private-access-change-detection");
+        let config = build_default_config(Vec::new());
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("temporary config is written");
+        let options = PrivateAccessRouteTableOptions {
+            profile_id: "sonicwall".to_string(),
+            cidrs: vec!["10.22.0.0/16".to_string()],
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
+            carrier_domains: Vec::new(),
+            proxy: None,
+        };
+
+        assert!(
+            run_private_access_route_table_config(&path, None, true, options.clone())
+                .expect("first update succeeds")
+        );
+        assert!(
+            !run_private_access_route_table_config(&path, None, true, options)
+                .expect("idempotent update succeeds")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
