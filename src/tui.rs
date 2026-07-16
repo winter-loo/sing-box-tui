@@ -26,6 +26,7 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
+    Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
@@ -833,6 +834,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
             .areas(frame.area());
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
+    let (internet_area, intranet_area) = if app.private_access.is_configured() {
+        let [internet_area, intranet_area] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(groups_area);
+        (internet_area, Some(intranet_area))
+    } else {
+        (groups_area, None)
+    };
 
     let groups = app
         .displayed_group_names()
@@ -852,7 +861,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             }
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    truncate_for_width(group_name, groups_area.width.saturating_sub(18) as usize),
+                    truncate_for_width(group_name, internet_area.width.saturating_sub(18) as usize),
                     style,
                 ),
                 Span::raw(" "),
@@ -869,17 +878,64 @@ fn draw(frame: &mut Frame, app: &mut App) {
         })
         .collect::<Vec<_>>();
 
-    let groups_title = "Internet Routes";
+    let groups_title = "Internet Proxy";
     let groups_block = Block::default()
         .title(groups_title)
         .borders(Borders::ALL)
-        .border_style(border_style(app.focus == Focus::Groups));
+        .border_style(border_style(
+            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Internet,
+        ));
     let groups_widget = List::new(groups)
         .block(groups_block)
-        .highlight_style(selected_style(app.focus == Focus::Groups))
+        .highlight_style(selected_style(
+            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Internet,
+        ))
         .highlight_symbol("> ");
-    let mut groups_state = ListState::default().with_selected(Some(app.displayed_group_index()));
-    frame.render_stateful_widget(groups_widget, groups_area, &mut groups_state);
+    let mut groups_state = ListState::default().with_selected(
+        (app.left_pane_section == LeftPaneSection::Internet).then_some(app.displayed_group_index()),
+    );
+    frame.render_stateful_widget(groups_widget, internet_area, &mut groups_state);
+
+    if let Some(intranet_area) = intranet_area {
+        let profiles = app
+            .private_access
+            .profiles
+            .iter()
+            .map(|profile| {
+                let state_label = if profile.background_pid.is_some() {
+                    "BACKGROUND"
+                } else {
+                    private_access_state_badge(profile.state.clone())
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        truncate_for_width(
+                            &profile.id,
+                            intranet_area.width.saturating_sub(18) as usize,
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(state_label, private_access_state_style(&profile.state)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let intranet_active =
+            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Intranet;
+        let intranet_block = Block::default()
+            .title("Intranet Proxy")
+            .borders(Borders::ALL)
+            .border_style(border_style(intranet_active));
+        let intranet_widget = List::new(profiles)
+            .block(intranet_block)
+            .highlight_style(selected_style(intranet_active))
+            .highlight_symbol("> ");
+        let mut intranet_state = ListState::default().with_selected(
+            (app.left_pane_section == LeftPaneSection::Intranet)
+                .then_some(app.private_access.focused_index),
+        );
+        frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
+    }
 
     let displayed_members = app.displayed_members();
     let members = app
@@ -955,6 +1011,40 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let mut members_state = ListState::default().with_selected(app.displayed_member_index());
     frame.render_stateful_widget(members_widget, members_area, &mut members_state);
 
+    if app.showing_intranet_details()
+        && let Some(profile) = app.private_access.focused_opt()
+    {
+        frame.render_widget(Clear, members_area);
+        let detail_view = app.intranet_detail_view(profile);
+        let details_block = Block::default()
+            .title(if app.intranet_detail_scroll == 0 {
+                format!("Intranet: {}", profile.id)
+            } else {
+                format!(
+                    "Intranet: {} [line {}]",
+                    profile.id,
+                    app.intranet_detail_scroll + 1
+                )
+            })
+            .borders(Borders::ALL)
+            .border_style(border_style(app.focus == Focus::Members));
+        let details_inner = details_block.inner(members_area);
+        frame.render_widget(details_block, members_area);
+        let [details_area, footer_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(details_inner);
+        let details = Paragraph::new(detail_view.lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.intranet_detail_scroll, 0));
+        frame.render_widget(details, details_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            footer_area,
+        );
+    }
+
     let help =
         Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
     frame.render_widget(help, status_area);
@@ -1000,32 +1090,248 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn status_lines(app: &App) -> Vec<Line<'_>> {
-    let benchmark_hint = app.selected_benchmark().map_or_else(
-        || {
-            format!(
-                "clash={}  order={}  auto={}  T group latency  t node latency  a auto-pick  / filter",
-                app.clash_mode_label(),
-                node_order_badge(app.latency_sort_mode),
-                auto_select_badge(app.auto_select_enabled)
-            )
-        },
-        |summary| {
-            let best = summary
-                .best_success()
-                .map(|item| format!("best={} {}", item.name, item.display_delay()))
-                .unwrap_or_else(|| "best=none".to_string());
-            format!(
-                "filter='{}'  tested={}  clash={}  order={}  auto={}  {}",
-                summary.pattern,
-                summary.results.len(),
-                app.clash_mode_label(),
-                node_order_badge(app.latency_sort_mode),
-                auto_select_badge(app.auto_select_enabled),
-                truncate_for_width(&best, 30)
-            )
-        },
+fn private_access_detail_view(
+    profile: &PrivateAccessProfileRuntime,
+    is_expanded: impl Fn(IntranetDetailSection) -> bool,
+) -> IntranetDetailView {
+    let state_label = if profile.background_pid.is_some() {
+        "BACKGROUND"
+    } else {
+        private_access_state_badge(profile.state.clone())
+    };
+    let gateway = if profile.server.trim().is_empty() {
+        "not configured".to_string()
+    } else {
+        format!("{}:{}", profile.server, profile.port)
+    };
+    let data_plane = match profile.mode {
+        PrivateAccessMode::Tun => "TUN".to_string(),
+        PrivateAccessMode::Bridge => profile
+            .bridge
+            .as_ref()
+            .map(|bridge| format!("{} at {}", bridge.kind, bridge.listen))
+            .unwrap_or_else(|| format!("HTTP bridge at {}", profile.bridge_listen)),
+    };
+    let capabilities = [
+        profile
+            .manifest
+            .capabilities
+            .pushed_routes
+            .then_some("routes"),
+        profile.manifest.capabilities.pushed_dns.then_some("DNS"),
+        profile
+            .manifest
+            .capabilities
+            .local_http_bridge
+            .then_some("HTTP bridge"),
+        profile
+            .manifest
+            .capabilities
+            .graceful_disconnect
+            .then_some("graceful disconnect"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("State: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(state_label, private_access_state_style(&profile.state)),
+        ]),
+        private_access_detail_line("Service", &profile.manifest.name),
+        private_access_detail_line(
+            "Protocol",
+            &format!(
+                "{} (service v{})",
+                profile.manifest.protocol, profile.manifest.version
+            ),
+        ),
+        private_access_detail_line("Gateway", &gateway),
+        private_access_detail_line(
+            "TLS verification",
+            if profile.tls_verify {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        ),
+        private_access_detail_line("Data plane", &data_plane),
+    ];
+    if !capabilities.is_empty() {
+        lines.push(private_access_detail_line("Capabilities", &capabilities));
+    }
+    if let Some(pid) = profile.background_pid {
+        lines.push(private_access_detail_line(
+            "Process",
+            &format!("background pid {pid}"),
+        ));
+    } else if profile.process.is_some() {
+        lines.push(private_access_detail_line("Process", "owned by this TUI"));
+    }
+
+    let mut sections = Vec::new();
+    append_private_access_detail_section(
+        &mut lines,
+        &mut sections,
+        IntranetDetailSection::Dns,
+        "DNS servers",
+        profile.dns.clone(),
+        "No DNS servers have been pushed.",
+        is_expanded(IntranetDetailSection::Dns),
     );
+    append_private_access_detail_section(
+        &mut lines,
+        &mut sections,
+        IntranetDetailSection::Routes,
+        "Routes",
+        profile
+            .routes
+            .iter()
+            .map(|route| route.cidr.clone())
+            .collect(),
+        "No routes have been pushed.",
+        is_expanded(IntranetDetailSection::Routes),
+    );
+    let domains = profile
+        .domains
+        .iter()
+        .map(|domain| format!("exact  {domain}"))
+        .chain(
+            profile
+                .domain_suffixes
+                .iter()
+                .map(|domain| format!("suffix *.{domain}")),
+        )
+        .collect();
+    append_private_access_detail_section(
+        &mut lines,
+        &mut sections,
+        IntranetDetailSection::Domains,
+        "Internal domains",
+        domains,
+        "No internal domains have been pushed.",
+        is_expanded(IntranetDetailSection::Domains),
+    );
+
+    if let Some(error) = profile.last_error.as_deref() {
+        lines.push(Line::default());
+        lines.push(private_access_detail_heading("Last error"));
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    IntranetDetailView { lines, sections }
+}
+
+fn append_private_access_detail_section(
+    lines: &mut Vec<Line<'static>>,
+    sections: &mut Vec<IntranetDetailSectionRange>,
+    section: IntranetDetailSection,
+    label: &str,
+    items: Vec<String>,
+    empty_message: &str,
+    expanded: bool,
+) {
+    const FOLDED_ITEM_LIMIT: usize = 10;
+
+    lines.push(Line::default());
+    let start = lines.len();
+    let item_count = items.len();
+    let foldable = item_count > FOLDED_ITEM_LIMIT;
+    let visible_count = if foldable && !expanded {
+        FOLDED_ITEM_LIMIT
+    } else {
+        item_count
+    };
+    let heading = match (foldable, expanded) {
+        (true, true) => format!("▼ {label} ({item_count}) [Enter to fold]"),
+        (true, false) => {
+            format!("▶ {label} ({item_count}) [showing {FOLDED_ITEM_LIMIT}; Enter to expand]")
+        }
+        (false, _) => format!("{label} ({item_count})"),
+    };
+    lines.push(private_access_detail_heading(heading));
+    if items.is_empty() {
+        lines.push(private_access_detail_empty(empty_message));
+    } else {
+        lines.extend(
+            items
+                .into_iter()
+                .take(visible_count)
+                .map(|item| Line::from(format!("  {item}"))),
+        );
+        if foldable && !expanded {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} more item(s)", item_count - visible_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    sections.push(IntranetDetailSectionRange {
+        section,
+        start,
+        end: lines.len(),
+        foldable,
+    });
+}
+
+fn private_access_detail_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.to_string()),
+    ])
+}
+
+fn private_access_detail_heading(value: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        value.into(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn private_access_detail_empty(value: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {value}"),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn status_lines(app: &App) -> Vec<Line<'_>> {
+    let benchmark_hint = if app.showing_intranet_details() {
+        "Intranet details are shown in the right panel".to_string()
+    } else {
+        app.selected_benchmark().map_or_else(
+            || {
+                format!(
+                    "clash={}  order={}  auto={}  T group latency  t node latency  a auto-pick  / filter",
+                    app.clash_mode_label(),
+                    node_order_badge(app.latency_sort_mode),
+                    auto_select_badge(app.auto_select_enabled)
+                )
+            },
+            |summary| {
+                let best = summary
+                    .best_success()
+                    .map(|item| format!("best={} {}", item.name, item.display_delay()))
+                    .unwrap_or_else(|| "best=none".to_string());
+                format!(
+                    "filter='{}'  tested={}  clash={}  order={}  auto={}  {}",
+                    summary.pattern,
+                    summary.results.len(),
+                    app.clash_mode_label(),
+                    node_order_badge(app.latency_sort_mode),
+                    auto_select_badge(app.auto_select_enabled),
+                    truncate_for_width(&best, 30)
+                )
+            },
+        )
+    };
 
     let bottom_line = if let Some(input) = app.filter_input.as_deref() {
         Line::from(vec![
@@ -1108,9 +1414,6 @@ fn status_lines(app: &App) -> Vec<Line<'_>> {
         Line::from(app.subscription_summary_line()),
         Line::from(app.sing_box_summary_line()),
     ];
-    if let Some(line) = app.private_access.summary_line() {
-        lines.push(line);
-    }
     lines.push(bottom_line);
     lines
 }
@@ -1125,8 +1428,8 @@ struct HelpBinding {
 const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "up",
-        summary: "Move selection up",
-        detail: "Move the highlighted row up in the active list or help panel.",
+        summary: "Move up / scroll details",
+        detail: "Move the highlighted row up, or scroll Intranet Proxy details when the right pane is focused.",
     },
     HelpBinding {
         key: "k",
@@ -1135,8 +1438,8 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "down",
-        summary: "Move selection down",
-        detail: "Move the highlighted row down in the active list or help panel.",
+        summary: "Move down / scroll details",
+        detail: "Move the highlighted row down, crossing from Internet Proxy into Intranet Proxy, or scroll right-pane details.",
     },
     HelpBinding {
         key: "j",
@@ -1170,8 +1473,8 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "space",
-        summary: "Switch Internet Route",
-        detail: "Apply the highlighted Internet Route selection through the controller API.",
+        summary: "Activate selection",
+        detail: "Apply an Internet Proxy selection, or open the selected Intranet Proxy profile details.",
     },
     HelpBinding {
         key: "m",
@@ -1251,7 +1554,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "V",
         summary: "Toggle Private Access",
-        detail: "Connect or disconnect the configured Private Access profile.",
+        detail: "Connect or disconnect the selected Intranet Proxy profile.",
     },
     HelpBinding {
         key: "o",
@@ -3428,6 +3731,42 @@ enum Focus {
     Members,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeftPaneSection {
+    Internet,
+    Intranet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IntranetDetailSection {
+    Dns,
+    Routes,
+    Domains,
+}
+
+impl IntranetDetailSection {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Routes => "routes",
+            Self::Domains => "domains",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntranetDetailSectionRange {
+    section: IntranetDetailSection,
+    start: usize,
+    end: usize,
+    foldable: bool,
+}
+
+struct IntranetDetailView {
+    lines: Vec<Line<'static>>,
+    sections: Vec<IntranetDetailSectionRange>,
+}
+
 #[derive(Clone, Debug)]
 struct LatencyChartState {
     selector: String,
@@ -3533,6 +3872,9 @@ struct App {
     internet_route_index: usize,
     member_index: usize,
     focus: Focus,
+    left_pane_section: LeftPaneSection,
+    intranet_detail_scroll: u16,
+    expanded_intranet_sections: BTreeSet<String>,
     status: String,
     flash: Option<(String, Instant)>,
     benchmark_filter: String,
@@ -3714,6 +4056,8 @@ struct PrivateAccessProfileRuntime {
     tls_verify: bool,
     routes: Vec<PrivateAccessRoute>,
     dns: Vec<String>,
+    domains: Vec<String>,
+    domain_suffixes: Vec<String>,
     bridge: Option<PrivateAccessBridge>,
     last_error: Option<String>,
     integration_failed: bool,
@@ -3745,6 +4089,8 @@ impl PrivateAccessProfileRuntime {
             tls_verify: false,
             routes: Vec::new(),
             dns: Vec::new(),
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
             bridge: None,
             last_error: None,
             integration_failed: false,
@@ -3752,6 +4098,7 @@ impl PrivateAccessProfileRuntime {
         })
     }
 
+    #[cfg(test)]
     fn default_sonicwall() -> Result<Self> {
         let manifest_path = env::var("SING_BOX_TUI_SONICWALL_MANIFEST")
             .ok()
@@ -3775,6 +4122,8 @@ impl PrivateAccessProfileRuntime {
             tls_verify: true,
             routes: Vec::new(),
             dns: Vec::new(),
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
             bridge: None,
             last_error: None,
             integration_failed: false,
@@ -3817,6 +4166,8 @@ impl PrivateAccessProfileRuntime {
             tls_verify: is_sonicwall,
             routes: Vec::new(),
             dns: Vec::new(),
+            domains: Vec::new(),
+            domain_suffixes: Vec::new(),
             bridge: None,
             last_error: None,
             integration_failed: false,
@@ -3954,12 +4305,6 @@ impl PrivateAccessRuntime {
                 profiles.push(PrivateAccessProfileRuntime::from_state(profile_state)?);
             }
         }
-        if !profiles
-            .iter()
-            .any(|profile| profile.manifest.id == "sonicwall")
-        {
-            profiles.push(PrivateAccessProfileRuntime::default_sonicwall()?);
-        }
         self.profiles = profiles;
         self.focused_index = self
             .focused_index
@@ -3974,6 +4319,7 @@ impl PrivateAccessRuntime {
             .collect()
     }
 
+    #[cfg(test)]
     fn summary_line(&self) -> Option<Line<'static>> {
         let focused = self.focused_opt()?;
         let mut spans = vec![Span::styled(
@@ -4040,6 +4386,7 @@ impl PrivateAccessRuntime {
     }
 }
 
+#[cfg(test)]
 fn private_access_profile_badge(
     profile: &PrivateAccessProfileRuntime,
     focused: bool,
@@ -4264,6 +4611,9 @@ impl App {
             internet_route_index: 0,
             member_index: 0,
             focus: Focus::Groups,
+            left_pane_section: LeftPaneSection::Internet,
+            intranet_detail_scroll: 0,
+            expanded_intranet_sections: BTreeSet::new(),
             status: String::from("Loading proxy groups..."),
             flash: None,
             benchmark_filter: String::new(),
@@ -4365,6 +4715,10 @@ impl App {
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
         self.private_access.apply_state(&state)?;
+        if !self.private_access.is_configured() {
+            self.left_pane_section = LeftPaneSection::Internet;
+            self.intranet_detail_scroll = 0;
+        }
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.auto_select_selector = state.auto_pick_selector;
@@ -4620,6 +4974,66 @@ impl App {
         }
     }
 
+    fn showing_intranet_details(&self) -> bool {
+        self.left_pane_section == LeftPaneSection::Intranet && self.private_access.is_configured()
+    }
+
+    fn intranet_detail_section_key(profile_id: &str, section: IntranetDetailSection) -> String {
+        format!("{profile_id}:{}", section.key())
+    }
+
+    fn intranet_detail_view(&self, profile: &PrivateAccessProfileRuntime) -> IntranetDetailView {
+        private_access_detail_view(profile, |section| {
+            self.expanded_intranet_sections
+                .contains(&Self::intranet_detail_section_key(&profile.id, section))
+        })
+    }
+
+    fn intranet_detail_line_count(&self) -> usize {
+        self.private_access
+            .focused_opt()
+            .map(|profile| self.intranet_detail_view(profile).lines.len())
+            .unwrap_or(0)
+    }
+
+    fn toggle_intranet_detail_section(&mut self) {
+        let Some(profile) = self.private_access.focused_opt() else {
+            return;
+        };
+        let profile_id = profile.id.clone();
+        let view = self.intranet_detail_view(profile);
+        let cursor = self.intranet_detail_scroll as usize;
+        let Some(range) = view
+            .sections
+            .iter()
+            .find(|range| range.foldable && cursor >= range.start && cursor < range.end)
+            .or_else(|| {
+                view.sections
+                    .iter()
+                    .find(|range| range.foldable && range.start >= cursor)
+            })
+            .or_else(|| view.sections.iter().rev().find(|range| range.foldable))
+            .copied()
+        else {
+            self.set_status_only("No detail section has more than 10 items");
+            return;
+        };
+        let key = Self::intranet_detail_section_key(&profile_id, range.section);
+        let expanded = if self.expanded_intranet_sections.remove(&key) {
+            false
+        } else {
+            self.expanded_intranet_sections.insert(key);
+            true
+        };
+        self.intranet_detail_scroll = range.start as u16;
+        self.set_status_only(format!(
+            "{} {} section for {}",
+            if expanded { "Expanded" } else { "Folded" },
+            range.section.key(),
+            profile_id
+        ));
+    }
+
     fn selected_root_choice_name(&self) -> Option<String> {
         self.implicit_root_group().and_then(|root| {
             self.internet_route_child_group_names(root)
@@ -4657,6 +5071,9 @@ impl App {
     }
 
     fn selected_member_panel_group(&self) -> Option<&ProxyGroup> {
+        if self.showing_intranet_details() {
+            return None;
+        }
         if self.implicit_root_mode() {
             let choice = self.selected_root_choice_name()?;
             return self.group_by_name(&choice);
@@ -5164,18 +5581,14 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Groups => Focus::Members,
                     Focus::Members => Focus::Groups,
                 };
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.focus = match self.focus {
-                    Focus::Groups => Focus::Members,
-                    Focus::Members => Focus::Groups,
-                };
-            }
+            KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
+            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_previous(),
             KeyCode::Char('g') => self.move_first(),
@@ -5198,6 +5611,9 @@ impl App {
             KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
             KeyCode::Char(' ') => self.activate_selection()?,
+            KeyCode::Enter if self.focus == Focus::Members && self.showing_intranet_details() => {
+                self.toggle_intranet_detail_section();
+            }
             KeyCode::Enter => {}
             _ => {}
         }
@@ -5645,6 +6061,10 @@ impl App {
     }
 
     fn open_latency_chart(&mut self) -> Result<()> {
+        if self.showing_intranet_details() {
+            self.set_status_only("Latency history is available for Internet Proxy nodes only");
+            return Ok(());
+        }
         let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
             self.set_status_only("No selector group available for latency history");
             return Ok(());
@@ -5709,18 +6129,38 @@ impl App {
 
     fn move_next(&mut self) {
         match self.focus {
-            Focus::Groups => {
-                if self.implicit_root_mode() {
-                    if self.internet_route_index + 1 < self.displayed_group_names().len() {
-                        self.internet_route_index += 1;
+            Focus::Groups => match self.left_pane_section {
+                LeftPaneSection::Internet => {
+                    let group_count = self.displayed_group_names().len();
+                    if self.displayed_group_index() + 1 < group_count {
+                        if self.implicit_root_mode() {
+                            self.internet_route_index += 1;
+                        } else {
+                            self.group_index += 1;
+                        }
                         self.sync_member_selection_to_current();
+                    } else if self.private_access.is_configured() {
+                        self.left_pane_section = LeftPaneSection::Intranet;
+                        self.private_access.focused_index = 0;
+                        self.intranet_detail_scroll = 0;
                     }
-                } else if self.group_index + 1 < self.groups.len() {
-                    self.group_index += 1;
-                    self.sync_member_selection_to_current();
                 }
-            }
+                LeftPaneSection::Intranet => {
+                    if self.private_access.focused_index + 1 < self.private_access.profiles.len() {
+                        self.private_access.focused_index += 1;
+                        self.intranet_detail_scroll = 0;
+                    }
+                }
+            },
             Focus::Members => {
+                if self.showing_intranet_details() {
+                    let max_scroll = self.intranet_detail_line_count().saturating_sub(1) as u16;
+                    self.intranet_detail_scroll = self
+                        .intranet_detail_scroll
+                        .saturating_add(1)
+                        .min(max_scroll);
+                    return;
+                }
                 let members = self.displayed_members();
                 if members.is_empty() {
                     return;
@@ -5735,18 +6175,39 @@ impl App {
 
     fn move_previous(&mut self) {
         match self.focus {
-            Focus::Groups => {
-                if self.implicit_root_mode() {
-                    if self.internet_route_index > 0 {
-                        self.internet_route_index -= 1;
+            Focus::Groups => match self.left_pane_section {
+                LeftPaneSection::Internet => {
+                    if self.displayed_group_index() > 0 {
+                        if self.implicit_root_mode() {
+                            self.internet_route_index -= 1;
+                        } else {
+                            self.group_index -= 1;
+                        }
                         self.sync_member_selection_to_current();
                     }
-                } else if self.group_index > 0 {
-                    self.group_index -= 1;
-                    self.sync_member_selection_to_current();
                 }
-            }
+                LeftPaneSection::Intranet => {
+                    if self.private_access.focused_index > 0 {
+                        self.private_access.focused_index -= 1;
+                        self.intranet_detail_scroll = 0;
+                    } else if !self.displayed_group_names().is_empty() {
+                        self.left_pane_section = LeftPaneSection::Internet;
+                        self.intranet_detail_scroll = 0;
+                        if self.implicit_root_mode() {
+                            self.internet_route_index =
+                                self.displayed_group_names().len().saturating_sub(1);
+                        } else {
+                            self.group_index = self.groups.len().saturating_sub(1);
+                        }
+                        self.sync_member_selection_to_current();
+                    }
+                }
+            },
             Focus::Members => {
+                if self.showing_intranet_details() {
+                    self.intranet_detail_scroll = self.intranet_detail_scroll.saturating_sub(1);
+                    return;
+                }
                 let members = self.displayed_members();
                 if members.is_empty() {
                     return;
@@ -5762,6 +6223,7 @@ impl App {
     fn move_first(&mut self) {
         match self.focus {
             Focus::Groups => {
+                self.left_pane_section = LeftPaneSection::Internet;
                 if self.implicit_root_mode() {
                     self.internet_route_index = 0;
                 } else {
@@ -5770,6 +6232,10 @@ impl App {
                 self.sync_member_selection_to_current();
             }
             Focus::Members => {
+                if self.showing_intranet_details() {
+                    self.intranet_detail_scroll = 0;
+                    return;
+                }
                 if let Some(first) = self.displayed_members().first().cloned() {
                     self.sync_selection_to_member_name(&first);
                 }
@@ -5780,7 +6246,12 @@ impl App {
     fn move_last(&mut self) {
         match self.focus {
             Focus::Groups => {
-                if self.implicit_root_mode() {
+                if self.private_access.is_configured() {
+                    self.left_pane_section = LeftPaneSection::Intranet;
+                    self.private_access.focused_index =
+                        self.private_access.profiles.len().saturating_sub(1);
+                    self.intranet_detail_scroll = 0;
+                } else if self.implicit_root_mode() {
                     let groups = self.displayed_group_names();
                     if !groups.is_empty() {
                         self.internet_route_index = groups.len() - 1;
@@ -5792,6 +6263,11 @@ impl App {
                 }
             }
             Focus::Members => {
+                if self.showing_intranet_details() {
+                    self.intranet_detail_scroll =
+                        self.intranet_detail_line_count().saturating_sub(1) as u16;
+                    return;
+                }
                 if let Some(last) = self.displayed_members().last().cloned() {
                     self.sync_selection_to_member_name(&last);
                 }
@@ -5800,6 +6276,14 @@ impl App {
     }
 
     fn activate_selection(&mut self) -> Result<()> {
+        if self.showing_intranet_details() {
+            let profile_id = self.private_access.focused().id.clone();
+            self.focus = Focus::Members;
+            self.set_status_only(format!(
+                "Showing Intranet Proxy details for {profile_id}; press V to connect or disconnect"
+            ));
+            return Ok(());
+        }
         if self.focus == Focus::Groups {
             if self.implicit_root_mode() {
                 self.activate_root_choice()?;
@@ -5923,6 +6407,10 @@ impl App {
     }
 
     fn start_group_benchmark(&mut self) -> Result<()> {
+        if self.showing_intranet_details() {
+            self.set_status_only("Latency tests are available for Internet Proxy nodes only");
+            return Ok(());
+        }
         let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
@@ -5966,6 +6454,10 @@ impl App {
     }
 
     fn start_member_benchmark(&mut self) -> Result<()> {
+        if self.showing_intranet_details() {
+            self.set_status_only("Latency tests are available for Internet Proxy nodes only");
+            return Ok(());
+        }
         let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
@@ -7286,6 +7778,9 @@ impl App {
                         );
                         self.private_access.profiles[profile_index].routes = routes.clone();
                         self.private_access.profiles[profile_index].dns = dns;
+                        self.private_access.profiles[profile_index].domains = domains.clone();
+                        self.private_access.profiles[profile_index].domain_suffixes =
+                            domain_suffixes.clone();
                         let carrier_domains = vec![
                             self.private_access.profiles[profile_index]
                                 .server
@@ -7838,18 +8333,19 @@ mod tests {
     use super::{
         App, AutoSelectSwitchPlan, BackgroundLatencyResult, BackgroundLatencySnapshot,
         CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
-        LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState,
-        LatencyChartTimeUnit, PrivateAccessMode, PrivateAccessProfileRuntime, PrivateAccessRuntime,
-        PrivateAccessState, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
-        SettingsEditState, SettingsField, SingBoxProcessRuntime,
-        command_matches_headless_auto_pick, command_matches_sing_box_run_for_config,
-        config_arg_matches_path, connection_is_direct, format_bytes, format_connection_line,
-        format_duration_badge, is_private_access_settings_field, latency_chart_segments,
-        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
-        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
+        LatencyChartState, LatencyChartTimeUnit, LeftPaneSection, PrivateAccessMode,
+        PrivateAccessProfileRuntime, PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE,
+        SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, SettingsEditState, SettingsField,
+        SingBoxProcessRuntime, command_matches_headless_auto_pick,
+        command_matches_sing_box_run_for_config, config_arg_matches_path, connection_is_direct,
+        format_bytes, format_connection_line, format_duration_badge,
+        is_private_access_settings_field, latency_chart_segments, latency_chart_threshold_line,
+        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
+        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
         normalize_http_connect_proxy, private_access_auth_display_value,
         settings_field_display_value, settings_field_value,
-        should_apply_private_access_state_after_integration, sing_box_config_args,
+        should_apply_private_access_state_after_integration, sing_box_config_args, status_lines,
         subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
         visible_settings_fields,
     };
@@ -7864,9 +8360,11 @@ mod tests {
     use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
     use crossterm::event::MouseEventKind;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use reqwest::Client as AsyncClient;
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -7950,6 +8448,9 @@ mod tests {
             internet_route_index: 0,
             member_index: 0,
             focus: Focus::Members,
+            left_pane_section: LeftPaneSection::Internet,
+            intranet_detail_scroll: 0,
+            expanded_intranet_sections: BTreeSet::new(),
             status: String::new(),
             flash: None,
             benchmark_filter: "美国".to_string(),
@@ -8034,6 +8535,25 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn rendered_app_lines(app: &mut App) -> Vec<String> {
+        let backend = TestBackend::new(140, 52);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| super::draw(frame, app))
+            .expect("draw TUI");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(140)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn rendered_app_text(app: &mut App) -> String {
+        rendered_app_lines(app).join("\n")
+    }
+
     fn internet_routes_app() -> App {
         let mut app = test_app();
         app.groups = vec![
@@ -8081,6 +8601,158 @@ mod tests {
         let mut app = test_app();
         app.private_access = PrivateAccessRuntime::new().expect("empty private access runtime");
         app
+    }
+
+    #[test]
+    fn left_pane_hides_intranet_section_without_configured_profiles() {
+        let mut app = test_app_without_private_access();
+
+        let screen = rendered_app_text(&mut app);
+
+        assert!(screen.contains("Internet Proxy"));
+        assert!(!screen.contains("Intranet Proxy"));
+    }
+
+    #[test]
+    fn selected_private_access_profile_renders_intranet_details() {
+        let mut app = test_app();
+        let profile = app.private_access.focused_mut();
+        profile.server = "vpn.example.com".to_string();
+        profile.state = PrivateAccessState::Connected;
+        profile.routes = vec![
+            PrivateAccessRoute {
+                cidr: "10.20.0.0/16".to_string(),
+            },
+            PrivateAccessRoute {
+                cidr: "172.20.4.0/24".to_string(),
+            },
+        ];
+        profile.dns = vec!["10.20.0.53".to_string()];
+        profile.domains = vec!["portal.internal.example".to_string()];
+        profile.domain_suffixes = vec!["corp.example".to_string()];
+        app.focus = Focus::Groups;
+        app.left_pane_section = LeftPaneSection::Intranet;
+
+        let screen = rendered_app_text(&mut app);
+
+        assert!(screen.contains("Internet Proxy"));
+        assert!(screen.contains("Intranet Proxy"));
+        assert!(screen.contains("Intranet: hillstone"));
+        assert!(screen.contains("vpn.example.com:4433"));
+        assert!(screen.contains("10.20.0.0/16"));
+        assert!(screen.contains("10.20.0.53"));
+        assert!(screen.contains("portal.internal.example"));
+        assert!(screen.contains("*.corp.example"));
+
+        app.focus = Focus::Members;
+        app.move_next();
+        assert_eq!(app.intranet_detail_scroll, 1);
+        app.move_previous();
+        assert_eq!(app.intranet_detail_scroll, 0);
+    }
+
+    #[test]
+    fn large_intranet_sections_fold_and_toggle_with_enter() {
+        let mut app = test_app();
+        app.private_access.focused_mut().routes = (0..103)
+            .map(|index| PrivateAccessRoute {
+                cidr: format!("10.20.{index}.0/24"),
+            })
+            .collect();
+        app.focus = Focus::Members;
+        app.left_pane_section = LeftPaneSection::Intranet;
+
+        let collapsed = app.intranet_detail_view(app.private_access.focused());
+        let route_range = collapsed
+            .sections
+            .iter()
+            .find(|range| range.section == IntranetDetailSection::Routes)
+            .copied()
+            .expect("routes section");
+        assert!(route_range.foldable);
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .cloned()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("▶ Routes (103)"));
+        assert!(collapsed_text.contains("… 93 more item(s)"));
+        assert!(collapsed_text.contains("10.20.9.0/24"));
+        assert!(!collapsed_text.contains("10.20.10.0/24"));
+
+        app.intranet_detail_scroll = route_range.start as u16;
+        app.handle_key(KeyCode::Enter).expect("expand routes");
+        let expanded = app.intranet_detail_view(app.private_access.focused());
+        assert_eq!(expanded.lines.len(), collapsed.lines.len() + 92);
+        assert!(
+            expanded
+                .lines
+                .iter()
+                .cloned()
+                .map(line_text)
+                .any(|line| line.contains("▼ Routes (103)"))
+        );
+
+        app.handle_key(KeyCode::Enter).expect("fold routes");
+        let folded_again = app.intranet_detail_view(app.private_access.focused());
+        assert_eq!(folded_again.lines.len(), collapsed.lines.len());
+    }
+
+    #[test]
+    fn intranet_footer_stays_fixed_and_status_omits_private_access_summary() {
+        let mut app = test_app();
+        app.private_access.focused_mut().routes = (0..40)
+            .map(|index| PrivateAccessRoute {
+                cidr: format!("172.20.{index}.0/24"),
+            })
+            .collect();
+        app.focus = Focus::Members;
+        app.left_pane_section = LeftPaneSection::Intranet;
+
+        let first = rendered_app_lines(&mut app);
+        let footer_row = first
+            .iter()
+            .position(|line| line.contains("Enter expand/fold"))
+            .expect("fixed intranet footer");
+        app.intranet_detail_scroll = 8;
+        let scrolled = rendered_app_lines(&mut app);
+        assert_eq!(
+            scrolled
+                .iter()
+                .position(|line| line.contains("Enter expand/fold")),
+            Some(footer_row)
+        );
+        assert!(
+            status_lines(&app)
+                .into_iter()
+                .map(line_text)
+                .all(|line| !line.starts_with("private access:"))
+        );
+    }
+
+    #[test]
+    fn left_pane_navigation_crosses_between_internet_and_intranet_sections() {
+        let mut app = test_app();
+        app.private_access
+            .profiles
+            .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+        app.focus = Focus::Groups;
+        app.left_pane_section = LeftPaneSection::Internet;
+
+        app.move_next();
+        assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
+        assert_eq!(app.private_access.focused_index, 0);
+
+        app.move_next();
+        assert_eq!(app.private_access.focused_index, 1);
+
+        app.move_previous();
+        assert_eq!(app.private_access.focused_index, 0);
+        app.move_previous();
+        assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
+        assert_eq!(app.displayed_group_index(), 0);
     }
 
     #[test]
@@ -9222,13 +9894,10 @@ mod tests {
             app.private_access.focused().server,
             "sslvpn.backup.example.com"
         );
-        assert_eq!(app.private_access.profiles.len(), 3);
-        assert_eq!(app.private_access.profiles[2].id, "sonicwall");
-        assert_eq!(app.private_access.profiles[2].server, "sslvpn.hundsun.com");
-        assert_eq!(app.private_access.profiles[2].mode, PrivateAccessMode::Tun);
+        assert_eq!(app.private_access.profiles.len(), 2);
         let saved = app.runtime_state();
         assert_eq!(saved.private_access_profiles[0].id, "office-backup");
-        assert_eq!(saved.private_access_profiles.len(), 3);
+        assert_eq!(saved.private_access_profiles.len(), 2);
     }
 
     #[test]
