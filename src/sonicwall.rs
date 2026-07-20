@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::{ACCEPT, LOCATION};
+use reqwest::header::{ACCEPT, CONNECTION, LOCATION};
 use reqwest::redirect::Policy;
-use reqwest::{StatusCode, Url};
+use reqwest::{RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -142,6 +142,7 @@ impl SonicwallAuthClient {
             .http1_only()
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(SONICWALL_HTTP_POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .timeout(Duration::from_secs(30))
             .user_agent(SONICWALL_USER_AGENT);
         if let Some(proxy) = http_connect_proxy.filter(|proxy| !proxy.trim().is_empty()) {
@@ -200,14 +201,15 @@ impl SonicwallAuthClient {
 
         let (response, logon_endpoint, official_logon_status, logon_capability) =
             if preferred_capability == SonicwallLogonCapability::LegacyAdd {
-                let response = self
-                    .client
-                    .post(self.endpoint(LEGACY_LOGON_ENDPOINT)?)
-                    .header(ACCEPT, SONICWALL_ACCEPT)
-                    .json(&json!({ "name": realm }))
-                    .send()
-                    .await
-                    .context("failed to start cached SonicWall legacy logon session")?;
+                let response = interactive_auth_request(
+                    self.client
+                        .post(self.endpoint(LEGACY_LOGON_ENDPOINT)?)
+                        .header(ACCEPT, SONICWALL_ACCEPT)
+                        .json(&json!({ "name": realm })),
+                )
+                .send()
+                .await
+                .context("failed to start cached SonicWall legacy logon session")?;
                 (
                     response,
                     LEGACY_LOGON_ENDPOINT,
@@ -215,14 +217,15 @@ impl SonicwallAuthClient {
                     SonicwallLogonCapability::LegacyAdd,
                 )
             } else {
-                let official_response = self
-                    .client
-                    .post(self.endpoint(OFFICIAL_LOGON_ENDPOINT)?)
-                    .header(ACCEPT, SONICWALL_ACCEPT)
-                    .json(&realm)
-                    .send()
-                    .await
-                    .context("failed to start SonicWall logon session")?;
+                let official_response = interactive_auth_request(
+                    self.client
+                        .post(self.endpoint(OFFICIAL_LOGON_ENDPOINT)?)
+                        .header(ACCEPT, SONICWALL_ACCEPT)
+                        .json(&realm),
+                )
+                .send()
+                .await
+                .context("failed to start SonicWall logon session")?;
                 let official_logon_status = official_response.status().as_u16();
                 if official_response.status().is_success() {
                     (
@@ -235,14 +238,15 @@ impl SonicwallAuthClient {
                     // Drain the failed response so reqwest can return the CONNECT/TLS
                     // connection to the pool before the legacy request is sent.
                     let _ = official_response.bytes().await;
-                    let fallback_response = self
-                        .client
-                        .post(self.endpoint(LEGACY_LOGON_ENDPOINT)?)
-                        .header(ACCEPT, SONICWALL_ACCEPT)
-                        .json(&json!({ "name": realm }))
-                        .send()
-                        .await
-                        .context("failed to start SonicWall logon session")?;
+                    let fallback_response = interactive_auth_request(
+                        self.client
+                            .post(self.endpoint(LEGACY_LOGON_ENDPOINT)?)
+                            .header(ACCEPT, SONICWALL_ACCEPT)
+                            .json(&json!({ "name": realm })),
+                    )
+                    .send()
+                    .await
+                    .context("failed to start SonicWall logon session")?;
                     (
                         fallback_response,
                         LEGACY_LOGON_ENDPOINT,
@@ -950,25 +954,6 @@ impl SonicwallAuthSession {
         })
     }
 
-    pub(crate) async fn get_json(&self, suffix: &str) -> Result<Value> {
-        let url = self.session_endpoint(suffix)?;
-        let response = self
-            .client
-            .get(url)
-            .header(ACCEPT, SONICWALL_ACCEPT)
-            .send()
-            .await
-            .map_err(|error| {
-                sonicwall_request_error(
-                    error,
-                    format!("failed to GET SonicWall session resource {suffix}"),
-                )
-            })?;
-        let value = decode_json_response(response, "read session resource").await?;
-        self.capture_logon_id(&value)?;
-        Ok(value)
-    }
-
     async fn try_get_gateway_json(&self, path: &str) -> Result<Option<Value>> {
         let url = self
             .gateway
@@ -1039,7 +1024,19 @@ impl SonicwallAuthSession {
     }
 
     async fn get_step(&self, suffix: &str) -> Result<SonicwallAuthStep> {
-        let value = self.get_json(suffix).await?;
+        let url = self.session_endpoint(suffix)?;
+        let response =
+            interactive_auth_request(self.client.get(url).header(ACCEPT, SONICWALL_ACCEPT))
+                .send()
+                .await
+                .map_err(|error| {
+                    sonicwall_request_error(
+                        error,
+                        format!("failed to GET SonicWall session resource {suffix}"),
+                    )
+                })?;
+        let value = decode_json_response(response, "read authentication session").await?;
+        self.capture_logon_id(&value)?;
         Ok(parse_auth_step(value))
     }
 
@@ -1048,19 +1045,20 @@ impl SonicwallAuthSession {
         T: Serialize + ?Sized,
     {
         let url = self.session_endpoint(suffix)?;
-        let response = self
-            .client
-            .post(url)
-            .header(ACCEPT, SONICWALL_ACCEPT)
-            .json(payload)
-            .send()
-            .await
-            .map_err(|error| {
-                sonicwall_request_error(
-                    error,
-                    format!("failed to POST SonicWall session resource {suffix}"),
-                )
-            })?;
+        let response = interactive_auth_request(
+            self.client
+                .post(url)
+                .header(ACCEPT, SONICWALL_ACCEPT)
+                .json(payload),
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            sonicwall_request_error(
+                error,
+                format!("failed to POST SonicWall session resource {suffix}"),
+            )
+        })?;
         let value = decode_json_response(response, "advance authentication session").await?;
         self.capture_logon_id(&value)?;
         Ok(parse_auth_step(value))
@@ -1090,6 +1088,15 @@ impl SonicwallAuthSession {
         }
         Ok(())
     }
+}
+
+fn interactive_auth_request(request: RequestBuilder) -> RequestBuilder {
+    // Authentication responses may leave the TUI waiting on human input for minutes. The
+    // cookie-backed SonicWall session must survive that pause, but its proxy TCP connection must
+    // not: sing-box can switch or recycle the selected outbound while the form is open. Closing
+    // this HTTP/1.1 connection after every interactive step prevents the next POST from reusing a
+    // stale CONNECT/TLS stream without shortening the user's authentication session.
+    request.header(CONNECTION, "close")
 }
 
 fn decode_logon_id(value: &str) -> Result<[u8; 16]> {
@@ -1509,9 +1516,26 @@ mod tests {
     }
 
     #[test]
-    fn auth_client_evicts_idle_connections_before_gateway_timeout() {
+    fn auth_client_evicts_idle_connections_without_expiring_the_cookie_session() {
         assert_eq!(SONICWALL_HTTP_POOL_IDLE_TIMEOUT.as_secs(), 15);
         assert!(SONICWALL_HTTP_POOL_IDLE_TIMEOUT.as_secs() < 30);
+    }
+
+    #[test]
+    fn interactive_authentication_steps_do_not_reuse_proxy_connections() {
+        let client = reqwest::Client::new();
+        let request = super::interactive_auth_request(
+            client.post("https://vpn.example.com/__api__/logon/session/authenticate"),
+        )
+        .build()
+        .expect("request builds");
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
     }
 
     #[test]
