@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use native_tls::{Protocol, TlsConnector, TlsStream};
+use socket2::{SockRef, TcpKeepalive};
 
 use super::inject_evpn_z;
 
@@ -69,7 +70,10 @@ fn connect_tcp(options: &EvpnTlsConnectOptions<'_>) -> Result<TcpStream> {
     let mut last_error = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, options.timeout) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                configure_tcp_keepalive(&stream)?;
+                return Ok(stream);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -79,6 +83,15 @@ fn connect_tcp(options: &EvpnTlsConnectOptions<'_>) -> Result<TcpStream> {
         .context(format!(
             "failed to connect to SonicWall EVPN underlay {host}:{port}"
         )))
+}
+
+fn configure_tcp_keepalive(stream: &TcpStream) -> Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .context("failed to configure SonicWall EVPN TCP keepalive")
 }
 
 fn parse_host_port(value: &str) -> Result<(String, u16)> {

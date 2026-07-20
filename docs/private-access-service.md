@@ -94,6 +94,13 @@ printf '%s\n' '{"type":"status","id":"smoke","service":"hillstone"}' \
 The service uses newline-delimited JSON over stdio. Human diagnostic logs are
 written to stderr so stdout stays parseable by the TUI.
 
+When Hillstone runs through the TUI, its connection lifecycle and runtime
+diagnostics are also persisted to `hillstone-private-access.log` in the working
+directory. The log includes connection stages, network setup, periodic
+bridge/TUN activity counters, keepalives, error chains, and the final session
+exit reason. Passwords, password environment-variable values, session IDs, and
+key material are not written to the file.
+
 Each Private Access profile can point at a service manifest. If `manifest_path` is
 empty or `null`, the profile uses the built-in Hillstone service. This allows
 multiple Hillstone accounts or gateways without duplicating manifest files.

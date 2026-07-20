@@ -2450,6 +2450,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha1",
+ "socket2",
  "tokio",
  "tun-rs",
  "unicode-segmentation",

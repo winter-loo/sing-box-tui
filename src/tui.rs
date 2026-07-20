@@ -4937,6 +4937,36 @@ impl App {
         self.groups.get(self.group_index)
     }
 
+    fn internet_outbound_context(&self) -> Option<String> {
+        let mut current = self
+            .implicit_root_group()
+            .or_else(|| self.selected_group())?;
+        let mut chain = vec![current.name.clone()];
+        let mut visited = BTreeSet::new();
+        visited.insert(current.name.clone());
+        loop {
+            let Some(selected) = current.current.as_deref() else {
+                break;
+            };
+            chain.push(selected.to_string());
+            let Some(next) = self.group_by_name(selected) else {
+                break;
+            };
+            if !visited.insert(next.name.clone()) {
+                chain.push("(cycle)".to_string());
+                break;
+            }
+            current = next;
+        }
+        (!chain.is_empty()).then(|| chain.join(" -> "))
+    }
+
+    fn internet_outbound_root_selector(&self) -> Option<String> {
+        self.implicit_root_group()
+            .or_else(|| self.selected_group())
+            .map(|group| group.name.clone())
+    }
+
     fn group_by_name(&self, name: &str) -> Option<&ProxyGroup> {
         self.groups.iter().find(|group| group.name == name)
     }
@@ -7614,6 +7644,14 @@ impl App {
         let http_connect_proxy = (service == "sonicwall")
             .then(|| normalize_http_connect_proxy(&self.system_proxy_server))
             .flatten();
+        let http_connect_proxy_context = (service == "sonicwall")
+            .then(|| self.internet_outbound_context())
+            .flatten();
+        let http_connect_controller =
+            (service == "sonicwall").then(|| self.client.base_url.clone());
+        let http_connect_selector = (service == "sonicwall")
+            .then(|| self.internet_outbound_root_selector())
+            .flatten();
         // Direct passwords are deliberately supported for a simpler local workflow. The value is
         // sent only to the service process; the settings list masks it unless the field is edited.
         let command = PrivateAccessCommand::Connect {
@@ -7629,6 +7667,9 @@ impl App {
                 "bridge_listen": self.private_access.focused().bridge_listen,
                 "tun_helper": tun_helper,
                 "http_connect_proxy": http_connect_proxy,
+                "http_connect_proxy_context": http_connect_proxy_context,
+                "http_connect_controller": http_connect_controller,
+                "http_connect_selector": http_connect_selector,
                 "tls_verify": self.private_access.focused().tls_verify,
             }),
         };
@@ -7984,6 +8025,11 @@ impl App {
                             self.push_private_access_progress(
                                 PrivateAccessProgressTone::Info,
                                 "完整诊断已写入 sonicwall-private-access.log".to_string(),
+                            );
+                        } else if service == "hillstone" {
+                            self.push_private_access_progress(
+                                PrivateAccessProgressTone::Info,
+                                "完整诊断已写入 hillstone-private-access.log".to_string(),
                             );
                         }
                         self.set_status_only(format!(

@@ -733,9 +733,15 @@ fn run_udp_http_proxy(
 
     let mut source_ports = SourcePortAllocator::new();
     let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
+    let started = Instant::now();
+    let mut next_diagnostic = Instant::now() + HILLSTONE_DIAGNOSTIC_INTERVAL;
+    let mut accepted_connections = 0_u64;
+    let mut failed_requests = 0_u64;
+    let mut keepalives_sent = 0_u64;
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut client, _)) => {
+                accepted_connections = accepted_connections.saturating_add(1);
                 // The keepalive loop needs a nonblocking listener, but macOS can hand accepted
                 // sockets to us in nonblocking mode too. That caused Chrome requests to fail as
                 // immediate WouldBlock reads and surfaced to the user as 502 Bad Gateway.
@@ -752,6 +758,7 @@ fn run_udp_http_proxy(
                     &mut source_ports,
                     timeout,
                 ) {
+                    failed_requests = failed_requests.saturating_add(1);
                     eprintln!("warning: failed to proxy browser request: {error:#}");
                     let _ = write_simple_http_error(&mut client, 502, "Bad Gateway");
                 }
@@ -771,6 +778,7 @@ fn run_udp_http_proxy(
                         client_ip,
                         gateway_ip,
                     )?;
+                    keepalives_sent = keepalives_sent.saturating_add(1);
                     next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -778,6 +786,13 @@ fn run_udp_http_proxy(
             Err(error) => {
                 eprintln!("warning: failed to accept local browser connection: {error}");
             }
+        }
+        if Instant::now() >= next_diagnostic {
+            eprintln!(
+                "Hillstone bridge heartbeat: elapsed={:.3}s accepted_connections={accepted_connections} failed_requests={failed_requests} keepalives_sent={keepalives_sent}",
+                started.elapsed().as_secs_f64()
+            );
+            next_diagnostic = Instant::now() + HILLSTONE_DIAGNOSTIC_INTERVAL;
         }
     }
     // Ctrl-C used to kill the process while the Hillstone control channel was still open, leaving
@@ -852,8 +867,14 @@ fn run_tun_data_plane(
 
     let mut udp_buffer = vec![0_u8; 65535];
     let mut next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
+    let started = Instant::now();
+    let mut next_diagnostic = Instant::now() + HILLSTONE_DIAGNOSTIC_INTERVAL;
     let mut tun_to_udp_packets = 0_u64;
     let mut udp_to_tun_packets = 0_u64;
+    let mut keepalives_sent = 0_u64;
+    let mut undecodable_packets = 0_u64;
+    let mut last_tun_to_udp = None;
+    let mut last_udp_to_tun = None;
 
     while !shutdown.load(Ordering::SeqCst) {
         let mut made_progress = false;
@@ -862,7 +883,8 @@ fn run_tun_data_plane(
             let esp_packet = esp.encap_ipv4(&packet)?;
             match socket.send(&esp_packet) {
                 Ok(_) => {
-                    tun_to_udp_packets += 1;
+                    tun_to_udp_packets = tun_to_udp_packets.saturating_add(1);
+                    last_tun_to_udp = Some(Instant::now());
                     made_progress = true;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
@@ -882,11 +904,13 @@ fn run_tun_data_plane(
                         .send_ipv4(&inner_packet)
                         .context("failed to write decapsulated IPv4 packet to TUN")?
                     {
-                        udp_to_tun_packets += 1;
+                        udp_to_tun_packets = udp_to_tun_packets.saturating_add(1);
+                        last_udp_to_tun = Some(Instant::now());
                         made_progress = true;
                     }
                 }
                 Err(error) => {
+                    undecodable_packets = undecodable_packets.saturating_add(1);
                     eprintln!("warning: dropped undecodable UDP ESP packet: {error:#}");
                 }
             }
@@ -894,7 +918,19 @@ fn run_tun_data_plane(
 
         if Instant::now() >= next_keepalive {
             send_connected_keepalive(&socket, &mut esp, client_ip, gateway_ip)?;
+            keepalives_sent = keepalives_sent.saturating_add(1);
             next_keepalive = Instant::now() + HILLSTONE_PROXY_KEEPALIVE_INTERVAL;
+        }
+
+        if Instant::now() >= next_diagnostic {
+            let now = Instant::now();
+            eprintln!(
+                "Hillstone TUN heartbeat: elapsed={:.3}s tun_to_udp_packets={tun_to_udp_packets} udp_to_tun_packets={udp_to_tun_packets} keepalives_sent={keepalives_sent} undecodable_packets={undecodable_packets} last_tun_to_udp={} last_udp_to_tun={}",
+                started.elapsed().as_secs_f64(),
+                hillstone_activity_age(now, last_tun_to_udp),
+                hillstone_activity_age(now, last_udp_to_tun)
+            );
+            next_diagnostic = Instant::now() + HILLSTONE_DIAGNOSTIC_INTERVAL;
         }
 
         if !made_progress {
@@ -908,6 +944,12 @@ fn run_tun_data_plane(
     tun.stop()
         .context("failed to stop Private Access TUN helper")?;
     Ok(())
+}
+
+fn hillstone_activity_age(now: Instant, activity: Option<Instant>) -> String {
+    activity
+        .map(|activity| format!("{:.3}s_ago", now.duration_since(activity).as_secs_f64()))
+        .unwrap_or_else(|| "never".to_string())
 }
 
 fn send_proxy_keepalive(
@@ -1345,6 +1387,7 @@ const HILLSTONE_AES128_CBC: u16 = 12;
 const HILLSTONE_HMAC_MD5_96: u16 = 1;
 const HILLSTONE_IPCOMP_NONE: u16 = 0;
 const HILLSTONE_PROXY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const HILLSTONE_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
