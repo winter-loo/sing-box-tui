@@ -1,9 +1,15 @@
+use std::cell::Cell;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
+const BENCHMARK_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const BENCHMARK_PRUNE_BATCH_SIZE: usize = 50_000;
 
 pub(crate) fn default_benchmark_db_path() -> PathBuf {
     env::var("SING_BOX_TUI_DB")
@@ -40,6 +46,7 @@ pub(crate) struct StoredBenchmarkRecord {
 
 pub(crate) struct BenchmarkStore {
     connection: Connection,
+    last_prune_at_ms: Cell<i64>,
 }
 
 impl BenchmarkStore {
@@ -47,7 +54,11 @@ impl BenchmarkStore {
         let connection = Connection::open(path.as_ref()).with_context(|| {
             format!("failed to open SQLite database {}", path.as_ref().display())
         })?;
-        let store = Self { connection };
+        configure_benchmark_connection(&connection, path.as_ref())?;
+        let store = Self {
+            connection,
+            last_prune_at_ms: Cell::new(current_timestamp_ms()?),
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -68,8 +79,9 @@ impl BenchmarkStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_benchmark_results_recorded_at
                     ON benchmark_results(recorded_at_ms);
-                CREATE INDEX IF NOT EXISTS idx_benchmark_results_selector_node
-                    ON benchmark_results(selector, node);
+                DROP INDEX IF EXISTS idx_benchmark_results_selector_node;
+                CREATE INDEX IF NOT EXISTS idx_benchmark_results_selector_node_recent
+                    ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC);
                 "#,
             )
             .context("failed to initialize benchmark_results SQLite schema")?;
@@ -77,10 +89,7 @@ impl BenchmarkStore {
     }
 
     pub(crate) fn record_benchmark(&self, record: &BenchmarkRecord<'_>) -> Result<()> {
-        let recorded_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system time is before UNIX epoch")?
-            .as_millis() as i64;
+        let recorded_at_ms = current_timestamp_ms()?;
         let delay_ms = record.delay_ms.map(|value| value as i64);
         self.connection
             .execute(
@@ -106,7 +115,41 @@ impl BenchmarkStore {
                 ],
             )
             .context("failed to insert benchmark result into SQLite")?;
+        if let Err(error) = self.maybe_prune_benchmark_history(recorded_at_ms) {
+            eprintln!("warning: failed to prune old benchmark history: {error:#}");
+        }
         Ok(())
+    }
+
+    fn maybe_prune_benchmark_history(&self, now_ms: i64) -> Result<()> {
+        let prune_interval_ms = BENCHMARK_PRUNE_INTERVAL.as_millis() as i64;
+        if now_ms.saturating_sub(self.last_prune_at_ms.get()) < prune_interval_ms {
+            return Ok(());
+        }
+        // Advance before deleting so a busy database does not make every subsequent insert retry
+        // the maintenance work. The bounded batch catches up over time without one huge WAL spike.
+        self.last_prune_at_ms.set(now_ms);
+        let cutoff_ms = now_ms.saturating_sub(BENCHMARK_RETENTION.as_millis() as i64);
+        self.prune_benchmarks_before(cutoff_ms, BENCHMARK_PRUNE_BATCH_SIZE)?;
+        Ok(())
+    }
+
+    fn prune_benchmarks_before(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.connection
+            .execute(
+                r#"
+                DELETE FROM benchmark_results
+                WHERE id IN (
+                    SELECT id
+                    FROM benchmark_results
+                    WHERE recorded_at_ms < ?1
+                    ORDER BY recorded_at_ms ASC, id ASC
+                    LIMIT ?2
+                )
+                "#,
+                params![cutoff_ms, limit as i64],
+            )
+            .context("failed to delete expired benchmark history")
     }
 
     pub(crate) fn node_latency_history(
@@ -125,7 +168,7 @@ impl BenchmarkStore {
                     FROM benchmark_results
                     WHERE selector = ?1
                         AND node = ?2
-                        AND completed != 0
+                        AND completed = 1
                     ORDER BY recorded_at_ms DESC, id DESC
                     LIMIT ?3
                 )
@@ -187,10 +230,38 @@ impl BenchmarkStore {
     }
 }
 
+fn current_timestamp_ms() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before UNIX epoch")?
+        .as_millis() as i64)
+}
+
+fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Result<()> {
+    connection
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .with_context(|| format!("failed to set SQLite busy timeout for {}", path.display()))?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .with_context(|| format!("failed to enable SQLite WAL mode for {}", path.display()))?;
+    connection
+        .pragma_update(None, "synchronous", "NORMAL")
+        .with_context(|| {
+            format!(
+                "failed to set SQLite synchronous=NORMAL for {}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BenchmarkRecord, BenchmarkStore};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn test_db_path() -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -198,6 +269,18 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("sing-box-tui-test-{nanos}.sqlite3"))
+    }
+
+    fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut text = path.as_os_str().to_os_string();
+        text.push(suffix);
+        PathBuf::from(text)
+    }
+
+    fn remove_test_db(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-shm"));
     }
 
     #[test]
@@ -225,7 +308,101 @@ mod tests {
         assert!(rows[0].completed);
         assert_eq!(rows[0].job_kind, "auto");
 
-        let _ = std::fs::remove_file(path);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn record_benchmark_waits_for_short_lived_write_lock() {
+        let path = test_db_path();
+        let holder = BenchmarkStore::open(&path).expect("open sqlite holder");
+        let writer = BenchmarkStore::open(&path).expect("open sqlite writer");
+        holder
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold write lock");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal writer started");
+            writer.record_benchmark(&BenchmarkRecord {
+                selector: "select",
+                node: "node-a",
+                filter: "node",
+                delay_ms: Some(42),
+                completed: true,
+                job_kind: "auto",
+            })
+        });
+
+        started_rx.recv().expect("writer started");
+        thread::sleep(Duration::from_millis(100));
+        holder
+            .connection
+            .execute_batch("COMMIT")
+            .expect("release write lock");
+        worker
+            .join()
+            .expect("writer thread")
+            .expect("record benchmark");
+
+        let rows = holder.recent_benchmarks(10).expect("read rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node, "node-a");
+        assert_eq!(rows[0].delay_ms, Some(42));
+
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn benchmark_history_uses_recent_index_and_prunes_in_bounded_batches() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        for recorded_at_ms in [100_i64, 200, 600] {
+            store
+                .connection
+                .execute(
+                    r#"
+                    INSERT INTO benchmark_results (
+                        recorded_at_ms, selector, node, filter, delay_ms, completed, job_kind
+                    ) VALUES (?1, 'select', 'node-a', 'node', 42, 1, 'auto')
+                    "#,
+                    [recorded_at_ms],
+                )
+                .expect("insert benchmark fixture");
+        }
+
+        let deleted = store
+            .prune_benchmarks_before(500, 1)
+            .expect("prune one expired row");
+        assert_eq!(deleted, 1);
+        let expired: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM benchmark_results WHERE recorded_at_ms < 500",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count expired rows");
+        assert_eq!(expired, 1, "the prune batch must stay bounded");
+
+        let mut statement = store
+            .connection
+            .prepare("PRAGMA index_list('benchmark_results')")
+            .expect("prepare index list");
+        let indexes = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query index list")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read index names");
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_benchmark_results_selector_node_recent")
+        );
+
+        drop(statement);
+        drop(store);
+        remove_test_db(&path);
     }
 
     #[test]
@@ -260,6 +437,6 @@ mod tests {
         assert_eq!(points[2].delay_ms, Some(80));
         assert!(points[0].recorded_at_ms <= points[1].recorded_at_ms);
 
-        let _ = std::fs::remove_file(path);
+        remove_test_db(&path);
     }
 }

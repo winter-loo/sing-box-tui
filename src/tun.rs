@@ -7,13 +7,14 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
 const TUN_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const TUN_NON_IPV4_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct TunHelperStartConfig {
@@ -541,6 +542,8 @@ impl TunHelperContext {
         let reader_shutdown = Arc::clone(&shutdown);
         let reader = thread::spawn(move || {
             let mut buffer = vec![0_u8; 65535];
+            let mut dropped_non_ipv4 = 0_u64;
+            let mut next_non_ipv4_log = Instant::now();
             while !reader_shutdown.load(Ordering::SeqCst) {
                 #[cfg(windows)]
                 let receive = reader_device.try_recv(&mut buffer);
@@ -550,12 +553,20 @@ impl TunHelperContext {
                     Ok(size) => {
                         let packet = &buffer[..size];
                         if packet.first().map(|byte| byte >> 4) != Some(4) {
-                            let _ = emit_tun_helper_event(
-                                &stdout,
-                                &TunHelperEvent::Log {
-                                    message: "dropped non-IPv4 packet from TUN".to_string(),
-                                },
-                            );
+                            dropped_non_ipv4 = dropped_non_ipv4.saturating_add(1);
+                            let now = Instant::now();
+                            if now >= next_non_ipv4_log {
+                                let _ = emit_tun_helper_event(
+                                    &stdout,
+                                    &TunHelperEvent::Log {
+                                        message: format!(
+                                            "dropped {dropped_non_ipv4} non-IPv4 packet(s) from TUN since previous report"
+                                        ),
+                                    },
+                                );
+                                dropped_non_ipv4 = 0;
+                                next_non_ipv4_log = now + TUN_NON_IPV4_LOG_INTERVAL;
+                            }
                             continue;
                         }
                         let _ = emit_tun_helper_event(

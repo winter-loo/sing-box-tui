@@ -76,7 +76,9 @@ const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const BACKGROUND_TASK_KIND_AUTO_PICK: &str = "headless-auto-pick";
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
-const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PRIVATE_ACCESS_EVENTS_PER_POLL: usize = 64;
 // Keep RFC1918 ranges out of the OS-level bypass list. The Hillstone bridge
 // problem showed why this matters: if macOS bypasses 10.* before traffic reaches
 // sing-box, sing-box cannot apply its route override to the local ESP bridge.
@@ -246,6 +248,40 @@ struct BackgroundWorkerRuntime {
     child: Option<Child>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackgroundStatusTarget {
+    pid: u32,
+    bind_addr: String,
+    token: String,
+}
+
+struct BackgroundStatusPollOutcome {
+    result: Result<BackgroundStatusSnapshot, String>,
+    process_alive: bool,
+}
+
+enum BackgroundStatusPollResolution {
+    Snapshot(Box<BackgroundStatusSnapshot>),
+    Retry(String),
+    Reconnect(String),
+}
+
+struct BackgroundStatusPollJob {
+    target: BackgroundStatusTarget,
+    receiver: mpsc::Receiver<BackgroundStatusPollOutcome>,
+    worker: JoinHandle<()>,
+}
+
+fn resolve_background_status_poll(
+    outcome: BackgroundStatusPollOutcome,
+) -> BackgroundStatusPollResolution {
+    match outcome.result {
+        Ok(snapshot) => BackgroundStatusPollResolution::Snapshot(Box::new(snapshot)),
+        Err(error) if outcome.process_alive => BackgroundStatusPollResolution::Retry(error),
+        Err(error) => BackgroundStatusPollResolution::Reconnect(error),
+    }
+}
+
 struct BackgroundWorkerRequest {
     command: BackgroundWorkerCommand,
     response: mpsc::Sender<BackgroundControlResponse>,
@@ -312,19 +348,22 @@ pub(crate) fn run_background_status() -> Result<()> {
         }))?;
         return Ok(());
     };
-    let alive = process_exists(state.pid);
-    if !alive {
-        remove_background_task_state_file();
-        print_json(serde_json::json!({
-            "status": "stale",
-            "kind": state.kind,
-            "pid": state.pid,
-        }))?;
-        return Ok(());
-    }
     let snapshot =
-        send_background_control_request_to_state(&state, BackgroundWorkerCommand::Status)
-            .context("failed to query background worker over TCP")?;
+        match send_background_control_request_to_state(&state, BackgroundWorkerCommand::Status) {
+            Ok(snapshot) => snapshot,
+            Err(_) if !process_exists(state.pid) => {
+                remove_background_task_state_file();
+                print_json(serde_json::json!({
+                    "status": "stale",
+                    "kind": state.kind,
+                    "pid": state.pid,
+                }))?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).context("failed to query live background worker over TCP");
+            }
+        };
     let mut value = serde_json::to_value(snapshot).context("failed to encode background status")?;
     if let Some(object) = value.as_object_mut() {
         object.insert("status".to_string(), Value::String("running".to_string()));
@@ -684,10 +723,35 @@ fn send_background_control_request_to_state(
     send_background_control_request(&state.bind_addr, &state.token, command)
 }
 
+fn spawn_background_status_poll(target: BackgroundStatusTarget) -> BackgroundStatusPollJob {
+    let worker_target = target.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = send_background_control_request(
+            &worker_target.bind_addr,
+            &worker_target.token,
+            BackgroundWorkerCommand::Status,
+        )
+        .map_err(|error| format!("{error:#}"));
+        // A successful control response already proves that the process is alive. Only use the
+        // slower platform process lookup after a TCP failure, and keep it off the TUI thread.
+        let process_alive = result.is_ok() || process_exists(worker_target.pid);
+        let _ = tx.send(BackgroundStatusPollOutcome {
+            result,
+            process_alive,
+        });
+    });
+    BackgroundStatusPollJob {
+        target,
+        receiver: rx,
+        worker,
+    }
+}
+
 fn wait_for_background_registry(child: &mut Child, log_path: &Path) -> Result<BackgroundTaskState> {
     let pid = child.id();
     let state_path = background_task_state_path();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + BACKGROUND_REGISTRY_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         match read_background_task_state()? {
             Some(state)
@@ -1917,12 +1981,44 @@ fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAccessAuthMod
     }
 }
 
-fn private_access_auth_display_value(field: &PrivateAccessAuthField, input: &str) -> String {
-    if field.sensitive {
-        "*".repeat(input.chars().count())
-    } else {
-        input.to_string()
+fn private_access_auth_display_value(_field: &PrivateAccessAuthField, input: &str) -> String {
+    input.to_string()
+}
+
+fn private_access_auth_initial_value(
+    profile: &PrivateAccessProfileRuntime,
+    field: &PrivateAccessAuthField,
+) -> String {
+    if let Some(option) = field.options.first() {
+        return option.value.clone();
     }
+    if profile.manifest.id != "sonicwall" {
+        return String::new();
+    }
+
+    let has_kind_marker = |expected: &str| {
+        field
+            .kind
+            .split(|character: char| {
+                character.is_ascii_whitespace() || matches!(character, ',' | ';')
+            })
+            .any(|marker| marker.eq_ignore_ascii_case(expected))
+    };
+    if has_kind_marker("is-username") {
+        return profile.username.clone();
+    }
+    if has_kind_marker("is-password") {
+        if !profile.password.is_empty() {
+            return profile.password.clone();
+        }
+        if !profile.password_env.is_empty() {
+            return env::var(&profile.password_env).unwrap_or_default();
+        }
+    }
+
+    // A generic sensitive/password field may be an OTP or another dynamic reply.
+    // Only the gateway's explicit is-password marker is safe to prefill.
+    String::new()
 }
 
 fn settings_field_label(field: SettingsField) -> &'static str {
@@ -2012,17 +2108,7 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
 }
 
 fn settings_field_display_value(app: &App, field: SettingsField) -> String {
-    match field {
-        SettingsField::PrivateAccessPassword
-            if app
-                .private_access
-                .focused_opt()
-                .is_some_and(|profile| !profile.password.is_empty()) =>
-        {
-            "<set>".to_string()
-        }
-        _ => settings_field_value(app, field),
-    }
+    settings_field_value(app, field)
 }
 
 fn parse_positive<T>(value: &str) -> Result<T>
@@ -3274,17 +3360,22 @@ fn process_is_zombie(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_exists(pid: u32) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.contains(&format!("\",\"{pid}\",\"")))
-        })
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    let mut exit_code = 0_u32;
+    let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code).is_ok() }
+        && exit_code == STILL_ACTIVE.0 as u32;
+    let _ = unsafe { CloseHandle(handle) };
+    alive
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -3899,6 +3990,7 @@ struct App {
     last_background_status_generation: u64,
     background_started_at_unix: u64,
     background_worker: Option<BackgroundWorkerRuntime>,
+    background_status_job: Option<BackgroundStatusPollJob>,
     benchmark_store: Option<BenchmarkStore>,
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
@@ -3979,6 +4071,7 @@ impl SingBoxProcessRuntime {
 
 #[derive(Clone, Debug)]
 struct PrivateAccessProgressModal {
+    profile_index: usize,
     title: String,
     entries: Vec<PrivateAccessProgressEntry>,
     done: bool,
@@ -4190,16 +4283,14 @@ impl PrivateAccessProfileRuntime {
         if let Some(value) = state.port.filter(|value| *value > 0) {
             self.port = value;
         }
-        if self.manifest.id != "sonicwall" {
-            if let Some(value) = normalize_optional_setting(state.username) {
-                self.username = value;
-            }
-            if let Some(value) = normalize_optional_setting(state.password) {
-                self.password = value;
-            }
-            if let Some(value) = normalize_optional_setting(state.password_env) {
-                self.password_env = value;
-            }
+        if let Some(value) = normalize_optional_setting(state.username) {
+            self.username = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.password) {
+            self.password = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.password_env) {
+            self.password_env = value;
         }
         if let Some(value) = normalize_optional_setting(state.bridge_listen) {
             self.bridge_listen = value;
@@ -4219,22 +4310,15 @@ impl PrivateAccessProfileRuntime {
     }
 
     fn runtime_state(&self) -> PrivateAccessProfileState {
-        let interactive_auth = self.manifest.id == "sonicwall";
         PrivateAccessProfileState {
             id: self.id.clone(),
             manifest_path: self.manifest_path.clone(),
             mode: Some(self.mode.as_str().to_string()),
             server: normalize_optional_setting(Some(self.server.clone())),
             port: Some(self.port),
-            username: (!interactive_auth)
-                .then(|| normalize_optional_setting(Some(self.username.clone())))
-                .flatten(),
-            password: (!interactive_auth)
-                .then(|| normalize_optional_setting(Some(self.password.clone())))
-                .flatten(),
-            password_env: (!interactive_auth)
-                .then(|| normalize_optional_setting(Some(self.password_env.clone())))
-                .flatten(),
+            username: normalize_optional_setting(Some(self.username.clone())),
+            password: normalize_optional_setting(Some(self.password.clone())),
+            password_env: normalize_optional_setting(Some(self.password_env.clone())),
             bridge_listen: normalize_optional_setting(Some(self.bridge_listen.clone())),
             tun_helper: if self.tun_helper.is_empty() {
                 None
@@ -4415,6 +4499,14 @@ fn private_access_profile_badge(
         Span::styled(label, state_style),
         Span::styled("]", Style::default().fg(Color::DarkGray)),
     ]
+}
+
+fn private_access_progress_title(profile: &PrivateAccessProfileRuntime) -> String {
+    format!(
+        "Private Access - {} ({})",
+        profile.id,
+        profile.mode.as_str()
+    )
 }
 
 fn private_access_state_badge(state: PrivateAccessState) -> &'static str {
@@ -4638,6 +4730,7 @@ impl App {
             last_background_status_generation: 0,
             background_started_at_unix: current_unix_timestamp(),
             background_worker: None,
+            background_status_job: None,
             benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
@@ -5393,86 +5486,129 @@ impl App {
         }
     }
 
+    fn current_background_status_target(&self) -> Result<Option<BackgroundStatusTarget>> {
+        if let Some(worker) = self.background_worker.as_ref() {
+            return Ok(Some(BackgroundStatusTarget {
+                pid: worker.pid,
+                bind_addr: worker.bind_addr.clone(),
+                token: worker.token.clone(),
+            }));
+        }
+        Ok(
+            read_background_task_state()?.map(|state| BackgroundStatusTarget {
+                pid: state.pid,
+                bind_addr: state.bind_addr,
+                token: state.token,
+            }),
+        )
+    }
+
+    fn clear_failed_background_status_target(
+        &mut self,
+        target: &BackgroundStatusTarget,
+    ) -> Result<()> {
+        if self
+            .background_worker
+            .as_ref()
+            .is_some_and(|worker| worker.pid == target.pid)
+        {
+            let mut worker = self.background_worker.take().expect("worker exists");
+            if let Some(child) = worker.child.as_mut() {
+                let _ = child.try_wait();
+            }
+        }
+        if read_background_task_state()?.is_some_and(|state| state.pid == target.pid) {
+            remove_background_task_state_file();
+        }
+        Ok(())
+    }
+
+    fn apply_background_status_snapshot(
+        &mut self,
+        snapshot: BackgroundStatusSnapshot,
+    ) -> Result<()> {
+        self.apply_background_latency_snapshot(snapshot.latency.as_ref());
+        if snapshot.status_generation > self.last_background_status_generation {
+            self.last_background_status_generation = snapshot.status_generation;
+            let status = snapshot.worker_status;
+            if background_status_requires_selector_refresh(&status) {
+                self.refresh()?;
+            }
+            self.set_status_only(format!("Auto-pick worker: {status}"));
+        }
+        Ok(())
+    }
+
     fn poll_background_auto_pick_status(&mut self) -> Result<()> {
         if !self.background_worker_management_enabled() {
             return Ok(());
         }
-        if self.last_background_status_refresh.elapsed() < BACKGROUND_STATUS_REFRESH_INTERVAL {
+
+        if let Some(job) = self.background_status_job.as_ref() {
+            let outcome = match job.receiver.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(BackgroundStatusPollOutcome {
+                    result: Err("background status poll thread disconnected".to_string()),
+                    // Do not create a replacement from an ambiguous polling failure. The next
+                    // poll can retry without risking a second live worker.
+                    process_alive: true,
+                }),
+            };
+            if let Some(outcome) = outcome {
+                let job = self
+                    .background_status_job
+                    .take()
+                    .expect("background status job exists");
+                let target = job.target;
+                let _ = job.worker.join();
+                if self.current_background_status_target()?.as_ref() == Some(&target) {
+                    match resolve_background_status_poll(outcome) {
+                        BackgroundStatusPollResolution::Snapshot(snapshot) => {
+                            if self.background_worker.is_none() {
+                                self.background_worker = Some(BackgroundWorkerRuntime {
+                                    pid: target.pid,
+                                    bind_addr: target.bind_addr.clone(),
+                                    token: target.token.clone(),
+                                    child: None,
+                                });
+                            }
+                            self.apply_background_status_snapshot(*snapshot)?;
+                        }
+                        BackgroundStatusPollResolution::Retry(error) => {
+                            self.set_status_only(format!(
+                                "Auto-pick worker TCP error; process is still alive, retrying: {error}"
+                            ));
+                        }
+                        BackgroundStatusPollResolution::Reconnect(error) => {
+                            self.set_status_only(format!(
+                                "Auto-pick worker exited after TCP error: {error}"
+                            ));
+                            self.clear_failed_background_status_target(&target)?;
+                            if self.auto_select_enabled {
+                                let worker = self.ensure_auto_pick_background_worker()?;
+                                self.set_status_only(format!(
+                                    "Auto-pick background worker {} pid {} after previous worker exited",
+                                    worker.label(),
+                                    worker.pid()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.background_status_job.is_some()
+            || self.last_background_status_refresh.elapsed() < BACKGROUND_STATUS_REFRESH_INTERVAL
+        {
             return Ok(());
         }
-        self.last_background_status_refresh = Instant::now();
-        let mut disconnected = false;
-        let snapshot = if let Some(worker) = self.background_worker.as_ref() {
-            if !process_exists(worker.pid) {
-                disconnected = true;
-                None
-            } else {
-                match send_background_control_request(
-                    &worker.bind_addr,
-                    &worker.token,
-                    BackgroundWorkerCommand::Status,
-                ) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        self.set_status_only(format!("Auto-pick worker TCP error: {error:#}"));
-                        disconnected = true;
-                        None
-                    }
-                }
-            }
-        } else if let Some(state) = read_background_task_state()? {
-            if process_exists(state.pid) {
-                match send_background_control_request_to_state(
-                    &state,
-                    BackgroundWorkerCommand::Status,
-                ) {
-                    Ok(snapshot) => {
-                        self.background_worker = Some(BackgroundWorkerRuntime {
-                            pid: state.pid,
-                            bind_addr: state.bind_addr,
-                            token: state.token,
-                            child: None,
-                        });
-                        Some(snapshot)
-                    }
-                    Err(error) => {
-                        self.set_status_only(format!("Auto-pick worker TCP error: {error:#}"));
-                        disconnected = true;
-                        None
-                    }
-                }
-            } else {
-                disconnected = true;
-                None
-            }
-        } else {
-            None
-        };
 
-        if let Some(snapshot) = snapshot {
-            self.apply_background_latency_snapshot(snapshot.latency.as_ref());
-            if snapshot.status_generation > self.last_background_status_generation {
-                self.last_background_status_generation = snapshot.status_generation;
-                let status = snapshot.worker_status;
-                if background_status_requires_selector_refresh(&status) {
-                    self.refresh()?;
-                }
-                self.set_status_only(format!("Auto-pick worker: {status}"));
-            }
-        }
-
-        if disconnected {
-            self.background_worker = None;
-            remove_background_task_state_file();
-            if self.auto_select_enabled {
-                let worker = self.ensure_auto_pick_background_worker()?;
-                self.set_status_only(format!(
-                    "Auto-pick background worker {} pid {} after previous worker exited",
-                    worker.label(),
-                    worker.pid()
-                ));
-            }
-        } else if self.auto_select_enabled && self.background_worker.is_none() {
+        if let Some(target) = self.current_background_status_target()? {
+            self.last_background_status_refresh = Instant::now();
+            self.background_status_job = Some(spawn_background_status_poll(target));
+        } else if self.auto_select_enabled {
             let worker = self.ensure_auto_pick_background_worker()?;
             self.set_status_only(format!(
                 "Auto-pick background worker {} pid {}",
@@ -6834,14 +6970,20 @@ impl App {
         let Some(store) = &self.benchmark_store else {
             return Ok(());
         };
-        store.record_benchmark(&BenchmarkRecord {
-            selector: group,
-            node: &result.name,
-            filter,
-            delay_ms: result.delay,
-            completed: result.completed,
-            job_kind: benchmark_job_kind_label(job_kind),
-        })
+        store
+            .record_benchmark(&BenchmarkRecord {
+                selector: group,
+                node: &result.name,
+                filter,
+                delay_ms: result.delay,
+                completed: result.completed,
+                job_kind: benchmark_job_kind_label(job_kind),
+            })
+            .with_context(|| format!("failed to record benchmark result for {}", result.name))
+            .unwrap_or_else(|error| {
+                eprintln!("warning: {error:#}");
+            });
+        Ok(())
     }
 
     fn poll_benchmark_updates(&mut self) -> Result<()> {
@@ -7182,29 +7324,37 @@ impl App {
     fn ensure_auto_pick_background_worker(&mut self) -> Result<BackgroundTaskEnsureResult> {
         let config = self.background_auto_pick_config();
         if let Some(worker) = self.background_worker.as_ref() {
-            if process_exists(worker.pid) {
-                send_background_control_request(
-                    &worker.bind_addr,
-                    &worker.token,
-                    BackgroundWorkerCommand::ApplyConfig { config },
-                )?;
-                return Ok(BackgroundTaskEnsureResult::AlreadyRunning(worker.pid));
+            match send_background_control_request(
+                &worker.bind_addr,
+                &worker.token,
+                BackgroundWorkerCommand::ApplyConfig {
+                    config: config.clone(),
+                },
+            ) {
+                Ok(_) => return Ok(BackgroundTaskEnsureResult::AlreadyRunning(worker.pid)),
+                Err(error) if process_exists(worker.pid) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "background auto-pick worker {} is alive but its control channel is unavailable",
+                            worker.pid
+                        )
+                    });
+                }
+                Err(_) => {}
             }
             self.background_worker = None;
         }
         if let Some(state) = read_background_task_state()? {
-            if process_exists(state.pid) {
-                let bind_addr = state.bind_addr.clone();
-                let token = state.token.clone();
-                if send_background_control_request(
-                    &bind_addr,
-                    &token,
-                    BackgroundWorkerCommand::ApplyConfig {
-                        config: config.clone(),
-                    },
-                )
-                .is_ok()
-                {
+            let bind_addr = state.bind_addr.clone();
+            let token = state.token.clone();
+            match send_background_control_request(
+                &bind_addr,
+                &token,
+                BackgroundWorkerCommand::ApplyConfig {
+                    config: config.clone(),
+                },
+            ) {
+                Ok(_) => {
                     self.background_worker = Some(BackgroundWorkerRuntime {
                         pid: state.pid,
                         bind_addr,
@@ -7213,8 +7363,18 @@ impl App {
                     });
                     return Ok(BackgroundTaskEnsureResult::AlreadyRunning(state.pid));
                 }
+                Err(error) if process_exists(state.pid) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "registered background auto-pick worker {} is alive but its control channel is unavailable",
+                            state.pid
+                        )
+                    });
+                }
+                Err(_) => {
+                    remove_background_task_state_file();
+                }
             }
-            let _ = stop_registered_background_auto_pick_task()?;
         }
         self.spawn_headless_auto_pick_process()
             .map(BackgroundTaskEnsureResult::Started)
@@ -7471,15 +7631,16 @@ impl App {
     }
 
     fn open_private_access_progress(&mut self) {
-        let Some(profile) = self.private_access.focused_opt() else {
+        self.open_private_access_progress_for_profile(self.private_access.focused_index);
+    }
+
+    fn open_private_access_progress_for_profile(&mut self, profile_index: usize) {
+        let Some(profile) = self.private_access.profiles.get(profile_index) else {
             return;
         };
         self.private_access_progress = Some(PrivateAccessProgressModal {
-            title: format!(
-                "Private Access - {} ({})",
-                profile.id,
-                profile.mode.as_str()
-            ),
+            profile_index,
+            title: private_access_progress_title(profile),
             entries: Vec::new(),
             done: false,
         });
@@ -7487,12 +7648,31 @@ impl App {
     }
 
     fn push_private_access_progress(&mut self, tone: PrivateAccessProgressTone, text: String) {
-        if self.private_access_progress.is_none() {
-            self.open_private_access_progress();
+        self.push_private_access_progress_for_profile(
+            self.private_access.focused_index,
+            tone,
+            text,
+        );
+    }
+
+    fn push_private_access_progress_for_profile(
+        &mut self,
+        profile_index: usize,
+        tone: PrivateAccessProgressTone,
+        text: String,
+    ) {
+        if !matches!(
+            self.private_access_progress.as_ref(),
+            Some(progress) if progress.profile_index == profile_index
+        ) {
+            self.open_private_access_progress_for_profile(profile_index);
         }
         let Some(progress) = self.private_access_progress.as_mut() else {
             return;
         };
+        if progress.profile_index != profile_index {
+            return;
+        }
         if progress
             .entries
             .last()
@@ -7506,14 +7686,28 @@ impl App {
     }
 
     fn finish_private_access_progress(&mut self) {
+        self.finish_private_access_progress_for_profile(self.private_access.focused_index);
+    }
+
+    fn finish_private_access_progress_for_profile(&mut self, profile_index: usize) {
         if let Some(progress) = self.private_access_progress.as_mut() {
-            progress.done = true;
+            if progress.profile_index == profile_index {
+                progress.done = true;
+            }
         }
     }
 
     fn fail_private_access_progress(&mut self, message: String) {
-        self.push_private_access_progress(PrivateAccessProgressTone::Error, message);
-        self.finish_private_access_progress();
+        self.fail_private_access_progress_for_profile(self.private_access.focused_index, message);
+    }
+
+    fn fail_private_access_progress_for_profile(&mut self, profile_index: usize, message: String) {
+        self.push_private_access_progress_for_profile(
+            profile_index,
+            PrivateAccessProgressTone::Error,
+            message,
+        );
+        self.finish_private_access_progress_for_profile(profile_index);
     }
 
     fn toggle_private_access_with_progress(&mut self) -> Result<()> {
@@ -7653,7 +7847,7 @@ impl App {
             .then(|| self.internet_outbound_root_selector())
             .flatten();
         // Direct passwords are deliberately supported for a simpler local workflow. The value is
-        // sent only to the service process; the settings list masks it unless the field is edited.
+        // sent only to the service process; the settings list displays the configured value.
         let command = PrivateAccessCommand::Connect {
             id: "tui-connect".to_string(),
             service: service.clone(),
@@ -7744,7 +7938,9 @@ impl App {
     fn poll_private_access_updates(&mut self) -> Result<()> {
         for profile_index in 0..self.private_access.profiles.len() {
             let mut stop_process = false;
-            loop {
+            // Keep protocol chatter from monopolizing the TUI loop. Any remaining events stay in
+            // the channel for the next frame, so keyboard input is serviced between batches.
+            for _ in 0..PRIVATE_ACCESS_EVENTS_PER_POLL {
                 let profile_id = self.private_access.profiles[profile_index].id.clone();
                 let event = match self.private_access.profiles[profile_index].process.as_ref() {
                     Some(process) => match process.try_recv() {
@@ -7790,9 +7986,13 @@ impl App {
                         if let Some((tone, text, done)) =
                             private_access_progress_for_state(&state, &message)
                         {
-                            self.push_private_access_progress(tone, text);
+                            self.push_private_access_progress_for_profile(
+                                profile_index,
+                                tone,
+                                text,
+                            );
                             if done {
-                                self.finish_private_access_progress();
+                                self.finish_private_access_progress_for_profile(profile_index);
                             }
                         }
                         self.set_status_only(format!(
@@ -7809,11 +8009,13 @@ impl App {
                         bridge,
                         ..
                     } => {
-                        self.push_private_access_progress(
+                        self.push_private_access_progress_for_profile(
+                            profile_index,
                             PrivateAccessProgressTone::Info,
                             format!("收到内网路由: {} 条", routes.len()),
                         );
-                        self.push_private_access_progress(
+                        self.push_private_access_progress_for_profile(
+                            profile_index,
                             PrivateAccessProgressTone::Info,
                             "修改 config.json 中...".to_string(),
                         );
@@ -7829,12 +8031,15 @@ impl App {
                                 .to_ascii_lowercase(),
                         ];
                         match self.merge_private_access_bypass_entries(&domains, &domain_suffixes) {
-                            Ok(added) if added > 0 => self.push_private_access_progress(
-                                PrivateAccessProgressTone::Success,
-                                format!("added {added} Private Access domain bypass rule(s)"),
-                            ),
+                            Ok(added) if added > 0 => self
+                                .push_private_access_progress_for_profile(
+                                    profile_index,
+                                    PrivateAccessProgressTone::Success,
+                                    format!("added {added} Private Access domain bypass rule(s)"),
+                                ),
                             Ok(_) => {}
-                            Err(error) => self.push_private_access_progress(
+                            Err(error) => self.push_private_access_progress_for_profile(
+                                profile_index,
                                 PrivateAccessProgressTone::Error,
                                 format!("failed to update system proxy bypass: {error:#}"),
                             ),
@@ -7857,11 +8062,14 @@ impl App {
                                 &fallback_listen,
                             ) {
                                 Ok(true) => {
-                                    self.push_private_access_progress(
+                                    self.push_private_access_progress_for_profile(
+                                        profile_index,
                                         PrivateAccessProgressTone::Success,
                                         "config.json 已更新".to_string(),
                                     );
-                                    match self.restart_sing_box_for_private_access_progress() {
+                                    match self
+                                        .restart_sing_box_for_private_access_progress(profile_index)
+                                    {
                                         Ok(restart) => {
                                             self.set_status_only(format!(
                                                 "Private Access {profile_id} ({service}) applied {} bridge route(s); {restart}",
@@ -7882,7 +8090,8 @@ impl App {
                                     }
                                 }
                                 Ok(false) => {
-                                    self.push_private_access_progress(
+                                    self.push_private_access_progress_for_profile(
+                                        profile_index,
                                         PrivateAccessProgressTone::Info,
                                         "没有需要写入的内网路由".to_string(),
                                     );
@@ -7893,7 +8102,10 @@ impl App {
                                     self.private_access.profiles[profile_index].state =
                                         PrivateAccessState::Error;
                                     let message = format!("修改 config.json 失败: {error}");
-                                    self.fail_private_access_progress(message.clone());
+                                    self.fail_private_access_progress_for_profile(
+                                        profile_index,
+                                        message.clone(),
+                                    );
                                     self.set_status_only(message);
                                 }
                             }
@@ -7907,7 +8119,8 @@ impl App {
                                 &carrier_domains,
                             ) {
                                 Ok(true) => {
-                                    self.push_private_access_progress(
+                                    self.push_private_access_progress_for_profile(
+                                        profile_index,
                                         PrivateAccessProgressTone::Success,
                                         "config.json 已更新".to_string(),
                                     );
@@ -7915,18 +8128,23 @@ impl App {
                                         // SonicWall authentication and EVPN TLS use sing-box's
                                         // local HTTP CONNECT inbound. Restarting the managed core
                                         // here tears down the carrier beneath the new TUN.
-                                        self.push_private_access_progress(
+                                        self.push_private_access_progress_for_profile(
+                                            profile_index,
                                             PrivateAccessProgressTone::Info,
                                             "SonicWall 隧道已连接；为保持承载连接，本次不重启 sing-box"
                                                 .to_string(),
                                         );
-                                        self.finish_private_access_progress();
+                                        self.finish_private_access_progress_for_profile(
+                                            profile_index,
+                                        );
                                         self.set_status_only(format!(
                                             "Private Access {profile_id} ({service}) connected; wrote {} TUN direct route(s) without restarting sing-box",
                                             routes.len()
                                         ));
                                     } else {
-                                        match self.restart_sing_box_for_private_access_progress() {
+                                        match self.restart_sing_box_for_private_access_progress(
+                                            profile_index,
+                                        ) {
                                             Ok(restart) => {
                                                 self.set_status_only(format!(
                                                     "Private Access {profile_id} ({service}) applied {} TUN direct route(s); {restart}",
@@ -7948,7 +8166,8 @@ impl App {
                                     }
                                 }
                                 Ok(false) => {
-                                    self.push_private_access_progress(
+                                    self.push_private_access_progress_for_profile(
+                                        profile_index,
                                         PrivateAccessProgressTone::Info,
                                         "没有需要写入的内网路由".to_string(),
                                     );
@@ -7959,7 +8178,10 @@ impl App {
                                     self.private_access.profiles[profile_index].state =
                                         PrivateAccessState::Error;
                                     let message = format!("修改 config.json 失败: {error}");
-                                    self.fail_private_access_progress(message.clone());
+                                    self.fail_private_access_progress_for_profile(
+                                        profile_index,
+                                        message.clone(),
+                                    );
                                     self.set_status_only(message);
                                 }
                             }
@@ -7976,15 +8198,10 @@ impl App {
                     } => {
                         self.private_access.profiles[profile_index].state =
                             PrivateAccessState::Connecting;
+                        let profile = &self.private_access.profiles[profile_index];
                         let inputs = fields
                             .iter()
-                            .map(|field| {
-                                field
-                                    .options
-                                    .first()
-                                    .map(|option| option.value.clone())
-                                    .unwrap_or_default()
-                            })
+                            .map(|field| private_access_auth_initial_value(profile, field))
                             .collect();
                         self.private_access_auth = Some(PrivateAccessAuthModal {
                             profile_index,
@@ -8020,14 +8237,19 @@ impl App {
                         {
                             self.private_access_auth = None;
                         }
-                        self.fail_private_access_progress(format!("连接失败: {error}"));
+                        self.fail_private_access_progress_for_profile(
+                            profile_index,
+                            format!("连接失败: {error}"),
+                        );
                         if service == "sonicwall" {
-                            self.push_private_access_progress(
+                            self.push_private_access_progress_for_profile(
+                                profile_index,
                                 PrivateAccessProgressTone::Info,
                                 "完整诊断已写入 sonicwall-private-access.log".to_string(),
                             );
                         } else if service == "hillstone" {
-                            self.push_private_access_progress(
+                            self.push_private_access_progress_for_profile(
+                                profile_index,
                                 PrivateAccessProgressTone::Info,
                                 "完整诊断已写入 hillstone-private-access.log".to_string(),
                             );
@@ -8164,19 +8386,27 @@ impl App {
         profile.integration_failed = true;
         profile.state = PrivateAccessState::Error;
         profile.last_error = Some(message.clone());
-        self.fail_private_access_progress(message);
+        self.fail_private_access_progress_for_profile(profile_index, message);
     }
 
-    fn restart_sing_box_for_private_access_progress(&mut self) -> Result<String> {
-        self.push_private_access_progress(
+    fn restart_sing_box_for_private_access_progress(
+        &mut self,
+        profile_index: usize,
+    ) -> Result<String> {
+        self.push_private_access_progress_for_profile(
+            profile_index,
             PrivateAccessProgressTone::Info,
             "重启 sing-box 中...".to_string(),
         );
         match self.restart_managed_sing_box() {
             Ok(result) if result.restarted_pids.is_empty() => {
                 let message = format!("sing-box 启动成功: pid {}", result.started_pid);
-                self.push_private_access_progress(PrivateAccessProgressTone::Success, message);
-                self.finish_private_access_progress();
+                self.push_private_access_progress_for_profile(
+                    profile_index,
+                    PrivateAccessProgressTone::Success,
+                    message,
+                );
+                self.finish_private_access_progress_for_profile(profile_index);
                 Ok(format!("started sing-box pid {}", result.started_pid))
             }
             Ok(result) => {
@@ -8184,8 +8414,12 @@ impl App {
                     "sing-box 重启成功: pid(s) {:?} -> {}",
                     result.restarted_pids, result.started_pid
                 );
-                self.push_private_access_progress(PrivateAccessProgressTone::Success, message);
-                self.finish_private_access_progress();
+                self.push_private_access_progress_for_profile(
+                    profile_index,
+                    PrivateAccessProgressTone::Success,
+                    message,
+                );
+                self.finish_private_access_progress_for_profile(profile_index);
                 Ok(format!(
                     "restarted sing-box pid(s) {:?} -> {}",
                     result.restarted_pids, result.started_pid
@@ -8381,16 +8615,16 @@ mod tests {
         CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
         IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
         LatencyChartState, LatencyChartTimeUnit, LeftPaneSection, PrivateAccessMode,
-        PrivateAccessProfileRuntime, PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE,
-        SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, SettingsEditState, SettingsField,
-        SingBoxProcessRuntime, command_matches_headless_auto_pick,
-        command_matches_sing_box_run_for_config, config_arg_matches_path, connection_is_direct,
-        format_bytes, format_connection_line, format_duration_badge,
-        is_private_access_settings_field, latency_chart_segments, latency_chart_threshold_line,
-        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
-        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        PrivateAccessProfileRuntime, PrivateAccessProgressTone, PrivateAccessRuntime,
+        PrivateAccessState, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+        SettingsEditState, SettingsField, SingBoxProcessRuntime,
+        command_matches_headless_auto_pick, command_matches_sing_box_run_for_config,
+        config_arg_matches_path, connection_is_direct, format_bytes, format_connection_line,
+        format_duration_badge, is_private_access_settings_field, latency_chart_segments,
+        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
+        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
         normalize_http_connect_proxy, private_access_auth_display_value,
-        settings_field_display_value, settings_field_value,
+        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
         should_apply_private_access_state_after_integration, sing_box_config_args, status_lines,
         subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
         visible_settings_fields,
@@ -8522,6 +8756,7 @@ mod tests {
             last_background_status_generation: 0,
             background_started_at_unix: super::current_unix_timestamp(),
             background_worker: None,
+            background_status_job: None,
             benchmark_store: None,
             state_store: None,
             bypass_rule_set_store: None,
@@ -9320,6 +9555,37 @@ mod tests {
     }
 
     #[test]
+    fn private_access_progress_title_follows_event_profile_not_focus() {
+        let mut app = test_app();
+        app.private_access
+            .profiles
+            .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+        app.private_access.focused_index = 1;
+        app.open_private_access_progress();
+        assert_eq!(
+            app.private_access_progress
+                .as_ref()
+                .expect("focused progress")
+                .title,
+            "Private Access - sonicwall (tun)"
+        );
+
+        app.push_private_access_progress_for_profile(
+            0,
+            PrivateAccessProgressTone::Error,
+            "连接失败: session_failed".to_string(),
+        );
+
+        let progress = app
+            .private_access_progress
+            .as_ref()
+            .expect("event profile progress");
+        assert_eq!(progress.profile_index, 0);
+        assert_eq!(progress.title, "Private Access - hillstone (bridge)");
+        assert!(private_access_progress_text(&app).contains("session_failed"));
+    }
+
+    #[test]
     fn private_access_service_spawn_failure_stays_inside_tui_state() {
         let mut app = test_app();
         app.private_access.focused_mut().server = "sslvpn.example.com".to_string();
@@ -9800,7 +10066,7 @@ mod tests {
     }
 
     #[test]
-    fn private_access_password_persists_but_settings_display_masks_it() {
+    fn private_access_password_persists_and_settings_display_shows_it() {
         let mut app = test_app();
         app.private_access.focused_mut().password = "plain-secret".to_string();
 
@@ -9815,7 +10081,7 @@ mod tests {
         );
         assert_eq!(
             settings_field_display_value(&app, SettingsField::PrivateAccessPassword),
-            "<set>"
+            "plain-secret"
         );
     }
 
@@ -10854,6 +11120,34 @@ mod tests {
     }
 
     #[test]
+    fn live_background_worker_poll_failure_retries_without_reconnect() {
+        let retry = super::resolve_background_status_poll(super::BackgroundStatusPollOutcome {
+            result: Err("temporary TCP timeout".to_string()),
+            process_alive: true,
+        });
+        assert!(matches!(
+            retry,
+            super::BackgroundStatusPollResolution::Retry(error)
+                if error == "temporary TCP timeout"
+        ));
+
+        let reconnect = super::resolve_background_status_poll(super::BackgroundStatusPollOutcome {
+            result: Err("worker exited".to_string()),
+            process_alive: false,
+        });
+        assert!(matches!(
+            reconnect,
+            super::BackgroundStatusPollResolution::Reconnect(error)
+                if error == "worker exited"
+        ));
+    }
+
+    #[test]
+    fn process_exists_recognizes_current_process() {
+        assert!(super::process_exists(std::process::id()));
+    }
+
+    #[test]
     fn background_tcp_control_round_trips_status_with_token() {
         let (addr, rx) = super::spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
             .expect("tcp server starts");
@@ -10900,6 +11194,59 @@ mod tests {
         assert_eq!(snapshot.status_generation, 7);
         assert_eq!(snapshot.filter, "香港");
         worker.join().expect("worker joins");
+    }
+
+    #[test]
+    fn background_status_poll_starts_without_blocking_the_caller() {
+        let (addr, rx) = super::spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
+            .expect("tcp server starts");
+        let responder = thread::spawn(move || {
+            let request = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request received");
+            thread::sleep(Duration::from_millis(300));
+            request
+                .response
+                .send(super::BackgroundControlResponse {
+                    ok: true,
+                    error: None,
+                    status: Some(super::BackgroundStatusSnapshot {
+                        kind: super::BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
+                        pid: 42,
+                        controller: DEFAULT_CONTROLLER.to_string(),
+                        config_path: PathBuf::from("config.json"),
+                        max_concurrency: 4,
+                        started_at_unix: 1,
+                        status_generation: 7,
+                        worker_status: "running".to_string(),
+                        updated_at_unix: 2,
+                        auto_pick_enabled: true,
+                        auto_pick_selector: Some("select".to_string()),
+                        filter: "香港".to_string(),
+                        latency: None,
+                    }),
+                })
+                .expect("response sends");
+        });
+
+        let started = Instant::now();
+        let job = super::spawn_background_status_poll(super::BackgroundStatusTarget {
+            pid: std::process::id(),
+            bind_addr: addr.to_string(),
+            token: "secret".to_string(),
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "starting the poll must not wait for the response"
+        );
+        let outcome = job
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("poll completes");
+        assert!(outcome.result.is_ok());
+        assert!(outcome.process_alive);
+        job.worker.join().expect("poll worker joins");
+        responder.join().expect("responder joins");
     }
 
     #[test]
@@ -11231,7 +11578,7 @@ mod tests {
     }
 
     #[test]
-    fn sonicwall_auth_secrets_are_masked_and_not_persisted() {
+    fn sonicwall_auth_displays_secrets_and_prefills_only_static_credentials() {
         let secret_field = PrivateAccessAuthField {
             id: "reply-2".to_string(),
             label: "Dynamic code".to_string(),
@@ -11242,21 +11589,51 @@ mod tests {
         };
         assert_eq!(
             private_access_auth_display_value(&secret_field, "123456"),
-            "******"
+            "123456"
         );
 
         let profile = PrivateAccessProfileRuntime::from_state(PrivateAccessProfileState {
             id: "sonicwall".to_string(),
             server: Some("sslvpn.example.com".to_string()),
-            username: Some("should-not-persist".to_string()),
-            password: Some("should-not-persist".to_string()),
-            password_env: Some("SHOULD_NOT_PERSIST".to_string()),
+            username: Some("alice".to_string()),
+            password: Some("static-secret".to_string()),
+            password_env: Some("SONICWALL_PASSWORD".to_string()),
             ..PrivateAccessProfileState::default()
         })
         .expect("SonicWall profile loads");
+
+        let username_field = PrivateAccessAuthField {
+            id: "reply-0".to_string(),
+            label: "Domain account".to_string(),
+            kind: "text is-username".to_string(),
+            sensitive: false,
+            required: true,
+            options: Vec::new(),
+        };
+        let password_field = PrivateAccessAuthField {
+            id: "reply-1".to_string(),
+            label: "Domain password".to_string(),
+            kind: "password is-password".to_string(),
+            sensitive: true,
+            required: true,
+            options: Vec::new(),
+        };
+        assert_eq!(
+            private_access_auth_initial_value(&profile, &username_field),
+            "alice"
+        );
+        assert_eq!(
+            private_access_auth_initial_value(&profile, &password_field),
+            "static-secret"
+        );
+        assert_eq!(
+            private_access_auth_initial_value(&profile, &secret_field),
+            ""
+        );
+
         let state = profile.runtime_state();
-        assert!(state.username.is_none());
-        assert!(state.password.is_none());
-        assert!(state.password_env.is_none());
+        assert_eq!(state.username.as_deref(), Some("alice"));
+        assert_eq!(state.password.as_deref(), Some("static-secret"));
+        assert_eq!(state.password_env.as_deref(), Some("SONICWALL_PASSWORD"));
     }
 }

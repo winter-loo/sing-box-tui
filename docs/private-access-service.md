@@ -35,8 +35,8 @@ can be connected at the same time, and sing-box route rules decide which
 service bridge receives a given intranet destination.
 
 `Private Access password` can also be stored directly in `sing-box-tui.json` for
-a simpler local workflow. The settings list masks the value as `<set>`, but the
-file still contains plaintext, so use this only on a trusted machine.
+a simpler local workflow. The settings list displays the plaintext value, and the
+file also contains plaintext, so use this only on a trusted machine.
 
 If `Private Access password` is empty, the service falls back to the configured
 environment variable. For example:
@@ -45,6 +45,13 @@ environment variable. For example:
 export HILLSTONE_PASSWORD='...'
 sing-box-tui run --config ./config.json
 ```
+
+SonicWall profiles use the same precedence. When the gateway marks challenge
+fields as `is-username` and `is-password`, the TUI prefills those two fields from
+the profile. Generic password fields remain empty because they may contain a
+dynamic password or one-time code. Interactive replies are never copied back to
+`sing-box-tui.json`. Password and dynamic-code inputs are displayed as entered in
+the authentication dialog, so the terminal should be treated as sensitive.
 
 ## Traffic Flow
 
