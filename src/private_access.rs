@@ -39,6 +39,7 @@ const SONICWALL_HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const SONICWALL_CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 const SONICWALL_TUNNEL_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
 const SONICWALL_RAPID_DISCONNECT_WINDOW: Duration = Duration::from_secs(60);
+const PRIVATE_ACCESS_EVENT_QUEUE_CAPACITY: usize = 256;
 const SONICWALL_RECONNECT_BACKOFFS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(3),
@@ -501,7 +502,7 @@ impl ExternalPrivateAccessService {
             .stderr
             .take()
             .context("service stderr was not piped")?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PRIVATE_ACCESS_EVENT_QUEUE_CAPACITY);
         let service_id = manifest.id.clone();
         let stdout_tx = tx.clone();
         let stdout_worker = thread::spawn(move || {
@@ -541,7 +542,9 @@ impl ExternalPrivateAccessService {
                             service: stderr_service_id.clone(),
                             message: line,
                         });
-                        let _ = stderr_tx.send(Ok(event));
+                        // Diagnostics are best-effort; never let a chatty stderr producer grow an
+                        // unbounded queue or block higher-priority protocol events on stdout.
+                        let _ = stderr_tx.try_send(Ok(event));
                     }
                     Err(error) => {
                         let _ = stderr_tx.send(Err(format!(

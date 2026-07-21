@@ -62,7 +62,7 @@ EVPN codec is not useful until the web flow has produced a valid team token.
 | `src/private_access.rs` | JSON-line service adapter, Gateway Profile cache, transport race, interactive challenge bridge, TUN/data loop, route/domain extraction, and diagnostics |
 | `src/tun.rs` | Privileged TUN helper, pushed DNS/MTU/address configuration, packet I/O, and route lifetime guards |
 | `src/config.rs` | sing-box carrier exception, system-DNS path, internal CIDR/domain rules, and idempotent config updates |
-| `src/tui.rs` | SonicWall profile, dynamic masked login form, progress/error display, conflict warning, and service lifecycle |
+| `src/tui.rs` | SonicWall profile, dynamic login form, progress/error display, conflict warning, and service lifecycle |
 | `src/bin/pas-sonicwall.rs` | Small service executable shim that dispatches to `sing-box-tui private-access-service sonicwall --stdio` |
 | `scripts/sonicwall_tls_probe.py` | Standalone, non-authenticating TLS ClientHello compatibility probe |
 
@@ -179,11 +179,14 @@ does not assume “username + password + exactly one OTP”. Each challenge may 
 - a follow-up challenge after submission.
 
 Sensitive values are held in `PrivateAccessSecret`, whose debug representation is
-redacted and whose memory is zeroized on drop. The TUI masks sensitive fields and the
-interactive SonicWall replies are not written into the profile or Gateway Profile
-cache. Authentication POSTs are not blindly retried: if a response is lost after the
-gateway accepted the credentials, retrying could submit a one-time code twice or
-advance the state machine incorrectly.
+redacted and whose memory is zeroized on drop. The authentication dialog displays
+password and dynamic-code input values as entered. The profile may opt into prefilling
+fields explicitly marked `is-username` and `is-password`. Generic password fields
+remain empty so a dynamic password or one-time code is never mistaken for the static
+password. Interactive SonicWall replies are not written into the profile or Gateway
+Profile cache. Authentication POSTs are not blindly retried: if a response is lost
+after the gateway accepted the credentials, retrying could submit a one-time code
+twice or advance the state machine incorrectly.
 
 ### 5.7 Interrogation, endpoint policy, and activation
 
@@ -351,7 +354,12 @@ the generated sing-box configuration actually differs.
 
 The client follows these rules:
 
-- Never persist interactive passwords or one-time codes.
+- Never persist interactive replies or one-time codes; only explicitly configured
+  profile credentials may be stored for prefill.
+- Treat the terminal as sensitive while the authentication dialog is open because
+  password and dynamic-code inputs are intentionally visible.
+- Treat the Private Access settings screen as sensitive because a configured direct
+  password is intentionally displayed in plaintext.
 - Mask sensitive form values and zeroize their backing strings on drop.
 - Never include full team/logon tokens in logs or errors.
 - Reject cross-origin session-resource locations.
