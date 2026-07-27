@@ -89,6 +89,20 @@ The helper is intentionally generic: it owns TUN creation and OS route cleanup,
 while the service owns protocol-specific authentication, encryption, and
 gateway packet transport.
 
+On Windows, the helper also installs temporary NRPT rules for gateway-pushed
+hostnames and domain suffixes. Those namespaces use the tunnel DNS servers,
+while unrelated names keep using the normal system DNS path. DNS server host
+routes and NRPT rules are removed with the TUN session. If a pushed suffix also
+contains the public SonicWall gateway hostname, an exact, higher-priority NRPT
+override keeps that gateway on DNS servers from the physical default-route
+interface while the remaining suffix continues to support dynamic intranet
+names. The shared sing-box TUN baseline is written before sing-box starts, so a
+successful Hillstone or
+SonicWall TUN connection does not edit `config.json` or restart sing-box.
+If abnormal termination leaves Windows network state behind, follow
+[`windows-private-access-emergency-cleanup.md`](windows-private-access-emergency-cleanup.md)
+and remove only entries that are positively identified as belonging to this program.
+
 ## Service Process
 
 The Hillstone service can be launched directly for protocol smoke tests:

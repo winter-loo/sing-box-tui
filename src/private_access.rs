@@ -1662,6 +1662,7 @@ async fn run_sonicwall_authenticated_tunnel(
                 session,
                 data_plane,
                 config.tun_helper.clone(),
+                config.server.clone(),
                 Arc::clone(&sink),
                 Arc::clone(&shutdown),
                 session_id,
@@ -1806,6 +1807,7 @@ async fn supervise_sonicwall_tun_data_plane(
     session: &SonicwallAuthSession,
     established: EstablishedEvpn,
     tun_helper: Option<Vec<String>>,
+    gateway: String,
     sink: Arc<JsonLineEventSink<io::Stdout>>,
     shutdown: Arc<AtomicBool>,
     session_id: &str,
@@ -1818,6 +1820,7 @@ async fn supervise_sonicwall_tun_data_plane(
         let result = run_sonicwall_tun_data_plane(
             established,
             tun_helper,
+            &gateway,
             worker_sink.as_ref(),
             worker_shutdown.as_ref(),
             &worker_session_id,
@@ -1942,6 +1945,7 @@ fn wait_for_sonicwall_auth_reply(
 fn run_sonicwall_tun_data_plane(
     mut evpn: EstablishedEvpn,
     tun_helper: Option<Vec<String>>,
+    gateway: &str,
     sink: &JsonLineEventSink<io::Stdout>,
     shutdown: &AtomicBool,
     session_id: &str,
@@ -1954,6 +1958,12 @@ fn run_sonicwall_tun_data_plane(
     let dns_servers = evpn.config.dns.clone();
     let domains = sonicwall_resource_domains(&evpn.config);
     let domain_suffixes = sonicwall_domain_suffixes(&evpn.config);
+    let dns_namespaces = domains
+        .iter()
+        .cloned()
+        .chain(domain_suffixes.iter().map(|suffix| format!(".{suffix}")))
+        .collect();
+    let dns_system_namespaces = sonicwall_gateway_domain(gateway).into_iter().collect();
     let mtu = evpn.config.ssl_mtu.unwrap_or(1428).clamp(1200, 1500);
     let mut tun = TunHelperClient::spawn(
         tun_helper,
@@ -1963,6 +1973,8 @@ fn run_sonicwall_tun_data_plane(
             prefix_len: u32::from(evpn.config.ipv4_prefix_len.clamp(1, 32)),
             route_cidrs: route_cidrs.clone(),
             dns_servers: dns_servers.clone(),
+            dns_namespaces,
+            dns_system_namespaces,
             mtu: Some(mtu),
         },
     )?;
@@ -2314,6 +2326,16 @@ fn normalize_domain(value: &str) -> Option<String> {
         return None;
     }
     Some(value)
+}
+
+fn sonicwall_gateway_domain(server: &str) -> Option<String> {
+    let server = server.trim();
+    let url = if server.contains("://") {
+        reqwest::Url::parse(server).ok()?
+    } else {
+        reqwest::Url::parse(&format!("https://{server}")).ok()?
+    };
+    normalize_domain(url.host_str()?)
 }
 
 fn extract_ipv4_cidrs(bytes: &[u8]) -> Vec<String> {
@@ -2789,7 +2811,7 @@ mod tests {
         describe_ipv4_packet, extract_ipv4_cidrs, ipv4_range_to_cidrs,
         is_sonicwall_team_auth_error, is_sonicwall_transport_disconnect, normalize_domain,
         normalize_ipv4_cidr, normalize_sonicwall_gateway_cache_key, normalize_tun_helper_command,
-        sonicwall_candidate_delays, sonicwall_outbound_chain,
+        sonicwall_candidate_delays, sonicwall_gateway_domain, sonicwall_outbound_chain,
     };
     use crate::sonicwall::SonicwallLogonCapability;
     use serde_json::json;
@@ -2932,6 +2954,19 @@ mod tests {
         assert_eq!(normalize_domain("192.168.75.64"), None);
         assert_eq!(normalize_domain("bad_label.hundsun.com"), None);
         assert_eq!(normalize_domain("-bad.hundsun.com"), None);
+    }
+
+    #[test]
+    fn sonicwall_gateway_domain_accepts_host_port_and_url() {
+        assert_eq!(
+            sonicwall_gateway_domain("SSLVPN.Hundsun.COM:443").as_deref(),
+            Some("sslvpn.hundsun.com")
+        );
+        assert_eq!(
+            sonicwall_gateway_domain("https://VPN.Example.com:8443/").as_deref(),
+            Some("vpn.example.com")
+        );
+        assert_eq!(sonicwall_gateway_domain("115.236.91.20"), None);
     }
 
     #[test]
