@@ -86,6 +86,9 @@ fn connect_tcp(options: &EvpnTlsConnectOptions<'_>) -> Result<TcpStream> {
 }
 
 fn configure_tcp_keepalive(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("failed to disable Nagle delay on SonicWall EVPN TCP stream")?;
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
         .with_interval(Duration::from_secs(10));

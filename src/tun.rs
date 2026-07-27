@@ -1,6 +1,12 @@
 use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
@@ -15,7 +21,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
 const TUN_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const TUN_HELPER_RECONFIGURE_TIMEOUT: Duration = Duration::from_secs(5);
 const TUN_NON_IPV4_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const TUN_READ_POLL_MIN_INTERVAL: Duration = Duration::from_millis(1);
+const TUN_READ_POLL_MAX_INTERVAL: Duration = Duration::from_millis(5);
+const TUN_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const TUN_WRITE_WOULD_BLOCK_RETRIES: usize = 50;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct TunHelperStartConfig {
@@ -39,6 +50,7 @@ pub(crate) struct TunHelperStartConfig {
 enum TunHelperCommand {
     Start { config: TunHelperStartConfig },
     Packet { payload: String },
+    Reset,
     Stop,
 }
 
@@ -147,7 +159,7 @@ impl TunHelperClient {
             interface: String::new(),
         };
         client.send_command(&TunHelperCommand::Start { config })?;
-        client.wait_ready()?;
+        client.wait_ready(TUN_HELPER_READY_TIMEOUT)?;
         Ok(client)
     }
 
@@ -194,6 +206,18 @@ impl TunHelperClient {
         }
     }
 
+    pub(crate) fn start_session(&mut self, config: TunHelperStartConfig) -> Result<()> {
+        self.send_command(&TunHelperCommand::Start { config })?;
+        self.wait_ready(TUN_HELPER_RECONFIGURE_TIMEOUT)
+    }
+
+    pub(crate) fn reset_session(&mut self) -> Result<()> {
+        self.send_command(&TunHelperCommand::Reset)?;
+        self.wait_stopped()?;
+        self.interface.clear();
+        Ok(())
+    }
+
     pub(crate) fn stop(mut self) -> Result<()> {
         let _ = self.send_command(&TunHelperCommand::Stop);
         let _ = self.child.wait();
@@ -215,8 +239,8 @@ impl TunHelperClient {
         Ok(())
     }
 
-    fn wait_ready(&mut self) -> Result<()> {
-        let deadline = std::time::Instant::now() + TUN_HELPER_READY_TIMEOUT;
+    fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
         let mut recent_logs = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -267,6 +291,56 @@ impl TunHelperClient {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     bail!(
                         "TUN helper event stream closed before ready{}",
+                        helper_log_suffix(&recent_logs)
+                    )
+                }
+            }
+        }
+    }
+
+    fn wait_stopped(&mut self) -> Result<()> {
+        let deadline = Instant::now() + TUN_HELPER_RECONFIGURE_TIMEOUT;
+        let mut recent_logs = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "timed out waiting for TUN helper session to reset{}",
+                    helper_log_suffix(&recent_logs)
+                );
+            }
+            match self
+                .event_rx
+                .recv_timeout(remaining.min(Duration::from_millis(500)))
+            {
+                Ok(Ok(TunHelperEvent::Stopped { .. })) => return Ok(()),
+                Ok(Ok(TunHelperEvent::Log { message })) => {
+                    remember_helper_log(&mut recent_logs, &message);
+                    eprintln!("TUN helper: {message}");
+                }
+                Ok(Ok(TunHelperEvent::Error { message })) => {
+                    bail!(
+                        "TUN helper failed while resetting: {message}{}",
+                        helper_log_suffix(&recent_logs)
+                    )
+                }
+                Ok(Ok(TunHelperEvent::Packet { .. } | TunHelperEvent::Ready { .. })) => {}
+                Ok(Err(error)) => bail!("{error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = self
+                        .child
+                        .try_wait()
+                        .context("failed to inspect TUN helper process status")?
+                    {
+                        bail!(
+                            "TUN helper exited while resetting with status {status}{}",
+                            helper_log_suffix(&recent_logs)
+                        );
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!(
+                        "TUN helper event stream closed while resetting{}",
                         helper_log_suffix(&recent_logs)
                     )
                 }
@@ -430,6 +504,17 @@ pub(crate) fn run_private_access_tun_helper_stdio(stdio: bool) -> Result<()> {
                     )?;
                 }
             }
+            TunHelperCommand::Reset => {
+                if let Some(context) = context.take() {
+                    context.stop();
+                }
+                emit_tun_helper_event(
+                    &stdout,
+                    &TunHelperEvent::Stopped {
+                        message: "session reset by request".to_string(),
+                    },
+                )?;
+            }
             TunHelperCommand::Stop => {
                 if let Some(context) = context.take() {
                     context.stop();
@@ -499,17 +584,22 @@ impl TunHelperContext {
         // The service process owns Hillstone session keys; the helper owns only the privileged
         // kernel-facing TUN state. This split was added after direct service-side TUN setup made
         // the normal TUI binary require root privileges.
-        let device = tun_rs::DeviceBuilder::new()
-            .ipv4(
-                config.client_ipv4,
-                config.prefix_len as u8,
-                config.gateway_ipv4,
-            )
-            .with(|builder| {
-                if let Some(mtu) = config.mtu {
-                    builder.mtu_v4(mtu);
-                }
-            })
+        let mut builder = tun_rs::DeviceBuilder::new().ipv4(
+            config.client_ipv4,
+            config.prefix_len as u8,
+            config.gateway_ipv4,
+        );
+        if let Some(mtu) = config.mtu {
+            #[cfg(windows)]
+            {
+                builder = builder.mtu_v4(mtu);
+            }
+            #[cfg(not(windows))]
+            {
+                builder = builder.mtu(mtu);
+            }
+        }
+        let device = builder
             .with(|_builder| {
                 #[cfg(any(
                     target_os = "macos",
@@ -558,6 +648,7 @@ impl TunHelperContext {
             let mut buffer = vec![0_u8; 65535];
             let mut dropped_non_ipv4 = 0_u64;
             let mut next_non_ipv4_log = Instant::now();
+            let mut read_poll_interval = TUN_READ_POLL_MIN_INTERVAL;
             while !reader_shutdown.load(Ordering::SeqCst) {
                 #[cfg(windows)]
                 let receive = reader_device.try_recv(&mut buffer);
@@ -565,6 +656,7 @@ impl TunHelperContext {
                 let receive = reader_device.recv(&mut buffer);
                 match receive {
                     Ok(size) => {
+                        read_poll_interval = TUN_READ_POLL_MIN_INTERVAL;
                         let packet = &buffer[..size];
                         if packet.first().map(|byte| byte >> 4) != Some(4) {
                             dropped_non_ipv4 = dropped_non_ipv4.saturating_add(1);
@@ -591,7 +683,9 @@ impl TunHelperContext {
                         );
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(read_poll_interval);
+                        read_poll_interval = (read_poll_interval + TUN_READ_POLL_MIN_INTERVAL)
+                            .min(TUN_READ_POLL_MAX_INTERVAL);
                     }
                     Err(error) => {
                         let _ = emit_tun_helper_event(
@@ -619,15 +713,7 @@ impl TunHelperContext {
         if packet.first().map(|byte| byte >> 4) != Some(4) {
             bail!("TUN helper write requires an inner IPv4 packet");
         }
-        match self.device.send(packet) {
-            Ok(size) if size == packet.len() => Ok(()),
-            Ok(size) => bail!(
-                "short TUN helper write: wrote {size} of {} bytes",
-                packet.len()
-            ),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
-            Err(error) => Err(error).context("failed to write IPv4 packet to TUN"),
-        }
+        write_ipv4_with_retry(packet.len(), || self.device.send(packet))
     }
 
     fn stop(mut self) {
@@ -636,6 +722,45 @@ impl TunHelperContext {
         let _ = self.device.shutdown();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
+fn write_ipv4_with_retry<F>(packet_len: usize, mut send: F) -> Result<()>
+where
+    F: FnMut() -> std::io::Result<usize>,
+{
+    let mut would_block_retries = 0;
+    loop {
+        match send() {
+            Ok(size) if size == packet_len => return Ok(()),
+            Ok(size) => bail!(
+                "short TUN helper write: wrote {size} of {} bytes",
+                packet_len
+            ),
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    && would_block_retries < TUN_WRITE_WOULD_BLOCK_RETRIES =>
+            {
+                would_block_retries += 1;
+                thread::sleep(TUN_WRITE_RETRY_INTERVAL);
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => bail!(
+                "timed out writing an IPv4 packet to TUN after {} retries",
+                TUN_WRITE_WOULD_BLOCK_RETRIES
+            ),
+            Err(error) => {
+                return Err(error).context("failed to write IPv4 packet to TUN");
+            }
         }
     }
 }
@@ -714,6 +839,7 @@ fn ipv4_cidr_contains(network: Ipv4Addr, prefix_len: u8, address: Ipv4Addr) -> b
     u32::from(network) & mask == u32::from(address) & mask
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn normalize_dns_namespace(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     let is_suffix = value.starts_with("*.") || value.starts_with('.');
@@ -743,12 +869,14 @@ fn normalize_dns_namespace(value: &str) -> Option<String> {
     })
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 #[derive(Debug, Eq, PartialEq)]
 struct TunDnsPolicyPlan {
     tunnel_namespaces: Vec<String>,
     system_namespaces: Vec<String>,
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn dns_namespace_matches_domain(namespace: &str, domain: &str) -> bool {
     namespace
         .strip_prefix('.')
@@ -756,6 +884,7 @@ fn dns_namespace_matches_domain(namespace: &str, domain: &str) -> bool {
         || namespace == domain
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn tun_dns_policy_plan(namespaces: &[String], system_namespaces: &[String]) -> TunDnsPolicyPlan {
     let mut tunnel_namespaces = namespaces
         .iter()
@@ -966,10 +1095,278 @@ fn run_windows_powershell(script: &str, environment: &[(&str, &str)]) -> Result<
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+struct MacosResolverFile {
+    path: PathBuf,
+    contents: String,
+}
+
+#[cfg(target_os = "macos")]
+struct TunDnsPolicyGuard {
+    resolver_files: Vec<MacosResolverFile>,
+}
+
+#[cfg(target_os = "macos")]
+impl TunDnsPolicyGuard {
+    fn install(
+        namespaces: &[String],
+        system_namespaces: &[String],
+        dns_servers: &[IpAddr],
+    ) -> Result<Self> {
+        let plan = tun_dns_policy_plan(namespaces, system_namespaces);
+        if plan.tunnel_namespaces.is_empty() && plan.system_namespaces.is_empty() {
+            return Ok(Self {
+                resolver_files: Vec::new(),
+            });
+        }
+        if dns_servers.is_empty() && !plan.tunnel_namespaces.is_empty() {
+            bail!("Private Access pushed DNS namespaces without any DNS server");
+        }
+
+        let system_dns_servers = if plan.system_namespaces.is_empty() {
+            Vec::new()
+        } else {
+            macos_default_dns_servers().context(
+                "failed to find the macOS primary DNS servers for the VPN gateway override",
+            )?
+        };
+        let resolver_dir = Path::new("/etc/resolver");
+        ensure_macos_resolver_directory(resolver_dir)?;
+        let pid = std::process::id();
+        let mut guard = Self {
+            resolver_files: Vec::new(),
+        };
+        for namespace in plan.tunnel_namespaces {
+            guard.install_resolver(resolver_dir, &namespace, dns_servers, pid)?;
+        }
+        for namespace in plan.system_namespaces {
+            guard.install_resolver(resolver_dir, &namespace, &system_dns_servers, pid)?;
+        }
+        flush_macos_dns_cache();
+        Ok(guard)
+    }
+
+    fn install_resolver(
+        &mut self,
+        resolver_dir: &Path,
+        namespace: &str,
+        dns_servers: &[IpAddr],
+        pid: u32,
+    ) -> Result<()> {
+        let domain = namespace.trim_start_matches('.');
+        let contents = macos_resolver_file_contents(namespace, dns_servers, pid)?;
+        let path = resolver_dir.join(domain);
+        remove_stale_owned_macos_resolver(&path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "failed to create macOS split-DNS resolver {}",
+                    path.display()
+                )
+            })?;
+        let write_result = file
+            .write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write macOS resolver {}", path.display()))
+            .and_then(|()| {
+                file.flush()
+                    .with_context(|| format!("failed to flush macOS resolver {}", path.display()))
+            });
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        self.resolver_files
+            .push(MacosResolverFile { path, contents });
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TunDnsPolicyGuard {
+    fn drop(&mut self) {
+        for resolver in self.resolver_files.iter().rev() {
+            match fs::read_to_string(&resolver.path) {
+                Ok(contents) if contents == resolver.contents => {
+                    if let Err(error) = fs::remove_file(&resolver.path) {
+                        eprintln!(
+                            "warning: failed to remove macOS resolver {}: {error}",
+                            resolver.path.display()
+                        );
+                    }
+                }
+                Ok(_) => eprintln!(
+                    "warning: not removing modified macOS resolver {}",
+                    resolver.path.display()
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "warning: failed to inspect macOS resolver {} during cleanup: {error}",
+                    resolver.path.display()
+                ),
+            }
+        }
+        flush_macos_dns_cache();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_resolver_file_contents(
+    namespace: &str,
+    dns_servers: &[IpAddr],
+    pid: u32,
+) -> Result<String> {
+    let domain = normalize_dns_namespace(namespace)
+        .map(|namespace| namespace.trim_start_matches('.').to_string())
+        .context("invalid macOS split-DNS namespace")?;
+    if domain.is_empty() || dns_servers.is_empty() {
+        bail!("macOS resolver {domain} requires at least one DNS server");
+    }
+    let mut contents = format!("# sing-box-tui private access pid={pid}\n");
+    for server in dns_servers.iter().take(3) {
+        contents.push_str(&format!("nameserver {server}\n"));
+    }
+    Ok(contents)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_resolver_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "macOS resolver path {} is not a real directory",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir(path).with_context(|| {
+                format!(
+                    "failed to create macOS resolver directory {}",
+                    path.display()
+                )
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect macOS resolver directory {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_stale_owned_macos_resolver(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect macOS resolver {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "macOS resolver path {} is not a regular file",
+            path.display()
+        );
+    }
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read existing macOS resolver {}", path.display()))?;
+    let owner = contents
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("# sing-box-tui private access pid="))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .with_context(|| {
+            format!(
+                "macOS split-DNS resolver already exists and is not owned by sing-box-tui: {}",
+                path.display()
+            )
+        })?;
+    if macos_process_exists(owner) {
+        bail!(
+            "macOS split-DNS resolver {} is owned by active process {owner}",
+            path.display()
+        );
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove stale macOS resolver {}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_exists(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_dns_servers() -> Result<Vec<IpAddr>> {
+    let output = Command::new("/usr/sbin/scutil")
+        .arg("--dns")
+        .output()
+        .context("failed to inspect macOS DNS configuration with scutil")?;
+    if !output.status.success() {
+        bail!("scutil --dns exited with status {}", output.status);
+    }
+    let servers = macos_default_dns_servers_from_scutil(&String::from_utf8_lossy(&output.stdout));
+    if servers.is_empty() {
+        bail!("macOS DNS configuration has no primary non-supplemental resolver");
+    }
+    Ok(servers)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_dns_servers_from_scutil(text: &str) -> Vec<IpAddr> {
+    for block in text.split("\n\n") {
+        if block.starts_with("DNS configuration (for scoped queries)") {
+            break;
+        }
+        if !block.trim_start().starts_with("resolver #")
+            || block
+                .lines()
+                .any(|line| line.trim_start().starts_with("domain "))
+            || block.lines().any(|line| line.contains("Supplemental"))
+        {
+            continue;
+        }
+        let servers = block
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.starts_with("nameserver[")
+                    .then(|| line.split_once(':')?.1.trim().parse::<IpAddr>().ok())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if !servers.is_empty() {
+            return servers;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+fn flush_macos_dns_cache() {
+    let _ = Command::new("/usr/bin/dscacheutil")
+        .arg("-flushcache")
+        .status();
+    let _ = Command::new("/usr/bin/killall")
+        .args(["-HUP", "mDNSResponder"])
+        .status();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 struct TunDnsPolicyGuard;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl TunDnsPolicyGuard {
     fn install(
         _namespaces: &[String],
@@ -1241,6 +1638,15 @@ fn run_command(program: &str, args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    ))]
+    use super::write_ipv4_with_retry;
     use super::{
         TunHelperCommand, TunHelperEvent, TunHelperStartConfig, helper_log_suffix,
         is_noninteractive_sudo_command, normalize_dns_namespace, parse_ipv4_cidr,
@@ -1250,6 +1656,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::route_add_args;
+    #[cfg(target_os = "macos")]
+    use super::{macos_default_dns_servers_from_scutil, macos_resolver_file_contents};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -1302,6 +1710,41 @@ mod tests {
 
         assert_eq!(value["type"], "packet");
         assert_eq!(value["payload"], "RAAAFA==");
+    }
+
+    #[test]
+    fn tun_helper_reset_command_serializes_as_json_line_protocol() {
+        let value: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&TunHelperCommand::Reset).expect("serializes"),
+        )
+        .expect("parses");
+
+        assert_eq!(value["type"], "reset");
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    ))]
+    #[test]
+    fn tun_write_retries_transient_would_block_instead_of_dropping_packet() {
+        let mut attempts = 0;
+
+        write_ipv4_with_retry(64, || {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            } else {
+                Ok(64)
+            }
+        })
+        .expect("transient TUN backpressure should recover");
+
+        assert_eq!(attempts, 3);
     }
 
     #[test]
@@ -1414,6 +1857,53 @@ mod tests {
 
         assert_eq!(plan.tunnel_namespaces, vec![".internal.example.com"]);
         assert!(plan.system_namespaces.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_split_dns_builds_owned_resolver_file() {
+        let contents = macos_resolver_file_contents(
+            ".hundsun.com",
+            &[
+                IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)),
+                IpAddr::V4(Ipv4Addr::new(10, 20, 30, 41)),
+            ],
+            1234,
+        )
+        .expect("resolver contents build");
+
+        assert_eq!(
+            contents,
+            "# sing-box-tui private access pid=1234\n\
+             nameserver 10.20.30.40\n\
+             nameserver 10.20.30.41\n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_split_dns_uses_primary_non_supplemental_resolver_for_gateway() {
+        let scutil = r#"
+resolver #1
+  domain   : tail.example
+  nameserver[0] : 100.100.100.100
+  flags    : Supplemental
+
+resolver #2
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : 1.1.1.1
+  flags    : Request A records
+
+DNS configuration (for scoped queries)
+"#;
+
+        assert_eq!(
+            macos_default_dns_servers_from_scutil(scutil),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            ]
+        );
     }
 
     #[test]

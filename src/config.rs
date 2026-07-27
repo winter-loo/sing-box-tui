@@ -1562,8 +1562,45 @@ fn ensure_private_access_carrier_route(
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .context("existing config outbounds must be an array")?;
-    let selector_tag =
+    let preferred_selector_tag =
         preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
+    let carrier_outbound_tag = if outbounds.iter().any(|outbound| {
+        outbound.get("tag").and_then(Value::as_str) == Some(preferred_selector_tag.as_str())
+    }) {
+        preferred_selector_tag
+    } else if let Some(tag) = outbounds
+        .iter()
+        .find(|outbound| {
+            outbound
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "selector" | "urltest"))
+        })
+        .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
+    {
+        tag.to_string()
+    } else {
+        let direct_tag = preferred_existing_tag(outbounds, DIRECT_TAG_ALIASES, DEFAULT_DIRECT_TAG);
+        if outbounds.iter().any(|outbound| {
+            outbound.get("tag").and_then(Value::as_str) == Some(direct_tag.as_str())
+        }) {
+            direct_tag
+        } else if let Some(tag) = outbounds
+            .iter()
+            .find(|outbound| is_replaceable_node_outbound(outbound))
+            .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
+        {
+            tag.to_string()
+        } else {
+            upsert_special_outbound(
+                outbounds,
+                &direct_tag,
+                || json!({ "type": "direct", "tag": direct_tag.clone() }),
+                |value| ensure_string_field(value, "type", "direct"),
+            )?;
+            direct_tag
+        }
+    };
     let route = root
         .entry("route")
         .or_insert_with(|| json!({}))
@@ -1599,7 +1636,7 @@ fn ensure_private_access_carrier_route(
                 .and_then(Value::as_str)
                 .unwrap_or("route")
                 == "route"
-            && rule.get("outbound").and_then(Value::as_str) == Some(selector_tag.as_str())
+            && rule.get("outbound").and_then(Value::as_str) == Some(carrier_outbound_tag.as_str())
             && !rule_string_values(rule, "domain").is_empty()
             && rule_string_values(rule, "domain")
                 .iter()
@@ -1611,6 +1648,7 @@ fn ensure_private_access_carrier_route(
         merged_domains.sort();
         merged_domains.dedup();
         rules[existing_index]["domain"] = json!(merged_domains);
+        rules[existing_index]["outbound"] = json!(carrier_outbound_tag);
         if existing_index > desired_index {
             let rule = rules.remove(existing_index);
             rules.insert(desired_index, rule);
@@ -1623,7 +1661,7 @@ fn ensure_private_access_carrier_route(
         json!({
             "action": "route",
             "domain": carrier_domains,
-            "outbound": selector_tag,
+            "outbound": carrier_outbound_tag,
         }),
     );
     Ok(())
@@ -2296,7 +2334,21 @@ mod tests {
             "dns": { "servers": [] },
             "outbounds": [
                 { "type": "direct", "tag": "direct" },
-                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+                { "type": "selector", "tag": "select", "outbounds": ["node-a"] },
+                {
+                    "type": "trojan",
+                    "tag": "node-a",
+                    "server": "proxy.example.com",
+                    "server_port": 443,
+                    "password": "secret"
+                },
+                {
+                    "type": "trojan",
+                    "tag": "unrelated-node",
+                    "server": "unrelated.example.com",
+                    "server_port": 443,
+                    "password": "secret"
+                }
             ],
             "route": {
                 "rules": [
@@ -2371,6 +2423,72 @@ mod tests {
         );
         assert_eq!(rules[domain_index]["outbound"], "direct");
         assert_eq!(config["route"]["auto_detect_interface"], false);
+    }
+
+    #[test]
+    fn private_access_carrier_preserves_custom_direct_rule() {
+        let mut config = json!({
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": {
+                "rules": [{
+                    "action": "route",
+                    "domain": ["sslvpn.hundsun.com", "keep-direct.example"],
+                    "outbound": "direct"
+                }]
+            }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "sonicwall".to_string(),
+                cidrs: Vec::new(),
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
+                proxy: None,
+            },
+        )
+        .expect("private access carrier is inserted");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.iter().any(|rule| {
+            rule["domain"] == json!(["sslvpn.hundsun.com", "keep-direct.example"])
+                && rule["outbound"] == "direct"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["domain"] == json!(["sslvpn.hundsun.com"]) && rule["outbound"] == "select"
+        }));
+    }
+
+    #[test]
+    fn private_access_carrier_uses_existing_direct_when_selector_is_absent() {
+        let mut config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [] }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "sonicwall".to_string(),
+                cidrs: Vec::new(),
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
+                proxy: None,
+            },
+        )
+        .expect("private access carrier is inserted");
+
+        assert!(config["route"]["rules"].as_array().is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule["domain"] == json!(["sslvpn.hundsun.com"]) && rule["outbound"] == "direct"
+            })
+        }));
     }
 
     #[test]

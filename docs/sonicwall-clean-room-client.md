@@ -25,6 +25,8 @@ The completed path covers:
 - Direct and explicit HTTP CONNECT proxy transports, with cached preference and a
   short staggered race between them.
 - Integration into the existing Private Access service and TUI lifecycle.
+- Gateway-compatible Connect Tunnel identity with native macOS endpoint-policy
+  evaluation.
 
 The code deliberately does not reuse vendor binaries or private libraries. The
 installed client version was useful only as observable compatibility metadata (for
@@ -84,13 +86,16 @@ At a high level, one connection follows this sequence:
    response.
 6. Evaluate supported endpoint-policy checks, activate the Connect Tunnel agent, and
    validate the returned logon/team token.
-7. Open the EVPN TLS connection using the same selected underlay.
+7. Open the EVPN TLS connection using the same HTTP CONNECT listener and the proxy
+   selected by the existing Internet auto picker.
 8. Negotiate EVPN version, authenticate the team token, exchange capabilities, and
    receive client network configuration.
 9. Start the TUN helper with the assigned address, prefix, DNS servers, and MTU.
 10. Install the gateway carrier exception and pushed private routes/domains.
 11. Exchange raw IPv4 packets in EVPN DATA frames while servicing control frames.
-12. On disconnect, stop packet I/O and release route/TUN guards.
+12. On a recoverable EVPN loss or a stable Internet auto-picker selection change,
+    reset the TUN context but retain the authorized helper process; reconfigure it
+    after reconnect. On final disconnect, release all guards.
 
 The HTTPS session token is never treated as a route or packet-layer credential. The
 control plane produces a fixed-size EVPN identity, and only that validated identity is
@@ -114,10 +119,11 @@ Each normalized gateway has a small persisted profile containing:
 - whether the modern `/__api__/logon` endpoint worked, was unsupported, or has not yet
   been determined.
 
-On Windows the cache is stored below the user's local application-data directory as
-`sing-box-tui/sonicwall-gateway-profiles.json`. Updates use an atomic replacement so a
-crash cannot leave a half-written JSON file. Cache read/write failures are warnings,
-not VPN failures.
+On Windows the cache is stored below the user's local application-data directory.
+On macOS and other Unix targets it uses `$XDG_CACHE_HOME/sing-box-tui` when set,
+otherwise `~/.cache/sing-box-tui`. Updates use an atomic replacement so a crash
+cannot leave a half-written JSON file. Cache read/write failures are warnings, not
+VPN failures.
 
 Persistence matters because the TUI intentionally stops the service process after an
 error or disconnect. An in-memory preference appeared to work in unit tests but was
@@ -324,7 +330,7 @@ The VPN gateway itself is carrier traffic and must remain reachable before the t
 exists. A broad internal-domain rule can accidentally capture it. For example:
 
 ```text
-vpn.example.com       -> normal selector / proxy (carrier exception)
+vpn.example.com       -> normal Internet selector / auto picker
 *.example.com         -> system DNS + direct through private tunnel
 10.0.0.0/8            -> direct through private tunnel
 ```
@@ -338,6 +344,12 @@ finish until authentication succeeds.
 the same as merely enabling a browser/system proxy. The gateway exception ensures the
 CONNECT request can reach the local sing-box listener, while internal resources use
 the established TUN path.
+
+The gateway exception uses the same root Internet selector as ordinary proxy traffic.
+The existing auto picker remains the only component allowed to measure or switch
+proxy nodes. SonicWall only observes the resulting selector chain; after the same new
+chain is seen twice, it re-establishes the long-lived EVPN connection so the next
+HTTP CONNECT consumes the auto picker's decision.
 
 ### 8.3 Internal DNS and route resources
 
@@ -398,7 +410,8 @@ Test coverage includes:
 - current and version-1 client configuration layouts;
 - CIDR/domain/range extraction and minimal range decomposition;
 - sing-box carrier-rule ordering and idempotent route generation;
-- TUN helper configuration and service/TUI event handling.
+- TUN helper configuration, reset protocol, backpressure retry, and service/TUI
+  event handling.
 
 The live gateway TLS test is ignored by default. It requires explicit network access
 and should never be a prerequisite for deterministic local or CI tests.
