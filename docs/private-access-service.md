@@ -53,6 +53,64 @@ dynamic password or one-time code. Interactive replies are never copied back to
 `sing-box-tui.json`. Password and dynamic-code inputs are displayed as entered in
 the authentication dialog, so the terminal should be treated as sensitive.
 
+### SonicWall on macOS
+
+The built-in SonicWall SMA 1000 / Connect Tunnel-compatible service uses TUN mode
+on macOS. Add a profile whose `id` is `sonicwall`; that id selects the built-in
+clean-room SonicWall service when no custom manifest is supplied:
+
+```json
+{
+  "id": "sonicwall",
+  "manifest_path": null,
+  "mode": "tun",
+  "server": "sslvpn.example.com",
+  "port": 443,
+  "username": "user",
+  "password": "",
+  "password_env": "",
+  "bridge_listen": "",
+  "tun_helper": [],
+  "tls_verify": true
+}
+```
+
+Before connecting from the TUI, authorize the privileged helper in a terminal:
+
+```bash
+sudo -v
+```
+
+The normal TUI and SonicWall service remain unprivileged. The default helper
+command uses `sudo -n` to create the macOS `utun` interface and install pushed
+routes, so it fails with a clear message instead of prompting inside the service
+protocol. Sites that deploy the binary centrally can configure `tun_helper` to
+invoke a pre-authorized helper instead.
+
+The authorized helper process is retained for the whole SonicWall login session.
+If EVPN reconnects, the service resets and reconfigures the existing helper instead
+of invoking `sudo` again. A changed gateway assignment therefore receives a fresh
+TUN address, route, and DNS configuration without requiring another password.
+
+On macOS the client retains the gateway-compatible Windows Connect Tunnel
+protocol identity while evaluating supported OS-version and process
+endpoint-policy checks against the local Mac. The compatibility identity is
+required by gateways that reject an unverified Macintosh agent payload.
+Windows-only registry checks remain unsupported and fail closed.
+
+The privileged helper also installs temporary split-DNS files below
+`/etc/resolver` for gateway-pushed domains. A more-specific resolver keeps the
+public SonicWall gateway hostname on the Mac's primary physical DNS servers.
+Resolver files carry the helper PID and are removed on disconnect only if their
+contents are still owned by that helper.
+
+The generated sing-box configuration routes public VPN gateway domains through
+the existing Internet selector. Node measurement and selection remain the sole
+responsibility of the normal Internet auto picker; the SonicWall service neither
+benchmarks candidates nor changes the selected proxy. If that shared selection
+stabilizes on a different path, the service re-establishes only its EVPN carrier
+and reuses the authenticated session and authorized TUN helper.
+
 ## Traffic Flow
 
 Private Access does not require a second browser proxy. In `bridge` mode, the

@@ -840,10 +840,8 @@ fn suspend_terminal_for_prompt(terminal: &mut DefaultTerminal) -> Result<()> {
     terminal.show_cursor()?;
     restore_terminal()?;
     println!();
-    println!("Private Access TUN helper may ask for your macOS sudo password below.");
-    println!(
-        "Complete the prompt in this terminal; the TUI will return after the helper is ready or fails."
-    );
+    println!("Private Access needs macOS administrator authorization for its TUN helper.");
+    println!("Complete the sudo prompt below; the login form will resume immediately afterward.");
     println!();
     Ok(())
 }
@@ -867,25 +865,28 @@ fn connect_private_access_with_terminal_prompt(
     );
     app.push_private_access_progress(
         PrivateAccessProgressTone::Info,
-        "需要管理员权限创建 TUN 接口，正在切换到终端提示...".to_string(),
+        "需要管理员权限创建 TUN 接口，正在预授权 sudo...".to_string(),
     );
     terminal.draw(|frame| draw(frame, app))?;
     suspend_terminal_for_prompt(terminal)?;
-    let result = (|| -> Result<()> {
-        app.toggle_private_access()?;
-        loop {
-            app.poll_private_access_updates()?;
-            let state = app.private_access.focused().state.clone();
-            if !matches!(state, PrivateAccessState::Connecting) {
-                println!();
-                println!("Private Access {}: {}", state.label(), app.status);
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    })();
+    let authorization = Command::new("sudo")
+        .arg("-v")
+        .status()
+        .context("failed to start sudo authorization for Private Access TUN helper");
     let resume_result = resume_terminal_after_prompt(terminal);
-    result.and(resume_result)
+    resume_result?;
+    let status = authorization?;
+    if !status.success() {
+        let message = format!("Private Access TUN helper sudo authorization failed: {status}");
+        app.fail_private_access_progress(message.clone());
+        app.set_status_only(message);
+        return Ok(());
+    }
+    app.push_private_access_progress(
+        PrivateAccessProgressTone::Success,
+        "sudo 预授权成功，继续登录...".to_string(),
+    );
+    app.toggle_private_access()
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -3175,16 +3176,11 @@ fn command_tokens(command: &str) -> Vec<String> {
 }
 
 fn command_program_name_matches(program: &str, expected: &str) -> bool {
-    Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| {
-            name.eq_ignore_ascii_case(expected)
-                || name
-                    .strip_suffix(".exe")
-                    .is_some_and(|base| base.eq_ignore_ascii_case(expected))
-        })
-        .unwrap_or(false)
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case(expected)
+        || name
+            .strip_suffix(".exe")
+            .is_some_and(|base| base.eq_ignore_ascii_case(expected))
 }
 
 fn command_matches_sing_box_run_for_config(command: &str, config_path: &Path) -> bool {
@@ -3429,11 +3425,6 @@ fn parse_windows_tasklist_image_names(text: &str) -> Vec<String> {
             Some(name.to_string())
         })
         .collect()
-}
-
-#[cfg(not(windows))]
-fn parse_windows_tasklist_image_names(_text: &str) -> Vec<String> {
-    Vec::new()
 }
 
 fn format_official_sonicwall_client_warning(processes: &[String]) -> String {
@@ -3917,9 +3908,18 @@ fn parse_private_access_mode(value: &str) -> Result<PrivateAccessMode> {
     }
 }
 
-fn helper_command_uses_interactive_sudo(command: &[String]) -> bool {
-    command.first().is_some_and(|program| program == "sudo")
-        && !command.iter().skip(1).any(|arg| arg == "-n")
+fn helper_command_uses_sudo(command: &[String]) -> bool {
+    command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|program| program == "sudo")
+}
+
+fn make_sudo_command_noninteractive(mut command: Vec<String>) -> Vec<String> {
+    if helper_command_uses_sudo(&command) && !command.iter().skip(1).any(|arg| arg == "-n") {
+        command.insert(1, "-n".to_string());
+    }
+    command
 }
 
 fn default_tui_tun_helper_command() -> Vec<String> {
@@ -3932,7 +3932,7 @@ fn default_tui_tun_helper_command() -> Vec<String> {
         "--stdio".to_string(),
     ];
     if tun_helper_needs_sudo() {
-        let mut command = vec!["sudo".to_string()];
+        let mut command = vec!["sudo".to_string(), "-n".to_string()];
         command.extend(helper_args);
         command
     } else {
@@ -7146,7 +7146,7 @@ impl App {
         ) && matches!(profile.mode, PrivateAccessMode::Tun)
             && self
                 .private_access_tun_helper_for_connect(profile)
-                .is_some_and(|command| helper_command_uses_interactive_sudo(&command))
+                .is_some_and(|command| helper_command_uses_sudo(&command))
     }
 
     fn private_access_tun_helper_for_connect(
@@ -7157,7 +7157,7 @@ impl App {
             return None;
         }
         if !profile.tun_helper.is_empty() {
-            return Some(profile.tun_helper.clone());
+            return Some(make_sudo_command_noninteractive(profile.tun_helper.clone()));
         }
         // TUN device setup may need a privileged helper. The TUI injects it only for the live
         // connect command, so the user gets a clear prompt without persisting machine-specific
@@ -10061,7 +10061,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_sudo_tun_helper_needs_terminal_prompt() {
+    fn sudo_tun_helper_needs_terminal_preauthorization() {
         let mut app = test_app();
         app.private_access.focused_mut().mode = PrivateAccessMode::Tun;
         app.private_access.focused_mut().tun_helper = vec![
@@ -10072,16 +10072,23 @@ mod tests {
         ];
 
         assert!(app.private_access_connect_needs_terminal_prompt());
+        assert!(
+            app.private_access_tun_helper_for_connect(app.private_access.focused())
+                .is_some_and(|command| command.iter().any(|arg| arg == "-n"))
+        );
 
         app.private_access.focused_mut().tun_helper = vec![
-            "sudo".to_string(),
-            "-n".to_string(),
+            "/usr/bin/sudo".to_string(),
             "target/debug/sing-box-tui".to_string(),
             "private-access-tun-helper".to_string(),
             "--stdio".to_string(),
         ];
 
-        assert!(!app.private_access_connect_needs_terminal_prompt());
+        assert!(app.private_access_connect_needs_terminal_prompt());
+        assert!(
+            app.private_access_tun_helper_for_connect(app.private_access.focused())
+                .is_some_and(|command| command.get(1).is_some_and(|arg| arg == "-n"))
+        );
     }
 
     #[test]
@@ -10097,7 +10104,7 @@ mod tests {
         {
             assert!(app.private_access_connect_needs_terminal_prompt());
             assert_eq!(command.first().map(String::as_str), Some("sudo"));
-            assert!(!command.iter().any(|arg| arg == "-n"));
+            assert!(command.iter().any(|arg| arg == "-n"));
         }
         #[cfg(not(unix))]
         {

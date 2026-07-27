@@ -1,5 +1,6 @@
 use std::env;
 use std::path::Path;
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -659,7 +660,7 @@ fn evaluate_os_version_rule(values: &str) -> Option<bool> {
         ("=", parts[0])
     };
     let expected = parse_version_tuple(version)?;
-    let current = current_windows_version()?;
+    let current = current_os_version()?;
     Some(compare_version_tuples(current, expected, operator))
 }
 
@@ -696,7 +697,7 @@ fn compare_version_tuples(
     }
 }
 
-fn current_windows_version() -> Option<(u32, u32, u32, u32)> {
+fn current_os_version() -> Option<(u32, u32, u32, u32)> {
     #[cfg(windows)]
     {
         let output = Command::new("cmd").args(["/C", "ver"]).output().ok()?;
@@ -708,7 +709,19 @@ fn current_windows_version() -> Option<(u32, u32, u32, u32)> {
             .collect::<String>();
         parse_version_tuple(&version)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout))
+            .and_then(|version| parse_version_tuple(version.trim()))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }
@@ -743,7 +756,23 @@ fn process_is_running(process: &str) -> bool {
                         .contains(&format!("\"{}.exe\"", process.to_ascii_lowercase()))
             })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/bin/ps")
+            .args(["-axo", "comm="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| Path::new(line.trim()).file_name())
+                    .filter_map(|name| name.to_str())
+                    .map(|name| name.trim_end_matches(".exe"))
+                    .any(|name| name.eq_ignore_ascii_case(process))
+            })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         false
     }
@@ -1588,7 +1617,10 @@ mod tests {
     #[test]
     fn default_agent_info_matches_modern_connect_tunnel_micro_interrogation() {
         let agent_info = default_agent_info();
+        assert_eq!(agent_info["mac"], json!(false));
+        assert_eq!(agent_info["osxlion"], json!(false));
         assert_eq!(agent_info["win"], json!(true));
+        assert_eq!(agent_info["platform"], json!("Windows"));
         assert_eq!(agent_info["modernTunnelClient"], json!(true));
         assert_eq!(agent_info["mobileConnect"], json!(false));
         assert_eq!(agent_info["nonInteractiveClient"], json!(false));
@@ -1641,6 +1673,48 @@ mod tests {
         ));
         assert!(wildcard_match("HUNDSUN*", "HundsunDomain"));
         assert!(!wildcard_match("HUNDSUN?", "HundsunDomain"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn epc_evaluator_reports_macos_version_rules() {
+        let interrogation = json!({
+            "zone_interrogation_list": [
+                { "id": "mac-version", "key": "OSVERSION", "values": ">=,0" }
+            ]
+        });
+        let evaluation = evaluate_supported_zone_interrogation(&interrogation);
+        let response = evaluation
+            .response
+            .expect("macOS version rule is supported");
+        assert_eq!(
+            response["interrogation_info"]["mac-version"]["result"],
+            json!(true)
+        );
+        assert!(evaluation.unsupported_keys.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn epc_evaluator_reports_running_macos_processes() {
+        let executable = std::env::current_exe().expect("current executable is available");
+        let process = executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test executable has a UTF-8 name");
+        let interrogation = json!({
+            "zone_interrogation_list": [
+                { "id": "current-process", "key": "PROCESS", "values": process }
+            ]
+        });
+        let evaluation = evaluate_supported_zone_interrogation(&interrogation);
+        let response = evaluation
+            .response
+            .expect("macOS process rule is supported");
+        assert_eq!(
+            response["interrogation_info"]["current-process"]["result"],
+            json!(true)
+        );
     }
 
     #[test]
