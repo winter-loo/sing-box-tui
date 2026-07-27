@@ -844,6 +844,8 @@ fn run_tun_data_plane(
             prefix_len,
             route_cidrs: route_cidrs.clone(),
             dns_servers: network.dns_ipv4.iter().copied().map(IpAddr::V4).collect(),
+            dns_namespaces: Vec::new(),
+            dns_system_namespaces: Vec::new(),
             mtu: None,
         },
     )?;

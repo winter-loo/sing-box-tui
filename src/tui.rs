@@ -34,8 +34,8 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::config::{
-    PrivateAccessRouteTableOptions, run_private_access_carrier_route_config,
-    run_private_access_route_table_config,
+    PrivateAccessRouteTableOptions, run_private_access_route_table_config,
+    run_private_access_tun_baseline_config,
 };
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkResult,
@@ -4168,7 +4168,7 @@ impl PrivateAccessProfileRuntime {
         Ok(Self {
             id: "hillstone".to_string(),
             manifest_path,
-            mode: PrivateAccessMode::Bridge,
+            mode: PrivateAccessMode::Tun,
             manifest,
             process: None,
             state: PrivateAccessState::Disconnected,
@@ -4233,11 +4233,7 @@ impl PrivateAccessProfileRuntime {
         let mut profile = Self {
             id,
             manifest_path,
-            mode: if is_sonicwall {
-                PrivateAccessMode::Tun
-            } else {
-                PrivateAccessMode::Bridge
-            },
+            mode: PrivateAccessMode::Tun,
             manifest,
             process: None,
             state: PrivateAccessState::Disconnected,
@@ -4767,7 +4763,7 @@ impl App {
         };
         app.apply_runtime_state(runtime_state.clone())?;
         if manage_sing_box {
-            app.ensure_private_access_carrier_routes()?;
+            app.ensure_private_access_tun_baseline()?;
             app.start_managed_sing_box()?;
             if let Err(error) = app.wait_for_controller_ready() {
                 let _ = app.shutdown_managed_sing_box();
@@ -4787,7 +4783,7 @@ impl App {
         Ok(app)
     }
 
-    fn ensure_private_access_carrier_routes(&self) -> Result<bool> {
+    fn ensure_private_access_tun_baseline(&self) -> Result<bool> {
         if !self.system_proxy_config_path.exists() {
             return Ok(false);
         }
@@ -4795,11 +4791,11 @@ impl App {
             .private_access
             .profiles
             .iter()
-            .filter(|profile| profile.manifest.id.eq_ignore_ascii_case("sonicwall"))
+            .filter(|profile| matches!(profile.mode, PrivateAccessMode::Tun))
             .map(|profile| profile.server.trim().to_ascii_lowercase())
             .filter(|server| !server.is_empty())
             .collect::<Vec<_>>();
-        run_private_access_carrier_route_config(
+        run_private_access_tun_baseline_config(
             &self.system_proxy_config_path,
             true,
             &carrier_domains,
@@ -7951,6 +7947,7 @@ impl App {
                                 Some(error.clone());
                             self.private_access.profiles[profile_index].state =
                                 PrivateAccessState::Error;
+                            self.clear_private_access_dynamic_network_state(profile_index);
                             self.set_status_with_flash(format!(
                                 "Private Access {profile_id} failed: {error}"
                             ));
@@ -7981,6 +7978,7 @@ impl App {
                             {
                                 self.private_access_auth = None;
                             }
+                            self.clear_private_access_dynamic_network_state(profile_index);
                             stop_process = true;
                         }
                         if let Some((tone, text, done)) =
@@ -8014,11 +8012,6 @@ impl App {
                             PrivateAccessProgressTone::Info,
                             format!("收到内网路由: {} 条", routes.len()),
                         );
-                        self.push_private_access_progress_for_profile(
-                            profile_index,
-                            PrivateAccessProgressTone::Info,
-                            "修改 config.json 中...".to_string(),
-                        );
                         self.private_access.profiles[profile_index].routes = routes.clone();
                         self.private_access.profiles[profile_index].dns = dns;
                         self.private_access.profiles[profile_index].domains = domains.clone();
@@ -8030,24 +8023,15 @@ impl App {
                                 .trim()
                                 .to_ascii_lowercase(),
                         ];
-                        match self.merge_private_access_bypass_entries(&domains, &domain_suffixes) {
-                            Ok(added) if added > 0 => self
-                                .push_private_access_progress_for_profile(
-                                    profile_index,
-                                    PrivateAccessProgressTone::Success,
-                                    format!("added {added} Private Access domain bypass rule(s)"),
-                                ),
-                            Ok(_) => {}
-                            Err(error) => self.push_private_access_progress_for_profile(
-                                profile_index,
-                                PrivateAccessProgressTone::Error,
-                                format!("failed to update system proxy bypass: {error:#}"),
-                            ),
-                        }
                         if matches!(
                             self.private_access.profiles[profile_index].mode,
                             PrivateAccessMode::Bridge
                         ) {
+                            self.push_private_access_progress_for_profile(
+                                profile_index,
+                                PrivateAccessProgressTone::Info,
+                                "修改 config.json 中...".to_string(),
+                            );
                             self.private_access.profiles[profile_index].bridge = bridge.clone();
                             let fallback_listen = self.private_access.profiles[profile_index]
                                 .bridge_listen
@@ -8111,80 +8095,36 @@ impl App {
                             }
                         } else {
                             self.private_access.profiles[profile_index].bridge = None;
-                            match self.apply_private_access_tun_routes(
-                                &profile_id,
-                                &routes,
-                                &domains,
-                                &domain_suffixes,
-                                &carrier_domains,
-                            ) {
-                                Ok(true) => {
-                                    self.push_private_access_progress_for_profile(
-                                        profile_index,
-                                        PrivateAccessProgressTone::Success,
-                                        "config.json 已更新".to_string(),
-                                    );
-                                    if service == "sonicwall" {
-                                        // SonicWall authentication and EVPN TLS use sing-box's
-                                        // local HTTP CONNECT inbound. Restarting the managed core
-                                        // here tears down the carrier beneath the new TUN.
-                                        self.push_private_access_progress_for_profile(
-                                            profile_index,
-                                            PrivateAccessProgressTone::Info,
-                                            "SonicWall 隧道已连接；为保持承载连接，本次不重启 sing-box"
-                                                .to_string(),
-                                        );
-                                        self.finish_private_access_progress_for_profile(
-                                            profile_index,
-                                        );
-                                        self.set_status_only(format!(
-                                            "Private Access {profile_id} ({service}) connected; wrote {} TUN direct route(s) without restarting sing-box",
-                                            routes.len()
-                                        ));
-                                    } else {
-                                        match self.restart_sing_box_for_private_access_progress(
-                                            profile_index,
-                                        ) {
-                                            Ok(restart) => {
-                                                self.set_status_only(format!(
-                                                    "Private Access {profile_id} ({service}) applied {} TUN direct route(s); {restart}",
-                                                    routes.len()
-                                                ));
-                                            }
-                                            Err(error) => {
-                                                let message = format!(
-                                                    "sing-box 重启失败，Private Access 不可用: {error:#}"
-                                                );
-                                                self.mark_private_access_integration_failed(
-                                                    profile_index,
-                                                    message.clone(),
-                                                );
-                                                self.set_status_only(message);
-                                                stop_process = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    self.push_private_access_progress_for_profile(
-                                        profile_index,
-                                        PrivateAccessProgressTone::Info,
-                                        "没有需要写入的内网路由".to_string(),
-                                    );
-                                }
-                                Err(error) => {
-                                    self.private_access.profiles[profile_index].last_error =
-                                        Some(error.to_string());
-                                    self.private_access.profiles[profile_index].state =
-                                        PrivateAccessState::Error;
-                                    let message = format!("修改 config.json 失败: {error}");
-                                    self.fail_private_access_progress_for_profile(
-                                        profile_index,
-                                        message.clone(),
-                                    );
-                                    self.set_status_only(message);
-                                }
+                            match self.refresh_private_access_system_proxy_bypass() {
+                                Ok(true) => self.push_private_access_progress_for_profile(
+                                    profile_index,
+                                    PrivateAccessProgressTone::Success,
+                                    format!(
+                                        "已临时应用 {} 条 Private Access 域名绕过规则",
+                                        domains.len() + domain_suffixes.len()
+                                    ),
+                                ),
+                                Ok(false) => {}
+                                Err(error) => self.push_private_access_progress_for_profile(
+                                    profile_index,
+                                    PrivateAccessProgressTone::Error,
+                                    format!("更新系统代理域名绕过失败: {error:#}"),
+                                ),
                             }
+                            // The privileged helper has already installed the pushed OS routes and
+                            // Windows split-DNS policy before emitting RoutesPushed. The common
+                            // sing-box baseline was written before core startup, so this path never
+                            // edits config.json or restarts the carrier process.
+                            self.push_private_access_progress_for_profile(
+                                profile_index,
+                                PrivateAccessProgressTone::Success,
+                                "TUN 路由和按域名分流 DNS 已生效".to_string(),
+                            );
+                            self.finish_private_access_progress_for_profile(profile_index);
+                            self.set_status_only(format!(
+                                "Private Access {profile_id} ({service}) connected with {} OS TUN route(s), without restarting sing-box",
+                                routes.len()
+                            ));
                         }
                     }
                     PrivateAccessEvent::AuthChallenge {
@@ -8230,6 +8170,7 @@ impl App {
                             Some(error.clone());
                         self.private_access.profiles[profile_index].state =
                             PrivateAccessState::Error;
+                        self.clear_private_access_dynamic_network_state(profile_index);
                         if self
                             .private_access_auth
                             .as_ref()
@@ -8276,32 +8217,52 @@ impl App {
         Ok(())
     }
 
-    fn merge_private_access_bypass_entries(
-        &mut self,
-        domains: &[String],
-        domain_suffixes: &[String],
-    ) -> Result<usize> {
-        let mut added = 0;
-        for entry in domains.iter().chain(domain_suffixes) {
-            for entry in parse_bypass_entries(entry) {
-                if !self.bypass_entries.contains(&entry) {
-                    self.bypass_entries.push(entry);
-                    added += 1;
+    fn effective_system_proxy_bypass_entries(&self) -> Vec<String> {
+        let mut entries = self.bypass_entries.clone();
+        for profile in &self.private_access.profiles {
+            if !matches!(profile.mode, PrivateAccessMode::Tun)
+                || matches!(
+                    profile.state,
+                    PrivateAccessState::Disconnected | PrivateAccessState::Error
+                )
+            {
+                continue;
+            }
+            for entry in profile.domains.iter().chain(&profile.domain_suffixes) {
+                for entry in parse_bypass_entries(entry) {
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
                 }
             }
         }
-        if added == 0 {
-            return Ok(0);
-        }
+        entries
+    }
 
-        self.save_runtime_state()?;
-        self.save_bypass_rule_set()?;
-        if self.system_proxy_enabled && self.system_proxy_job.is_none() {
-            run_system_proxy_update(&self.system_proxy_server, true, &self.bypass_entries)
-                .context("failed to refresh system proxy with Private Access bypass rules")?;
-            self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
+    fn refresh_private_access_system_proxy_bypass(&mut self) -> Result<bool> {
+        if !self.system_proxy_enabled || self.system_proxy_job.is_some() {
+            return Ok(false);
         }
-        Ok(added)
+        let bypass_entries = self.effective_system_proxy_bypass_entries();
+        run_system_proxy_update(&self.system_proxy_server, true, &bypass_entries)
+            .context("failed to refresh system proxy with Private Access bypass rules")?;
+        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
+        Ok(true)
+    }
+
+    fn clear_private_access_dynamic_network_state(&mut self, profile_index: usize) {
+        let profile = &mut self.private_access.profiles[profile_index];
+        profile.routes.clear();
+        profile.dns.clear();
+        profile.domains.clear();
+        profile.domain_suffixes.clear();
+        profile.bridge = None;
+        if let Err(error) = self.refresh_private_access_system_proxy_bypass() {
+            self.set_status_with_flash(format!(
+                "Failed to remove Private Access system proxy bypass: {}",
+                truncate_for_width(&format!("{error:#}"), 90)
+            ));
+        }
     }
 
     fn apply_private_access_routes(
@@ -8342,40 +8303,6 @@ impl App {
                 domain_suffixes: domain_suffixes.to_vec(),
                 carrier_domains: carrier_domains.to_vec(),
                 proxy: Some(proxy),
-            },
-        )?;
-        Ok(changed)
-    }
-
-    fn apply_private_access_tun_routes(
-        &self,
-        profile_id: &str,
-        routes: &[PrivateAccessRoute],
-        domains: &[String],
-        domain_suffixes: &[String],
-        carrier_domains: &[String],
-    ) -> Result<bool> {
-        if routes.is_empty()
-            && domains.is_empty()
-            && domain_suffixes.is_empty()
-            && carrier_domains.is_empty()
-        {
-            return Ok(false);
-        }
-        // In TUN mode the kernel route points pushed intranet CIDRs at the helper-owned utun
-        // interface. Browsers may still enter through sing-box's system proxy, so sing-box must
-        // route those CIDRs to its direct outbound instead of the old local HTTP bridge override.
-        let changed = run_private_access_route_table_config(
-            &self.system_proxy_config_path,
-            None,
-            true,
-            PrivateAccessRouteTableOptions {
-                profile_id: profile_id.to_string(),
-                cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
-                domains: domains.to_vec(),
-                domain_suffixes: domain_suffixes.to_vec(),
-                carrier_domains: carrier_domains.to_vec(),
-                proxy: None,
             },
         )?;
         Ok(changed)
@@ -8440,7 +8367,7 @@ impl App {
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
         let enable = !self.system_proxy_enabled;
         let server = self.system_proxy_server.clone();
-        let bypass_entries = self.bypass_entries.clone();
+        let bypass_entries = self.effective_system_proxy_bypass_entries();
         let (tx, rx) = mpsc::channel();
         let worker_server = server.clone();
         let worker = thread::spawn(move || {
@@ -9093,31 +9020,43 @@ mod tests {
     }
 
     #[test]
-    fn private_access_domains_are_persisted_as_system_proxy_bypass_entries() {
+    fn private_access_domains_are_ephemeral_system_proxy_bypass_entries() {
         let mut app = test_app();
-        let added = app
-            .merge_private_access_bypass_entries(
-                &["service.hundsun.com".to_string()],
-                &["Hundsun.COM".to_string(), "hs.handsome.com.cn".to_string()],
-            )
-            .expect("private access bypass entries merge");
+        app.bypass_entries = vec!["deeloo.cn".to_string()];
+        let profile = app.private_access.focused_mut();
+        profile.mode = PrivateAccessMode::Tun;
+        profile.state = PrivateAccessState::Connecting;
+        profile.domains = vec!["service.hundsun.com".to_string()];
+        profile.domain_suffixes = vec!["Hundsun.COM".to_string(), "hs.handsome.com.cn".to_string()];
+        let mut sonicwall =
+            PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile");
+        sonicwall.state = PrivateAccessState::Connected;
+        sonicwall.domain_suffixes = vec!["hundsun.com".to_string()];
+        app.private_access.profiles.push(sonicwall);
 
-        assert_eq!(added, 3);
         assert_eq!(
-            app.bypass_entries,
+            app.effective_system_proxy_bypass_entries(),
             vec![
+                "deeloo.cn".to_string(),
                 "service.hundsun.com".to_string(),
                 "hundsun.com".to_string(),
                 "hs.handsome.com.cn".to_string(),
             ]
         );
+        assert_eq!(app.bypass_entries, vec!["deeloo.cn".to_string()]);
+
+        app.private_access.focused_mut().state = PrivateAccessState::Disconnected;
+        app.clear_private_access_dynamic_network_state(0);
         assert_eq!(
-            app.merge_private_access_bypass_entries(
-                &["SERVICE.HUNDSUN.COM".to_string()],
-                &["*.hundsun.com".to_string()],
-            )
-            .expect("duplicate private access bypass entries merge"),
-            0
+            app.effective_system_proxy_bypass_entries(),
+            vec!["deeloo.cn".to_string(), "hundsun.com".to_string()]
+        );
+
+        app.private_access.profiles[1].state = PrivateAccessState::Disconnected;
+        app.clear_private_access_dynamic_network_state(1);
+        assert_eq!(
+            app.effective_system_proxy_bypass_entries(),
+            vec!["deeloo.cn".to_string()]
         );
     }
 
@@ -9581,7 +9520,7 @@ mod tests {
             .as_ref()
             .expect("event profile progress");
         assert_eq!(progress.profile_index, 0);
-        assert_eq!(progress.title, "Private Access - hillstone (bridge)");
+        assert_eq!(progress.title, "Private Access - hillstone (tun)");
         assert!(private_access_progress_text(&app).contains("session_failed"));
     }
 
@@ -9657,11 +9596,16 @@ mod tests {
     }
 
     #[test]
-    fn sonicwall_gateway_proxy_exception_is_written_before_sing_box_startup() {
+    fn common_tun_baseline_is_written_before_sing_box_startup() {
         let mut app = test_app();
+        let mut hillstone =
+            PrivateAccessProfileRuntime::default_hillstone().expect("Hillstone profile");
+        hillstone.mode = PrivateAccessMode::Tun;
+        hillstone.server = "sslvpn.geovisearth.com".to_string();
         app.private_access = PrivateAccessRuntime {
             profiles: vec![
                 PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"),
+                hillstone,
             ],
             focused_index: 0,
         };
@@ -9695,8 +9639,8 @@ mod tests {
         app.system_proxy_config_path = config_path.clone();
 
         let changed = app
-            .ensure_private_access_carrier_routes()
-            .expect("carrier route is written");
+            .ensure_private_access_tun_baseline()
+            .expect("TUN baseline is written");
 
         assert!(changed);
         let text = std::fs::read_to_string(&config_path).expect("config reads");
@@ -9704,8 +9648,10 @@ mod tests {
         let rules = config["route"]["rules"].as_array().expect("route rules");
         let carrier_index = rules
             .iter()
-            .position(|rule| rule["domain"] == json!(["sslvpn.hundsun.com"]))
-            .expect("SonicWall carrier rule exists");
+            .position(|rule| {
+                rule["domain"] == json!(["sslvpn.geovisearth.com", "sslvpn.hundsun.com"])
+            })
+            .expect("common carrier rule exists");
         let bypass_index = rules
             .iter()
             .position(|rule| rule["rule_set"] == json!(["sing-box-tui-bypass"]))
@@ -9717,6 +9663,23 @@ mod tests {
         assert!(carrier_index < bypass_index);
         assert!(carrier_index < internal_index);
         assert_eq!(rules[carrier_index]["outbound"], "select");
+        assert_eq!(config["route"]["auto_detect_interface"], false);
+        assert!(
+            rules
+                .iter()
+                .any(|rule| { rule["ip_is_private"] == true && rule["outbound"] == "direct" })
+        );
+        assert!(
+            config["dns"]["servers"]
+                .as_array()
+                .is_some_and(|servers| servers.iter().any(|server| {
+                    server["tag"] == "private-access-system" && server["type"] == "local"
+                }))
+        );
+        assert!(
+            !app.ensure_private_access_tun_baseline()
+                .expect("TUN baseline is idempotent")
+        );
         let _ = std::fs::remove_file(config_path);
     }
 
@@ -9827,61 +9790,33 @@ mod tests {
     }
 
     #[test]
-    fn private_access_tun_route_application_removes_bridge_override() {
-        let app = test_app();
+    fn private_access_tun_baseline_does_not_write_dynamic_routes() {
+        let mut app = test_app();
+        app.private_access.focused_mut().mode = PrivateAccessMode::Tun;
+        app.private_access.focused_mut().server = "sslvpn.example.com".to_string();
         let config_path = test_state_path();
         let config = json!({
-            "outbounds": [{ "type": "direct", "tag": "direct" }],
-            "route": {
-                "rules": [{
-                    "action": "route",
-                    "ip_cidr": ["10.1.0.0/16", "10.255.0.0/24"],
-                    "outbound": "direct",
-                    "override_address": "127.0.0.1",
-                    "override_port": 18080
-                }]
-            }
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": { "rules": [] }
         });
         std::fs::write(
             &config_path,
             serde_json::to_string_pretty(&config).expect("config serializes"),
         )
         .expect("config writes");
-        let mut app = app;
         app.system_proxy_config_path = config_path.clone();
 
-        app.apply_private_access_tun_routes(
-            "hillstone",
-            &[
-                PrivateAccessRoute {
-                    cidr: "10.1.0.0/16".to_string(),
-                },
-                PrivateAccessRoute {
-                    cidr: "10.255.0.0/24".to_string(),
-                },
-                PrivateAccessRoute {
-                    cidr: "10.253.0.0/24".to_string(),
-                },
-            ],
-            &[],
-            &[],
-            &[],
-        )
-        .expect("TUN routes apply");
+        app.ensure_private_access_tun_baseline()
+            .expect("TUN baseline applies");
 
         let text = std::fs::read_to_string(&config_path).expect("config reads");
         let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
         assert_eq!(config["route"]["auto_detect_interface"], false);
         let rules = config["route"]["rules"].as_array().expect("route rules");
-        let rule = rules
-            .iter()
-            .find(|rule| {
-                rule["ip_cidr"] == json!(["10.1.0.0/16", "10.255.0.0/24", "10.253.0.0/24"])
-            })
-            .expect("private access TUN direct rule exists");
-        assert_eq!(rule["outbound"], "direct");
-        assert!(rule.get("override_address").is_none());
-        assert!(rule.get("override_port").is_none());
+        assert!(!rules.iter().any(|rule| rule.get("ip_cidr").is_some()));
         let _ = std::fs::remove_file(config_path);
     }
 
@@ -9889,6 +9824,7 @@ mod tests {
     fn private_access_summary_shows_explicit_state_and_details() {
         let mut app = test_app();
         let focused = app.private_access.focused_mut();
+        focused.mode = PrivateAccessMode::Bridge;
         focused.state = PrivateAccessState::Connected;
         focused.routes = vec![PrivateAccessRoute {
             cidr: "10.1.0.0/16".to_string(),
@@ -10031,7 +9967,7 @@ mod tests {
             .as_ref()
             .and_then(|edit| edit.error.as_deref())
             .expect("settings error is shown inside settings panel");
-        assert_eq!(app.private_access.focused().mode, PrivateAccessMode::Bridge);
+        assert_eq!(app.private_access.focused().mode, PrivateAccessMode::Tun);
         assert!(error.contains("disconnect Private Access before changing data plane mode"));
     }
 

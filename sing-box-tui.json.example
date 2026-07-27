@@ -20,7 +20,7 @@
     {
       "id": "office",
       "manifest_path": null,
-      "mode": "bridge",
+      "mode": "tun",
       "server": "sslvpn.example.com",
       "port": 4433,
       "username": "your-username",

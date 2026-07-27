@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -25,6 +26,10 @@ pub(crate) struct TunHelperStartConfig {
     pub(crate) route_cidrs: Vec<String>,
     #[serde(default)]
     pub(crate) dns_servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub(crate) dns_namespaces: Vec<String>,
+    #[serde(default)]
+    pub(crate) dns_system_namespaces: Vec<String>,
     #[serde(default)]
     pub(crate) mtu: Option<u16>,
 }
@@ -469,6 +474,7 @@ fn emit_tun_helper_event(
 struct TunHelperContext {
     device: Arc<tun_rs::SyncDevice>,
     interface: String,
+    _dns_policy: TunDnsPolicyGuard,
     _routes: TunRouteGuard,
     shutdown: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
@@ -524,7 +530,7 @@ impl TunHelperContext {
             .build_sync()
             .context("failed to create TUN device with tun-rs")?;
         #[cfg(windows)]
-        if !config.dns_servers.is_empty() {
+        if !config.dns_servers.is_empty() && config.dns_namespaces.is_empty() {
             device
                 .set_dns_servers(&config.dns_servers)
                 .context("failed to apply pushed DNS servers to TUN interface")?;
@@ -534,8 +540,16 @@ impl TunHelperContext {
             .set_nonblocking(true)
             .context("failed to set TUN helper device nonblocking")?;
         let interface = device.name().context("failed to read TUN interface name")?;
-        let routes = TunRouteGuard::install_routes(&interface, &config.route_cidrs)
+        let route_cidrs =
+            tun_route_cidrs_with_dns_servers(&config.route_cidrs, &config.dns_servers)?;
+        let routes = TunRouteGuard::install_routes(&interface, &route_cidrs)
             .context("failed to install pushed TUN routes")?;
+        let dns_policy = TunDnsPolicyGuard::install(
+            &config.dns_namespaces,
+            &config.dns_system_namespaces,
+            &config.dns_servers,
+        )
+        .context("failed to install Private Access split-DNS policy")?;
         let device = Arc::new(device);
         let reader_device = Arc::clone(&device);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -594,6 +608,7 @@ impl TunHelperContext {
         Ok(Self {
             device,
             interface,
+            _dns_policy: dns_policy,
             _routes: routes,
             shutdown,
             reader: Some(reader),
@@ -653,6 +668,316 @@ impl TunHelperContext {
     }
 
     fn stop(self) {}
+}
+
+fn tun_route_cidrs_with_dns_servers(
+    route_cidrs: &[String],
+    dns_servers: &[IpAddr],
+) -> Result<Vec<String>> {
+    let mut routes = Vec::new();
+    let mut parsed_routes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for cidr in route_cidrs {
+        let (network, prefix_len) = parse_ipv4_cidr(cidr)
+            .with_context(|| format!("invalid TUN route CIDR pushed by Private Access: {cidr}"))?;
+        let normalized = format!("{network}/{prefix_len}");
+        if seen.insert(normalized.clone()) {
+            routes.push(normalized);
+            parsed_routes.push((network, prefix_len));
+        }
+    }
+    for server in dns_servers {
+        let IpAddr::V4(server) = server else {
+            continue;
+        };
+        if parsed_routes
+            .iter()
+            .any(|(network, prefix_len)| ipv4_cidr_contains(*network, *prefix_len, *server))
+        {
+            continue;
+        }
+        let host_route = format!("{server}/32");
+        if seen.insert(host_route.clone()) {
+            routes.push(host_route);
+            parsed_routes.push((*server, 32));
+        }
+    }
+    Ok(routes)
+}
+
+fn ipv4_cidr_contains(network: Ipv4Addr, prefix_len: u8, address: Ipv4Addr) -> bool {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    };
+    u32::from(network) & mask == u32::from(address) & mask
+}
+
+fn normalize_dns_namespace(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    let is_suffix = value.starts_with("*.") || value.starts_with('.');
+    let domain = value
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.parse::<IpAddr>().is_ok()
+        || !domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    Some(if is_suffix {
+        format!(".{domain}")
+    } else {
+        domain.to_string()
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TunDnsPolicyPlan {
+    tunnel_namespaces: Vec<String>,
+    system_namespaces: Vec<String>,
+}
+
+fn dns_namespace_matches_domain(namespace: &str, domain: &str) -> bool {
+    namespace
+        .strip_prefix('.')
+        .is_some_and(|suffix| domain == suffix || domain.ends_with(&format!(".{suffix}")))
+        || namespace == domain
+}
+
+fn tun_dns_policy_plan(namespaces: &[String], system_namespaces: &[String]) -> TunDnsPolicyPlan {
+    let mut tunnel_namespaces = namespaces
+        .iter()
+        .filter_map(|namespace| normalize_dns_namespace(namespace))
+        .collect::<Vec<_>>();
+    tunnel_namespaces.sort();
+    tunnel_namespaces.dedup();
+
+    let mut requested_system_namespaces = system_namespaces
+        .iter()
+        .filter_map(|namespace| normalize_dns_namespace(namespace))
+        .filter(|namespace| !namespace.starts_with('.'))
+        .collect::<Vec<_>>();
+    requested_system_namespaces.sort();
+    requested_system_namespaces.dedup();
+
+    // An exact tunnel rule for an excluded gateway would tie with the system-DNS rule. Remove it;
+    // broader suffix rules remain in place for dynamic intranet hostnames and are overridden by
+    // the more-specific system-DNS rule below.
+    tunnel_namespaces.retain(|namespace| !requested_system_namespaces.contains(namespace));
+    let system_namespaces = requested_system_namespaces
+        .into_iter()
+        .filter(|domain| {
+            tunnel_namespaces
+                .iter()
+                .any(|namespace| dns_namespace_matches_domain(namespace, domain))
+        })
+        .collect();
+
+    TunDnsPolicyPlan {
+        tunnel_namespaces,
+        system_namespaces,
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct TunDnsPolicyGuard {
+    rule_names: Vec<String>,
+}
+
+#[cfg(target_os = "windows")]
+impl TunDnsPolicyGuard {
+    fn install(
+        namespaces: &[String],
+        system_namespaces: &[String],
+        dns_servers: &[IpAddr],
+    ) -> Result<Self> {
+        let plan = tun_dns_policy_plan(namespaces, system_namespaces);
+        if plan.tunnel_namespaces.is_empty() && plan.system_namespaces.is_empty() {
+            return Ok(Self {
+                rule_names: Vec::new(),
+            });
+        }
+        let mut servers = dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        servers.sort();
+        servers.dedup();
+        if servers.is_empty() && !plan.tunnel_namespaces.is_empty() {
+            bail!("Private Access pushed DNS namespaces without any DNS server");
+        }
+
+        let marker = format!("sing-box-tui private access pid={}", std::process::id());
+        let servers = servers.join(",");
+        let mut guard = Self {
+            rule_names: Vec::new(),
+        };
+        for namespace in plan.tunnel_namespaces {
+            let output = run_windows_powershell(
+                WINDOWS_ADD_NRPT_RULE_SCRIPT,
+                &[
+                    ("SING_BOX_TUI_NRPT_NAMESPACE", namespace.as_str()),
+                    ("SING_BOX_TUI_NRPT_SERVERS", servers.as_str()),
+                    ("SING_BOX_TUI_NRPT_SERVER_MODE", "explicit"),
+                    ("SING_BOX_TUI_NRPT_MARKER", marker.as_str()),
+                ],
+            )
+            .with_context(|| format!("failed to add Windows NRPT rule for {namespace}"))?;
+            let rule_name = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .next_back()
+                .context("Add-DnsClientNrptRule did not return a rule name")?;
+            guard.rule_names.push(rule_name.to_string());
+        }
+        for namespace in plan.system_namespaces {
+            let output = run_windows_powershell(
+                WINDOWS_ADD_NRPT_RULE_SCRIPT,
+                &[
+                    ("SING_BOX_TUI_NRPT_NAMESPACE", namespace.as_str()),
+                    ("SING_BOX_TUI_NRPT_SERVERS", ""),
+                    ("SING_BOX_TUI_NRPT_SERVER_MODE", "system"),
+                    ("SING_BOX_TUI_NRPT_MARKER", marker.as_str()),
+                ],
+            )
+            .with_context(|| {
+                format!("failed to add Windows system-DNS override for {namespace}")
+            })?;
+            let rule_name = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .next_back()
+                .context("Add-DnsClientNrptRule did not return a rule name")?;
+            guard.rule_names.push(rule_name.to_string());
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for TunDnsPolicyGuard {
+    fn drop(&mut self) {
+        for rule_name in self.rule_names.iter().rev() {
+            if let Err(error) = run_windows_powershell(
+                WINDOWS_REMOVE_NRPT_RULE_SCRIPT,
+                &[("SING_BOX_TUI_NRPT_RULE_NAME", rule_name.as_str())],
+            ) {
+                eprintln!("warning: failed to remove Windows NRPT rule {rule_name}: {error:#}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_ADD_NRPT_RULE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$namespace = $env:SING_BOX_TUI_NRPT_NAMESPACE
+$serverMode = $env:SING_BOX_TUI_NRPT_SERVER_MODE
+if ($serverMode -eq 'system') {
+    $servers = @()
+    $allDefaultRoutes = @(
+        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+            Where-Object { $_.NextHop -ne '0.0.0.0' } |
+            Sort-Object RouteMetric, InterfaceMetric
+    )
+    $physicalInterfaceIndexes = @(
+        Get-NetAdapter -Physical |
+            Where-Object { $_.Status -eq 'Up' } |
+            ForEach-Object { $_.ifIndex }
+    )
+    $defaultRoutes = @(
+        $allDefaultRoutes |
+            Where-Object { $physicalInterfaceIndexes -contains $_.InterfaceIndex }
+    )
+    if ($defaultRoutes.Count -eq 0) {
+        $defaultRoutes = $allDefaultRoutes
+    }
+    foreach ($route in $defaultRoutes) {
+        $servers = @(
+            (Get-DnsClientServerAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4).ServerAddresses |
+                Where-Object { $_ }
+        )
+        if ($servers.Count -gt 0) { break }
+    }
+    if ($servers.Count -eq 0) {
+        throw "No IPv4 DNS servers found on a default-route interface for NRPT namespace: $namespace"
+    }
+} else {
+    $servers = @($env:SING_BOX_TUI_NRPT_SERVERS.Split(',') | Where-Object { $_ })
+}
+$marker = $env:SING_BOX_TUI_NRPT_MARKER
+$existing = @(Get-DnsClientNrptRule | Where-Object { @($_.Namespace) -contains $namespace })
+foreach ($rule in $existing) {
+    if ($rule.Comment -match '^sing-box-tui private access pid=(\d+)$') {
+        $owner = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+        if ($null -eq $owner) {
+            Remove-DnsClientNrptRule -Name $rule.Name -Force -Confirm:$false
+            continue
+        }
+    }
+    throw "Windows NRPT namespace already has a rule: $namespace"
+}
+$rule = Add-DnsClientNrptRule -Namespace $namespace -NameServers $servers -Comment $marker -DisplayName $marker -PassThru
+$rule.Name
+"#;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_REMOVE_NRPT_RULE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+Remove-DnsClientNrptRule -Name $env:SING_BOX_TUI_NRPT_RULE_NAME -Force -Confirm:$false
+"#;
+
+#[cfg(target_os = "windows")]
+fn run_windows_powershell(script: &str, environment: &[(&str, &str)]) -> Result<String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .envs(environment.iter().copied())
+        .output()
+        .context("failed to start Windows PowerShell for split DNS")?;
+    if !output.status.success() {
+        bail!(
+            "Windows PowerShell exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "windows"))]
+struct TunDnsPolicyGuard;
+
+#[cfg(not(target_os = "windows"))]
+impl TunDnsPolicyGuard {
+    fn install(
+        _namespaces: &[String],
+        _system_namespaces: &[String],
+        _dns_servers: &[IpAddr],
+    ) -> Result<Self> {
+        Ok(Self)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -918,8 +1243,9 @@ fn run_command(program: &str, args: &[String]) -> Result<()> {
 mod tests {
     use super::{
         TunHelperCommand, TunHelperEvent, TunHelperStartConfig, helper_log_suffix,
-        is_noninteractive_sudo_command, parse_ipv4_cidr, remember_helper_log,
-        should_preflight_tun_helper_command,
+        is_noninteractive_sudo_command, normalize_dns_namespace, parse_ipv4_cidr,
+        remember_helper_log, should_preflight_tun_helper_command, tun_dns_policy_plan,
+        tun_route_cidrs_with_dns_servers,
     };
 
     #[cfg(target_os = "macos")]
@@ -935,6 +1261,11 @@ mod tests {
                 prefix_len: 22,
                 route_cidrs: vec!["10.1.0.0/16".to_string()],
                 dns_servers: vec![IpAddr::V4(Ipv4Addr::new(10, 1, 0, 53))],
+                dns_namespaces: vec![
+                    "service.hundsun.com".to_string(),
+                    ".hundsun.com".to_string(),
+                ],
+                dns_system_namespaces: vec!["sslvpn.hundsun.com".to_string()],
                 mtu: Some(1428),
             },
         };
@@ -948,6 +1279,14 @@ mod tests {
         assert_eq!(value["config"]["gateway_ipv4"], "10.250.252.1");
         assert_eq!(value["config"]["route_cidrs"][0], "10.1.0.0/16");
         assert_eq!(value["config"]["dns_servers"][0], "10.1.0.53");
+        assert_eq!(
+            value["config"]["dns_namespaces"],
+            serde_json::json!(["service.hundsun.com", ".hundsun.com"])
+        );
+        assert_eq!(
+            value["config"]["dns_system_namespaces"],
+            serde_json::json!(["sslvpn.hundsun.com"])
+        );
         assert_eq!(value["config"]["mtu"], 1428);
     }
 
@@ -1025,6 +1364,70 @@ mod tests {
             format!("{error:#}").contains("prefix length greater than 32"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn split_dns_namespaces_preserve_exact_and_suffix_matching() {
+        assert_eq!(
+            normalize_dns_namespace("Service.Hundsun.COM."),
+            Some("service.hundsun.com".to_string())
+        );
+        assert_eq!(
+            normalize_dns_namespace("*.Hundsun.COM."),
+            Some(".hundsun.com".to_string())
+        );
+        assert_eq!(
+            normalize_dns_namespace(".hs.handsome.com.cn"),
+            Some(".hs.handsome.com.cn".to_string())
+        );
+        assert_eq!(normalize_dns_namespace("10.1.0.53"), None);
+        assert_eq!(normalize_dns_namespace("bad domain"), None);
+    }
+
+    #[test]
+    fn split_dns_keeps_dynamic_suffix_and_overrides_public_gateway_exactly() {
+        let plan = tun_dns_policy_plan(
+            &[
+                ".hundsun.com".to_string(),
+                "service.hundsun.com".to_string(),
+                "sslvpn.hundsun.com".to_string(),
+            ],
+            &["SSLVPN.Hundsun.COM.".to_string()],
+        );
+
+        assert_eq!(
+            plan.tunnel_namespaces,
+            vec![".hundsun.com", "service.hundsun.com"]
+        );
+        assert_eq!(plan.system_namespaces, vec!["sslvpn.hundsun.com"]);
+    }
+
+    #[test]
+    fn split_dns_does_not_add_unneeded_gateway_override() {
+        let plan = tun_dns_policy_plan(
+            &[".internal.example.com".to_string()],
+            &[
+                "vpn.example.com".to_string(),
+                ".invalid.example.com".to_string(),
+            ],
+        );
+
+        assert_eq!(plan.tunnel_namespaces, vec![".internal.example.com"]);
+        assert!(plan.system_namespaces.is_empty());
+    }
+
+    #[test]
+    fn dns_servers_receive_host_routes_only_when_not_already_covered() {
+        let routes = tun_route_cidrs_with_dns_servers(
+            &["10.1.2.3/16".to_string()],
+            &[
+                IpAddr::V4(Ipv4Addr::new(10, 1, 0, 53)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 10, 53)),
+            ],
+        )
+        .expect("routes normalize");
+
+        assert_eq!(routes, vec!["10.1.0.0/16", "192.168.10.53/32"]);
     }
 
     #[cfg(target_os = "macos")]

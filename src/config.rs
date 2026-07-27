@@ -265,7 +265,7 @@ pub(crate) fn run_private_access_route_table_config(
     Ok(changed)
 }
 
-pub(crate) fn run_private_access_carrier_route_config(
+pub(crate) fn run_private_access_tun_baseline_config(
     config_path: &PathBuf,
     write: bool,
     carrier_domains: &[String],
@@ -275,7 +275,7 @@ pub(crate) fn run_private_access_carrier_route_config(
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
     let original = config.clone();
-    ensure_private_access_carrier_route(&mut config, carrier_domains)?;
+    ensure_private_access_tun_baseline(&mut config, carrier_domains)?;
     let changed = config != original;
     if write && changed {
         let contents =
@@ -311,7 +311,11 @@ pub(crate) fn ensure_private_access_route_table(
     if options.profile_id.trim().is_empty() {
         anyhow::bail!("private access profile id cannot be empty");
     }
-    ensure_private_access_carrier_route(config, &options.carrier_domains)?;
+    if options.proxy.is_none() {
+        ensure_private_access_tun_baseline(config, &options.carrier_domains)?;
+    } else {
+        ensure_private_access_carrier_route(config, &options.carrier_domains)?;
+    }
     let target_cidrs = normalize_ipv4_cidrs(&options.cidrs)?;
     let target_domains = normalize_private_access_domains(&options.domains);
     let target_domain_suffixes = normalize_private_access_domains(&options.domain_suffixes);
@@ -338,19 +342,10 @@ pub(crate) fn ensure_private_access_route_table(
         },
     )?;
 
-    ensure_private_access_system_dns(root)?;
-
     let route_value = root.entry("route").or_insert_with(|| json!({}));
     let route = route_value
         .as_object_mut()
         .context("existing config route must be an object")?;
-    if options.proxy.is_none() {
-        // Private Access TUN mode relies on the OS route table to send pushed intranet CIDRs into
-        // the helper-owned utun interface. sing-box's auto_detect_interface pins direct dials to
-        // the default physical interface, which bypasses that utun route and causes 502 timeouts
-        // for browser traffic entering through the mixed/system proxy inbound.
-        route.insert("auto_detect_interface".to_string(), Value::Bool(false));
-    }
     let rules_value = route
         .entry("rules")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -1491,6 +1486,65 @@ fn normalize_ipv4_cidrs(values: &[String]) -> Result<Vec<Ipv4Cidr>> {
     Ok(cidrs)
 }
 
+fn ensure_private_access_tun_baseline(
+    config: &mut Value,
+    carrier_domains: &[String],
+) -> Result<()> {
+    ensure_private_access_carrier_route(config, carrier_domains)?;
+
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let outbounds = root
+        .entry("outbounds")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config outbounds must be an array")?;
+    let direct_tag = preferred_existing_tag(outbounds, DIRECT_TAG_ALIASES, DEFAULT_DIRECT_TAG);
+    upsert_special_outbound(
+        outbounds,
+        &direct_tag,
+        || json!({ "type": "direct", "tag": direct_tag }),
+        |value| {
+            ensure_string_field(value, "type", "direct");
+        },
+    )?;
+    ensure_private_access_system_dns(root)?;
+
+    let route = root
+        .entry("route")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    // Private Access TUN mode relies on the OS route table. Pinning direct dials to the physical
+    // default interface bypasses the helper-owned TUN interface.
+    route.insert("auto_detect_interface".to_string(), Value::Bool(false));
+    let rules = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    if !rules.iter().any(|rule| {
+        rule.get("ip_is_private").and_then(Value::as_bool) == Some(true)
+            && rule.get("outbound").and_then(Value::as_str) == Some(direct_tag.as_str())
+            && rule.get("override_address").is_none()
+            && rule.get("override_port").is_none()
+    }) {
+        let index = rules
+            .iter()
+            .position(|rule| rule.get("clash_mode").is_some())
+            .unwrap_or(rules.len());
+        rules.insert(
+            index,
+            json!({
+                "ip_is_private": true,
+                "outbound": direct_tag,
+            }),
+        );
+    }
+    Ok(())
+}
+
 fn ensure_private_access_carrier_route(
     config: &mut Value,
     carrier_domains: &[String],
@@ -1510,12 +1564,6 @@ fn ensure_private_access_carrier_route(
         .context("existing config outbounds must be an array")?;
     let selector_tag =
         preferred_existing_tag(outbounds, SELECTOR_TAG_ALIASES, DEFAULT_SELECTOR_TAG);
-    let carrier_rule = json!({
-        "action": "route",
-        "domain": carrier_domains,
-        "outbound": selector_tag,
-    });
-
     let route = root
         .entry("route")
         .or_insert_with(|| json!({}))
@@ -1526,8 +1574,7 @@ fn ensure_private_access_carrier_route(
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .context("existing config route.rules must be an array")?;
-    rules.retain(|rule| rule != &carrier_rule);
-    let index = rules
+    let desired_index = rules
         .iter()
         .position(|rule| rule_references_rule_set(rule, DEFAULT_BYPASS_RULE_SET_TAG))
         .or_else(|| {
@@ -1537,7 +1584,48 @@ fn ensure_private_access_carrier_route(
                 .map(|index| index + 1)
         })
         .unwrap_or(0);
-    rules.insert(index, carrier_rule);
+
+    let existing_index = rules.iter().position(|rule| {
+        let object = match rule.as_object() {
+            Some(object) => object,
+            None => return false,
+        };
+        let only_carrier_fields = object
+            .keys()
+            .all(|key| matches!(key.as_str(), "action" | "domain" | "outbound"));
+        only_carrier_fields
+            && rule
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("route")
+                == "route"
+            && rule.get("outbound").and_then(Value::as_str) == Some(selector_tag.as_str())
+            && !rule_string_values(rule, "domain").is_empty()
+            && rule_string_values(rule, "domain")
+                .iter()
+                .any(|domain| carrier_domains.contains(domain))
+    });
+    if let Some(existing_index) = existing_index {
+        let mut merged_domains = rule_string_values(&rules[existing_index], "domain");
+        merged_domains.extend(carrier_domains);
+        merged_domains.sort();
+        merged_domains.dedup();
+        rules[existing_index]["domain"] = json!(merged_domains);
+        if existing_index > desired_index {
+            let rule = rules.remove(existing_index);
+            rules.insert(desired_index, rule);
+        }
+        return Ok(());
+    }
+
+    rules.insert(
+        desired_index,
+        json!({
+            "action": "route",
+            "domain": carrier_domains,
+            "outbound": selector_tag,
+        }),
+    );
     Ok(())
 }
 
@@ -1896,7 +1984,7 @@ mod tests {
         build_default_config_with_options, build_full_config_with_provider_node_sets,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
         ensure_private_access_route_table, merge_into_existing_config,
-        run_private_access_route_table_config,
+        run_private_access_route_table_config, run_private_access_tun_baseline_config,
     };
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
@@ -2310,6 +2398,84 @@ mod tests {
         assert!(
             !run_private_access_route_table_config(&path, None, true, options)
                 .expect("idempotent update succeeds")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn private_access_tun_baseline_merges_carriers_without_rule_churn() {
+        let path = temp_config_path("private-access-tun-baseline");
+        let config = json!({
+            "dns": { "servers": [] },
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": {
+                "auto_detect_interface": true,
+                "rules": [
+                    { "action": "hijack-dns", "protocol": "dns" },
+                    {
+                        "action": "route",
+                        "rule_set": [DEFAULT_BYPASS_RULE_SET_TAG],
+                        "outbound": "direct"
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("temporary config is written");
+
+        let carriers = vec![
+            "sslvpn.hundsun.com".to_string(),
+            "sslvpn.geovisearth.com".to_string(),
+        ];
+        assert!(
+            run_private_access_tun_baseline_config(&path, true, &carriers)
+                .expect("first baseline update succeeds")
+        );
+        let first = fs::read_to_string(&path).expect("updated config reads");
+        assert!(
+            !run_private_access_tun_baseline_config(&path, true, &carriers)
+                .expect("repeated baseline update succeeds")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("idempotent config reads"),
+            first
+        );
+
+        assert!(
+            !run_private_access_tun_baseline_config(
+                &path,
+                true,
+                &["sslvpn.hundsun.com".to_string()],
+            )
+            .expect("subset carrier update succeeds")
+        );
+        let parsed: Value = serde_json::from_str(&first).expect("updated config parses");
+        assert_eq!(parsed["route"]["auto_detect_interface"], false);
+        assert!(
+            parsed["route"]["rules"]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|rule| {
+                    rule["domain"] == json!(["sslvpn.geovisearth.com", "sslvpn.hundsun.com"])
+                        && rule["outbound"] == "select"
+                }))
+        );
+        assert!(parsed["route"]["rules"].as_array().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule["ip_is_private"] == true && rule["outbound"] == "direct")
+        }));
+        assert!(
+            parsed["dns"]["servers"]
+                .as_array()
+                .is_some_and(|servers| servers.iter().any(|server| {
+                    server["tag"] == PRIVATE_ACCESS_SYSTEM_DNS_TAG && server["type"] == "local"
+                }))
         );
         let _ = fs::remove_file(path);
     }
