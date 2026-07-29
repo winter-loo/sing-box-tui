@@ -35,7 +35,6 @@ use crate::tun::{TunHelperClient, TunHelperStartConfig};
 
 const SONICWALL_DIAGNOSTIC_LOG: &str = "sonicwall-private-access.log";
 const HILLSTONE_DIAGNOSTIC_LOG: &str = "hillstone-private-access.log";
-const SONICWALL_HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const SONICWALL_CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 const SONICWALL_OUTBOUND_CHANGE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const SONICWALL_TUNNEL_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
@@ -1005,13 +1004,6 @@ fn start_sonicwall_service_session(
     })
 }
 
-fn sonicwall_candidate_delays(preferred: SonicwallTransport) -> (Duration, Duration) {
-    match preferred {
-        SonicwallTransport::Direct => (Duration::ZERO, SONICWALL_HAPPY_EYEBALLS_DELAY),
-        SonicwallTransport::Proxy => (SONICWALL_HAPPY_EYEBALLS_DELAY, Duration::ZERO),
-    }
-}
-
 async fn discover_sonicwall_candidate(
     server: &str,
     tls_verify: bool,
@@ -1034,87 +1026,38 @@ async fn discover_sonicwall_candidate(
 async fn discover_sonicwall_transport(
     server: &str,
     tls_verify: bool,
-    fallback_proxy: Option<&str>,
-    preferred: SonicwallTransport,
+    configured_proxy: Option<&str>,
 ) -> Result<(
     SonicwallAuthClient,
     Vec<crate::sonicwall::SonicwallRealm>,
     SonicwallTransport,
 )> {
-    let Some(proxy) = fallback_proxy.filter(|proxy| !proxy.trim().is_empty()) else {
-        append_sonicwall_diagnostic(
-            "transport",
-            "HTTP CONNECT proxy unavailable; probing direct HTTPS only",
-        );
-        let (client, realms) = discover_sonicwall_candidate(
-            server,
-            tls_verify,
-            None,
-            SonicwallTransport::Direct,
-            Duration::ZERO,
-        )
-        .await
-        .context("direct SonicWall gateway discovery failed")?;
-        return Ok((client, realms, SonicwallTransport::Direct));
-    };
-
-    let (direct_delay, proxy_delay) = sonicwall_candidate_delays(preferred);
+    let proxy = configured_proxy.filter(|proxy| !proxy.trim().is_empty());
+    let transport = sonicwall_configured_transport(proxy);
     append_sonicwall_diagnostic(
         "transport",
         &format!(
-            "racing direct and proxy HTTPS candidates; preferred={}; alternate_delay_ms={}",
-            preferred.label(),
-            SONICWALL_HAPPY_EYEBALLS_DELAY.as_millis()
+            "using configured {} HTTPS transport without fallback",
+            transport.label()
         ),
     );
-    let direct = discover_sonicwall_candidate(
-        server,
-        tls_verify,
-        None,
-        SonicwallTransport::Direct,
-        direct_delay,
-    );
-    let proxied = discover_sonicwall_candidate(
-        server,
-        tls_verify,
-        Some(proxy),
-        SonicwallTransport::Proxy,
-        proxy_delay,
-    );
-    tokio::pin!(direct);
-    tokio::pin!(proxied);
+    let (client, realms) =
+        discover_sonicwall_candidate(server, tls_verify, proxy, transport, Duration::ZERO)
+            .await
+            .with_context(|| {
+                format!(
+                    "configured {} SonicWall gateway discovery failed",
+                    transport.label()
+                )
+            })?;
+    Ok((client, realms, transport))
+}
 
-    tokio::select! {
-        direct_result = &mut direct => match direct_result {
-            Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Direct)),
-            Err(direct_error) => {
-                append_sonicwall_diagnostic(
-                    "transport",
-                    &format!("direct discovery candidate failed: {direct_error:#}; waiting for proxy candidate"),
-                );
-                match proxied.await {
-                    Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Proxy)),
-                    Err(proxy_error) => Err(anyhow::anyhow!(
-                        "direct SonicWall gateway discovery failed ({direct_error:#}); HTTP CONNECT proxy discovery also failed ({proxy_error:#})"
-                    )),
-                }
-            }
-        },
-        proxy_result = &mut proxied => match proxy_result {
-            Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Proxy)),
-            Err(proxy_error) => {
-                append_sonicwall_diagnostic(
-                    "transport",
-                    &format!("proxy discovery candidate failed: {proxy_error:#}; waiting for direct candidate"),
-                );
-                match direct.await {
-                    Ok((client, realms)) => Ok((client, realms, SonicwallTransport::Direct)),
-                    Err(direct_error) => Err(anyhow::anyhow!(
-                        "HTTP CONNECT proxy discovery failed ({proxy_error:#}); direct SonicWall gateway discovery also failed ({direct_error:#})"
-                    )),
-                }
-            }
-        },
+fn sonicwall_configured_transport(proxy: Option<&str>) -> SonicwallTransport {
+    if proxy.is_some_and(|proxy| !proxy.trim().is_empty()) {
+        SonicwallTransport::Proxy
+    } else {
+        SonicwallTransport::Direct
     }
 }
 
@@ -1125,16 +1068,12 @@ async fn run_sonicwall_authentication(
     shutdown: Arc<AtomicBool>,
     gateway_profiles: Arc<Mutex<SonicwallGatewayProfileCache>>,
 ) -> Result<()> {
-    let proxy_from_env = std::env::var("SONICWALL_EVPN_PROXY").ok();
-    let fallback_proxy = config
-        .http_connect_proxy
-        .as_deref()
-        .or(proxy_from_env.as_deref());
+    let configured_proxy = config.http_connect_proxy.as_deref();
     append_sonicwall_diagnostic(
         "transport",
         &format!(
             "configured HTTP CONNECT proxy={}; outbound_context={}",
-            fallback_proxy.unwrap_or("none"),
+            configured_proxy.unwrap_or("none"),
             config
                 .http_connect_proxy_context
                 .as_deref()
@@ -1148,19 +1087,14 @@ async fn run_sonicwall_authentication(
     append_sonicwall_diagnostic(
         "profile",
         &format!(
-            "gateway={} preferred_transport={} logon_capability={}",
+            "gateway={} configured_transport={} logon_capability={}",
             normalize_sonicwall_gateway_cache_key(&config.server),
-            cached_profile.transport.label(),
+            sonicwall_configured_transport(configured_proxy).label(),
             cached_profile.logon_capability.label()
         ),
     );
-    let (client, realms, selected_transport) = discover_sonicwall_transport(
-        &config.server,
-        config.tls_verify,
-        fallback_proxy,
-        cached_profile.transport,
-    )
-    .await?;
+    let (client, realms, selected_transport) =
+        discover_sonicwall_transport(&config.server, config.tls_verify, configured_proxy).await?;
     {
         let mut profiles = gateway_profiles
             .lock()
@@ -1176,12 +1110,12 @@ async fn run_sonicwall_authentication(
     append_sonicwall_diagnostic(
         "transport",
         &format!(
-            "selected {} HTTPS transport via Happy Eyeballs",
+            "selected configured {} HTTPS transport",
             selected_transport.label()
         ),
     );
     let selected_proxy = (selected_transport == SonicwallTransport::Proxy)
-        .then_some(fallback_proxy)
+        .then_some(configured_proxy)
         .flatten();
     if !realms.is_empty() && !realms.iter().any(|realm| realm.name == config.realm) {
         let names = realms
@@ -1199,7 +1133,7 @@ async fn run_sonicwall_authentication(
         return Ok(());
     }
 
-    let evpn_fallback_proxy = selected_proxy.is_none().then_some(fallback_proxy).flatten();
+    let evpn_fallback_proxy = None;
     let mut preferred_logon_capability = cached_profile.logon_capability;
     let mut reauthentication_sequence = 0_u64;
     loop {
@@ -1486,6 +1420,13 @@ impl SonicwallOutboundChangeDetector {
     }
 }
 
+fn sonicwall_should_monitor_outbound_changes(_follows_internet_selector: bool) -> bool {
+    // Keep an established VPN carrier stable while the normal Internet auto picker changes.
+    // A real EVPN transport loss still enters the reconnect path, which reads the latest
+    // selector chain immediately before establishing the replacement carrier.
+    false
+}
+
 fn sonicwall_outbound_chain(
     proxies: &HashMap<String, SonicwallControllerProxy>,
     root_selector: &str,
@@ -1712,7 +1653,8 @@ async fn run_sonicwall_authenticated_tunnel(
         }
         if let Some(data_plane) = established.take() {
             let connected_at = Instant::now();
-            let monitor_outbound = data_plane.follows_internet_selector;
+            let monitor_outbound =
+                sonicwall_should_monitor_outbound_changes(data_plane.follows_internet_selector);
             let outcome = supervise_sonicwall_tun_data_plane(
                 session,
                 config,
@@ -3027,14 +2969,14 @@ mod tests {
         JsonLineEventSink, PrivateAccessAuthField, PrivateAccessCommand, PrivateAccessEvent,
         PrivateAccessEventEnvelope, PrivateAccessRoute, PrivateAccessSecret,
         PrivateAccessServiceCapabilities, PrivateAccessServiceManifest, PrivateAccessState,
-        SONICWALL_HAPPY_EYEBALLS_DELAY, SonicwallControllerProxy, SonicwallGatewayProfileCache,
-        SonicwallOutboundChangeDetector, SonicwallTransport, default_hillstone_manifest,
-        default_sonicwall_manifest, describe_ipv4_packet, extract_ipv4_cidrs, ipv4_range_to_cidrs,
+        SonicwallControllerProxy, SonicwallGatewayProfileCache, SonicwallOutboundChangeDetector,
+        SonicwallTransport, default_hillstone_manifest, default_sonicwall_manifest,
+        describe_ipv4_packet, extract_ipv4_cidrs, ipv4_range_to_cidrs,
         is_sonicwall_outbound_change, is_sonicwall_team_auth_error,
         is_sonicwall_transport_disconnect, normalize_domain, normalize_ipv4_cidr,
         normalize_sonicwall_gateway_cache_key, normalize_tun_helper_command,
-        schedule_sonicwall_reconnect, sonicwall_candidate_delays, sonicwall_gateway_domain,
-        sonicwall_outbound_chain,
+        schedule_sonicwall_reconnect, sonicwall_configured_transport, sonicwall_gateway_domain,
+        sonicwall_outbound_chain, sonicwall_should_monitor_outbound_changes,
     };
     use crate::sonicwall::SonicwallLogonCapability;
     use serde_json::json;
@@ -3075,18 +3017,6 @@ mod tests {
         assert_eq!(
             normalize_sonicwall_gateway_cache_key(" HTTPS://VPN.Example.com/// "),
             "https://vpn.example.com"
-        );
-    }
-
-    #[test]
-    fn sonicwall_happy_eyeballs_gives_cached_transport_a_head_start() {
-        assert_eq!(
-            sonicwall_candidate_delays(SonicwallTransport::Direct),
-            (Duration::ZERO, SONICWALL_HAPPY_EYEBALLS_DELAY)
-        );
-        assert_eq!(
-            sonicwall_candidate_delays(SonicwallTransport::Proxy),
-            (SONICWALL_HAPPY_EYEBALLS_DELAY, Duration::ZERO)
         );
     }
 
@@ -3264,6 +3194,24 @@ mod tests {
         assert!(!detector.observe("manual -> provider-a -> node-a"));
         assert!(!detector.observe("manual -> provider-b -> node-b"));
         assert!(detector.observe("manual -> provider-b -> node-b"));
+    }
+
+    #[test]
+    fn sonicwall_pins_connected_carrier_across_auto_picker_changes() {
+        assert!(!sonicwall_should_monitor_outbound_changes(true));
+        assert!(!sonicwall_should_monitor_outbound_changes(false));
+    }
+
+    #[test]
+    fn sonicwall_configured_transport_has_no_fallback() {
+        assert_eq!(
+            sonicwall_configured_transport(None),
+            SonicwallTransport::Direct
+        );
+        assert_eq!(
+            sonicwall_configured_transport(Some("127.0.0.1:6780")),
+            SonicwallTransport::Proxy
+        );
     }
 
     #[test]

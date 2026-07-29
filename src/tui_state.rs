@@ -39,6 +39,8 @@ pub(crate) struct PrivateAccessProfileState {
     pub(crate) tun_helper: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) tls_verify: bool,
+    #[serde(default)]
+    pub(crate) use_internet_proxy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) background_pid: Option<u32>,
 }
@@ -265,6 +267,23 @@ mod tests {
         assert!(profile.get("server").is_none());
         assert!(profile.get("username").is_none());
         assert!(profile.get("password").is_none());
+    }
+
+    #[test]
+    fn sonicwall_profile_persists_internet_proxy_choice() {
+        let state = TuiRuntimeState {
+            private_access_profiles: vec![PrivateAccessProfileState {
+                id: "sonicwall".to_string(),
+                use_internet_proxy: true,
+                ..PrivateAccessProfileState::default()
+            }],
+            ..TuiRuntimeState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+
+        assert!(restored.private_access_profiles[0].use_internet_proxy);
     }
 
     #[test]

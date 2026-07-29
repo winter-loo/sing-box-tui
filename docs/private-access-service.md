@@ -71,9 +71,15 @@ clean-room SonicWall service when no custom manifest is supplied:
   "password_env": "",
   "bridge_listen": "",
   "tun_helper": [],
+  "use_internet_proxy": false,
   "tls_verify": true
 }
 ```
+
+`use_internet_proxy` explicitly selects the SonicWall HTTPS transport. Its default
+value is `false`, which uses a direct connection. Set it to `true` to use the
+currently selected Internet proxy. The selected mode is strict: connection failures
+do not trigger an automatic switch to the other transport.
 
 Before connecting from the TUI, authorize the privileged helper in a terminal:
 
