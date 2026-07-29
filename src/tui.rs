@@ -105,6 +105,7 @@ const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::PrivateAccessPassword,
     SettingsField::PrivateAccessPasswordEnv,
     SettingsField::PrivateAccessBridgeListen,
+    SettingsField::PrivateAccessUseInternetProxy,
     SettingsField::PrivateAccessTlsVerify,
 ];
 
@@ -1806,6 +1807,13 @@ fn visible_settings_fields(app: &App) -> Vec<SettingsField> {
         .filter(|field| {
             !is_private_access_settings_field(*field) || app.private_access.is_configured()
         })
+        .filter(|field| {
+            *field != SettingsField::PrivateAccessUseInternetProxy
+                || app
+                    .private_access
+                    .focused_opt()
+                    .is_some_and(|profile| profile.manifest.id == "sonicwall")
+        })
         .collect()
 }
 
@@ -1821,6 +1829,7 @@ fn is_private_access_settings_field(field: SettingsField) -> bool {
             | SettingsField::PrivateAccessPassword
             | SettingsField::PrivateAccessPasswordEnv
             | SettingsField::PrivateAccessBridgeListen
+            | SettingsField::PrivateAccessUseInternetProxy
             | SettingsField::PrivateAccessTlsVerify
     )
 }
@@ -2041,6 +2050,7 @@ fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::PrivateAccessPassword => "Private Access password",
         SettingsField::PrivateAccessPasswordEnv => "Private Access password env",
         SettingsField::PrivateAccessBridgeListen => "Private Access bridge listen",
+        SettingsField::PrivateAccessUseInternetProxy => "SonicWall use Internet proxy",
         SettingsField::PrivateAccessTlsVerify => "Private Access TLS verify",
     }
 }
@@ -2100,6 +2110,11 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
             .focused_opt()
             .map(|profile| profile.bridge_listen.clone())
             .unwrap_or_default(),
+        SettingsField::PrivateAccessUseInternetProxy => app
+            .private_access
+            .focused_opt()
+            .map(|profile| profile.use_internet_proxy.to_string())
+            .unwrap_or_default(),
         SettingsField::PrivateAccessTlsVerify => app
             .private_access
             .focused_opt()
@@ -2143,6 +2158,31 @@ fn normalize_http_connect_proxy(value: &str) -> Option<String> {
         .unwrap_or(value)
         .trim_end_matches('/');
     (!value.is_empty()).then(|| value.to_string())
+}
+
+type SonicwallHttpConnectSettings = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn sonicwall_http_connect_settings(
+    use_internet_proxy: bool,
+    system_proxy_server: &str,
+    outbound_context: Option<String>,
+    controller: &str,
+    selector: Option<String>,
+) -> SonicwallHttpConnectSettings {
+    if !use_internet_proxy {
+        return (None, None, None, None);
+    }
+    (
+        normalize_http_connect_proxy(system_proxy_server),
+        outbound_context,
+        Some(controller.to_string()),
+        selector,
+    )
 }
 
 fn normalize_optional_setting(value: Option<String>) -> Option<String> {
@@ -3882,6 +3922,7 @@ enum SettingsField {
     PrivateAccessPassword,
     PrivateAccessPasswordEnv,
     PrivateAccessBridgeListen,
+    PrivateAccessUseInternetProxy,
     PrivateAccessTlsVerify,
 }
 
@@ -4147,6 +4188,7 @@ struct PrivateAccessProfileRuntime {
     bridge_listen: String,
     tun_helper: Vec<String>,
     tls_verify: bool,
+    use_internet_proxy: bool,
     routes: Vec<PrivateAccessRoute>,
     dns: Vec<String>,
     domains: Vec<String>,
@@ -4180,6 +4222,7 @@ impl PrivateAccessProfileRuntime {
             bridge_listen: "127.0.0.1:16780".to_string(),
             tun_helper: Vec::new(),
             tls_verify: false,
+            use_internet_proxy: false,
             routes: Vec::new(),
             dns: Vec::new(),
             domains: Vec::new(),
@@ -4213,6 +4256,7 @@ impl PrivateAccessProfileRuntime {
             bridge_listen: String::new(),
             tun_helper: Vec::new(),
             tls_verify: true,
+            use_internet_proxy: false,
             routes: Vec::new(),
             dns: Vec::new(),
             domains: Vec::new(),
@@ -4253,6 +4297,7 @@ impl PrivateAccessProfileRuntime {
             },
             tun_helper: Vec::new(),
             tls_verify: is_sonicwall,
+            use_internet_proxy: false,
             routes: Vec::new(),
             dns: Vec::new(),
             domains: Vec::new(),
@@ -4298,6 +4343,7 @@ impl PrivateAccessProfileRuntime {
                 .collect();
         }
         self.tls_verify = state.tls_verify;
+        self.use_internet_proxy = state.use_internet_proxy;
         self.background_pid = state.background_pid.filter(|pid| process_exists(*pid));
         if self.background_pid.is_some() {
             self.state = PrivateAccessState::Connected;
@@ -4322,6 +4368,7 @@ impl PrivateAccessProfileRuntime {
                 Some(self.tun_helper.clone())
             },
             tls_verify: self.tls_verify,
+            use_internet_proxy: self.use_internet_proxy,
             background_pid: self.background_pid.filter(|pid| process_exists(*pid)),
         }
     }
@@ -6204,6 +6251,15 @@ impl App {
                     .context("bridge listen must be an IPv4:PORT address")?;
                 self.private_access.focused_mut().bridge_listen = value.to_string();
             }
+            SettingsField::PrivateAccessUseInternetProxy => {
+                if private_access_profile_settings_locked(self.private_access.focused()) {
+                    bail!("disconnect Private Access before changing SonicWall transport");
+                }
+                if self.private_access.focused().manifest.id != "sonicwall" {
+                    bail!("Internet proxy transport is only configurable for SonicWall");
+                }
+                self.private_access.focused_mut().use_internet_proxy = parse_bool_setting(value)?;
+            }
             SettingsField::PrivateAccessTlsVerify => {
                 self.private_access.focused_mut().tls_verify = parse_bool_setting(value)?;
             }
@@ -7681,6 +7737,20 @@ impl App {
             .push(PrivateAccessProgressEntry { tone, text });
     }
 
+    fn append_private_access_progress_for_profile(
+        &mut self,
+        profile_index: usize,
+        tone: PrivateAccessProgressTone,
+        text: String,
+    ) {
+        if matches!(
+            self.private_access_progress.as_ref(),
+            Some(progress) if progress.profile_index == profile_index
+        ) {
+            self.push_private_access_progress_for_profile(profile_index, tone, text);
+        }
+    }
+
     fn finish_private_access_progress(&mut self) {
         self.finish_private_access_progress_for_profile(self.private_access.focused_index);
     }
@@ -7831,17 +7901,22 @@ impl App {
             )
         };
         let tun_helper = self.private_access_tun_helper_for_connect(self.private_access.focused());
-        let http_connect_proxy = (service == "sonicwall")
-            .then(|| normalize_http_connect_proxy(&self.system_proxy_server))
-            .flatten();
-        let http_connect_proxy_context = (service == "sonicwall")
-            .then(|| self.internet_outbound_context())
-            .flatten();
-        let http_connect_controller =
-            (service == "sonicwall").then(|| self.client.base_url.clone());
-        let http_connect_selector = (service == "sonicwall")
-            .then(|| self.internet_outbound_root_selector())
-            .flatten();
+        let (
+            http_connect_proxy,
+            http_connect_proxy_context,
+            http_connect_controller,
+            http_connect_selector,
+        ) = if service == "sonicwall" {
+            sonicwall_http_connect_settings(
+                self.private_access.focused().use_internet_proxy,
+                &self.system_proxy_server,
+                self.internet_outbound_context(),
+                &self.client.base_url,
+                self.internet_outbound_root_selector(),
+            )
+        } else {
+            (None, None, None, None)
+        };
         // Direct passwords are deliberately supported for a simpler local workflow. The value is
         // sent only to the service process; the settings list displays the configured value.
         let command = PrivateAccessCommand::Connect {
@@ -7984,7 +8059,7 @@ impl App {
                         if let Some((tone, text, done)) =
                             private_access_progress_for_state(&state, &message)
                         {
-                            self.push_private_access_progress_for_profile(
+                            self.append_private_access_progress_for_profile(
                                 profile_index,
                                 tone,
                                 text,
@@ -8007,7 +8082,7 @@ impl App {
                         bridge,
                         ..
                     } => {
-                        self.push_private_access_progress_for_profile(
+                        self.append_private_access_progress_for_profile(
                             profile_index,
                             PrivateAccessProgressTone::Info,
                             format!("收到内网路由: {} 条", routes.len()),
@@ -8027,7 +8102,7 @@ impl App {
                             self.private_access.profiles[profile_index].mode,
                             PrivateAccessMode::Bridge
                         ) {
-                            self.push_private_access_progress_for_profile(
+                            self.append_private_access_progress_for_profile(
                                 profile_index,
                                 PrivateAccessProgressTone::Info,
                                 "修改 config.json 中...".to_string(),
@@ -8046,7 +8121,7 @@ impl App {
                                 &fallback_listen,
                             ) {
                                 Ok(true) => {
-                                    self.push_private_access_progress_for_profile(
+                                    self.append_private_access_progress_for_profile(
                                         profile_index,
                                         PrivateAccessProgressTone::Success,
                                         "config.json 已更新".to_string(),
@@ -8074,7 +8149,7 @@ impl App {
                                     }
                                 }
                                 Ok(false) => {
-                                    self.push_private_access_progress_for_profile(
+                                    self.append_private_access_progress_for_profile(
                                         profile_index,
                                         PrivateAccessProgressTone::Info,
                                         "没有需要写入的内网路由".to_string(),
@@ -8096,7 +8171,7 @@ impl App {
                         } else {
                             self.private_access.profiles[profile_index].bridge = None;
                             match self.refresh_private_access_system_proxy_bypass() {
-                                Ok(true) => self.push_private_access_progress_for_profile(
+                                Ok(true) => self.append_private_access_progress_for_profile(
                                     profile_index,
                                     PrivateAccessProgressTone::Success,
                                     format!(
@@ -8105,7 +8180,7 @@ impl App {
                                     ),
                                 ),
                                 Ok(false) => {}
-                                Err(error) => self.push_private_access_progress_for_profile(
+                                Err(error) => self.append_private_access_progress_for_profile(
                                     profile_index,
                                     PrivateAccessProgressTone::Error,
                                     format!("更新系统代理域名绕过失败: {error:#}"),
@@ -8115,7 +8190,7 @@ impl App {
                             // Windows split-DNS policy before emitting RoutesPushed. The common
                             // sing-box baseline was written before core startup, so this path never
                             // edits config.json or restarts the carrier process.
-                            self.push_private_access_progress_for_profile(
+                            self.append_private_access_progress_for_profile(
                                 profile_index,
                                 PrivateAccessProgressTone::Success,
                                 "TUN 路由和按域名分流 DNS 已生效".to_string(),
@@ -8552,9 +8627,9 @@ mod tests {
         latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
         normalize_http_connect_proxy, private_access_auth_display_value,
         private_access_auth_initial_value, settings_field_display_value, settings_field_value,
-        should_apply_private_access_state_after_integration, sing_box_config_args, status_lines,
-        subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
-        visible_settings_fields,
+        should_apply_private_access_state_after_integration, sing_box_config_args,
+        sonicwall_http_connect_settings, status_lines, subscription_report_badge,
+        system_proxy_bypass_entries, truncate_for_width, visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -8591,6 +8666,35 @@ mod tests {
             Some("127.0.0.1:6780")
         );
         assert_eq!(normalize_http_connect_proxy("  "), None);
+    }
+
+    #[test]
+    fn sonicwall_transport_setting_is_exclusive() {
+        let direct = sonicwall_http_connect_settings(
+            false,
+            "127.0.0.1:6780",
+            Some("manual -> node-a".to_string()),
+            "http://127.0.0.1:9992",
+            Some("manual".to_string()),
+        );
+        assert_eq!(direct, (None, None, None, None));
+
+        let proxied = sonicwall_http_connect_settings(
+            true,
+            "127.0.0.1:6780",
+            Some("manual -> node-a".to_string()),
+            "http://127.0.0.1:9992",
+            Some("manual".to_string()),
+        );
+        assert_eq!(
+            proxied,
+            (
+                Some("127.0.0.1:6780".to_string()),
+                Some("manual -> node-a".to_string()),
+                Some("http://127.0.0.1:9992".to_string()),
+                Some("manual".to_string()),
+            )
+        );
     }
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::runtime::Builder as TokioRuntimeBuilder;
@@ -9525,6 +9629,25 @@ mod tests {
     }
 
     #[test]
+    fn background_private_access_progress_does_not_open_modal() {
+        let mut app = test_app();
+
+        app.append_private_access_progress_for_profile(
+            0,
+            PrivateAccessProgressTone::Info,
+            "Internet proxy selection changed; migrating the SonicWall data tunnel".to_string(),
+        );
+        app.append_private_access_progress_for_profile(
+            0,
+            PrivateAccessProgressTone::Success,
+            "TUN 路由和按域名分流 DNS 已生效".to_string(),
+        );
+        app.finish_private_access_progress_for_profile(0);
+
+        assert!(app.private_access_progress.is_none());
+    }
+
+    #[test]
     fn private_access_service_spawn_failure_stays_inside_tui_state() {
         let mut app = test_app();
         app.private_access.focused_mut().server = "sslvpn.example.com".to_string();
@@ -10185,6 +10308,30 @@ mod tests {
 
         assert_eq!(app.private_access.focused_id(), "backup-office");
         assert_eq!(app.runtime_state().private_access_profiles[0].id, "office");
+    }
+
+    #[test]
+    fn sonicwall_internet_proxy_setting_is_profile_scoped() {
+        let mut app = test_app();
+        assert!(
+            !visible_settings_fields(&app).contains(&SettingsField::PrivateAccessUseInternetProxy)
+        );
+
+        app.private_access
+            .profiles
+            .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+        app.private_access.focused_index = 1;
+        assert!(
+            visible_settings_fields(&app).contains(&SettingsField::PrivateAccessUseInternetProxy)
+        );
+
+        app.apply_settings_value(
+            SettingsField::PrivateAccessUseInternetProxy,
+            "true".to_string(),
+        )
+        .expect("proxy choice saves");
+        assert!(app.private_access.focused().use_internet_proxy);
+        assert!(app.runtime_state().private_access_profiles[1].use_internet_proxy);
     }
 
     #[test]

@@ -635,6 +635,7 @@ impl TunHelperContext {
         let routes = TunRouteGuard::install_routes(&interface, &route_cidrs)
             .context("failed to install pushed TUN routes")?;
         let dns_policy = TunDnsPolicyGuard::install(
+            &interface,
             &config.dns_namespaces,
             &config.dns_system_namespaces,
             &config.dns_servers,
@@ -839,7 +840,7 @@ fn ipv4_cidr_contains(network: Ipv4Addr, prefix_len: u8, address: Ipv4Addr) -> b
     u32::from(network) & mask == u32::from(address) & mask
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn normalize_dns_namespace(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     let is_suffix = value.starts_with("*.") || value.starts_with('.');
@@ -928,6 +929,7 @@ struct TunDnsPolicyGuard {
 #[cfg(target_os = "windows")]
 impl TunDnsPolicyGuard {
     fn install(
+        _interface: &str,
         namespaces: &[String],
         system_namespaces: &[String],
         dns_servers: &[IpAddr],
@@ -1109,6 +1111,7 @@ struct TunDnsPolicyGuard {
 #[cfg(target_os = "macos")]
 impl TunDnsPolicyGuard {
     fn install(
+        _interface: &str,
         namespaces: &[String],
         system_namespaces: &[String],
         dns_servers: &[IpAddr],
@@ -1363,12 +1366,89 @@ fn flush_macos_dns_cache() {
         .status();
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-struct TunDnsPolicyGuard;
+#[cfg(target_os = "linux")]
+struct TunDnsPolicyGuard {
+    interface: String,
+    configured: bool,
+}
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
 impl TunDnsPolicyGuard {
     fn install(
+        interface: &str,
+        namespaces: &[String],
+        _system_namespaces: &[String],
+        dns_servers: &[IpAddr],
+    ) -> Result<Self> {
+        let mut guard = Self {
+            interface: interface.to_string(),
+            configured: false,
+        };
+        for args in linux_resolvectl_configure_args(interface, namespaces, dns_servers)? {
+            run_command("resolvectl", &args)
+                .context("failed to configure systemd-resolved split DNS")?;
+            guard.configured = true;
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TunDnsPolicyGuard {
+    fn drop(&mut self) {
+        if !self.configured {
+            return;
+        }
+        let args = vec!["revert".to_string(), self.interface.clone()];
+        if let Err(error) = run_command("resolvectl", &args) {
+            eprintln!(
+                "warning: failed to revert split DNS on {}: {error:#}",
+                self.interface
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_resolvectl_configure_args(
+    interface: &str,
+    namespaces: &[String],
+    dns_servers: &[IpAddr],
+) -> Result<Vec<Vec<String>>> {
+    let route_domains = namespaces
+        .iter()
+        .filter_map(|namespace| normalize_dns_namespace(namespace))
+        .map(|namespace| format!("~{}", namespace.trim_start_matches('.')))
+        .collect::<BTreeSet<_>>();
+    if route_domains.is_empty() {
+        return Ok(Vec::new());
+    }
+    if dns_servers.is_empty() {
+        bail!("Private Access pushed DNS namespaces without any DNS server");
+    }
+
+    let mut dns_args = vec!["dns".to_string(), interface.to_string()];
+    dns_args.extend(dns_servers.iter().map(ToString::to_string));
+    let mut domain_args = vec!["domain".to_string(), interface.to_string()];
+    domain_args.extend(route_domains);
+    Ok(vec![
+        dns_args,
+        domain_args,
+        vec![
+            "default-route".to_string(),
+            interface.to_string(),
+            "false".to_string(),
+        ],
+    ])
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+struct TunDnsPolicyGuard;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+impl TunDnsPolicyGuard {
+    fn install(
+        _interface: &str,
         _namespaces: &[String],
         _system_namespaces: &[String],
         _dns_servers: &[IpAddr],
@@ -1406,6 +1486,44 @@ impl Drop for TunRouteGuard {
         for cidr in self.routes.iter().rev() {
             let args = route_delete_args(&self.interface, cidr);
             if let Err(error) = run_command("route", &args) {
+                eprintln!(
+                    "warning: failed to remove TUN route {cidr} from {}: {error:#}",
+                    self.interface
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct TunRouteGuard {
+    interface: String,
+    routes: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl TunRouteGuard {
+    pub(crate) fn install_routes(interface: &str, route_cidrs: &[String]) -> Result<Self> {
+        let mut guard = Self {
+            interface: interface.to_string(),
+            routes: Vec::new(),
+        };
+        for cidr in route_cidrs {
+            let args = linux_route_add_args(interface, cidr);
+            run_command("ip", &args)
+                .with_context(|| format!("failed to add TUN route {cidr} via {interface}"))?;
+            guard.routes.push(cidr.clone());
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TunRouteGuard {
+    fn drop(&mut self) {
+        for cidr in self.routes.iter().rev() {
+            let args = linux_route_delete_args(&self.interface, cidr);
+            if let Err(error) = run_command("ip", &args) {
                 eprintln!(
                     "warning: failed to remove TUN route {cidr} from {}: {error:#}",
                     self.interface
@@ -1584,14 +1702,38 @@ fn ipv4_network_address(address: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(address) & mask)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) struct TunRouteGuard;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 impl TunRouteGuard {
     pub(crate) fn install_routes(_interface: &str, _route_cidrs: &[String]) -> Result<Self> {
-        bail!("Private Access pushed route installation currently supports macOS and Windows only")
+        bail!(
+            "Private Access pushed route installation currently supports Linux, macOS, and Windows only"
+        )
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_add_args(interface: &str, cidr: &str) -> Vec<String> {
+    vec![
+        "route".to_string(),
+        "add".to_string(),
+        cidr.to_string(),
+        "dev".to_string(),
+        interface.to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_delete_args(interface: &str, cidr: &str) -> Vec<String> {
+    vec![
+        "route".to_string(),
+        "del".to_string(),
+        cidr.to_string(),
+        "dev".to_string(),
+        interface.to_string(),
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -1618,7 +1760,7 @@ fn route_delete_args(interface: &str, cidr: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, args: &[String]) -> Result<()> {
     let output = Command::new(program)
         .args(args)
@@ -1656,6 +1798,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::route_add_args;
+    #[cfg(target_os = "linux")]
+    use super::{linux_resolvectl_configure_args, linux_route_add_args, linux_route_delete_args};
     #[cfg(target_os = "macos")]
     use super::{macos_default_dns_servers_from_scutil, macos_resolver_file_contents};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1926,6 +2070,45 @@ DNS configuration (for scoped queries)
         assert_eq!(
             route_add_args("utun9", "10.1.0.0/16"),
             ["-n", "add", "-net", "10.1.0.0/16", "-interface", "utun9"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builds_linux_ip_route_args_for_pushed_cidr() {
+        assert_eq!(
+            linux_route_add_args("tun0", "10.1.0.0/16"),
+            ["route", "add", "10.1.0.0/16", "dev", "tun0"]
+        );
+        assert_eq!(
+            linux_route_delete_args("tun0", "10.1.0.0/16"),
+            ["route", "del", "10.1.0.0/16", "dev", "tun0"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builds_linux_systemd_resolved_split_dns_configuration() {
+        let commands = linux_resolvectl_configure_args(
+            "tun0",
+            &[
+                ".hundsun.com".to_string(),
+                "service.hundsun.com".to_string(),
+            ],
+            &[
+                IpAddr::V4(Ipv4Addr::new(10, 22, 1, 6)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 60, 14)),
+            ],
+        )
+        .expect("Linux split DNS commands build");
+
+        assert_eq!(
+            commands,
+            vec![
+                vec!["dns", "tun0", "10.22.1.6", "192.168.60.14"],
+                vec!["domain", "tun0", "~hundsun.com", "~service.hundsun.com"],
+                vec!["default-route", "tun0", "false"],
+            ]
         );
     }
 }

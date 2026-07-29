@@ -22,8 +22,7 @@ The completed path covers:
   handoff needed by the tested gateway.
 - The proprietary EVPN tunnel setup over a specially formed TLS connection.
 - Client configuration parsing, TUN creation, DNS setup, and split-route installation.
-- Direct and explicit HTTP CONNECT proxy transports, with cached preference and a
-  short staggered race between them.
+- Explicit direct and HTTP CONNECT proxy transports selected per profile.
 - Integration into the existing Private Access service and TUI lifecycle.
 - Gateway-compatible Connect Tunnel identity with native macOS endpoint-policy
   evaluation.
@@ -129,21 +128,12 @@ Persistence matters because the TUI intentionally stops the service process afte
 error or disconnect. An in-memory preference appeared to work in unit tests but was
 lost before the next real connection.
 
-### 5.3 Direct/Proxy Happy Eyeballs
+### 5.3 Explicit Direct/Proxy Selection
 
-Serial direct-first fallback made an unreachable direct path particularly painful:
-several discovery requests could each wait for their own timeout before the proxy was
-attempted. The current algorithm treats transport choice as a race:
-
-- the cached preferred candidate starts immediately;
-- the other candidate starts 250 ms later;
-- the first candidate that completes realm discovery wins;
-- the losing future is cancelled;
-- only the winner's HTTP client and discovered realms continue into login.
-
-This preserves the desired “direct preferred, proxy fallback” policy without paying a
-full direct timeout on every authentication attempt. A success also refreshes the
-persisted preference for the next process.
+Each SonicWall profile explicitly selects its HTTPS transport. Direct mode creates no
+HTTP CONNECT proxy client. Internet-proxy mode uses the currently selected Internet
+proxy for gateway discovery and EVPN bootstrap. The modes are mutually exclusive:
+neither discovery nor tunnel bootstrap silently falls back to the other transport.
 
 ### 5.4 One HTTP client per authentication session
 
@@ -450,10 +440,11 @@ and should never be a prerequisite for deterministic local or CI tests.
 
 ### Transport and routing
 
-11. **Direct-first should be a race, not a chain of timeouts.** A 250 ms stagger gives
-    direct a meaningful head start while proxy fallback remains fast.
-12. **Persist transport knowledge across process restarts.** The service lifecycle made
-    an in-memory cache practically useless.
+11. **Transport policy belongs in profile configuration.** Direct and Internet-proxy
+    modes should be predictable, mutually exclusive choices rather than implicit
+    recovery behavior.
+12. **Do not silently change transports after failure.** A strict choice keeps routing,
+    security policy, and diagnostics aligned with the operator's intent.
 13. **Preserve the gateway hostname through CONNECT.** It participates in SNI,
     certificate verification, virtual hosting, and policy routing.
 14. **Carrier routing can deadlock VPN bootstrap.** The exact gateway exception must
