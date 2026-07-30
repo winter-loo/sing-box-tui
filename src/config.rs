@@ -36,6 +36,9 @@ pub(crate) struct PrivateAccessRouteTableOptions {
     pub(crate) cidrs: Vec<String>,
     pub(crate) domains: Vec<String>,
     pub(crate) domain_suffixes: Vec<String>,
+    pub(crate) previous_cidrs: Vec<String>,
+    pub(crate) previous_domains: Vec<String>,
+    pub(crate) previous_domain_suffixes: Vec<String>,
     pub(crate) carrier_domains: Vec<String>,
     pub(crate) proxy: Option<SocketAddrV4>,
 }
@@ -231,6 +234,9 @@ pub(crate) fn run_hillstone_route_table_config(
             cidrs: options.cidrs,
             domains: Vec::new(),
             domain_suffixes: Vec::new(),
+            previous_cidrs: Vec::new(),
+            previous_domains: Vec::new(),
+            previous_domain_suffixes: Vec::new(),
             carrier_domains: Vec::new(),
             proxy: Some(options.proxy),
         },
@@ -298,6 +304,9 @@ pub(crate) fn ensure_hillstone_route_table(
             cidrs: options.cidrs,
             domains: Vec::new(),
             domain_suffixes: Vec::new(),
+            previous_cidrs: Vec::new(),
+            previous_domains: Vec::new(),
+            previous_domain_suffixes: Vec::new(),
             carrier_domains: Vec::new(),
             proxy: Some(options.proxy),
         },
@@ -319,6 +328,10 @@ pub(crate) fn ensure_private_access_route_table(
     let target_cidrs = normalize_ipv4_cidrs(&options.cidrs)?;
     let target_domains = normalize_private_access_domains(&options.domains);
     let target_domain_suffixes = normalize_private_access_domains(&options.domain_suffixes);
+    let previous_cidrs = normalize_ipv4_cidrs(&options.previous_cidrs)?;
+    let previous_domains = normalize_private_access_domains(&options.previous_domains);
+    let previous_domain_suffixes =
+        normalize_private_access_domains(&options.previous_domain_suffixes);
     if target_cidrs.is_empty() && target_domains.is_empty() && target_domain_suffixes.is_empty() {
         return Ok(());
     }
@@ -358,7 +371,11 @@ pub(crate) fn ensure_private_access_route_table(
             &target_cidrs,
             &target_domains,
             &target_domain_suffixes,
+            &previous_cidrs,
+            &previous_domains,
+            &previous_domain_suffixes,
             &direct_tag,
+            options.proxy,
         )
     });
 
@@ -1672,32 +1689,80 @@ fn rule_matches_private_access_route_targets(
     target_cidrs: &[Ipv4Cidr],
     target_domains: &[String],
     target_domain_suffixes: &[String],
+    previous_cidrs: &[Ipv4Cidr],
+    previous_domains: &[String],
+    previous_domain_suffixes: &[String],
     direct_tag: &str,
+    proxy: Option<SocketAddrV4>,
 ) -> bool {
-    if rule.get("action").and_then(Value::as_str) == Some("resolve")
-        && rule.get("server").and_then(Value::as_str) == Some(PRIVATE_ACCESS_SYSTEM_DNS_TAG)
-    {
-        return true;
+    let Some(object) = rule.as_object() else {
+        return false;
+    };
+    let domains = rule_string_values(rule, "domain");
+    let domain_suffixes = rule_string_values(rule, "domain_suffix");
+    let matches_domains = (domains == target_domains && domain_suffixes == target_domain_suffixes)
+        || (domains == previous_domains && domain_suffixes == previous_domain_suffixes);
+
+    if rule.get("action").and_then(Value::as_str) == Some("resolve") {
+        let only_managed_fields = object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "action" | "server" | "strategy" | "disable_cache" | "domain" | "domain_suffix"
+            )
+        });
+        return only_managed_fields
+            && rule.get("server").and_then(Value::as_str) == Some(PRIVATE_ACCESS_SYSTEM_DNS_TAG)
+            && matches_domains;
     }
-    if rule.get("action").and_then(Value::as_str) != Some("route") {
+    if rule.get("action").and_then(Value::as_str) != Some("route")
+        || rule.get("outbound").and_then(Value::as_str) != Some(direct_tag)
+    {
         return false;
     }
-    if !(rule.get("override_address").is_some()
-        || rule.get("override_port").is_some()
-        || rule.get("outbound").and_then(Value::as_str) == Some(direct_tag))
-    {
+    let only_managed_fields = object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action"
+                | "outbound"
+                | "override_address"
+                | "override_port"
+                | "port"
+                | "ip_cidr"
+                | "domain"
+                | "domain_suffix"
+        )
+    });
+    if !only_managed_fields {
         return false;
     }
-    rule_ip_cidrs(rule).into_iter().any(|rule_cidr| {
-        target_cidrs
-            .iter()
-            .any(|target| rule_cidr.overlaps(*target))
-    }) || rule_string_values(rule, "domain")
-        .iter()
-        .any(|domain| target_domains.contains(domain))
-        || rule_string_values(rule, "domain_suffix")
-            .iter()
-            .any(|suffix| target_domain_suffixes.contains(suffix))
+    let is_bridge_override =
+        rule.get("override_address").is_some() && rule.get("override_port").is_some();
+    if proxy.is_some() && !is_bridge_override {
+        return false;
+    }
+    let cidrs = rule_ip_cidrs(rule);
+    let matches_profile_cidrs = !cidrs.is_empty()
+        && cidrs.iter().any(|rule_cidr| {
+            target_cidrs
+                .iter()
+                .chain(previous_cidrs)
+                .any(|profile_cidr| rule_cidr.overlaps(*profile_cidr))
+        });
+    let replaces_bridge_with_tun = proxy.is_none()
+        && rule.get("override_address").is_some()
+        && rule.get("override_port").is_some()
+        && !cidrs.is_empty()
+        && cidrs.iter().all(|rule_cidr| {
+            target_cidrs
+                .iter()
+                .any(|target_cidr| rule_cidr.overlaps(*target_cidr))
+        });
+    ((is_bridge_override && matches_profile_cidrs)
+        || (!is_bridge_override
+            && (cidrs == target_cidrs || cidrs == previous_cidrs)
+            && !cidrs.is_empty()))
+        || replaces_bridge_with_tun
+        || matches_domains && (!domains.is_empty() || !domain_suffixes.is_empty())
 }
 
 fn ensure_private_access_system_dns(root: &mut serde_json::Map<String, Value>) -> Result<()> {
@@ -2256,6 +2321,9 @@ mod tests {
                 cidrs: vec!["10.1.0.0/16".to_string()],
                 domains: Vec::new(),
                 domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
                 carrier_domains: Vec::new(),
                 proxy: Some("127.0.0.1:18080".parse().expect("proxy parses")),
             },
@@ -2271,6 +2339,120 @@ mod tests {
         assert!(rule.get("port").is_none());
         assert_eq!(rule["override_address"], "127.0.0.1");
         assert_eq!(rule["override_port"], 18080);
+    }
+
+    #[test]
+    fn private_access_route_update_preserves_overlapping_custom_direct_rule() {
+        let mut config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [{
+                "action": "route",
+                "ip_cidr": ["10.1.0.0/16", "192.168.0.0/16"],
+                "protocol": "tcp",
+                "outbound": "direct"
+            }] }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "hillstone".to_string(),
+                cidrs: vec!["10.1.0.0/16".to_string()],
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
+                proxy: Some("127.0.0.1:18080".parse().expect("proxy parses")),
+            },
+        )
+        .expect("route update succeeds");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.iter().any(|rule| {
+            rule["ip_cidr"] == json!(["10.1.0.0/16", "192.168.0.0/16"]) && rule["protocol"] == "tcp"
+        }));
+    }
+
+    #[test]
+    fn private_access_route_update_removes_disjoint_previous_managed_route() {
+        let mut config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [{
+                "action": "route",
+                "ip_cidr": ["10.1.0.0/16"],
+                "outbound": "direct",
+                "override_address": "127.0.0.1",
+                "override_port": 18080
+            }] }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "hillstone".to_string(),
+                cidrs: vec!["10.2.0.0/16".to_string()],
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                previous_cidrs: vec!["10.1.0.0/16".to_string()],
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
+                proxy: Some("127.0.0.1:18080".parse().expect("proxy parses")),
+            },
+        )
+        .expect("route update succeeds");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["ip_cidr"] == json!(["10.2.0.0/16"]))
+        );
+    }
+
+    #[test]
+    fn private_access_domain_update_preserves_other_profiles_resolve_rule() {
+        let mut config = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [{
+                "action": "resolve",
+                "server": PRIVATE_ACCESS_SYSTEM_DNS_TAG,
+                "strategy": "ipv4_only",
+                "disable_cache": true,
+                "domain": ["profile-a.internal"]
+            }] }
+        });
+
+        ensure_private_access_route_table(
+            &mut config,
+            PrivateAccessRouteTableOptions {
+                profile_id: "profile-b".to_string(),
+                cidrs: Vec::new(),
+                domains: vec!["profile-b.internal".to_string()],
+                domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
+                proxy: Some("127.0.0.1:18081".parse().expect("proxy parses")),
+            },
+        )
+        .expect("domain update succeeds");
+
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.iter().any(|rule| {
+            rule["action"] == "resolve" && rule["domain"] == json!(["profile-a.internal"])
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["action"] == "resolve" && rule["domain"] == json!(["profile-b.internal"])
+        }));
     }
 
     #[test]
@@ -2305,6 +2487,9 @@ mod tests {
                 ],
                 domains: Vec::new(),
                 domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
                 carrier_domains: Vec::new(),
                 proxy: None,
             },
@@ -2371,6 +2556,9 @@ mod tests {
                 cidrs: vec!["192.168.0.0/16".to_string()],
                 domains: vec!["Service.Hundsun.com".to_string()],
                 domain_suffixes: vec!["*.Hundsun.COM.".to_string()],
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
                 carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
                 proxy: None,
             },
@@ -2448,6 +2636,9 @@ mod tests {
                 cidrs: Vec::new(),
                 domains: Vec::new(),
                 domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
                 carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
                 proxy: None,
             },
@@ -2478,6 +2669,9 @@ mod tests {
                 cidrs: Vec::new(),
                 domains: Vec::new(),
                 domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
                 carrier_domains: vec!["sslvpn.hundsun.com".to_string()],
                 proxy: None,
             },
@@ -2505,6 +2699,9 @@ mod tests {
             cidrs: vec!["10.22.0.0/16".to_string()],
             domains: Vec::new(),
             domain_suffixes: Vec::new(),
+            previous_cidrs: Vec::new(),
+            previous_domains: Vec::new(),
+            previous_domain_suffixes: Vec::new(),
             carrier_domains: Vec::new(),
             proxy: None,
         };
