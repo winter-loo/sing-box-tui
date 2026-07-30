@@ -3301,6 +3301,40 @@ fn command_matches_headless_auto_pick(command: &str) -> bool {
         && args.iter().any(|arg| arg == "--headless-auto-pick")
 }
 
+fn command_matches_private_access_service(
+    command: &str,
+    manifest: &PrivateAccessServiceManifest,
+) -> bool {
+    let tokens = command_tokens(command);
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let expected_program = manifest
+        .executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&manifest.executable);
+    if !command_program_name_matches(program, expected_program) {
+        return false;
+    }
+    manifest
+        .args
+        .iter()
+        .all(|expected| tokens.iter().skip(1).any(|actual| actual == expected))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn private_access_process_exists(pid: u32, manifest: &PrivateAccessServiceManifest) -> bool {
+    process_exists(pid)
+        && background_process_command(pid)
+            .is_ok_and(|command| command_matches_private_access_service(&command, manifest))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn private_access_process_exists(pid: u32, _manifest: &PrivateAccessServiceManifest) -> bool {
+    process_exists(pid)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn background_process_command(pid: u32) -> Result<String> {
     let output = Command::new("ps")
@@ -4344,7 +4378,9 @@ impl PrivateAccessProfileRuntime {
         }
         self.tls_verify = state.tls_verify;
         self.use_internet_proxy = state.use_internet_proxy;
-        self.background_pid = state.background_pid.filter(|pid| process_exists(*pid));
+        self.background_pid = state
+            .background_pid
+            .filter(|pid| private_access_process_exists(*pid, &self.manifest));
         if self.background_pid.is_some() {
             self.state = PrivateAccessState::Connected;
         }
@@ -7325,7 +7361,10 @@ impl App {
     fn detach_private_access_for_background(&mut self) -> Result<usize> {
         let mut detached = 0;
         for profile in &mut self.private_access.profiles {
-            if profile.background_pid.is_some_and(process_exists) {
+            if profile
+                .background_pid
+                .is_some_and(|pid| private_access_process_exists(pid, &profile.manifest))
+            {
                 detached += 1;
                 continue;
             }
@@ -8082,6 +8121,13 @@ impl App {
                         bridge,
                         ..
                     } => {
+                        let previous_routes =
+                            self.private_access.profiles[profile_index].routes.clone();
+                        let previous_domains =
+                            self.private_access.profiles[profile_index].domains.clone();
+                        let previous_domain_suffixes = self.private_access.profiles[profile_index]
+                            .domain_suffixes
+                            .clone();
                         self.append_private_access_progress_for_profile(
                             profile_index,
                             PrivateAccessProgressTone::Info,
@@ -8116,6 +8162,9 @@ impl App {
                                 &routes,
                                 &domains,
                                 &domain_suffixes,
+                                &previous_routes,
+                                &previous_domains,
+                                &previous_domain_suffixes,
                                 &carrier_domains,
                                 bridge,
                                 &fallback_listen,
@@ -8346,6 +8395,9 @@ impl App {
         routes: &[PrivateAccessRoute],
         domains: &[String],
         domain_suffixes: &[String],
+        previous_routes: &[PrivateAccessRoute],
+        previous_domains: &[String],
+        previous_domain_suffixes: &[String],
         carrier_domains: &[String],
         bridge: Option<PrivateAccessBridge>,
         fallback_listen: &str,
@@ -8376,6 +8428,12 @@ impl App {
                 cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
                 domains: domains.to_vec(),
                 domain_suffixes: domain_suffixes.to_vec(),
+                previous_cidrs: previous_routes
+                    .iter()
+                    .map(|route| route.cidr.clone())
+                    .collect(),
+                previous_domains: previous_domains.to_vec(),
+                previous_domain_suffixes: previous_domain_suffixes.to_vec(),
                 carrier_domains: carrier_domains.to_vec(),
                 proxy: Some(proxy),
             },
@@ -9251,6 +9309,24 @@ mod tests {
     }
 
     #[test]
+    fn private_access_process_matcher_requires_expected_service_command() {
+        let manifest = super::default_hillstone_manifest().expect("manifest builds");
+        let executable = &manifest.executable;
+        assert!(super::command_matches_private_access_service(
+            &format!("{executable} private-access-service hillstone --stdio"),
+            &manifest
+        ));
+        assert!(!super::command_matches_private_access_service(
+            "sleep 3600",
+            &manifest
+        ));
+        assert!(!super::command_matches_private_access_service(
+            &format!("{executable} run --headless-auto-pick"),
+            &manifest
+        ));
+    }
+
+    #[test]
     fn background_bind_rejects_remote_addresses_without_explicit_allow() {
         assert!(super::validate_background_bind_addr_with_remote("127.0.0.1:0", false).is_ok());
         assert!(super::validate_background_bind_addr_with_remote("[::1]:0", false).is_ok());
@@ -9834,6 +9910,9 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
+                &[],
                 Some(PrivateAccessBridge {
                     kind: "http".to_string(),
                     listen: "127.0.0.1:16780".to_string(),
@@ -9879,6 +9958,9 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
             None,
             "127.0.0.1:16780",
         )
@@ -9888,6 +9970,9 @@ mod tests {
             &[PrivateAccessRoute {
                 cidr: "10.2.0.0/16".to_string(),
             }],
+            &[],
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -9990,21 +10075,14 @@ mod tests {
     }
 
     #[test]
-    fn private_access_background_session_from_state_is_shown_as_background() {
+    fn private_access_background_session_is_shown_as_background() {
         let mut app = test_app();
         let pid = std::process::id();
-        let state = TuiRuntimeState {
-            private_access_profiles: vec![PrivateAccessProfileState {
-                id: "hillstone".to_string(),
-                server: Some("sslvpn.example.com".to_string()),
-                username: Some("alice".to_string()),
-                background_pid: Some(pid),
-                ..PrivateAccessProfileState::default()
-            }],
-            ..TuiRuntimeState::default()
-        };
-
-        app.apply_runtime_state(state).expect("state applies");
+        let focused = app.private_access.focused_mut();
+        focused.server = "sslvpn.example.com".to_string();
+        focused.username = "alice".to_string();
+        focused.background_pid = Some(pid);
+        focused.state = PrivateAccessState::Connected;
 
         assert_eq!(
             app.private_access.focused().state,
@@ -10044,6 +10122,29 @@ mod tests {
         assert_eq!(
             app.runtime_state().private_access_profiles[0].background_pid,
             None
+        );
+    }
+
+    #[test]
+    fn unrelated_live_pid_is_discarded_from_private_access_state() {
+        let mut app = test_app();
+        let unrelated_pid = std::process::id();
+        assert!(super::process_exists(unrelated_pid));
+        let state = TuiRuntimeState {
+            private_access_profiles: vec![PrivateAccessProfileState {
+                id: "hillstone".to_string(),
+                background_pid: Some(unrelated_pid),
+                ..PrivateAccessProfileState::default()
+            }],
+            ..TuiRuntimeState::default()
+        };
+
+        app.apply_runtime_state(state).expect("state applies");
+
+        assert_eq!(app.private_access.focused().background_pid, None);
+        assert_eq!(
+            app.private_access.focused().state,
+            PrivateAccessState::Disconnected
         );
     }
 

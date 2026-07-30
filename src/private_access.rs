@@ -819,6 +819,10 @@ struct SonicwallServiceSession {
     worker: JoinHandle<()>,
 }
 
+fn sonicwall_session_should_shutdown_after_stdio(detached: bool) -> bool {
+    !detached
+}
+
 fn run_sonicwall_private_access_service_stdio() -> Result<()> {
     let detached = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(JsonLineEventSink::new(
@@ -920,7 +924,14 @@ fn run_sonicwall_private_access_service_stdio() -> Result<()> {
                     continue;
                 }
                 detached.store(true, Ordering::SeqCst);
-                stop_sonicwall_service_session(&sink, session.take())?;
+                sink.state(
+                    if session.is_some() {
+                        PrivateAccessState::Connected
+                    } else {
+                        PrivateAccessState::Disconnected
+                    },
+                    "service detached from TUI",
+                )?;
             }
             PrivateAccessCommand::Status { .. } => {
                 let state = if session.is_some() {
@@ -933,8 +944,10 @@ fn run_sonicwall_private_access_service_stdio() -> Result<()> {
         }
     }
     if let Some(active) = session.take() {
-        active.shutdown.store(true, Ordering::SeqCst);
-        let _ = active.auth_tx.send(SonicwallAuthInput::Cancel);
+        if sonicwall_session_should_shutdown_after_stdio(detached.load(Ordering::SeqCst)) {
+            active.shutdown.store(true, Ordering::SeqCst);
+            let _ = active.auth_tx.send(SonicwallAuthInput::Cancel);
+        }
         let _ = active.worker.join();
     }
     Ok(())
@@ -3251,6 +3264,12 @@ mod tests {
         assert_eq!(value["type"], "detach");
         assert_eq!(value["service"], "hillstone");
         assert!(value["session_id"].is_null());
+    }
+
+    #[test]
+    fn detached_sonicwall_session_is_not_shutdown_when_stdio_closes() {
+        assert!(!super::sonicwall_session_should_shutdown_after_stdio(true));
+        assert!(super::sonicwall_session_should_shutdown_after_stdio(false));
     }
 
     #[test]
