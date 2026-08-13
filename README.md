@@ -33,12 +33,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.
 ```
 
 Use `-DownloadParts 1` to disable parallel downloading. Disable the GitHub
-proxy fallback with `-GitHubProxy ""`, or override it with another prefix URL:
+proxy fallback with `-GitHubProxy ""`, override it with another prefix URL,
+or use `-ForceGitHubProxy` to route all GitHub requests through it without a
+direct attempt:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -DownloadParts 1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy ""
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy "https://example.com/anywhere"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -ForceGitHubProxy
 ```
 
 Start the TUI:
@@ -246,6 +249,7 @@ Useful Windows options:
 scripts\windows\install.cmd -Version v0.1.0
 scripts\windows\install.cmd -SkipSingBox
 scripts\windows\install.cmd -DownloadParts 1 -Force
+scripts\windows\install.cmd -ForceGitHubProxy
 ```
 
 Useful macOS/Linux options:
@@ -254,6 +258,8 @@ Useful macOS/Linux options:
 scripts/install.sh --check-only
 scripts/install.sh --dry-run --force
 scripts/install.sh --version v0.1.0 --force
+scripts/install.sh --force-github-proxy
+scripts/install.sh --github-proxy https://example.com/anywhere --force-github-proxy
 ```
 
 ## Requirements

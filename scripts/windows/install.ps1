@@ -7,6 +7,7 @@ param(
     [string]$SingBoxVersion = "v1.13.13-winterloo.2",
     [string]$SingBoxSha256 = "dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9",
     [string]$GitHubProxy = "https://deeloo.cn/anywhere",
+    [switch]$ForceGitHubProxy,
     [ValidateRange(1, 16)]
     [int]$DownloadParts = 4,
     [ValidateRange(1, 3600)]
@@ -22,6 +23,10 @@ param(
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+if ($ForceGitHubProxy -and [string]::IsNullOrWhiteSpace($GitHubProxy)) {
+    throw "-ForceGitHubProxy requires a non-empty -GitHubProxy URL"
+}
+
 function Write-Step([string]$Message) {
     Write-Host "==> $Message"
 }
@@ -34,6 +39,10 @@ function Join-GitHubProxyUrl([string]$Url) {
 }
 
 function Invoke-GitHubApi([string]$Url) {
+    if ($ForceGitHubProxy) {
+        Write-Step "Using GitHub proxy for API request: $GitHubProxy"
+        return Invoke-RestMethod -Uri (Join-GitHubProxyUrl $Url) -Headers @{ "User-Agent" = "sing-box-tui-installer" }
+    }
     try {
         return Invoke-RestMethod -Uri $Url -Headers @{ "User-Agent" = "sing-box-tui-installer" }
     } catch {
@@ -335,6 +344,16 @@ function Invoke-GitHubAssetDownload($Asset, [string]$OutFile) {
     $downloadUrl = $Asset.browser_download_url
     if (-not $downloadUrl) {
         $downloadUrl = $Asset.url
+    }
+
+    if ($ForceGitHubProxy) {
+        $proxySourceUrl = $Asset.url
+        if (-not $proxySourceUrl) {
+            $proxySourceUrl = $downloadUrl
+        }
+        Write-Step "Using GitHub proxy for asset download: $GitHubProxy"
+        Invoke-DownloadUrl (Join-GitHubProxyUrl $proxySourceUrl) $OutFile
+        return
     }
 
     try {
