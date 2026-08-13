@@ -6,6 +6,7 @@ param(
     [string]$SingBoxRepo = "winter-loo/sing-box",
     [string]$SingBoxVersion = "v1.13.13-winterloo.2",
     [string]$SingBoxSha256 = "dcf5be84da3361eadd22efb23df5d5426826ad51b2a7d0c07f90d938da684ec9",
+    [string]$SingBoxDir,
     [string]$GitHubProxy = "https://deeloo.cn/anywhere",
     [switch]$ForceGitHubProxy,
     [ValidateRange(1, 16)]
@@ -26,6 +27,13 @@ $ErrorActionPreference = "Stop"
 if ($ForceGitHubProxy -and [string]::IsNullOrWhiteSpace($GitHubProxy)) {
     throw "-ForceGitHubProxy requires a non-empty -GitHubProxy URL"
 }
+
+$singBoxDirSpecified = $PSBoundParameters.ContainsKey("SingBoxDir")
+if ($singBoxDirSpecified -and [string]::IsNullOrWhiteSpace($SingBoxDir)) {
+    throw "-SingBoxDir requires a non-empty directory"
+}
+$coreDir = if ($singBoxDirSpecified) { $SingBoxDir } else { Join-Path $InstallDir "core" }
+$coreExe = Join-Path $coreDir "sing-box.exe"
 
 function Write-Step([string]$Message) {
     Write-Host "==> $Message"
@@ -413,9 +421,7 @@ function Add-UserPath([string]$PathToAdd) {
 }
 
 function Install-SingBoxCore {
-    $coreDir = Join-Path $InstallDir "core"
-    $coreExe = Join-Path $coreDir "sing-box.exe"
-    if ((Test-Path $coreExe) -and -not $Force) {
+    if ((Test-Path $coreExe -PathType Leaf) -and -not $Force) {
         Write-Step "sing-box core already installed at $coreExe"
         Add-UserPath $coreDir
         return
@@ -442,8 +448,9 @@ function Install-SingBoxCore {
 }
 
 if (-not $SkipSingBox) {
-    if (Get-Command sing-box -ErrorAction SilentlyContinue) {
-        Write-Step "sing-box already found"
+    $globalSingBox = if (-not $singBoxDirSpecified) { Get-Command sing-box -ErrorAction SilentlyContinue } else { $null }
+    if ($globalSingBox) {
+        Write-Step "sing-box already found: $($globalSingBox.Source)"
     } else {
         Install-SingBoxCore
     }

@@ -42,6 +42,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy ""
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -GitHubProxy "https://example.com/anywhere"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -ForceGitHubProxy
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -SingBoxDir "D:\Tools\sing-box"
 ```
 
 Start the TUI:
@@ -229,7 +230,10 @@ Selecting a node inside an Internet Route group updates that child selector and 
 ## Installation
 
 The platform installers install `sing-box-tui` and install the configured
-`sing-box` core release when `sing-box` is not already on `PATH`.
+`sing-box` core release when `sing-box` is not already on `PATH`. Set
+`-SingBoxDir` on Windows or `--sing-box-dir` on macOS/Linux to install it in a
+specific directory. When this option is set, the installer checks only that
+directory for the `sing-box` executable instead of checking the global `PATH`.
 
 Windows:
 
@@ -250,6 +254,7 @@ scripts\windows\install.cmd -Version v0.1.0
 scripts\windows\install.cmd -SkipSingBox
 scripts\windows\install.cmd -DownloadParts 1 -Force
 scripts\windows\install.cmd -ForceGitHubProxy
+scripts\windows\install.cmd -SingBoxDir "D:\Tools\sing-box"
 ```
 
 Useful macOS/Linux options:
@@ -260,6 +265,7 @@ scripts/install.sh --dry-run --force
 scripts/install.sh --version v0.1.0 --force
 scripts/install.sh --force-github-proxy
 scripts/install.sh --github-proxy https://example.com/anywhere --force-github-proxy
+scripts/install.sh --sing-box-dir "$HOME/.local/bin"
 ```
 
 ## Requirements
