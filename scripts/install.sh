@@ -671,7 +671,7 @@ append_profile_line() {
 add_user_path() {
   path_to_add=$1
   escaped_path=$(printf '%s' "$path_to_add" | sed "s/'/'\\\\''/g")
-  posix_path_line="case \"\$PATH\" in *'$escaped_path'*) ;; *) export PATH=\"\$PATH\":'$escaped_path' ;; esac"
+  posix_path_line="case \":\$PATH:\" in *:'$escaped_path':*) ;; *) export PATH=\"\$PATH\":'$escaped_path' ;; esac"
 
   if [ -n "${SING_BOX_TUI_PROFILE-}" ]; then
     case "$SING_BOX_TUI_PROFILE" in
