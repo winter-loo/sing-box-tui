@@ -8,6 +8,7 @@ SING_BOX_REPO=${SING_BOX_REPO:-winter-loo/sing-box}
 SING_BOX_VERSION=${SING_BOX_VERSION:-v1.13.13-winterloo.2}
 SING_BOX_SHA256=${SING_BOX_SHA256:-auto}
 GITHUB_PROXY=${GITHUB_PROXY-https://deeloo.cn/anywhere}
+FORCE_GITHUB_PROXY=${FORCE_GITHUB_PROXY:-0}
 DOWNLOAD_PARTS=${DOWNLOAD_PARTS:-4}
 DOWNLOAD_TIMEOUT_SEC=${DOWNLOAD_TIMEOUT_SEC:-600}
 DOWNLOAD_STALL_TIMEOUT_SEC=${DOWNLOAD_STALL_TIMEOUT_SEC:-30}
@@ -34,6 +35,7 @@ Options:
   --sing-box-version VERSION     sing-box release tag
   --sing-box-sha256 SHA256       expected core hash, or "auto" for asset digest
   --github-proxy URL             fallback prefix for GitHub requests; "" disables
+  --force-github-proxy           route every GitHub request through the proxy
   --download-parts COUNT         parallel download parts, 1-16 (default: 4)
   --download-timeout-sec SEC     total request timeout, 1-3600 (default: 600)
   --download-stall-timeout-sec SEC
@@ -47,7 +49,8 @@ Options:
   -h, --help                     show this help
 
 Defaults can also be overridden with the corresponding uppercase environment
-variables, for example REPO, INSTALL_DIR, GITHUB_PROXY, and DOWNLOAD_PARTS.
+variables, for example REPO, INSTALL_DIR, GITHUB_PROXY, FORCE_GITHUB_PROXY,
+and DOWNLOAD_PARTS.
 EOF
 }
 
@@ -107,6 +110,10 @@ while [ "$#" -gt 0 ]; do
       require_value "$@"
       GITHUB_PROXY=$2
       shift 2
+      ;;
+    --force-github-proxy)
+      FORCE_GITHUB_PROXY=1
+      shift
       ;;
     --download-parts)
       require_value "$@"
@@ -174,6 +181,18 @@ validate_range() {
 validate_range "$DOWNLOAD_PARTS" 1 16 --download-parts
 validate_range "$DOWNLOAD_TIMEOUT_SEC" 1 3600 --download-timeout-sec
 validate_range "$DOWNLOAD_STALL_TIMEOUT_SEC" 1 600 --download-stall-timeout-sec
+
+case "$FORCE_GITHUB_PROXY" in
+  0|1) ;;
+  *)
+    echo "error: FORCE_GITHUB_PROXY must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [ "$FORCE_GITHUB_PROXY" -eq 1 ] && [ -z "$GITHUB_PROXY" ]; then
+  echo "error: --force-github-proxy requires a non-empty --github-proxy URL" >&2
+  exit 2
+fi
 
 case $(uname -s) in
   Linux)
@@ -256,6 +275,9 @@ fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   write_step "Platform: $PLATFORM_NAME $(uname -m) ($TARGET_TRIPLE)"
+  if [ "$FORCE_GITHUB_PROXY" -eq 1 ]; then
+    write_step "Would route all GitHub requests through $GITHUB_PROXY"
+  fi
   if [ "$SKIP_SING_BOX" -eq 0 ]; then
     if command -v sing-box >/dev/null 2>&1; then
       write_step "sing-box already found: $(command -v sing-box)"
@@ -329,6 +351,12 @@ curl_request() {
 github_api() {
   url=$1
   output=$2
+  if [ "$FORCE_GITHUB_PROXY" -eq 1 ]; then
+    write_step "Using GitHub proxy for API request: $GITHUB_PROXY"
+    curl_request "$(proxy_url "$url")" "$output" application/vnd.github+json ||
+      die "GitHub API request failed through $GITHUB_PROXY: $url"
+    return 0
+  fi
   if curl_request "$url" "$output" application/vnd.github+json 2>/dev/null; then
     return 0
   fi
@@ -566,6 +594,16 @@ download_github_asset() {
   api_url=${record%%|*}
   remainder=${record#*|}
   browser_url=${remainder%%|*}
+  if [ "$FORCE_GITHUB_PROXY" -eq 1 ]; then
+    proxy_source_url=$api_url
+    if [ -z "$proxy_source_url" ]; then
+      proxy_source_url=$browser_url
+    fi
+    write_step "Using GitHub proxy for asset download: $GITHUB_PROXY"
+    download_url "$(proxy_url "$proxy_source_url")" "$output" application/octet-stream ||
+      die "GitHub asset download failed through $GITHUB_PROXY: $browser_url"
+    return 0
+  fi
   if download_url "$browser_url" "$output" application/octet-stream; then
     return 0
   fi
