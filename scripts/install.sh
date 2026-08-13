@@ -260,7 +260,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     if command -v sing-box >/dev/null 2>&1; then
       write_step "sing-box already found: $(command -v sing-box)"
     elif [ -f "$CORE_EXE" ] && [ "$FORCE" -eq 0 ]; then
-      write_step "sing-box core already installed at $CORE_EXE"
+      if [ -x "$CORE_EXE" ]; then
+        write_step "sing-box core already installed at $CORE_EXE"
+      else
+        write_step "Would restore execute permission on $CORE_EXE"
+      fi
     else
       core_version=${SING_BOX_VERSION#v}
       core_asset=sing-box-$core_version-$TARGET_OS-$CORE_ARCH
@@ -268,7 +272,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     fi
   fi
   if [ -f "$TUI_EXE" ] && [ "$FORCE" -eq 0 ]; then
-    write_step "sing-box-tui already installed at $TUI_EXE"
+    if [ -x "$TUI_EXE" ]; then
+      write_step "sing-box-tui already installed at $TUI_EXE"
+    else
+      write_step "Would restore execute permission on $TUI_EXE"
+    fi
   else
     tui_version=$VERSION
     if [ "$VERSION" = latest ]; then
@@ -582,22 +590,15 @@ sha256_file() {
   fi
 }
 
-add_user_path() {
-  path_to_add=$1
-  case ":$PATH:" in
-    *:"$path_to_add":*)
-      return 0
-      ;;
-  esac
-
-  escaped_path=$(printf '%s' "$path_to_add" | sed "s/'/'\\\\''/g")
-  path_line="export PATH=\"\$PATH\":'$escaped_path'"
-  if [ -n "${SING_BOX_TUI_PROFILE-}" ]; then
-    profile=$SING_BOX_TUI_PROFILE
-  elif [ "$TARGET_OS" = darwin ] && [ "${SHELL-}" != "${SHELL%/zsh}" ]; then
-    profile=$HOME/.zprofile
-  else
-    profile=$HOME/.profile
+append_profile_line() {
+  profile=$1
+  path_line=$2
+  profile_dir=${profile%/*}
+  if [ "$profile_dir" != "$profile" ]; then
+    if [ -z "$profile_dir" ]; then
+      profile_dir=/
+    fi
+    mkdir -p "$profile_dir"
   fi
   if [ ! -f "$profile" ] || ! grep -Fqx "$path_line" "$profile"; then
     {
@@ -606,7 +607,57 @@ add_user_path() {
       echo "$path_line"
     } >> "$profile"
   fi
-  PATH=$PATH:$path_to_add
+}
+
+add_user_path() {
+  path_to_add=$1
+  escaped_path=$(printf '%s' "$path_to_add" | sed "s/'/'\\\\''/g")
+  posix_path_line="case \"\$PATH\" in *'$escaped_path'*) ;; *) export PATH=\"\$PATH\":'$escaped_path' ;; esac"
+
+  if [ -n "${SING_BOX_TUI_PROFILE-}" ]; then
+    case "$SING_BOX_TUI_PROFILE" in
+      *.fish)
+        fish_path=$(printf '%s' "$path_to_add" | sed "s/'/\\\\'/g")
+        append_profile_line "$SING_BOX_TUI_PROFILE" "fish_add_path --append '$fish_path'"
+        ;;
+      *)
+        append_profile_line "$SING_BOX_TUI_PROFILE" "$posix_path_line"
+        ;;
+    esac
+  else
+    shell_name=${SHELL-}
+    shell_name=${shell_name##*/}
+    case "$shell_name" in
+      bash)
+        append_profile_line "$HOME/.bashrc" "$posix_path_line"
+        if [ -f "$HOME/.bash_profile" ]; then
+          login_profile=$HOME/.bash_profile
+        elif [ -f "$HOME/.bash_login" ]; then
+          login_profile=$HOME/.bash_login
+        else
+          login_profile=$HOME/.profile
+        fi
+        append_profile_line "$login_profile" "$posix_path_line"
+        ;;
+      zsh)
+        zsh_config_dir=${ZDOTDIR:-$HOME}
+        append_profile_line "$zsh_config_dir/.zshenv" "$posix_path_line"
+        ;;
+      fish)
+        fish_config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/fish
+        fish_path=$(printf '%s' "$path_to_add" | sed "s/'/\\\\'/g")
+        append_profile_line "$fish_config_dir/config.fish" "fish_add_path --append '$fish_path'"
+        ;;
+      *)
+        append_profile_line "$HOME/.profile" "$posix_path_line"
+        ;;
+    esac
+  fi
+
+  case ":$PATH:" in
+    *:"$path_to_add":*) ;;
+    *) PATH=$PATH:$path_to_add ;;
+  esac
   export PATH
 }
 
@@ -616,6 +667,10 @@ install_sing_box_core() {
     return 0
   fi
   if [ -f "$CORE_EXE" ] && [ "$FORCE" -eq 0 ]; then
+    if [ ! -x "$CORE_EXE" ]; then
+      chmod u+x "$CORE_EXE"
+      write_step "Restored execute permission on $CORE_EXE"
+    fi
     write_step "sing-box core already installed at $CORE_EXE"
     add_user_path "$CORE_DIR"
     return 0
@@ -661,6 +716,10 @@ install_sing_box_core() {
 install_tui() {
   mkdir -p "$INSTALL_DIR"
   if [ -f "$TUI_EXE" ] && [ "$FORCE" -eq 0 ]; then
+    if [ ! -x "$TUI_EXE" ]; then
+      chmod u+x "$TUI_EXE"
+      write_step "Restored execute permission on $TUI_EXE"
+    fi
     write_step "sing-box-tui already installed at $TUI_EXE"
     return 0
   fi
