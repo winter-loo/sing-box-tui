@@ -268,6 +268,23 @@ scripts/install.sh --github-proxy https://example.com/anywhere --force-github-pr
 scripts/install.sh --sing-box-dir "$HOME/.local/bin"
 ```
 
+The Unix installer uses four parallel byte-range requests by default and falls
+back to `https://deeloo.cn/anywhere` when GitHub is unavailable. If a network
+or proxy does not handle ranges reliably, use a single request. The timeout
+options control the total transfer time and how long a connection may make no
+progress:
+
+```sh
+scripts/install.sh --download-parts 1
+scripts/install.sh --download-timeout-sec 1800 --download-stall-timeout-sec 120
+scripts/install.sh --github-proxy https://example.com/github-proxy
+scripts/install.sh --github-proxy ""
+```
+
+Passing an empty GitHub proxy disables the fallback. Run
+`scripts/install.sh --help` for all installer options and environment-variable
+overrides.
+
 ## Requirements
 
 - `sing-box` must expose `experimental.clash_api.external_controller`, usually `127.0.0.1:9992`

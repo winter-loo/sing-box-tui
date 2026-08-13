@@ -64,6 +64,10 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Test Unix installer
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: sh scripts/tests/install.sh
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 

@@ -15,7 +15,7 @@ SING_BOX_DIR=${SING_BOX_DIR-}
 GITHUB_PROXY=${GITHUB_PROXY-https://deeloo.cn/anywhere}
 FORCE_GITHUB_PROXY=${FORCE_GITHUB_PROXY:-0}
 DOWNLOAD_PARTS=${DOWNLOAD_PARTS:-4}
-DOWNLOAD_TIMEOUT_SEC=${DOWNLOAD_TIMEOUT_SEC:-600}
+DOWNLOAD_TIMEOUT_SEC=${DOWNLOAD_TIMEOUT_SEC:-1800}
 DOWNLOAD_STALL_TIMEOUT_SEC=${DOWNLOAD_STALL_TIMEOUT_SEC:-30}
 SKIP_SING_BOX=0
 NO_PATH=0
@@ -43,7 +43,7 @@ Options:
   --github-proxy URL             fallback prefix for GitHub requests; "" disables
   --force-github-proxy           route every GitHub request through the proxy
   --download-parts COUNT         parallel download parts, 1-16 (default: 4)
-  --download-timeout-sec SEC     total request timeout, 1-3600 (default: 600)
+  --download-timeout-sec SEC     total request timeout, 1-3600 (default: 1800)
   --download-stall-timeout-sec SEC
                                  no-progress timeout, 1-600 (default: 30)
   --skip-sing-box                do not install the sing-box core
@@ -346,7 +346,8 @@ cleanup() {
     rm -rf "$TEMP_DIR"
   fi
 }
-trap cleanup 0 HUP INT TERM
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
 
 proxy_url() {
   echo "${GITHUB_PROXY%/}/$1"
@@ -470,126 +471,193 @@ curl_download() {
   fi
 }
 
+final_header_value() {
+  headers=$1
+  expected_name=$2
+  awk -v expected_name="$expected_name" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      separator = index(line, ":")
+      if (separator > 0 && tolower(substr(line, 1, separator - 1)) == expected_name) {
+        value = substr(line, separator + 1)
+        sub(/^[[:space:]]*/, "", value)
+      }
+    }
+    END { print value }
+  ' "$headers"
+}
+
+download_range_part() {
+  url=$1
+  part_file=$2
+  accept=$3
+  start=$4
+  end=$5
+  headers=$part_file.headers
+  status_file=$part_file.status
+  rm -f "$part_file" "$headers" "$status_file"
+  curl -LsS \
+    --connect-timeout "$DOWNLOAD_STALL_TIMEOUT_SEC" \
+    --max-time "$DOWNLOAD_TIMEOUT_SEC" \
+    --speed-limit 1 \
+    --speed-time "$DOWNLOAD_STALL_TIMEOUT_SEC" \
+    -A "$USER_AGENT" \
+    -H "Accept: $accept" \
+    --range "$start-$end" \
+    -D "$headers" \
+    -w '%{http_code}' \
+    -o "$part_file" \
+    "$url" > "$status_file"
+}
+
+valid_range_part() {
+  part_file=$1
+  start=$2
+  end=$3
+  length=$4
+  [ -f "$part_file" ] || return 1
+  [ -f "$part_file.headers" ] || return 1
+  [ -f "$part_file.status" ] || return 1
+  status_code=$(tr -d '[:space:]' < "$part_file.status")
+  [ "$status_code" = 206 ] || return 1
+  content_range=$(final_header_value "$part_file.headers" content-range)
+  content_range_unit=${content_range%% *}
+  content_range_value=${content_range#* }
+  [ "$(printf '%s' "$content_range_unit" | tr '[:upper:]' '[:lower:]')" = bytes ] || return 1
+  [ "$content_range_value" = "$start-$end/$length" ] || return 1
+  expected=$(( end - start + 1 ))
+  actual=$(wc -c < "$part_file" | tr -d '[:space:]')
+  [ "$actual" = "$expected" ]
+}
+
+remove_range_parts() {
+  output=$1
+  parts=$2
+  index=0
+  while [ "$index" -lt "$parts" ]; do
+    rm -f "$output.part.$index" "$output.part.$index.headers" "$output.part.$index.status"
+    index=$(( index + 1 ))
+  done
+}
+
 parallel_download() {
   url=$1
   output=$2
   accept=$3
   parts=$4
-  headers=$TEMP_DIR/download-headers
+  probe=$output.part.probe
 
-  if ! curl -fLsSI \
-    --connect-timeout "$DOWNLOAD_STALL_TIMEOUT_SEC" \
-    --max-time "$DOWNLOAD_TIMEOUT_SEC" \
-    -A "$USER_AGENT" \
-    -H "Accept: $accept" \
-    -o "$headers" \
-    "$url"; then
+  if ! download_range_part "$url" "$probe" "$accept" 0 0; then
+    rm -f "$probe" "$probe.headers" "$probe.status"
     return 1
   fi
 
-  length=$(awk '
-    tolower($1) == "content-length:" {
-      gsub(/\r/, "", $2)
-      content_length = $2
-    }
-    END { print content_length }
-  ' "$headers")
-  accept_ranges=$(awk '
-    tolower($1) == "accept-ranges:" {
-      gsub(/\r/, "", $2)
-      ranges = tolower($2)
-    }
-    END { print ranges }
-  ' "$headers")
+  probe_status=$(tr -d '[:space:]' < "$probe.status")
+  if [ "$probe_status" = 200 ]; then
+    if mv "$probe" "$output"; then
+      rm -f "$probe.headers" "$probe.status"
+      return 0
+    fi
+    rm -f "$probe" "$probe.headers" "$probe.status"
+    return 1
+  fi
+  if [ "$probe_status" != 206 ]; then
+    rm -f "$probe" "$probe.headers" "$probe.status"
+    case "$probe_status" in
+      405|416) return 2 ;;
+      *) return 1 ;;
+    esac
+  fi
 
+  content_range=$(final_header_value "$probe.headers" content-range)
+  content_range_unit=${content_range%% *}
+  content_range_value=${content_range#* }
+  if [ "$(printf '%s' "$content_range_unit" | tr '[:upper:]' '[:lower:]')" != bytes ]; then
+    rm -f "$probe" "$probe.headers" "$probe.status"
+    return 1
+  fi
+  length=${content_range_value#0-0/}
+  if [ "$content_range_value" = "$length" ]; then
+    rm -f "$probe" "$probe.headers" "$probe.status"
+    return 1
+  fi
   case "$length" in
-    ''|*[!0-9]*) return 1 ;;
+    ''|*[!0-9]*)
+      rm -f "$probe" "$probe.headers" "$probe.status"
+      return 1
+      ;;
   esac
-  if [ "$length" -le 0 ]; then
+  if [ "$length" -le 0 ] || [ "$length" -gt 2147483647 ]; then
+    rm -f "$probe" "$probe.headers" "$probe.status"
     return 1
   fi
-  if [ -n "$accept_ranges" ] && [ "$accept_ranges" != bytes ]; then
-    return 1
-  fi
-  if [ "$length" -gt 2147483647 ]; then
-    return 1
-  fi
+  rm -f "$probe" "$probe.headers" "$probe.status"
+
   if [ "$parts" -gt "$length" ]; then
     parts=$length
   fi
-
-  chunk_size=$(( (length + parts - 1) / parts ))
+  chunk_size=$(( length / parts ))
   index=0
   pids=
   while [ "$index" -lt "$parts" ]; do
     start=$(( index * chunk_size ))
     end=$(( start + chunk_size - 1 ))
-    if [ "$end" -ge "$length" ]; then
+    if [ "$index" -eq $((parts - 1)) ] || [ "$end" -ge "$length" ]; then
       end=$(( length - 1 ))
     fi
     part_file=$output.part.$index
-    rm -f "$part_file"
-    curl -fLsS \
-      --retry 2 \
-      --retry-delay 1 \
-      --connect-timeout "$DOWNLOAD_STALL_TIMEOUT_SEC" \
-      --max-time "$DOWNLOAD_TIMEOUT_SEC" \
-      --speed-limit 1 \
-      --speed-time "$DOWNLOAD_STALL_TIMEOUT_SEC" \
-      -A "$USER_AGENT" \
-      -H "Accept: $accept" \
-      --range "$start-$end" \
-      -o "$part_file" \
-      "$url" &
+    download_range_part "$url" "$part_file" "$accept" "$start" "$end" &
     pids="$pids $!"
     index=$(( index + 1 ))
   done
 
-  failed=0
   for pid in $pids; do
-    if ! wait "$pid"; then
-      failed=1
+    wait "$pid" || true
+  done
+
+  index=0
+  retry_pids=
+  while [ "$index" -lt "$parts" ]; do
+    start=$(( index * chunk_size ))
+    end=$(( start + chunk_size - 1 ))
+    if [ "$index" -eq $((parts - 1)) ] || [ "$end" -ge "$length" ]; then
+      end=$(( length - 1 ))
     fi
+    part_file=$output.part.$index
+    if ! valid_range_part "$part_file" "$start" "$end" "$length"; then
+      write_step "Retrying download part $((index + 1))/$parts"
+      download_range_part "$url" "$part_file" "$accept" "$start" "$end" &
+      retry_pids="$retry_pids $!"
+    fi
+    index=$(( index + 1 ))
+  done
+  for pid in $retry_pids; do
+    wait "$pid" || true
   done
 
   index=0
   while [ "$index" -lt "$parts" ]; do
     start=$(( index * chunk_size ))
     end=$(( start + chunk_size - 1 ))
-    if [ "$end" -ge "$length" ]; then
+    if [ "$index" -eq $((parts - 1)) ] || [ "$end" -ge "$length" ]; then
       end=$(( length - 1 ))
     fi
-    expected=$(( end - start + 1 ))
-    part_file=$output.part.$index
-    if [ ! -f "$part_file" ]; then
-      failed=1
-    else
-      actual=$(wc -c < "$part_file" | tr -d '[:space:]')
-      if [ "$actual" != "$expected" ]; then
-        failed=1
-      fi
+    if ! valid_range_part "$output.part.$index" "$start" "$end" "$length"; then
+      remove_range_parts "$output" "$parts"
+      return 1
     fi
     index=$(( index + 1 ))
   done
-
-  if [ "$failed" -ne 0 ]; then
-    index=0
-    while [ "$index" -lt "$parts" ]; do
-      rm -f "$output.part.$index"
-      index=$(( index + 1 ))
-    done
-    return 1
-  fi
 
   : > "$output"
   index=0
   while [ "$index" -lt "$parts" ]; do
-    part_file=$output.part.$index
-    cat "$part_file" >> "$output"
-    rm -f "$part_file"
+    cat "$output.part.$index" >> "$output"
     index=$(( index + 1 ))
   done
   actual=$(wc -c < "$output" | tr -d '[:space:]')
+  remove_range_parts "$output" "$parts"
   [ "$actual" = "$length" ]
 }
 
@@ -601,9 +669,15 @@ download_url() {
     write_step "Downloading with $DOWNLOAD_PARTS parallel parts: $url"
     if parallel_download "$url" "$output" "$accept" "$DOWNLOAD_PARTS"; then
       return 0
+    else
+      parallel_status=$?
     fi
     rm -f "$output"
-    write_step "Parallel download unavailable; falling back to a single request"
+    if [ "$parallel_status" -ne 2 ]; then
+      write_step "Parallel download failed"
+      return 1
+    fi
+    write_step "Byte ranges unsupported; falling back to a single request"
   fi
   write_step "Downloading with a single request: $url"
   curl_download "$url" "$output" "$accept"
