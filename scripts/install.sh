@@ -7,6 +7,11 @@ INSTALL_DIR=${INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sing-box-tui}
 SING_BOX_REPO=${SING_BOX_REPO:-winter-loo/sing-box}
 SING_BOX_VERSION=${SING_BOX_VERSION:-v1.13.13-winterloo.2}
 SING_BOX_SHA256=${SING_BOX_SHA256:-auto}
+SING_BOX_DIR_SPECIFIED=0
+if [ "${SING_BOX_DIR+x}" = x ]; then
+  SING_BOX_DIR_SPECIFIED=1
+fi
+SING_BOX_DIR=${SING_BOX_DIR-}
 GITHUB_PROXY=${GITHUB_PROXY-https://deeloo.cn/anywhere}
 FORCE_GITHUB_PROXY=${FORCE_GITHUB_PROXY:-0}
 DOWNLOAD_PARTS=${DOWNLOAD_PARTS:-4}
@@ -25,7 +30,7 @@ usage() {
 Usage: scripts/install.sh [OPTIONS]
 
 Install the sing-box-tui release for the current Unix platform and install the
-configured sing-box core release when sing-box is not already on PATH.
+configured sing-box core release when sing-box is not already available.
 
 Options:
   --repo OWNER/REPO              sing-box-tui GitHub repository
@@ -34,6 +39,7 @@ Options:
   --sing-box-repo OWNER/REPO     sing-box GitHub repository
   --sing-box-version VERSION     sing-box release tag
   --sing-box-sha256 SHA256       expected core hash, or "auto" for asset digest
+  --sing-box-dir DIR             install and check for sing-box in this directory
   --github-proxy URL             fallback prefix for GitHub requests; "" disables
   --force-github-proxy           route every GitHub request through the proxy
   --download-parts COUNT         parallel download parts, 1-16 (default: 4)
@@ -49,8 +55,8 @@ Options:
   -h, --help                     show this help
 
 Defaults can also be overridden with the corresponding uppercase environment
-variables, for example REPO, INSTALL_DIR, GITHUB_PROXY, FORCE_GITHUB_PROXY,
-and DOWNLOAD_PARTS.
+variables, for example REPO, INSTALL_DIR, SING_BOX_DIR, GITHUB_PROXY,
+FORCE_GITHUB_PROXY, and DOWNLOAD_PARTS.
 EOF
 }
 
@@ -104,6 +110,12 @@ while [ "$#" -gt 0 ]; do
     --sing-box-sha256)
       require_value "$@"
       SING_BOX_SHA256=$2
+      shift 2
+      ;;
+    --sing-box-dir)
+      require_value "$@"
+      SING_BOX_DIR=$2
+      SING_BOX_DIR_SPECIFIED=1
       shift 2
       ;;
     --github-proxy)
@@ -182,6 +194,11 @@ validate_range "$DOWNLOAD_PARTS" 1 16 --download-parts
 validate_range "$DOWNLOAD_TIMEOUT_SEC" 1 3600 --download-timeout-sec
 validate_range "$DOWNLOAD_STALL_TIMEOUT_SEC" 1 600 --download-stall-timeout-sec
 
+if [ "$SING_BOX_DIR_SPECIFIED" -eq 1 ] && [ -z "$SING_BOX_DIR" ]; then
+  echo "error: --sing-box-dir requires a non-empty directory" >&2
+  exit 2
+fi
+
 case "$FORCE_GITHUB_PROXY" in
   0|1) ;;
   *)
@@ -238,7 +255,11 @@ case "$TARGET_OS/$TARGET_ARCH" in
 esac
 
 TUI_EXE=$INSTALL_DIR/sing-box-tui
-CORE_DIR=$INSTALL_DIR/core
+if [ "$SING_BOX_DIR_SPECIFIED" -eq 1 ]; then
+  CORE_DIR=$SING_BOX_DIR
+else
+  CORE_DIR=$INSTALL_DIR/core
+fi
 CORE_EXE=$CORE_DIR/sing-box
 
 check_installation() {
@@ -253,7 +274,7 @@ check_installation() {
   fi
 
   if [ "$SKIP_SING_BOX" -eq 0 ]; then
-    if command -v sing-box >/dev/null 2>&1; then
+    if [ "$SING_BOX_DIR_SPECIFIED" -eq 0 ] && command -v sing-box >/dev/null 2>&1; then
       echo "sing-box found: $(command -v sing-box)"
     elif [ -f "$CORE_EXE" ] && [ -x "$CORE_EXE" ]; then
       echo "sing-box found: $CORE_EXE"
@@ -279,7 +300,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     write_step "Would route all GitHub requests through $GITHUB_PROXY"
   fi
   if [ "$SKIP_SING_BOX" -eq 0 ]; then
-    if command -v sing-box >/dev/null 2>&1; then
+    if [ "$SING_BOX_DIR_SPECIFIED" -eq 0 ] && command -v sing-box >/dev/null 2>&1; then
       write_step "sing-box already found: $(command -v sing-box)"
     elif [ -f "$CORE_EXE" ] && [ "$FORCE" -eq 0 ]; then
       if [ -x "$CORE_EXE" ]; then
@@ -700,7 +721,7 @@ add_user_path() {
 }
 
 install_sing_box_core() {
-  if command -v sing-box >/dev/null 2>&1; then
+  if [ "$SING_BOX_DIR_SPECIFIED" -eq 0 ] && command -v sing-box >/dev/null 2>&1; then
     write_step "sing-box already found: $(command -v sing-box)"
     return 0
   fi
