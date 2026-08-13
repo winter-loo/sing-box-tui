@@ -223,34 +223,37 @@ Selector Groups | Internet Routes | Nodes
 
 Selecting a node inside an Internet Route group updates that child selector and then points the parent selector at that route group. This supports configs shaped like `手动选择 -> 宝贝云 -> node`.
 
-## Onboarding
+## Installation
 
-Run the onboarding script before first use. It checks whether `sing-box` is already on `PATH`; if not, it installs sing-box with the platform's official installer path.
+The platform installers install `sing-box-tui` and install the configured
+`sing-box` core release when `sing-box` is not already on `PATH`.
 
 Windows:
 
 ```powershell
-scripts\onboard.cmd
+scripts\windows\install.cmd
 ```
 
 macOS/Linux:
 
 ```sh
-scripts/onboard.sh
+scripts/install.sh
 ```
 
-Useful options:
+Useful Windows options:
 
 ```powershell
-scripts\onboard.cmd --check-only
-scripts\onboard.cmd --dry-run --force
-scripts\onboard.cmd --version 1.13.13 --force
+scripts\windows\install.cmd -Version v0.1.0
+scripts\windows\install.cmd -SkipSingBox
+scripts\windows\install.cmd -DownloadParts 1 -Force
 ```
 
+Useful macOS/Linux options:
+
 ```sh
-scripts/onboard.sh --check-only
-scripts/onboard.sh --dry-run --force
-scripts/onboard.sh --version 1.13.13 --force
+scripts/install.sh --check-only
+scripts/install.sh --dry-run --force
+scripts/install.sh --version v0.1.0 --force
 ```
 
 ## Requirements
