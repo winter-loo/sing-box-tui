@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,11 +28,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             binary: sing-box-tui
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             binary: sing-box-tui
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
             binary: sing-box-tui
@@ -65,7 +65,7 @@ jobs:
         run: cargo test --locked
 
       - name: Test Unix installer
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.archive == 'tar.gz'
         run: sh scripts/tests/install.sh
 
       - name: Build release binary
@@ -92,17 +92,44 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-tui-${{ env.RELEASE_VERSION }}-${{ matrix.target }}
-          path: |
-            dist/*.zip
-            dist/*.tar.gz
+          name: release-${{ matrix.target }}
+          path: dist/sing-box-tui-${{ env.RELEASE_VERSION }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  publish:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            "sing-box-tui-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"
+            "sing-box-tui-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+            "sing-box-tui-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+            "sing-box-tui-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz"
+          )
+          for asset in "${expected[@]}"; do
+            test -s "dist/${asset}"
+          done
+          actual_count=$(find dist -maxdepth 1 -type f | wc -l | tr -d '[:space:]')
+          test "${actual_count}" -eq "${#expected[@]}"
+
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.zip
-            dist/*.tar.gz
+          files: dist/*
           generate_release_notes: true
