@@ -55,7 +55,7 @@ By default, `run` finds `sing-box` through `PATH`. To use a core installed
 elsewhere or with a custom filename, specify its executable path:
 
 ```powershell
-sing-box-tui run --sing-box-executable "D:\Tools\sing-box\sing-box.exe"
+sing-box-tui run --sing-box "D:\Tools\sing-box\sing-box.exe"
 ```
 
 On first launch, the TUI shows a setup wizard. Paste a sing-box subscription URL
