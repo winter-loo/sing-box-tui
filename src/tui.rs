@@ -291,6 +291,7 @@ struct BackgroundWorkerRequest {
 pub(crate) fn run_tui(
     controller: Option<String>,
     max_concurrency: Option<usize>,
+    sing_box_executable: PathBuf,
     keep_sing_box_running: bool,
     subscription_refresh: TuiSubscriptionRefreshOptions,
 ) -> Result<()> {
@@ -306,6 +307,7 @@ pub(crate) fn run_tui(
         ApiClient::new(controller, secret)?,
         max_concurrency.unwrap_or(DEFAULT_BENCHMARK_MAX_CONCURRENCY),
         subscription_refresh,
+        sing_box_executable,
         keep_sing_box_running,
         true,
     )?;
@@ -335,6 +337,7 @@ pub(crate) fn run_headless_auto_pick(
             disabled: true,
             ..subscription_refresh
         },
+        PathBuf::from("sing-box"),
         true,
         false,
     )?;
@@ -3005,8 +3008,11 @@ struct SingBoxRestartSummary {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResult> {
-    let pids = find_sing_box_run_pids_for_config(config_path)?;
+fn restart_sing_box_for_config(
+    executable: &Path,
+    config_path: &Path,
+) -> Result<SingBoxRestartResult> {
+    let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
     for pid in &pids {
         stop_sing_box_pid(*pid)
             .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
@@ -3024,7 +3030,7 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
             log_path.display()
         )
     })?;
-    let mut child = Command::new("sing-box")
+    let mut child = Command::new(executable)
         .arg("run")
         .arg("--config")
         .arg(config_path)
@@ -3034,7 +3040,8 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
         .spawn()
         .with_context(|| {
             format!(
-                "failed to start sing-box run --config {}",
+                "failed to start {} run --config {}",
+                executable.display(),
                 config_path.display()
             )
         })?;
@@ -3045,7 +3052,8 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
         .context("failed to inspect restarted sing-box process")?
     {
         bail!(
-            "sing-box exited immediately with {status}; see {}",
+            "{} exited immediately with {status}; see {}",
+            executable.display(),
             log_path.display()
         );
     }
@@ -3057,8 +3065,11 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
 }
 
 #[cfg(windows)]
-fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResult> {
-    let pids = find_sing_box_run_pids_for_config(config_path)?;
+fn restart_sing_box_for_config(
+    executable: &Path,
+    config_path: &Path,
+) -> Result<SingBoxRestartResult> {
+    let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
     for pid in &pids {
         stop_sing_box_pid(*pid)
             .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
@@ -3076,7 +3087,7 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
             log_path.display()
         )
     })?;
-    let mut child = Command::new("sing-box")
+    let mut child = Command::new(executable)
         .arg("run")
         .arg("--config")
         .arg(config_path)
@@ -3086,7 +3097,8 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
         .spawn()
         .with_context(|| {
             format!(
-                "failed to start sing-box run --config {}",
+                "failed to start {} run --config {}",
+                executable.display(),
                 config_path.display()
             )
         })?;
@@ -3097,7 +3109,8 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
         .context("failed to inspect restarted sing-box process")?
     {
         bail!(
-            "sing-box exited immediately with {status}; see {}",
+            "{} exited immediately with {status}; see {}",
+            executable.display(),
             log_path.display()
         );
     }
@@ -3109,12 +3122,15 @@ fn restart_sing_box_for_config(config_path: &Path) -> Result<SingBoxRestartResul
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn restart_sing_box_for_config(_config_path: &Path) -> Result<SingBoxRestartResult> {
+fn restart_sing_box_for_config(
+    _executable: &Path,
+    _config_path: &Path,
+) -> Result<SingBoxRestartResult> {
     bail!("automatic sing-box restart is only available on Windows, macOS, and Linux")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
+fn find_sing_box_run_pids_for_config(executable: &Path, config_path: &Path) -> Result<Vec<u32>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
@@ -3129,7 +3145,7 @@ fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
         let Some((pid, command)) = parse_ps_pid_command(line) else {
             continue;
         };
-        if command_matches_sing_box_run_for_config(command, config_path) {
+        if command_matches_sing_box_run_for_config(command, executable, config_path) {
             pids.push(pid);
         }
     }
@@ -3137,13 +3153,13 @@ fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
 }
 
 #[cfg(windows)]
-fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
+fn find_sing_box_run_pids_for_config(executable: &Path, config_path: &Path) -> Result<Vec<u32>> {
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
         ])
         .output()
         .context("failed to list sing-box processes with PowerShell")?;
@@ -3155,7 +3171,11 @@ fn find_sing_box_run_pids_for_config(config_path: &Path) -> Result<Vec<u32>> {
             stderr.trim()
         );
     }
-    parse_windows_process_json(&String::from_utf8_lossy(&output.stdout), config_path)
+    parse_windows_process_json(
+        &String::from_utf8_lossy(&output.stdout),
+        executable,
+        config_path,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3167,7 +3187,11 @@ fn parse_ps_pid_command(line: &str) -> Option<(u32, &str)> {
 }
 
 #[cfg(windows)]
-fn parse_windows_process_json(text: &str, config_path: &Path) -> Result<Vec<u32>> {
+fn parse_windows_process_json(
+    text: &str,
+    executable: &Path,
+    config_path: &Path,
+) -> Result<Vec<u32>> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(Vec::new());
@@ -3185,7 +3209,7 @@ fn parse_windows_process_json(text: &str, config_path: &Path) -> Result<Vec<u32>
             .get("CommandLine")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if command_matches_sing_box_run_for_config(command, config_path)
+        if command_matches_sing_box_run_for_config(command, executable, config_path)
             && let Some(pid) = process.get("ProcessId").and_then(Value::as_u64)
         {
             pids.push(pid as u32);
@@ -3217,20 +3241,59 @@ fn command_tokens(command: &str) -> Vec<String> {
 
 fn command_program_name_matches(program: &str, expected: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let expected = expected.rsplit(['/', '\\']).next().unwrap_or(expected);
     name.eq_ignore_ascii_case(expected)
         || name
             .strip_suffix(".exe")
             .is_some_and(|base| base.eq_ignore_ascii_case(expected))
+        || expected
+            .strip_suffix(".exe")
+            .is_some_and(|base| name.eq_ignore_ascii_case(base))
 }
 
-fn command_matches_sing_box_run_for_config(command: &str, config_path: &Path) -> bool {
-    let args = command_tokens(command);
+fn command_args_for_executable(command: &str, executable: &Path) -> Vec<String> {
+    let expected_program = executable
+        .file_name()
+        .unwrap_or(executable.as_os_str())
+        .to_string_lossy();
+    let mut prefixes = vec![
+        executable.to_string_lossy().to_string(),
+        expected_program.to_string(),
+    ];
+    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+    prefixes.dedup();
+
+    for prefix in prefixes {
+        let Some(rest) = command.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let mut args = vec![prefix];
+        args.extend(command_tokens(rest.trim_start()));
+        return args;
+    }
+
+    command_tokens(command)
+}
+
+fn command_matches_sing_box_run_for_config(
+    command: &str,
+    executable: &Path,
+    config_path: &Path,
+) -> bool {
+    let args = command_args_for_executable(command, executable);
     if args.len() < 3 {
         return false;
     }
+    let expected_program = executable
+        .file_name()
+        .unwrap_or(executable.as_os_str())
+        .to_string_lossy();
     let program_is_sing_box = args
         .first()
-        .is_some_and(|program| command_program_name_matches(program, "sing-box"));
+        .is_some_and(|program| command_program_name_matches(program, &expected_program));
     if !program_is_sing_box || !args.iter().any(|arg| arg == "run") {
         return false;
     }
@@ -4129,14 +4192,16 @@ struct VerifyJob {
 }
 
 struct SingBoxProcessRuntime {
+    executable: PathBuf,
     managed_pid: Option<u32>,
     managed_child: Option<Child>,
     keep_running: bool,
 }
 
 impl SingBoxProcessRuntime {
-    fn new(keep_running: bool) -> Self {
+    fn new(executable: PathBuf, keep_running: bool) -> Self {
         Self {
+            executable,
             managed_pid: None,
             managed_child: None,
             keep_running,
@@ -4762,6 +4827,7 @@ impl App {
         client: ApiClient,
         benchmark_max_concurrency: usize,
         subscription_refresh_options: TuiSubscriptionRefreshOptions,
+        sing_box_executable: PathBuf,
         keep_sing_box_running: bool,
         manage_sing_box: bool,
     ) -> Result<Self> {
@@ -4839,7 +4905,7 @@ impl App {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
-            sing_box: SingBoxProcessRuntime::new(keep_sing_box_running),
+            sing_box: SingBoxProcessRuntime::new(sing_box_executable, keep_sing_box_running),
             private_access: PrivateAccessRuntime::new()?,
             private_access_progress: None,
             private_access_auth: None,
@@ -7272,7 +7338,8 @@ impl App {
 
     fn restart_managed_sing_box(&mut self) -> Result<SingBoxRestartSummary> {
         self.stop_managed_sing_box_process()?;
-        let result = restart_sing_box_for_config(&self.system_proxy_config_path)?;
+        let result =
+            restart_sing_box_for_config(&self.sing_box.executable, &self.system_proxy_config_path)?;
         let summary = SingBoxRestartSummary {
             restarted_pids: result.restarted_pids,
             started_pid: result.started_pid,
@@ -8876,7 +8943,7 @@ mod tests {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             verify_job: None,
-            sing_box: SingBoxProcessRuntime::new(false),
+            sing_box: SingBoxProcessRuntime::new(PathBuf::from("sing-box"), false),
             private_access: PrivateAccessRuntime::with_default_hillstone()
                 .expect("private access runtime"),
             private_access_progress: None,
@@ -9245,36 +9312,72 @@ mod tests {
 
     #[test]
     fn sing_box_process_matcher_accepts_run_command_for_config() {
+        let executable = PathBuf::from("sing-box");
         let config = PathBuf::from("config.json");
 
         assert!(command_matches_sing_box_run_for_config(
             "sing-box run --config ./config.json",
+            &executable,
             &config
         ));
         assert!(command_matches_sing_box_run_for_config(
             "/usr/local/bin/sing-box run -c config.json",
+            &executable,
             &config
         ));
         assert!(command_matches_sing_box_run_for_config(
             "sing-box run --config=/Users/ldd/proj/rust/sing-box-tui/config.json",
+            &executable,
+            &config
+        ));
+    }
+
+    #[test]
+    fn sing_box_process_matcher_uses_only_custom_executable() {
+        let executable = PathBuf::from(r#"C:\Program Files\Vendor\proxy-core.exe"#);
+        let config = PathBuf::from("config.json");
+
+        assert!(command_matches_sing_box_run_for_config(
+            r#""C:\Program Files\Vendor\proxy-core.exe" run --config config.json"#,
+            &executable,
+            &config
+        ));
+        assert!(command_matches_sing_box_run_for_config(
+            "/opt/vendor/proxy-core run -c ./config.json",
+            &executable,
+            &config
+        ));
+        let executable_with_space = PathBuf::from("/tmp/review path/proxy-core");
+        assert!(command_matches_sing_box_run_for_config(
+            "/tmp/review path/proxy-core run -c ./config.json",
+            &executable_with_space,
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
+            "sing-box run --config config.json",
+            &executable,
             &config
         ));
     }
 
     #[test]
     fn sing_box_process_matcher_rejects_non_matching_commands() {
+        let executable = PathBuf::from("proxy-core");
         let config = PathBuf::from("config.json");
 
         assert!(!command_matches_sing_box_run_for_config(
-            "sing-box version",
+            "proxy-core version",
+            &executable,
             &config
         ));
         assert!(!command_matches_sing_box_run_for_config(
-            "target/debug/sing-box-tui",
+            "other-core run --config config.json",
+            &executable,
             &config
         ));
         assert!(!command_matches_sing_box_run_for_config(
-            "sing-box run --config ./other.json",
+            "proxy-core run --config ./other.json",
+            &executable,
             &config
         ));
     }
