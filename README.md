@@ -330,7 +330,7 @@ Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,�
 
 TUI latency results are written to SQLite at `./singbox.sqlite3` by default. Set `SING_BOX_TUI_DB=/path/to/singbox.sqlite3` to use a different database. Rows are stored in `benchmark_results` with timestamp, selector, node, filter, latency in milliseconds, completion state, and test kind (`group`, `single`, or `auto`).
 
-TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last latency filter, whether auto-pick is enabled, the auto-pick target selector, the current selected node for each selector group, and the last explicit TUN mode choice (so a regenerated config that lost the `tun` inbound is re-applied on the next startup). On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
+TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last latency filter, whether auto-pick is enabled, the auto-pick target selector, the current selected node for each selector group, and the last explicit TUN mode and China IP routing choices (so a regenerated config that lost the `tun` inbound or the geoip/geosite rule-sets is re-applied on the next startup). On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector.
 
 When auto-pick is enabled, the worker pid, TCP address, and token are recorded so `sing-box-tui background status` can query it and `sing-box-tui background stop` can stop it. Live TUI-to-worker interaction uses TCP while the registry file is only discovery data, not the live communication channel. Pressing `q` stops the worker together with the managed sing-box process; pressing `B` leaves sing-box, the worker, and active Private Access sessions running with their last applied settings. Starting the TUI again reconnects to the existing TCP-managed worker when auto-pick is enabled. Private Access sessions left by `B` are shown as `BACKGROUND` while the recorded profile pid is still alive.
 
@@ -678,6 +678,24 @@ requires `sudo` on macOS/Linux (the TUI runs `sudo -v` first) or an
 Administrator session on Windows, because sing-box must create a network
 interface and change routes. For manual config edits, see
 [docs/tun-mode.md](docs/tun-mode.md).
+
+### How do I toggle China IP routing?
+
+Open TUI settings with `o` and edit the **China IP routing** field to `true` or
+`false`. When enabling, the TUI first downloads the `geoip-cn`, `geosite-cn`,
+`geosite-geolocation-cn`, and `geosite-geolocation-!cn` binary rule-sets through
+the running proxy into `sing-box-tui-rulesets/` next to the config, then writes
+them as local rule-sets so China IPs/domains go `direct` (`国内直连`) while
+everything else follows the selector. The download runs through the proxy
+because the rule-set source (`raw.githubusercontent.com`) is usually unreachable
+directly, and a local rule-set means sing-box never depends on reaching it at
+startup. Changing it restarts the managed sing-box process. The setting is
+remembered in `sing-box-tui.json` and re-applied if a subscription refresh
+regenerates the config without those rule-sets.
+
+This is separate from `--include-geosite-rules`, which additionally bundles the
+`AdGuardSDNSFilter` ad-block rule-set and only affects newly generated default
+configs.
 
 ### Why does the first-run wizard appear?
 

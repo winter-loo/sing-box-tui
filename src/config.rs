@@ -18,6 +18,37 @@ use crate::defaults::{
 const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
 const PRIVATE_ACCESS_SYSTEM_DNS_TAG: &str = "private-access-system";
 
+// China split-routing rule-set tags. These are the binary rule-sets the China IP routing
+// toggle adds or removes, distinct from the AdGuard ad-block rule-set.
+const CHINA_GEOIP_RULE_SET_TAG: &str = "geoip-cn";
+const CHINA_GEOSITE_CN_RULE_SET_TAG: &str = "geosite-cn";
+const CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG: &str = "geosite-geolocation-cn";
+const CHINA_GEOSITE_GEOLOCATION_NOT_CN_RULE_SET_TAG: &str = "geosite-geolocation-!cn";
+const CHINA_IP_ROUTING_CLIENT_SUBNET: &str = "114.114.114.114/24";
+const CHINA_IP_ROUTING_RULESET_DIR: &str = "sing-box-tui-rulesets";
+
+// Canonical (tag, download URL) pairs for the China split-routing rule-sets. The TUI downloads
+// these through the proxy and writes them as local binary rule-sets so sing-box never needs to
+// reach GitHub raw at startup (a failed remote download is fatal for sing-box).
+pub(crate) const CHINA_IP_ROUTING_RULE_SETS: &[(&str, &str)] = &[
+    (
+        CHINA_GEOIP_RULE_SET_TAG,
+        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+    ),
+    (
+        CHINA_GEOSITE_CN_RULE_SET_TAG,
+        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+    ),
+    (
+        CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG,
+        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-cn.srs",
+    ),
+    (
+        CHINA_GEOSITE_GEOLOCATION_NOT_CN_RULE_SET_TAG,
+        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
+    ),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HillstoneRouteOptions {
     pub(crate) target: Ipv4Addr,
@@ -364,6 +395,411 @@ fn is_tun_inbound(inbound: &Value) -> bool {
     inbound.get("type").and_then(Value::as_str) == Some("tun")
 }
 
+fn china_ip_routing_rule_set_tags() -> &'static [&'static str] {
+    &[
+        CHINA_GEOIP_RULE_SET_TAG,
+        CHINA_GEOSITE_CN_RULE_SET_TAG,
+        CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG,
+        CHINA_GEOSITE_GEOLOCATION_NOT_CN_RULE_SET_TAG,
+    ]
+}
+
+fn china_ip_routing_route_rule_tags() -> &'static [&'static str] {
+    &[
+        CHINA_GEOIP_RULE_SET_TAG,
+        CHINA_GEOSITE_CN_RULE_SET_TAG,
+        CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG,
+    ]
+}
+
+fn china_ip_routing_rule_sets(direct_tag: &str) -> Vec<Value> {
+    CHINA_IP_ROUTING_RULE_SETS
+        .iter()
+        .map(|&(tag, url)| {
+            json!({
+                "type": "remote",
+                "tag": tag,
+                "format": "binary",
+                "url": url,
+                "download_detour": direct_tag,
+                "update_interval": "30d",
+            })
+        })
+        .collect()
+}
+
+fn china_ip_routing_local_rule_sets(ruleset_dir: &Path) -> Vec<Value> {
+    CHINA_IP_ROUTING_RULE_SETS
+        .iter()
+        .map(|&(tag, _)| {
+            json!({
+                "type": "local",
+                "tag": tag,
+                "format": "binary",
+                "path": ruleset_dir.join(format!("{tag}.srs")).to_string_lossy().into_owned(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn china_ip_routing_ruleset_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(CHINA_IP_ROUTING_RULESET_DIR)
+}
+
+fn china_ip_routing_route_rules(direct_tag: &str) -> Vec<Value> {
+    vec![
+        json!({ "rule_set": CHINA_GEOIP_RULE_SET_TAG, "outbound": direct_tag }),
+        json!({ "rule_set": CHINA_GEOSITE_CN_RULE_SET_TAG, "outbound": direct_tag }),
+        json!({
+            "rule_set": CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG,
+            "outbound": direct_tag,
+        }),
+    ]
+}
+
+fn china_ip_routing_dns_rules() -> Vec<Value> {
+    vec![
+        json!({
+            "rule_set": CHINA_GEOSITE_CN_RULE_SET_TAG,
+            "server": DEFAULT_LOCAL_DNS_TAG,
+        }),
+        json!({
+            "rule_set": CHINA_GEOSITE_GEOLOCATION_CN_RULE_SET_TAG,
+            "server": DEFAULT_LOCAL_DNS_TAG,
+        }),
+        json!({
+            "type": "logical",
+            "mode": "and",
+            "rules": [
+                { "rule_set": CHINA_GEOSITE_GEOLOCATION_NOT_CN_RULE_SET_TAG, "invert": true },
+                { "rule_set": CHINA_GEOIP_RULE_SET_TAG }
+            ],
+            "server": DEFAULT_REMOTE_DNS_TAG,
+            "client_subnet": CHINA_IP_ROUTING_CLIENT_SUBNET,
+        }),
+    ]
+}
+
+fn is_direct_clash_mode(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "direct" | "直连")
+}
+
+fn is_global_clash_mode(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "global" | "全局")
+}
+
+fn is_rule_clash_mode(value: &str) -> bool {
+    !is_direct_clash_mode(value) && !is_global_clash_mode(value)
+}
+
+fn clash_mode_rule_insert_index(rules: &[Value]) -> usize {
+    // Insert China rules before the rule-mode catch-all so they apply in rule mode while the
+    // direct/global mode overrides still take precedence. The rule mode is any clash_mode value
+    // that is neither direct nor global (covers 规则 / Rule / rule, etc.). If none is found, append
+    // at the end rather than before the first clash_mode rule, which would break global mode.
+    rules
+        .iter()
+        .position(|rule| {
+            rule.get("clash_mode")
+                .and_then(Value::as_str)
+                .is_some_and(is_rule_clash_mode)
+        })
+        .unwrap_or(rules.len())
+}
+
+/// Reports whether the sing-box config already has the China split-routing rule-sets enabled.
+pub(crate) fn config_has_china_ip_routing(config_path: &Path) -> Result<bool> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    Ok(config_has_china_ip_routing_value(&config))
+}
+
+fn config_has_china_ip_routing_value(config: &Value) -> bool {
+    config
+        .get("route")
+        .and_then(|route| route.get("rule_set"))
+        .and_then(Value::as_array)
+        .is_some_and(|rule_sets| {
+            rule_sets.iter().any(|rule_set| {
+                rule_set.get("tag").and_then(Value::as_str) == Some(CHINA_GEOIP_RULE_SET_TAG)
+            })
+        })
+}
+
+/// Adds or removes the China split-routing rule-sets and rules in the sing-box config,
+/// writing the result back in place when it changed. Returns whether the config was modified.
+pub(crate) fn set_china_ip_routing(config_path: &Path, enable: bool) -> Result<bool> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let original = config.clone();
+    let ruleset_dir = china_ip_routing_ruleset_dir(config_path);
+    ensure_china_ip_routing(&mut config, enable, &ruleset_dir)?;
+    let changed = config != original;
+    if changed {
+        let contents =
+            serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
+        fs::write(config_path, format!("{contents}\n"))
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    Ok(changed)
+}
+
+fn existing_direct_outbound_tag(outbounds: &[Value]) -> Option<String> {
+    outbounds
+        .iter()
+        .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+        .find(|tag| DIRECT_TAG_ALIASES.iter().any(|alias| alias == tag))
+        .map(ToString::to_string)
+        .or_else(|| {
+            outbounds
+                .iter()
+                .find(|outbound| outbound.get("type").and_then(Value::as_str) == Some("direct"))
+                .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
+                .map(ToString::to_string)
+        })
+}
+
+fn existing_selector_outbound_tag(outbounds: &[Value]) -> Option<String> {
+    outbounds
+        .iter()
+        .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+        .find(|tag| SELECTOR_TAG_ALIASES.iter().any(|alias| alias == tag))
+        .map(ToString::to_string)
+        .or_else(|| {
+            outbounds
+                .iter()
+                .find(|outbound| {
+                    matches!(
+                        outbound.get("type").and_then(Value::as_str),
+                        Some("selector" | "urltest")
+                    )
+                })
+                .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
+                .map(ToString::to_string)
+        })
+}
+
+/// Ensures the `local` and `remote` DNS servers the China DNS rules reference actually exist,
+/// adding the canonical definitions when they are missing.
+fn ensure_china_ip_routing_dns_servers(root: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let selector_tag = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
+    let dns = root
+        .entry("dns")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config dns must be an object")?;
+    let servers = dns
+        .entry("servers")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.servers must be an array")?;
+    if !servers
+        .iter()
+        .any(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_LOCAL_DNS_TAG))
+    {
+        servers.push(json!({
+            "type": "tls",
+            "tag": DEFAULT_LOCAL_DNS_TAG,
+            "server": "223.5.5.5",
+            "server_port": 853,
+        }));
+    }
+    if !servers
+        .iter()
+        .any(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG))
+    {
+        let mut server = json!({
+            "type": "tls",
+            "tag": DEFAULT_REMOTE_DNS_TAG,
+            "server": "8.8.8.8",
+            "server_port": 853,
+        });
+        if let Some(selector_tag) = selector_tag {
+            server
+                .as_object_mut()
+                .expect("DNS server is an object")
+                .insert("detour".to_string(), Value::String(selector_tag));
+        }
+        servers.push(server);
+    }
+    Ok(())
+}
+
+const RULE_MATCHER_FIELDS: &[&str] = &[
+    "rule_set",
+    "rules",
+    "domain",
+    "domain_suffix",
+    "domain_keyword",
+    "domain_regex",
+    "ip_cidr",
+    "ip_is_private",
+    "source_ip_cidr",
+    "source_ip_is_private",
+    "port",
+    "source_port",
+    "network",
+    "protocol",
+    "process_name",
+    "process_path",
+    "clash_mode",
+    "inbound",
+    "geosite",
+    "geoip",
+    "query_type",
+];
+
+fn object_has_any_matcher(object: &serde_json::Map<String, Value>) -> bool {
+    RULE_MATCHER_FIELDS
+        .iter()
+        .any(|field| match object.get(*field) {
+            Some(Value::Array(items)) => !items.is_empty(),
+            Some(_) => true,
+            None => false,
+        })
+}
+
+fn strip_rule_set_tags(rule: &mut Value, tags: &[&str]) {
+    let Some(object) = rule.as_object_mut() else {
+        return;
+    };
+    let Some(rule_set) = object.get_mut("rule_set") else {
+        return;
+    };
+    match rule_set {
+        Value::String(tag) if tags.contains(&tag.as_str()) => {
+            object.remove("rule_set");
+        }
+        Value::Array(items) => {
+            items.retain(|item| !item.as_str().is_some_and(|tag| tags.contains(&tag)));
+            if items.is_empty() {
+                object.remove("rule_set");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Removes the China rule-set tags from a route rule while keeping unrelated matchers. Returns
+/// true when the rule is left with no matcher and must be dropped (a matcher-less rule would
+/// match everything).
+fn strip_china_ip_routing_from_route_rule(rule: &mut Value) -> bool {
+    strip_rule_set_tags(rule, china_ip_routing_route_rule_tags());
+    rule.as_object()
+        .is_none_or(|object| !object_has_any_matcher(object))
+}
+
+/// Removes the China rule-set tags from a DNS rule, including nested logical rules. Returns true
+/// when the rule must be dropped.
+fn strip_china_ip_routing_from_dns_rule(rule: &mut Value) -> bool {
+    strip_rule_set_tags(rule, china_ip_routing_rule_set_tags());
+    if let Some(object) = rule.as_object_mut()
+        && let Some(Value::Array(nested)) = object.get_mut("rules")
+    {
+        nested.retain(|nested| {
+            !nested
+                .get("rule_set")
+                .and_then(Value::as_str)
+                .is_some_and(|tag| china_ip_routing_rule_set_tags().contains(&tag))
+        });
+        if nested.is_empty() {
+            object.remove("rules");
+        }
+    }
+    rule.as_object()
+        .is_none_or(|object| !object_has_any_matcher(object))
+}
+
+fn ensure_china_ip_routing(config: &mut Value, enable: bool, ruleset_dir: &Path) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+
+    // Resolve the direct outbound up front so a missing one is rejected before any mutation.
+    let direct_tag = if enable {
+        root.get("outbounds")
+            .and_then(Value::as_array)
+            .and_then(|outbounds| existing_direct_outbound_tag(outbounds))
+            .context("cannot enable China IP routing: no direct outbound in the config")?
+    } else {
+        String::new()
+    };
+
+    {
+        let route = root
+            .entry("route")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("existing config route must be an object")?;
+
+        let rule_sets = route
+            .entry("rule_set")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("existing config route.rule_set must be an array")?;
+        rule_sets.retain(|rule_set| {
+            !china_ip_routing_rule_set_tags().contains(
+                &rule_set
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        });
+        if enable {
+            rule_sets.extend(china_ip_routing_local_rule_sets(ruleset_dir));
+        }
+
+        let rules = route
+            .entry("rules")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("existing config route.rules must be an array")?;
+        rules.retain_mut(|rule| !strip_china_ip_routing_from_route_rule(rule));
+        if enable {
+            let route_rules = china_ip_routing_route_rules(&direct_tag);
+            let index = clash_mode_rule_insert_index(rules);
+            for (offset, rule) in route_rules.into_iter().enumerate() {
+                rules.insert(index + offset, rule);
+            }
+        }
+    }
+
+    if enable {
+        ensure_china_ip_routing_dns_servers(root)?;
+    }
+    let dns = root
+        .entry("dns")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config dns must be an object")?;
+    let dns_rule_values = dns
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.rules must be an array")?;
+    dns_rule_values.retain_mut(|rule| !strip_china_ip_routing_from_dns_rule(rule));
+    if enable {
+        let dns_rules = china_ip_routing_dns_rules();
+        let index = clash_mode_rule_insert_index(dns_rule_values);
+        for (offset, rule) in dns_rules.into_iter().enumerate() {
+            dns_rule_values.insert(index + offset, rule);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn ensure_hillstone_route_table(
     config: &mut Value,
@@ -658,31 +1094,7 @@ pub(crate) fn build_default_config_with_options(
         }),
     ];
     if options.include_geosite_rules {
-        dns_rules.extend([
-            json!({
-                "rule_set": "geosite-cn",
-                "server": DEFAULT_LOCAL_DNS_TAG,
-            }),
-            json!({
-                "rule_set": "geosite-geolocation-cn",
-                "server": DEFAULT_LOCAL_DNS_TAG,
-            }),
-            json!({
-                "type": "logical",
-                "mode": "and",
-                "rules": [
-                    {
-                        "rule_set": "geosite-geolocation-!cn",
-                        "invert": true,
-                    },
-                    {
-                        "rule_set": "geoip-cn",
-                    }
-                ],
-                "server": DEFAULT_REMOTE_DNS_TAG,
-                "client_subnet": "114.114.114.114/24",
-            }),
-        ]);
+        dns_rules.extend(china_ip_routing_dns_rules());
     }
     dns_rules.push(json!({
         "clash_mode": "规则",
@@ -734,24 +1146,11 @@ pub(crate) fn build_default_config_with_options(
         }),
     ];
     if options.include_geosite_rules {
-        route_rules.extend([
-            json!({
-                "rule_set": "geoip-cn",
-                "outbound": DEFAULT_DIRECT_TAG,
-            }),
-            json!({
-                "rule_set": "geosite-cn",
-                "outbound": DEFAULT_DIRECT_TAG,
-            }),
-            json!({
-                "rule_set": "geosite-geolocation-cn",
-                "outbound": DEFAULT_DIRECT_TAG,
-            }),
-            json!({
-                "rule_set": "AdGuardSDNSFilter",
-                "outbound": DEFAULT_AD_BLOCK_SELECTOR_TAG,
-            }),
-        ]);
+        route_rules.extend(china_ip_routing_route_rules(DEFAULT_DIRECT_TAG));
+        route_rules.push(json!({
+            "rule_set": "AdGuardSDNSFilter",
+            "outbound": DEFAULT_AD_BLOCK_SELECTOR_TAG,
+        }));
     }
     route_rules.push(json!({
         "clash_mode": "规则",
@@ -765,48 +1164,15 @@ pub(crate) fn build_default_config_with_options(
         "path": DEFAULT_BYPASS_RULE_SET_PATH,
     })];
     if options.include_geosite_rules {
-        route_rule_sets.extend([
-            json!({
-                "type": "remote",
-                "tag": "geoip-cn",
-                "format": "binary",
-                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
-                "download_detour": DEFAULT_DIRECT_TAG,
-                "update_interval": "30d",
-            }),
-            json!({
-                "type": "remote",
-                "tag": "geosite-cn",
-                "format": "binary",
-                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-                "download_detour": DEFAULT_DIRECT_TAG,
-                "update_interval": "30d",
-            }),
-            json!({
-                "type": "remote",
-                "tag": "geosite-geolocation-cn",
-                "format": "binary",
-                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-cn.srs",
-                "download_detour": DEFAULT_DIRECT_TAG,
-                "update_interval": "30d",
-            }),
-            json!({
-                "type": "remote",
-                "tag": "geosite-geolocation-!cn",
-                "format": "binary",
-                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-!cn.srs",
-                "download_detour": DEFAULT_DIRECT_TAG,
-                "update_interval": "30d",
-            }),
-            json!({
-                "type": "remote",
-                "tag": "AdGuardSDNSFilter",
-                "format": "binary",
-                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
-                "download_detour": DEFAULT_DIRECT_TAG,
-                "update_interval": "30d",
-            }),
-        ]);
+        route_rule_sets.extend(china_ip_routing_rule_sets(DEFAULT_DIRECT_TAG));
+        route_rule_sets.push(json!({
+            "type": "remote",
+            "tag": "AdGuardSDNSFilter",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs",
+            "download_detour": DEFAULT_DIRECT_TAG,
+            "update_interval": "30d",
+        }));
     }
 
     json!({
@@ -2145,11 +2511,11 @@ mod tests {
         DefaultConfigOptions, HillstoneRouteTableOptions, PRIVATE_ACCESS_SYSTEM_DNS_TAG,
         PrivateAccessRouteTableOptions, ProviderNodeSet, build_default_config,
         build_default_config_with_options, build_full_config_with_provider_node_sets,
-        config_has_internet_tun_inbound, default_tun_inbound,
+        config_has_china_ip_routing, config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
         ensure_private_access_route_table, merge_into_existing_config,
         run_private_access_route_table_config, run_private_access_tun_baseline_config,
-        set_internet_tun_mode,
+        set_china_ip_routing, set_internet_tun_mode,
     };
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
@@ -3489,6 +3855,270 @@ mod tests {
         assert!(set_internet_tun_mode(&path, false).expect("disables"));
         assert!(!config_has_internet_tun_inbound(&path).expect("detects after disable"));
         assert!(!set_internet_tun_mode(&path, false).expect("disables idempotently"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_adds_and_removes_rules_idempotently() {
+        let path = temp_config_path("china-ip-routing-toggle");
+        let base = json!({
+            "inbounds": [{
+                "type": "mixed",
+                "listen": "::",
+                "listen_port": 6780,
+                "set_system_proxy": false
+            }],
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "dns": {
+                "servers": [
+                    { "type": "tls", "tag": "remote", "server": "8.8.8.8" },
+                    { "type": "tls", "tag": "local", "server": "223.5.5.5" }
+                ],
+                "rules": [
+                    { "clash_mode": "全局", "server": "remote" },
+                    { "clash_mode": "直连", "server": "local" },
+                    { "clash_mode": "规则", "server": "remote" }
+                ]
+            },
+            "route": {
+                "rules": [
+                    { "action": "hijack-dns" },
+                    { "clash_mode": "直连", "outbound": "国内直连" },
+                    { "clash_mode": "全局", "outbound": "手动选择" },
+                    { "ip_is_private": true, "outbound": "国内直连" },
+                    { "clash_mode": "规则", "outbound": "手动选择" }
+                ],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        assert!(!config_has_china_ip_routing(&path).expect("detects"));
+
+        assert!(set_china_ip_routing(&path, true).expect("enables"));
+        assert!(config_has_china_ip_routing(&path).expect("detects after enable"));
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let rule_set_tags = enabled["route"]["rule_set"]
+            .as_array()
+            .expect("rule sets")
+            .iter()
+            .filter_map(|value| value["tag"].as_str())
+            .collect::<Vec<_>>();
+        for tag in [
+            "geoip-cn",
+            "geosite-cn",
+            "geosite-geolocation-cn",
+            "geosite-geolocation-!cn",
+        ] {
+            assert!(rule_set_tags.contains(&tag), "missing rule-set {tag}");
+        }
+        assert!(!rule_set_tags.contains(&"AdGuardSDNSFilter"));
+        // Rule-sets are local (pre-downloaded) binary files, never remote, so startup does not
+        // depend on reaching the download URL.
+        let rule_sets = enabled["route"]["rule_set"].as_array().expect("rule sets");
+        for rule_set in rule_sets {
+            if rule_set_tags.contains(&rule_set["tag"].as_str().unwrap_or_default()) {
+                assert_eq!(rule_set["type"], "local");
+                assert_eq!(rule_set["format"], "binary");
+                assert!(rule_set.get("path").is_some());
+                assert!(rule_set.get("url").is_none());
+            }
+        }
+        // China route rule is inserted before the 规则 catch-all, not after it.
+        let route_rules = enabled["route"]["rules"].as_array().expect("route rules");
+        let final_rule = route_rules.last().expect("route rules");
+        assert_eq!(final_rule["clash_mode"], "规则");
+
+        // Enabling again is a no-op.
+        assert!(!set_china_ip_routing(&path, true).expect("enables idempotently"));
+
+        assert!(set_china_ip_routing(&path, false).expect("disables"));
+        assert!(!config_has_china_ip_routing(&path).expect("detects after disable"));
+        assert!(!set_china_ip_routing(&path, false).expect("disables idempotently"));
+        let disabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let rule_set_tags = disabled["route"]["rule_set"]
+            .as_array()
+            .expect("rule sets")
+            .iter()
+            .filter_map(|value| value["tag"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!rule_set_tags.contains(&"geoip-cn"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_rejects_when_no_direct_outbound_exists() {
+        let path = temp_config_path("china-ip-routing-no-direct");
+        let base = json!({
+            "outbounds": [{ "type": "selector", "tag": "手动选择", "outbounds": [] }],
+            "route": { "rules": [], "rule_set": [] }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        let error = set_china_ip_routing(&path, true).expect_err("rejects without direct");
+        assert!(error.to_string().contains("direct outbound"));
+
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert_eq!(after, base, "config must be left unchanged on rejection");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_uses_custom_direct_outbound_tag() {
+        let path = temp_config_path("china-ip-routing-custom-direct");
+        let base = json!({
+            "outbounds": [{ "type": "direct", "tag": "bypass" }],
+            "route": {
+                "rules": [{ "clash_mode": "规则", "outbound": "bypass" }],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let geoip_rule = enabled["route"]["rules"]
+            .as_array()
+            .expect("route rules")
+            .iter()
+            .find(|rule| rule["rule_set"] == "geoip-cn")
+            .expect("geoip route rule");
+        assert_eq!(geoip_rule["outbound"], "bypass");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_adds_missing_dns_servers() {
+        let path = temp_config_path("china-ip-routing-dns-servers");
+        let base = json!({
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "route": {
+                "rules": [{ "clash_mode": "规则", "outbound": "手动选择" }],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let dns_tags = enabled["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .filter_map(|server| server["tag"].as_str())
+            .collect::<Vec<_>>();
+        assert!(dns_tags.contains(&"local"));
+        assert!(dns_tags.contains(&"remote"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_preserves_unrelated_rule_set_members() {
+        let path = temp_config_path("china-ip-routing-compound-rule");
+        let base = json!({
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "route": {
+                "rules": [
+                    { "rule_set": ["geosite-cn", "custom-corporate"], "outbound": "国内直连" },
+                    { "clash_mode": "规则", "outbound": "手动选择" }
+                ],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        set_china_ip_routing(&path, false).expect("disables");
+        let disabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let rules = disabled["route"]["rules"].as_array().expect("route rules");
+        let compound = rules
+            .iter()
+            .find(|rule| rule["rule_set"].is_array())
+            .expect("compound rule survives");
+        assert_eq!(compound["rule_set"], json!(["custom-corporate"]));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_keeps_english_global_mode_ahead_of_china_rules() {
+        let path = temp_config_path("china-ip-routing-english-modes");
+        let base = json!({
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": {
+                "rules": [
+                    { "clash_mode": "Direct", "outbound": "direct" },
+                    { "clash_mode": "Global", "outbound": "select" },
+                    { "clash_mode": "Rule", "outbound": "select" }
+                ],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let rules = enabled["route"]["rules"].as_array().expect("route rules");
+        let geoip_index = rules
+            .iter()
+            .position(|rule| rule["rule_set"] == "geoip-cn")
+            .expect("geoip rule present");
+        let global_index = rules
+            .iter()
+            .position(|rule| rule["clash_mode"] == "Global")
+            .expect("global rule present");
+        assert!(
+            geoip_index > global_index,
+            "China rules must come after the global-mode override"
+        );
 
         let _ = fs::remove_file(path);
     }

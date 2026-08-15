@@ -34,9 +34,9 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::config::{
-    PrivateAccessRouteTableOptions, config_has_internet_tun_inbound,
-    run_private_access_route_table_config, run_private_access_tun_baseline_config,
-    set_internet_tun_mode,
+    PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
+    config_has_internet_tun_inbound, run_private_access_route_table_config,
+    run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
 };
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkResult,
@@ -54,6 +54,7 @@ use crate::private_access::{
     PrivateAccessServiceManifest, PrivateAccessState, default_hillstone_manifest,
     default_sonicwall_manifest, load_private_access_manifest,
 };
+use crate::ruleset::download_china_ip_routing_rulesets;
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
 };
@@ -97,6 +98,7 @@ const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::AutoPickThresholdMs,
     SettingsField::AutoPickIntervalSec,
     SettingsField::SystemProxyServer,
+    SettingsField::ChinaIpRouting,
     SettingsField::PrivateAccessProfile,
     SettingsField::PrivateAccessManifestPath,
     SettingsField::PrivateAccessMode,
@@ -2089,6 +2091,7 @@ fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
         SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
         SettingsField::SystemProxyServer => "System proxy server",
+        SettingsField::ChinaIpRouting => "China IP routing",
         SettingsField::PrivateAccessProfile => "Private Access profile",
         SettingsField::PrivateAccessManifestPath => "Private Access service manifest",
         SettingsField::PrivateAccessMode => "Private Access mode",
@@ -2113,6 +2116,7 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
         SettingsField::SystemProxyServer => app.system_proxy_server.clone(),
+        SettingsField::ChinaIpRouting => app.china_ip_routing_enabled.to_string(),
         SettingsField::PrivateAccessProfile => app
             .private_access
             .focused_opt()
@@ -4194,6 +4198,7 @@ enum SettingsField {
     AutoPickThresholdMs,
     AutoPickIntervalSec,
     SystemProxyServer,
+    ChinaIpRouting,
     PrivateAccessProfile,
     PrivateAccessManifestPath,
     PrivateAccessMode,
@@ -4341,6 +4346,8 @@ struct App {
     tun_enabled: bool,
     tun_explicit: bool,
     tun_toggle_job: Option<TunToggleJob>,
+    china_ip_routing_enabled: bool,
+    china_ip_routing_explicit: bool,
     verify_job: Option<VerifyJob>,
     sing_box: SingBoxProcessRuntime,
     private_access: PrivateAccessRuntime,
@@ -5036,6 +5043,8 @@ impl App {
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
         let tun_enabled =
             config_has_internet_tun_inbound(&system_proxy_config_path).unwrap_or(false);
+        let china_ip_routing_enabled =
+            config_has_china_ip_routing(&system_proxy_config_path).unwrap_or(false);
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let mut app = Self {
@@ -5104,6 +5113,8 @@ impl App {
             tun_enabled,
             tun_explicit: false,
             tun_toggle_job: None,
+            china_ip_routing_enabled,
+            china_ip_routing_explicit: false,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(sing_box_executable, keep_sing_box_running),
             private_access: PrivateAccessRuntime::new()?,
@@ -5113,6 +5124,7 @@ impl App {
         app.apply_runtime_state(runtime_state.clone())?;
         if manage_sing_box {
             app.reconcile_persisted_tun_mode()?;
+            app.reconcile_persisted_china_ip_routing()?;
             app.ensure_private_access_tun_baseline()?;
             app.authorize_tun_elevation_if_needed()?;
             app.start_managed_sing_box()?;
@@ -5164,6 +5176,23 @@ impl App {
             config_has_internet_tun_inbound(&self.system_proxy_config_path).unwrap_or(false);
         if in_config != self.tun_enabled {
             set_internet_tun_mode(&self.system_proxy_config_path, self.tun_enabled)?;
+        }
+        Ok(())
+    }
+
+    /// Re-applies an explicit China IP routing choice to the config when it drifted, e.g. after a
+    /// subscription refresh regenerated the config without the geoip/geosite rule-sets.
+    fn reconcile_persisted_china_ip_routing(&self) -> Result<()> {
+        if !self.china_ip_routing_explicit || !self.system_proxy_config_path.exists() {
+            return Ok(());
+        }
+        let in_config =
+            config_has_china_ip_routing(&self.system_proxy_config_path).unwrap_or(false);
+        if in_config != self.china_ip_routing_enabled {
+            set_china_ip_routing(
+                &self.system_proxy_config_path,
+                self.china_ip_routing_enabled,
+            )?;
         }
         Ok(())
     }
@@ -5230,6 +5259,10 @@ impl App {
         if let Some(value) = state.tun_enabled {
             self.tun_enabled = value;
             self.tun_explicit = true;
+        }
+        if let Some(value) = state.china_ip_routing_enabled {
+            self.china_ip_routing_enabled = value;
+            self.china_ip_routing_explicit = true;
         }
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
@@ -5323,6 +5356,9 @@ impl App {
             system_proxy_server: Some(self.system_proxy_server.clone()),
             system_proxy_server_override: self.system_proxy_server_override,
             tun_enabled: self.tun_explicit.then_some(self.tun_enabled),
+            china_ip_routing_enabled: self
+                .china_ip_routing_explicit
+                .then_some(self.china_ip_routing_enabled),
             private_access_profiles: self.private_access.runtime_states(),
         }
     }
@@ -6544,6 +6580,42 @@ impl App {
                 }
                 self.system_proxy_server = value.to_string();
                 self.system_proxy_server_override = true;
+            }
+            SettingsField::ChinaIpRouting => {
+                let enable = parse_bool_setting(value)?;
+                if enable {
+                    let ruleset_dir = china_ip_routing_ruleset_dir(&self.system_proxy_config_path);
+                    let proxy_server = self.system_proxy_server.clone();
+                    self.client
+                        .runtime
+                        .block_on(download_china_ip_routing_rulesets(
+                            Some(&proxy_server),
+                            &ruleset_dir,
+                        ))?;
+                }
+                let changed = set_china_ip_routing(&self.system_proxy_config_path, enable)?;
+                self.china_ip_routing_enabled = enable;
+                self.china_ip_routing_explicit = true;
+                self.save_runtime_state()?;
+                if changed {
+                    self.restart_managed_sing_box()?;
+                    let label = if enable { "enabled" } else { "disabled" };
+                    match self.wait_for_controller_ready() {
+                        Ok(()) => self.set_status_with_flash(format!(
+                            "China IP routing {label}; sing-box restarted"
+                        )),
+                        Err(error) => self.set_status_with_flash(format!(
+                            "China IP routing {label}; controller not ready: {}",
+                            truncate_for_width(&format!("{error:#}"), 60)
+                        )),
+                    }
+                } else {
+                    self.set_status_with_flash(format!(
+                        "China IP routing already {}",
+                        if enable { "enabled" } else { "disabled" }
+                    ));
+                }
+                return Ok(());
             }
             SettingsField::PrivateAccessProfile => {
                 self.private_access.set_focus_by_id(value)?;
@@ -9305,6 +9377,8 @@ mod tests {
             tun_enabled: false,
             tun_explicit: false,
             tun_toggle_job: None,
+            china_ip_routing_enabled: false,
+            china_ip_routing_explicit: false,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(PathBuf::from("sing-box"), false),
             private_access: PrivateAccessRuntime::with_default_hillstone()
@@ -9385,6 +9459,35 @@ mod tests {
 
         assert!(app.tun_enabled);
         assert!(app.tun_explicit);
+    }
+
+    #[test]
+    fn apply_runtime_state_restores_explicit_china_ip_routing_intent() {
+        let mut app = test_app();
+        app.apply_runtime_state(TuiRuntimeState {
+            china_ip_routing_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        })
+        .expect("state applies");
+
+        assert!(app.china_ip_routing_enabled);
+        assert!(app.china_ip_routing_explicit);
+    }
+
+    #[test]
+    fn china_ip_routing_settings_field_reflects_enabled_state() {
+        let mut app = test_app();
+        assert_eq!(
+            settings_field_value(&app, SettingsField::ChinaIpRouting),
+            "false"
+        );
+
+        app.china_ip_routing_enabled = true;
+        assert_eq!(
+            settings_field_value(&app, SettingsField::ChinaIpRouting),
+            "true"
+        );
+        assert!(visible_settings_fields(&app).contains(&SettingsField::ChinaIpRouting));
     }
 
     fn line_text(line: ratatui::text::Line<'_>) -> String {
