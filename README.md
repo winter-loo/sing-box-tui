@@ -532,6 +532,7 @@ Detached auto-pick worker commands are available separately:
 - `b`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
 - `B`: exit the TUI while keeping the managed sing-box process, auto-pick background worker, and active Private Access sessions running
 - `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
+- `\`: toggle the Internet Proxy TUN mode; adds or removes the sing-box `tun` inbound in the configured `config.json` and restarts the managed sing-box process. On macOS/Linux this needs `sudo` (the TUI prompts with `sudo -v`); on Windows it needs an Administrator session.
 - `Enter`: unused for selection
 - `T`: asynchronously test latency for all nodes in the current selector/group using the current filter
 - `t`: asynchronously test latency for only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
@@ -669,6 +670,14 @@ scripts\windows\set-system-proxy.cmd -Disable
 System proxy is easier to toggle and works for applications that respect OS
 proxy settings. TUN mode captures more traffic but needs a sing-box config with
 a TUN inbound and usually requires higher system permissions.
+
+Press `\` in the TUI to toggle the Internet Proxy TUN mode. It adds or removes
+the sing-box `tun` inbound (`tun-in`, `auto_route`/`strict_route`) in the
+configured config and restarts the managed sing-box process. Toggling TUN on
+requires `sudo` on macOS/Linux (the TUI runs `sudo -v` first) or an
+Administrator session on Windows, because sing-box must create a network
+interface and change routes. For manual config edits, see
+[docs/tun-mode.md](docs/tun-mode.md).
 
 ### Why does the first-run wizard appear?
 

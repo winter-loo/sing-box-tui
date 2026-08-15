@@ -292,6 +292,78 @@ pub(crate) fn run_private_access_tun_baseline_config(
     Ok(changed)
 }
 
+pub(crate) fn default_tun_inbound() -> Value {
+    json!({
+        "type": "tun",
+        "tag": "tun-in",
+        "address": [
+            "172.19.0.1/30",
+            "2001:470:f9da:fdfa::1/64"
+        ],
+        "mtu": 9000,
+        "auto_route": true,
+        "strict_route": true,
+        "stack": "mixed",
+        "endpoint_independent_nat": true,
+    })
+}
+
+/// Reports whether the sing-box config already contains an Internet Proxy TUN inbound.
+///
+/// This is the sing-box `tun` inbound (system traffic capture) managed by the TUI's
+/// Internet Proxy TUN toggle, distinct from the Private Access TUN data-plane helper.
+pub(crate) fn config_has_internet_tun_inbound(config_path: &Path) -> Result<bool> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    Ok(config_has_tun_inbound(&config))
+}
+
+/// Adds or removes the Internet Proxy TUN inbound in the sing-box config, writing the
+/// result back in place when it changed. Returns whether the config was modified.
+pub(crate) fn set_internet_tun_mode(config_path: &Path, enable: bool) -> Result<bool> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut config: Value = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let original = config.clone();
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+    let inbounds = root
+        .entry("inbounds")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config inbounds must be an array")?;
+    if enable {
+        if !inbounds.iter().any(is_tun_inbound) {
+            inbounds.push(default_tun_inbound());
+        }
+    } else {
+        inbounds.retain(|inbound| !is_tun_inbound(inbound));
+    }
+    let changed = config != original;
+    if changed {
+        let contents =
+            serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
+        fs::write(config_path, format!("{contents}\n"))
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    Ok(changed)
+}
+
+fn config_has_tun_inbound(config: &Value) -> bool {
+    config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|inbounds| inbounds.iter().any(is_tun_inbound))
+}
+
+fn is_tun_inbound(inbound: &Value) -> bool {
+    inbound.get("type").and_then(Value::as_str) == Some("tun")
+}
+
 #[cfg(test)]
 pub(crate) fn ensure_hillstone_route_table(
     config: &mut Value,
@@ -541,19 +613,7 @@ pub(crate) fn build_default_config_with_options(
         "set_system_proxy": false,
     })];
     if options.include_tun_mode {
-        inbounds.push(json!({
-            "type": "tun",
-            "tag": "tun-in",
-            "address": [
-                "172.19.0.1/30",
-                "2001:470:f9da:fdfa::1/64"
-            ],
-            "mtu": 9000,
-            "auto_route": true,
-            "strict_route": true,
-            "stack": "mixed",
-            "endpoint_independent_nat": true,
-        }));
+        inbounds.push(default_tun_inbound());
     }
 
     let mut outbounds = Vec::with_capacity(imported_nodes.len() + 5);
@@ -2085,9 +2145,11 @@ mod tests {
         DefaultConfigOptions, HillstoneRouteTableOptions, PRIVATE_ACCESS_SYSTEM_DNS_TAG,
         PrivateAccessRouteTableOptions, ProviderNodeSet, build_default_config,
         build_default_config_with_options, build_full_config_with_provider_node_sets,
+        config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
         ensure_private_access_route_table, merge_into_existing_config,
         run_private_access_route_table_config, run_private_access_tun_baseline_config,
+        set_internet_tun_mode,
     };
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
@@ -3366,6 +3428,69 @@ mod tests {
             "action": "sniff",
             "timeout": "1s"
         })));
+    }
+
+    #[test]
+    fn default_tun_inbound_is_a_tun_inbound_with_auto_route() {
+        let inbound = default_tun_inbound();
+        assert_eq!(inbound["type"], "tun");
+        assert_eq!(inbound["tag"], "tun-in");
+        assert_eq!(inbound["auto_route"], true);
+        assert_eq!(inbound["strict_route"], true);
+        assert_eq!(inbound["stack"], "mixed");
+    }
+
+    #[test]
+    fn set_internet_tun_mode_adds_and_removes_tun_inbound_idempotently() {
+        let path = temp_config_path("internet-tun-toggle");
+        let base = json!({
+            "inbounds": [{
+                "type": "mixed",
+                "listen": "::",
+                "listen_port": 6780,
+                "set_system_proxy": false
+            }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }]
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        assert!(!config_has_internet_tun_inbound(&path).expect("detects"));
+
+        assert!(set_internet_tun_mode(&path, true).expect("enables"));
+        assert!(config_has_internet_tun_inbound(&path).expect("detects after enable"));
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert_eq!(
+            enabled["inbounds"]
+                .as_array()
+                .expect("inbounds array")
+                .iter()
+                .filter(|value| value["type"] == "tun")
+                .count(),
+            1
+        );
+
+        // Enabling again is a no-op and keeps the mixed inbound.
+        assert!(!set_internet_tun_mode(&path, true).expect("enables idempotently"));
+        let again: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert!(
+            again["inbounds"]
+                .as_array()
+                .expect("inbounds array")
+                .iter()
+                .any(|value| value["type"] == "mixed")
+        );
+
+        assert!(set_internet_tun_mode(&path, false).expect("disables"));
+        assert!(!config_has_internet_tun_inbound(&path).expect("detects after disable"));
+        assert!(!set_internet_tun_mode(&path, false).expect("disables idempotently"));
+
+        let _ = fs::remove_file(path);
     }
 
     fn value_references(value: &Value, needle: &str) -> bool {

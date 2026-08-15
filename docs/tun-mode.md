@@ -2,6 +2,24 @@
 
 This note documents the process for enabling TUN mode in a sing-box config.
 
+## Toggling TUN from the TUI
+
+When the TUI manages sing-box (`sing-box-tui run`), press `\` to toggle the
+Internet Proxy TUN mode without editing the config by hand:
+
+- It adds or removes a `tun` inbound (`tag: "tun-in"` with `auto_route`,
+  `strict_route`, and `stack: mixed`) in the configured `config.json`.
+- It restarts the managed sing-box process so the change takes effect.
+- Enabling TUN requires elevated permissions: on macOS/Linux the TUI runs
+  `sudo -v` first and then restarts sing-box through `sudo -n`; on Windows it
+  requires an Administrator session. Disabling TUN restarts sing-box normally.
+
+The TUI status bar shows whether TUN is currently enabled (`\` key). This is a
+different mechanism from the Private Access TUN data-plane helper, which is a
+separate root-run helper process for enterprise intranet access.
+
+The sections below cover the manual, config-file route.
+
 ## What TUN Mode Changes
 
 The current `./config.json` may only expose a local proxy listener such as:
