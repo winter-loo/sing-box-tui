@@ -3227,7 +3227,11 @@ fn stop_sing_box_pid_escalating(pid: u32) -> Result<()> {
     match stop_sing_box_pid(pid) {
         Ok(()) => Ok(()),
         Err(error) => {
-            if !process_exists(pid) {
+            // `process_exists` uses `kill -0`, which reports EPERM (and therefore false) for a
+            // root-owned process from a non-root user, so it cannot tell "already gone" apart from
+            // "still running but owned by root". Use `ps` instead, which lists processes regardless
+            // of ownership, so an elevated sing-box is still killed through sudo.
+            if !process_alive_via_ps(pid) {
                 return Ok(());
             }
             stop_sing_box_pid_sudo(pid).map_err(|_| error)
@@ -3653,6 +3657,22 @@ fn process_is_zombie(pid: u32) -> bool {
     String::from_utf8_lossy(&output.stdout)
         .trim_start()
         .starts_with('Z')
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_alive_via_ps(pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    else {
+        // Cannot inspect the process list; assume alive so the caller still attempts the kill.
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let stat = String::from_utf8_lossy(&output.stdout);
+    !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
 }
 
 #[cfg(windows)]
@@ -5094,6 +5114,7 @@ impl App {
         if manage_sing_box {
             app.reconcile_persisted_tun_mode()?;
             app.ensure_private_access_tun_baseline()?;
+            app.authorize_tun_elevation_if_needed()?;
             app.start_managed_sing_box()?;
             if let Err(error) = app.wait_for_controller_ready() {
                 let _ = app.shutdown_managed_sing_box();
@@ -5143,6 +5164,26 @@ impl App {
             config_has_internet_tun_inbound(&self.system_proxy_config_path).unwrap_or(false);
         if in_config != self.tun_enabled {
             set_internet_tun_mode(&self.system_proxy_config_path, self.tun_enabled)?;
+        }
+        Ok(())
+    }
+
+    /// Prompts for sudo credentials before the first elevated sing-box restart. `start_managed_sing_box`
+    /// uses `sudo -n`, which never prompts, so a config that already has a TUN inbound would fail to
+    /// launch sing-box once the cached sudo timestamp expires. Running `sudo -v` here re-authorizes
+    /// interactively while the terminal is still in its normal (non-raw) mode.
+    fn authorize_tun_elevation_if_needed(&self) -> Result<()> {
+        if !self.tun_enabled || !tun_helper_needs_sudo() {
+            return Ok(());
+        }
+        let status = Command::new("sudo")
+            .arg("-v")
+            .status()
+            .context("failed to start sudo authorization for TUN mode")?;
+        if !status.success() {
+            bail!(
+                "sudo authorization failed ({status}); TUN mode needs an elevated sing-box process"
+            );
         }
         Ok(())
     }
@@ -11849,6 +11890,11 @@ mod tests {
     #[test]
     fn process_exists_recognizes_current_process() {
         assert!(super::process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn process_alive_via_ps_recognizes_current_process() {
+        assert!(super::process_alive_via_ps(std::process::id()));
     }
 
     #[test]
