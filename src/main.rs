@@ -45,6 +45,7 @@ fn main() -> Result<()> {
             subscription_input,
             subscription_cache,
             subscription_config_path,
+            sing_box_executable,
             subscription_refresh_disabled,
             force_subscription_refresh,
             include_geosite_rules,
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
                 run_tui(
                     controller,
                     max_concurrency,
+                    sing_box_executable,
                     keep_sing_box_running,
                     subscription_options,
                 )
