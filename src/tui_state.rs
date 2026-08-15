@@ -79,6 +79,8 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) china_ip_routing_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tun_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) private_access_profiles: Vec<PrivateAccessProfileState>,
@@ -286,6 +288,21 @@ mod tests {
         let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
 
         assert!(restored.private_access_profiles[0].use_internet_proxy);
+    }
+
+    #[test]
+    fn china_ip_routing_enabled_is_omitted_when_unset_and_persists_when_set() {
+        let state = TuiRuntimeState::default();
+        let value = serde_json::to_value(&state).expect("serializes");
+        assert!(value.get("china_ip_routing_enabled").is_none());
+
+        let state = TuiRuntimeState {
+            china_ip_routing_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+        assert_eq!(restored.china_ip_routing_enabled, Some(true));
     }
 
     #[test]
