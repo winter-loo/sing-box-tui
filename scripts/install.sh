@@ -497,7 +497,7 @@ download_range_part() {
   headers=$part_file.headers
   status_file=$part_file.status
   rm -f "$part_file" "$headers" "$status_file"
-  curl -fLsS \
+  curl -LsS \
     --connect-timeout "$DOWNLOAD_STALL_TIMEOUT_SEC" \
     --max-time "$DOWNLOAD_TIMEOUT_SEC" \
     --speed-limit 1 \

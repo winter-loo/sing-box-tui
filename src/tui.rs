@@ -3251,12 +3251,39 @@ fn command_program_name_matches(program: &str, expected: &str) -> bool {
             .is_some_and(|base| name.eq_ignore_ascii_case(base))
 }
 
+fn command_args_for_executable(command: &str, executable: &Path) -> Vec<String> {
+    let expected_program = executable
+        .file_name()
+        .unwrap_or(executable.as_os_str())
+        .to_string_lossy();
+    let mut prefixes = vec![
+        executable.to_string_lossy().to_string(),
+        expected_program.to_string(),
+    ];
+    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+    prefixes.dedup();
+
+    for prefix in prefixes {
+        let Some(rest) = command.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let mut args = vec![prefix];
+        args.extend(command_tokens(rest.trim_start()));
+        return args;
+    }
+
+    command_tokens(command)
+}
+
 fn command_matches_sing_box_run_for_config(
     command: &str,
     executable: &Path,
     config_path: &Path,
 ) -> bool {
-    let args = command_tokens(command);
+    let args = command_args_for_executable(command, executable);
     if args.len() < 3 {
         return false;
     }
@@ -9318,6 +9345,12 @@ mod tests {
         assert!(command_matches_sing_box_run_for_config(
             "/opt/vendor/proxy-core run -c ./config.json",
             &executable,
+            &config
+        ));
+        let executable_with_space = PathBuf::from("/tmp/review path/proxy-core");
+        assert!(command_matches_sing_box_run_for_config(
+            "/tmp/review path/proxy-core run -c ./config.json",
+            &executable_with_space,
             &config
         ));
         assert!(!command_matches_sing_box_run_for_config(

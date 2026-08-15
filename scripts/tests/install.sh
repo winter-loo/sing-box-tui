@@ -39,6 +39,7 @@ output=
 headers=
 write_out=
 range=
+fail_on_http_error=0
 url=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -53,7 +54,10 @@ while [ "$#" -gt 0 ]; do
         --range) range=$value ;;
       esac
       ;;
-    -*) shift ;;
+    -*)
+      case "$1" in *f*) fail_on_http_error=1 ;; esac
+      shift
+      ;;
     *) url=$1; shift ;;
   esac
 done
@@ -111,6 +115,9 @@ if [ -n "$headers" ]; then
   } > "$headers"
 fi
 [ -z "$write_out" ] || printf '%s' "$status"
+if [ "$fail_on_http_error" -eq 1 ] && [ "$status" -ge 400 ]; then
+  exit 22
+fi
 EOF
 chmod 755 "$TEST_ROOT/bin/curl"
 
