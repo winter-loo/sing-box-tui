@@ -34,8 +34,9 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::config::{
-    PrivateAccessRouteTableOptions, run_private_access_route_table_config,
-    run_private_access_tun_baseline_config,
+    PrivateAccessRouteTableOptions, config_has_internet_tun_inbound,
+    run_private_access_route_table_config, run_private_access_tun_baseline_config,
+    set_internet_tun_mode,
 };
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkResult,
@@ -811,6 +812,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_benchmark_updates()?;
         app.poll_subscription_refresh_updates()?;
         app.poll_system_proxy_updates();
+        app.poll_tun_toggle_updates();
         app.poll_private_access_updates()?;
         app.poll_verify_updates();
         app.poll_background_auto_pick_status()?;
@@ -829,6 +831,10 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     && app.private_access_connect_needs_terminal_prompt()
                 {
                     connect_private_access_with_terminal_prompt(&mut terminal, app)?;
+                } else if matches!(key.code, KeyCode::Char('\\'))
+                    && app.tun_toggle_needs_terminal_prompt()
+                {
+                    toggle_tun_with_terminal_prompt(&mut terminal, app)?;
                 } else if !app.handle_key(key.code)? {
                     return Ok(());
                 }
@@ -840,12 +846,12 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     }
 }
 
-fn suspend_terminal_for_prompt(terminal: &mut DefaultTerminal) -> Result<()> {
+fn suspend_terminal_for_prompt(terminal: &mut DefaultTerminal, message: &str) -> Result<()> {
     terminal.show_cursor()?;
     restore_terminal()?;
     println!();
-    println!("Private Access needs macOS administrator authorization for its TUN helper.");
-    println!("Complete the sudo prompt below; the login form will resume immediately afterward.");
+    println!("{message}");
+    println!("Complete the sudo prompt below; the TUI will resume immediately afterward.");
     println!();
     Ok(())
 }
@@ -872,7 +878,10 @@ fn connect_private_access_with_terminal_prompt(
         "需要管理员权限创建 TUN 接口，正在预授权 sudo...".to_string(),
     );
     terminal.draw(|frame| draw(frame, app))?;
-    suspend_terminal_for_prompt(terminal)?;
+    suspend_terminal_for_prompt(
+        terminal,
+        "Private Access needs administrator authorization for its TUN helper.",
+    )?;
     let authorization = Command::new("sudo")
         .arg("-v")
         .status()
@@ -891,6 +900,28 @@ fn connect_private_access_with_terminal_prompt(
         "sudo 预授权成功，继续登录...".to_string(),
     );
     app.toggle_private_access()
+}
+
+fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    app.set_status_only("Enabling TUN mode needs administrator authorization...");
+    terminal.draw(|frame| draw(frame, app))?;
+    suspend_terminal_for_prompt(
+        terminal,
+        "TUN mode needs administrator authorization to create the network interface.",
+    )?;
+    let authorization = Command::new("sudo")
+        .arg("-v")
+        .status()
+        .context("failed to start sudo authorization for TUN mode");
+    let resume_result = resume_terminal_after_prompt(terminal);
+    resume_result?;
+    let status = authorization?;
+    if !status.success() {
+        app.set_status_with_flash(format!("TUN mode sudo authorization failed: {status}"));
+        return Ok(());
+    }
+    app.toggle_tun_mode();
+    Ok(())
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -1447,6 +1478,15 @@ fn status_lines(app: &App) -> Vec<Line<'_>> {
                     Color::DarkGray
                 }),
             ),
+            Span::styled("\\", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                " tun  ",
+                Style::default().fg(if app.tun_enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
             Span::styled("T/t", Style::default().fg(Color::Cyan)),
             Span::raw(" latency  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
@@ -1609,6 +1649,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         key: "p",
         summary: "Toggle system proxy",
         detail: "Enable or disable the OS system proxy for the detected sing-box mixed inbound.",
+    },
+    HelpBinding {
+        key: "\\",
+        summary: "Toggle TUN mode",
+        detail: "Add or remove the sing-box TUN inbound and restart sing-box to capture system traffic. Needs administrator/root privileges on macOS and Linux.",
     },
     HelpBinding {
         key: "u",
@@ -2999,6 +3044,7 @@ struct SingBoxRestartResult {
     restarted_pids: Vec<u32>,
     started_pid: u32,
     child: Child,
+    elevated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3011,13 +3057,15 @@ struct SingBoxRestartSummary {
 fn restart_sing_box_for_config(
     executable: &Path,
     config_path: &Path,
+    elevate: bool,
 ) -> Result<SingBoxRestartResult> {
     let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
     for pid in &pids {
-        stop_sing_box_pid(*pid)
+        stop_sing_box_pid_escalating(*pid)
             .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
     }
 
+    let use_sudo = elevate && tun_helper_needs_sudo();
     let log_path = sing_box_process_log_path(config_path);
     let log = OpenOptions::new()
         .create(true)
@@ -3030,10 +3078,8 @@ fn restart_sing_box_for_config(
             log_path.display()
         )
     })?;
-    let mut child = Command::new(executable)
-        .arg("run")
-        .arg("--config")
-        .arg(config_path)
+    let mut command = sing_box_run_command(executable, config_path, use_sudo);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
@@ -3045,7 +3091,14 @@ fn restart_sing_box_for_config(
                 config_path.display()
             )
         })?;
-    let started_pid = child.id();
+    // When elevated through sudo, the direct child is the sudo wrapper. Resolve the actual
+    // sing-box pid so shutdown can signal it directly (a root-owned process cannot be killed
+    // by a non-root TUI without going through sudo).
+    let started_pid = if use_sudo {
+        resolve_new_sing_box_pid(executable, config_path, &pids)?
+    } else {
+        child.id()
+    };
     std::thread::sleep(Duration::from_millis(500));
     if let Some(status) = child
         .try_wait()
@@ -3061,6 +3114,7 @@ fn restart_sing_box_for_config(
         restarted_pids: pids,
         started_pid,
         child,
+        elevated: use_sudo,
     })
 }
 
@@ -3068,6 +3122,7 @@ fn restart_sing_box_for_config(
 fn restart_sing_box_for_config(
     executable: &Path,
     config_path: &Path,
+    _elevate: bool,
 ) -> Result<SingBoxRestartResult> {
     let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
     for pid in &pids {
@@ -3118,6 +3173,7 @@ fn restart_sing_box_for_config(
         restarted_pids: pids,
         started_pid,
         child,
+        elevated: false,
     })
 }
 
@@ -3125,8 +3181,92 @@ fn restart_sing_box_for_config(
 fn restart_sing_box_for_config(
     _executable: &Path,
     _config_path: &Path,
+    _elevate: bool,
 ) -> Result<SingBoxRestartResult> {
     bail!("automatic sing-box restart is only available on Windows, macOS, and Linux")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sing_box_run_command(executable: &Path, config_path: &Path, use_sudo: bool) -> Command {
+    if use_sudo {
+        let mut command = Command::new("sudo");
+        command
+            .arg("-n")
+            .arg(executable)
+            .arg("run")
+            .arg("--config")
+            .arg(config_path);
+        command
+    } else {
+        let mut command = Command::new(executable);
+        command.arg("run").arg("--config").arg(config_path);
+        command
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_new_sing_box_pid(executable: &Path, config_path: &Path, exclude: &[u32]) -> Result<u32> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
+        if let Some(pid) = pids.iter().copied().find(|pid| !exclude.contains(pid)) {
+            return Ok(pid);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "sing-box did not appear in the process list after an elevated start; see {}",
+                sing_box_process_log_path(config_path).display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_sing_box_pid_escalating(pid: u32) -> Result<()> {
+    match stop_sing_box_pid(pid) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if !process_exists(pid) {
+                return Ok(());
+            }
+            stop_sing_box_pid_sudo(pid).map_err(|_| error)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_sing_box_pid_sudo(pid: u32) -> Result<()> {
+    let status = Command::new("sudo")
+        .args(["-n", "kill"])
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to stop elevated sing-box process {pid}"))?;
+    if !status.success() {
+        bail!("failed to stop elevated sing-box process {pid}: sudo kill exited with {status}");
+    }
+    if wait_for_processes_to_exit(&[pid]).is_ok() {
+        return Ok(());
+    }
+    let status = Command::new("sudo")
+        .args(["-n", "kill", "-9"])
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to force stop elevated sing-box process {pid}"))?;
+    if !status.success() {
+        bail!(
+            "failed to force stop elevated sing-box process {pid}: sudo kill -9 exited with {status}"
+        );
+    }
+    wait_for_processes_to_exit(&[pid])
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stop_sing_box_pid_escalating(pid: u32) -> Result<()> {
+    // Elevated restart is never requested outside macOS/Linux, so this just falls
+    // back to the platform stop path (taskkill on Windows). It keeps the elevated
+    // branch in `stop_managed_sing_box_process` compilable on every platform.
+    stop_sing_box_pid(pid)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4178,6 +4318,8 @@ struct App {
     system_proxy_enabled: bool,
     system_proxy_job: Option<SystemProxyJob>,
     last_system_proxy_status_refresh: Instant,
+    tun_enabled: bool,
+    tun_toggle_job: Option<TunToggleJob>,
     verify_job: Option<VerifyJob>,
     sing_box: SingBoxProcessRuntime,
     private_access: PrivateAccessRuntime,
@@ -4210,6 +4352,12 @@ struct SystemProxyJob {
     worker: JoinHandle<()>,
 }
 
+struct TunToggleJob {
+    enable: bool,
+    receiver: mpsc::Receiver<Result<String, String>>,
+    worker: JoinHandle<()>,
+}
+
 struct VerifyJob {
     receiver: mpsc::Receiver<VerificationReport>,
     worker: JoinHandle<()>,
@@ -4219,6 +4367,7 @@ struct SingBoxProcessRuntime {
     executable: PathBuf,
     managed_pid: Option<u32>,
     managed_child: Option<Child>,
+    elevated: bool,
     keep_running: bool,
 }
 
@@ -4228,6 +4377,7 @@ impl SingBoxProcessRuntime {
             executable,
             managed_pid: None,
             managed_child: None,
+            elevated: false,
             keep_running,
         }
     }
@@ -4863,6 +5013,8 @@ impl App {
             default_system_proxy_server(&subscription_refresh_options.config_path);
         let system_proxy_enabled = system_proxy_matches(&system_proxy_server);
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
+        let tun_enabled =
+            config_has_internet_tun_inbound(&system_proxy_config_path).unwrap_or(false);
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let mut app = Self {
@@ -4928,6 +5080,8 @@ impl App {
             system_proxy_enabled,
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            tun_enabled,
+            tun_toggle_job: None,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(sing_box_executable, keep_sing_box_running),
             private_access: PrivateAccessRuntime::new()?,
@@ -5938,6 +6092,7 @@ impl App {
             KeyCode::Char('b') => self.open_bypass_modal(),
             KeyCode::Char('B') => return self.keep_sing_box_running_in_background(),
             KeyCode::Char('p') => self.set_system_proxy(),
+            KeyCode::Char('\\') => self.toggle_tun_mode(),
             KeyCode::Char('i') => self.open_latency_chart()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.start_verify(),
@@ -7362,14 +7517,19 @@ impl App {
 
     fn restart_managed_sing_box(&mut self) -> Result<SingBoxRestartSummary> {
         self.stop_managed_sing_box_process()?;
-        let result =
-            restart_sing_box_for_config(&self.sing_box.executable, &self.system_proxy_config_path)?;
+        let elevate = self.tun_enabled;
+        let result = restart_sing_box_for_config(
+            &self.sing_box.executable,
+            &self.system_proxy_config_path,
+            elevate,
+        )?;
         let summary = SingBoxRestartSummary {
             restarted_pids: result.restarted_pids,
             started_pid: result.started_pid,
         };
         self.sing_box.managed_pid = Some(result.started_pid);
         self.sing_box.managed_child = Some(result.child);
+        self.sing_box.elevated = result.elevated;
         Ok(summary)
     }
 
@@ -7798,15 +7958,29 @@ impl App {
 
     fn stop_managed_sing_box_process(&mut self) -> Result<Option<u32>> {
         let pid = self.sing_box.managed_pid.take();
+        let elevated = self.sing_box.elevated;
+        self.sing_box.elevated = false;
         if let Some(mut child) = self.sing_box.managed_child.take() {
             let child_pid = child.id();
+            if elevated {
+                // Kill the root-owned sing-box first through sudo, then reap the sudo wrapper.
+                if let Some(pid) = pid {
+                    stop_sing_box_pid_escalating(pid)
+                        .with_context(|| format!("failed to stop elevated sing-box pid {pid}"))?;
+                }
+            }
             stop_sing_box_child(&mut child)
                 .with_context(|| format!("failed to stop managed sing-box pid {child_pid}"))?;
             return Ok(Some(child_pid));
         }
         if let Some(pid) = pid {
-            stop_sing_box_pid(pid)
-                .with_context(|| format!("failed to stop managed sing-box pid {pid}"))?;
+            if elevated {
+                stop_sing_box_pid_escalating(pid)
+                    .with_context(|| format!("failed to stop elevated sing-box pid {pid}"))?;
+            } else {
+                stop_sing_box_pid(pid)
+                    .with_context(|| format!("failed to stop managed sing-box pid {pid}"))?;
+            }
             return Ok(Some(pid));
         }
         Ok(None)
@@ -8661,6 +8835,92 @@ impl App {
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
     }
 
+    fn tun_toggle_needs_terminal_prompt(&self) -> bool {
+        self.tun_toggle_job.is_none() && !self.tun_enabled && tun_helper_needs_sudo()
+    }
+
+    fn toggle_tun_mode(&mut self) {
+        if self.tun_toggle_job.is_some() {
+            self.set_status_only("TUN mode update is already running");
+            return;
+        }
+        let enable = !self.tun_enabled;
+        let config_path = self.system_proxy_config_path.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = set_internet_tun_mode(&config_path, enable)
+                .map(|changed| {
+                    if changed {
+                        if enable {
+                            "enabled".to_string()
+                        } else {
+                            "disabled".to_string()
+                        }
+                    } else {
+                        format!("already {}", if enable { "enabled" } else { "disabled" })
+                    }
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.tun_toggle_job = Some(TunToggleJob {
+            enable,
+            receiver: rx,
+            worker,
+        });
+        if enable {
+            self.set_status_only("Enabling TUN mode...");
+        } else {
+            self.set_status_only("Disabling TUN mode...");
+        }
+    }
+
+    fn poll_tun_toggle_updates(&mut self) {
+        let Some(job) = self.tun_toggle_job.as_ref() else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("TUN mode worker disconnected".to_string()),
+        };
+        let job = self.tun_toggle_job.take().expect("TUN toggle job exists");
+        let _ = job.worker.join();
+        match result {
+            Ok(state) => {
+                self.tun_enabled = job.enable;
+                match self.restart_managed_sing_box() {
+                    Ok(summary) => {
+                        let restarted = format!(
+                            "sing-box restarted pid(s) {:?} -> {}",
+                            summary.restarted_pids, summary.started_pid
+                        );
+                        if let Err(error) = self.wait_for_controller_ready() {
+                            self.set_status_with_flash(format!(
+                                "TUN mode {state}; {restarted}; controller not ready: {}",
+                                truncate_for_width(&format!("{error:#}"), 60)
+                            ));
+                        } else {
+                            self.set_status_with_flash(format!("TUN mode {state}; {restarted}"));
+                        }
+                    }
+                    Err(error) => {
+                        self.set_status_with_flash(format!(
+                            "TUN mode {state} but sing-box restart failed: {}",
+                            truncate_for_width(&format!("{error:#}"), 70)
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                self.set_status_with_flash(format!(
+                    "TUN mode update failed: {}",
+                    truncate_for_width(&error, 90)
+                ));
+            }
+        }
+    }
+
     fn open_benchmark_filter_modal(&mut self) {
         self.filter_input = Some(self.benchmark_filter.clone());
         self.flash = None;
@@ -8966,6 +9226,8 @@ mod tests {
             system_proxy_enabled: false,
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            tun_enabled: false,
+            tun_toggle_job: None,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(PathBuf::from("sing-box"), false),
             private_access: PrivateAccessRuntime::with_default_hillstone()
@@ -8973,6 +9235,54 @@ mod tests {
             private_access_progress: None,
             private_access_auth: None,
         }
+    }
+
+    #[test]
+    fn tun_toggle_is_documented_in_help_and_key_bar() {
+        let app = test_app();
+        assert!(
+            super::HELP_BINDINGS
+                .iter()
+                .any(|binding| binding.key == "\\" && binding.summary == "Toggle TUN mode")
+        );
+        let key_bar = status_lines(&app)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(key_bar.contains(" tun "));
+    }
+
+    #[test]
+    fn backslash_toggles_tun_mode_against_the_config_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sing-box-tui-tun-toggle-{nanos}.json"));
+        std::fs::write(
+            &path,
+            r#"{"inbounds":[{"type":"mixed","listen":"::","listen_port":6780,"set_system_proxy":false}],"outbounds":[{"type":"direct","tag":"direct"}]}"#,
+        )
+        .expect("write temp config");
+
+        let mut app = test_app();
+        app.system_proxy_config_path = path.clone();
+        app.handle_key(KeyCode::Char('\\'))
+            .expect("backslash is handled");
+
+        let job = app.tun_toggle_job.take().expect("tun toggle job started");
+        let result = job
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reports");
+        let _ = job.worker.join();
+        assert!(result.is_ok());
+
+        let text = std::fs::read_to_string(&path).expect("read temp config");
+        assert!(text.contains("\"tun\""));
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn line_text(line: ratatui::text::Line<'_>) -> String {
