@@ -216,11 +216,12 @@ impl CliCommand {
                             .context("--config/--subscription-config requires a file path")?,
                     );
                 }
-                "--sing-box-executable" => {
+                "--sing-box" | "--sing-box-executable" => {
+                    let flag = args[i].as_str();
                     i += 1;
                     sing_box_executable = PathBuf::from(
                         args.get(i)
-                            .context("--sing-box-executable requires a path or program name")?,
+                            .with_context(|| format!("{flag} requires a path or program name"))?,
                     );
                 }
                 "--subscription-input" => {
@@ -1145,8 +1146,9 @@ fn print_run_usage() {
         "      --config <FILE>                 sing-box config path for TUI subscription refresh"
     );
     println!(
-        "      --sing-box-executable <PATH>    sing-box executable or program name (default: sing-box)"
+        "      --sing-box <PATH>               sing-box executable or program name (default: sing-box)"
     );
+    println!("      --sing-box-executable <PATH>    Alias for --sing-box");
     println!(
         "      --subscription-input <FILE>     Provider URL file (default: {DEFAULT_SUBSCRIPTION_SOURCE_PATH})"
     );
@@ -1446,42 +1448,46 @@ mod tests {
     }
 
     #[test]
-    fn run_command_accepts_sing_box_executable() {
-        let command = CliCommand::parse([
-            "run".to_string(),
-            "--sing-box-executable".to_string(),
-            "/opt/sing-box/bin/proxy-core".to_string(),
-            "--config".to_string(),
-            "config.json".to_string(),
-        ])
-        .expect("run command parses");
+    fn run_command_accepts_sing_box_executable_options() {
+        for flag in ["--sing-box", "--sing-box-executable"] {
+            let command = CliCommand::parse([
+                "run".to_string(),
+                flag.to_string(),
+                "/opt/sing-box/bin/proxy-core".to_string(),
+                "--config".to_string(),
+                "config.json".to_string(),
+            ])
+            .expect("run command parses");
 
-        match command {
-            CliCommand::Run {
-                sing_box_executable,
-                subscription_config_path,
-                ..
-            } => {
-                assert_eq!(
+            match command {
+                CliCommand::Run {
                     sing_box_executable,
-                    PathBuf::from("/opt/sing-box/bin/proxy-core")
-                );
-                assert_eq!(subscription_config_path, PathBuf::from("config.json"));
+                    subscription_config_path,
+                    ..
+                } => {
+                    assert_eq!(
+                        sing_box_executable,
+                        PathBuf::from("/opt/sing-box/bin/proxy-core")
+                    );
+                    assert_eq!(subscription_config_path, PathBuf::from("config.json"));
+                }
+                _ => panic!("expected run command"),
             }
-            _ => panic!("expected run command"),
         }
     }
 
     #[test]
     fn run_command_rejects_missing_sing_box_executable() {
-        let error = CliCommand::parse(["run".to_string(), "--sing-box-executable".to_string()])
-            .expect_err("missing executable should fail");
+        for flag in ["--sing-box", "--sing-box-executable"] {
+            let error = CliCommand::parse(["run".to_string(), flag.to_string()])
+                .expect_err("missing executable should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--sing-box-executable requires a path or program name")
-        );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{flag} requires a path or program name"))
+            );
+        }
     }
 
     #[test]
