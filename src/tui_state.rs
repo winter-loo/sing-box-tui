@@ -78,6 +78,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) system_proxy_server: Option<String>,
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tun_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) private_access_profiles: Vec<PrivateAccessProfileState>,
 }
@@ -284,6 +286,24 @@ mod tests {
         let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
 
         assert!(restored.private_access_profiles[0].use_internet_proxy);
+    }
+
+    #[test]
+    fn tun_enabled_is_omitted_when_not_explicitly_set() {
+        let state = TuiRuntimeState::default();
+        let value = serde_json::to_value(&state).expect("serializes");
+        assert!(value.get("tun_enabled").is_none());
+    }
+
+    #[test]
+    fn tun_enabled_persists_when_explicitly_set() {
+        let state = TuiRuntimeState {
+            tun_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+        assert_eq!(restored.tun_enabled, Some(true));
     }
 
     #[test]

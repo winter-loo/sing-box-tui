@@ -4319,6 +4319,7 @@ struct App {
     system_proxy_job: Option<SystemProxyJob>,
     last_system_proxy_status_refresh: Instant,
     tun_enabled: bool,
+    tun_explicit: bool,
     tun_toggle_job: Option<TunToggleJob>,
     verify_job: Option<VerifyJob>,
     sing_box: SingBoxProcessRuntime,
@@ -5081,6 +5082,7 @@ impl App {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             tun_enabled,
+            tun_explicit: false,
             tun_toggle_job: None,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(sing_box_executable, keep_sing_box_running),
@@ -5090,6 +5092,7 @@ impl App {
         };
         app.apply_runtime_state(runtime_state.clone())?;
         if manage_sing_box {
+            app.reconcile_persisted_tun_mode()?;
             app.ensure_private_access_tun_baseline()?;
             app.start_managed_sing_box()?;
             if let Err(error) = app.wait_for_controller_ready() {
@@ -5127,6 +5130,21 @@ impl App {
             true,
             &carrier_domains,
         )
+    }
+
+    /// Re-applies an explicit TUN toggle choice to the config when it drifted, e.g. after a
+    /// subscription refresh regenerated the config without the TUN inbound. Only runs when the
+    /// user has explicitly toggled TUN in the TUI, so a manually edited config is never touched.
+    fn reconcile_persisted_tun_mode(&self) -> Result<()> {
+        if !self.tun_explicit || !self.system_proxy_config_path.exists() {
+            return Ok(());
+        }
+        let in_config =
+            config_has_internet_tun_inbound(&self.system_proxy_config_path).unwrap_or(false);
+        if in_config != self.tun_enabled {
+            set_internet_tun_mode(&self.system_proxy_config_path, self.tun_enabled)?;
+        }
+        Ok(())
     }
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
@@ -5167,6 +5185,10 @@ impl App {
         {
             self.system_proxy_server = value;
             self.system_proxy_server_override = state.system_proxy_server_override;
+        }
+        if let Some(value) = state.tun_enabled {
+            self.tun_enabled = value;
+            self.tun_explicit = true;
         }
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
@@ -5259,6 +5281,7 @@ impl App {
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy_server.clone()),
             system_proxy_server_override: self.system_proxy_server_override,
+            tun_enabled: self.tun_explicit.then_some(self.tun_enabled),
             private_access_profiles: self.private_access.runtime_states(),
         }
     }
@@ -8889,6 +8912,13 @@ impl App {
         match result {
             Ok(state) => {
                 self.tun_enabled = job.enable;
+                self.tun_explicit = true;
+                let persist_note = self.save_runtime_state().err().map(|error| {
+                    format!(
+                        "; failed to persist state: {}",
+                        truncate_for_width(&format!("{error:#}"), 40)
+                    )
+                });
                 match self.restart_managed_sing_box() {
                     Ok(summary) => {
                         let restarted = format!(
@@ -8897,17 +8927,22 @@ impl App {
                         );
                         if let Err(error) = self.wait_for_controller_ready() {
                             self.set_status_with_flash(format!(
-                                "TUN mode {state}; {restarted}; controller not ready: {}",
-                                truncate_for_width(&format!("{error:#}"), 60)
+                                "TUN mode {state}; {restarted}; controller not ready: {}{}",
+                                truncate_for_width(&format!("{error:#}"), 60),
+                                persist_note.as_deref().unwrap_or("")
                             ));
                         } else {
-                            self.set_status_with_flash(format!("TUN mode {state}; {restarted}"));
+                            self.set_status_with_flash(format!(
+                                "TUN mode {state}; {restarted}{}",
+                                persist_note.as_deref().unwrap_or("")
+                            ));
                         }
                     }
                     Err(error) => {
                         self.set_status_with_flash(format!(
-                            "TUN mode {state} but sing-box restart failed: {}",
-                            truncate_for_width(&format!("{error:#}"), 70)
+                            "TUN mode {state} but sing-box restart failed: {}{}",
+                            truncate_for_width(&format!("{error:#}"), 70),
+                            persist_note.as_deref().unwrap_or("")
                         ));
                     }
                 }
@@ -9227,6 +9262,7 @@ mod tests {
             system_proxy_job: None,
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             tun_enabled: false,
+            tun_explicit: false,
             tun_toggle_job: None,
             verify_job: None,
             sing_box: SingBoxProcessRuntime::new(PathBuf::from("sing-box"), false),
@@ -9283,6 +9319,31 @@ mod tests {
         assert!(text.contains("\"tun\""));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_state_persists_tun_only_after_an_explicit_toggle() {
+        let mut app = test_app();
+        assert_eq!(app.runtime_state().tun_enabled, None);
+
+        app.tun_enabled = true;
+        assert_eq!(app.runtime_state().tun_enabled, None);
+
+        app.tun_explicit = true;
+        assert_eq!(app.runtime_state().tun_enabled, Some(true));
+    }
+
+    #[test]
+    fn apply_runtime_state_restores_explicit_tun_intent() {
+        let mut app = test_app();
+        app.apply_runtime_state(TuiRuntimeState {
+            tun_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        })
+        .expect("state applies");
+
+        assert!(app.tun_enabled);
+        assert!(app.tun_explicit);
     }
 
     fn line_text(line: ratatui::text::Line<'_>) -> String {
