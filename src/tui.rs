@@ -3251,15 +3251,43 @@ fn command_program_name_matches(program: &str, expected: &str) -> bool {
             .is_some_and(|base| name.eq_ignore_ascii_case(base))
 }
 
+fn path_text_has_directory(path: &str) -> bool {
+    path.rsplit_once(['/', '\\'])
+        .is_some_and(|(parent, _)| !parent.is_empty())
+}
+
+fn executable_basename(executable: &Path) -> String {
+    let text = executable.to_string_lossy();
+    text.rsplit(['/', '\\']).next().unwrap_or(&text).to_string()
+}
+
+fn command_path_text_matches(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+        || actual
+            .strip_suffix(".exe")
+            .is_some_and(|base| base.eq_ignore_ascii_case(expected))
+        || expected
+            .strip_suffix(".exe")
+            .is_some_and(|base| actual.eq_ignore_ascii_case(base))
+}
+
+fn command_program_matches_executable(program: &str, executable: &Path) -> bool {
+    let executable_text = executable.to_string_lossy();
+    let expected_name = executable_basename(executable);
+    let executable_has_directory = path_text_has_directory(&executable_text);
+    let program_has_directory = path_text_has_directory(program);
+
+    if executable_has_directory && program_has_directory {
+        return command_path_text_matches(program, &executable_text);
+    }
+
+    command_program_name_matches(program, &expected_name)
+}
+
 fn command_args_for_executable(command: &str, executable: &Path) -> Vec<String> {
-    let expected_program = executable
-        .file_name()
-        .unwrap_or(executable.as_os_str())
-        .to_string_lossy();
-    let mut prefixes = vec![
-        executable.to_string_lossy().to_string(),
-        expected_program.to_string(),
-    ];
+    let executable_text = executable.to_string_lossy();
+    let expected_program = executable_basename(executable);
+    let mut prefixes = vec![executable_text.to_string(), expected_program];
     prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
     prefixes.dedup();
 
@@ -3287,13 +3315,9 @@ fn command_matches_sing_box_run_for_config(
     if args.len() < 3 {
         return false;
     }
-    let expected_program = executable
-        .file_name()
-        .unwrap_or(executable.as_os_str())
-        .to_string_lossy();
     let program_is_sing_box = args
         .first()
-        .is_some_and(|program| command_program_name_matches(program, &expected_program));
+        .is_some_and(|program| command_program_matches_executable(program, executable));
     if !program_is_sing_box || !args.iter().any(|arg| arg == "run") {
         return false;
     }
@@ -9343,6 +9367,16 @@ mod tests {
             &config
         ));
         assert!(command_matches_sing_box_run_for_config(
+            "proxy-core.exe run -c ./config.json",
+            &executable,
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
+            r#"C:\Other Vendor\proxy-core.exe run --config config.json"#,
+            &executable,
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
             "/opt/vendor/proxy-core run -c ./config.json",
             &executable,
             &config
@@ -9350,6 +9384,11 @@ mod tests {
         let executable_with_space = PathBuf::from("/tmp/review path/proxy-core");
         assert!(command_matches_sing_box_run_for_config(
             "/tmp/review path/proxy-core run -c ./config.json",
+            &executable_with_space,
+            &config
+        ));
+        assert!(!command_matches_sing_box_run_for_config(
+            "/tmp/other path/proxy-core run -c ./config.json",
             &executable_with_space,
             &config
         ));
