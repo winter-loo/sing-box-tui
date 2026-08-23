@@ -941,11 +941,18 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 fn draw(frame: &mut Frame, app: &mut App) {
     let implicit_root_mode = app.implicit_root_mode();
     let status_lines = status_lines(app);
+    let status_footer = status_footer_line(app);
     let status_line_count = status_lines.len() as u16;
-    let status_height = status_line_count.saturating_add(2).max(3);
-    let [main, status_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(status_height)])
-            .areas(frame.area());
+    let status_box_height = status_line_count.saturating_add(2).max(3);
+    let status_region_height = status_box_height.saturating_add(1);
+    let [main, status_region] = Layout::vertical([
+        Constraint::Min(10),
+        Constraint::Length(status_region_height),
+    ])
+    .areas(frame.area());
+    let [status_area, status_footer_area] =
+        Layout::vertical([Constraint::Length(status_box_height), Constraint::Length(1)])
+            .areas(status_region);
     let [groups_area, members_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
     let (internet_area, intranet_area) = if app.private_access.is_configured() {
@@ -1162,6 +1169,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let help =
         Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
     frame.render_widget(help, status_area);
+    frame.render_widget(Paragraph::new(status_footer), status_footer_area);
 
     if let Some(message) = app.flash_message() {
         let estimated_width = frame
@@ -1436,37 +1444,56 @@ fn private_access_detail_empty(value: &str) -> Line<'static> {
 }
 
 fn status_lines(app: &App) -> Vec<Line<'_>> {
-    let benchmark_hint = if app.showing_intranet_details() {
-        "Intranet details are shown in the right panel".to_string()
-    } else {
-        app.selected_benchmark().map_or_else(
-            || {
-                format!(
-                    "clash={}  order={}  auto={}  T group latency  t node latency  a auto-pick  / filter",
-                    app.clash_mode_label(),
-                    node_order_badge(app.latency_sort_mode),
-                    auto_select_badge(app.auto_select_enabled)
-                )
-            },
-            |summary| {
-                let best = summary
-                    .best_success()
-                    .map(|item| format!("best={} {}", item.name, item.display_delay()))
-                    .unwrap_or_else(|| "best=none".to_string());
-                format!(
-                    "filter='{}'  tested={}  clash={}  order={}  auto={}  {}",
-                    summary.pattern,
-                    summary.results.len(),
-                    app.clash_mode_label(),
-                    node_order_badge(app.latency_sort_mode),
-                    auto_select_badge(app.auto_select_enabled),
-                    truncate_for_width(&best, 30)
-                )
-            },
-        )
-    };
+    let mut selection_context = format!(
+        "clash={}  Pick={}  filter='{}'",
+        app.clash_mode_label(),
+        pick_mode_badge(app.auto_select_enabled),
+        app.benchmark_filter
+    );
+    if app.showing_intranet_details() {
+        selection_context.push_str("  Intranet details are shown in the right panel");
+    }
 
-    let bottom_line = if let Some(input) = app.filter_input.as_deref() {
+    vec![
+        Line::from(vec![
+            Span::styled("System Proxy: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.system_proxy_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                Style::default().fg(if app.system_proxy_enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("Tun Mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.tun_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                Style::default().fg(if app.tun_enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("  "),
+            Span::raw(selection_context),
+        ]),
+        Line::from(app.connections_summary_line()),
+        Line::from(app.subscription_summary_line()),
+        Line::from(app.sing_box_summary_line()),
+    ]
+}
+
+fn status_footer_line(app: &App) -> Line<'_> {
+    let line = if let Some(input) = app.filter_input.as_deref() {
         Line::from(vec![
             Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
             Span::raw(input),
@@ -1487,77 +1514,7 @@ fn status_lines(app: &App) -> Vec<Line<'_>> {
     } else {
         Line::from(app.status_line())
     };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Arrows/jk", Style::default().fg(Color::Cyan)),
-            Span::raw(" move  "),
-            Span::styled("Tab/h/l", Style::default().fg(Color::Cyan)),
-            Span::raw(" switch pane  "),
-            Span::styled("Space", Style::default().fg(Color::Cyan)),
-            Span::raw(" select  "),
-            Span::styled("m", Style::default().fg(Color::Cyan)),
-            Span::raw(" clash mode  "),
-            Span::styled("b", Style::default().fg(Color::Cyan)),
-            Span::raw(" bypass  "),
-            Span::styled("B", Style::default().fg(Color::Cyan)),
-            Span::raw(" background  "),
-            Span::styled("p", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                " system proxy  ",
-                Style::default().fg(if app.system_proxy_enabled {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::styled("\\", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                " tun  ",
-                Style::default().fg(if app.tun_enabled {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::styled("T/t", Style::default().fg(Color::Cyan)),
-            Span::raw(" latency  "),
-            Span::styled("s", Style::default().fg(Color::Cyan)),
-            Span::raw(" sort order  "),
-            Span::styled("a", Style::default().fg(Color::Cyan)),
-            Span::raw(" auto-pick  "),
-            Span::styled("i", Style::default().fg(Color::Cyan)),
-            Span::raw(" info  "),
-            Span::styled("c", Style::default().fg(Color::Cyan)),
-            Span::raw(" connections  "),
-            Span::styled("v", Style::default().fg(Color::Cyan)),
-            Span::raw(" verify  "),
-            Span::styled("V", Style::default().fg(Color::Cyan)),
-            Span::raw(" private access  "),
-            Span::styled("o", Style::default().fg(Color::Cyan)),
-            Span::raw(" settings  "),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" filter  "),
-            Span::styled("r", Style::default().fg(Color::Cyan)),
-            Span::raw(" refresh  "),
-            Span::styled("u", Style::default().fg(Color::Cyan)),
-            Span::raw(" update subs  "),
-            Span::styled("?", Style::default().fg(Color::Cyan)),
-            Span::raw(" help  "),
-            Span::styled("q", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit"),
-        ]),
-        Line::from(vec![
-            Span::styled("Controller: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.client.base_url.as_str()),
-        ]),
-        Line::from(benchmark_hint),
-        Line::from(app.connections_summary_line()),
-        Line::from(app.subscription_summary_line()),
-        Line::from(app.sing_box_summary_line()),
-    ];
-    lines.push(bottom_line);
-    lines
+    line.patch_style(Style::default().fg(Color::DarkGray))
 }
 
 #[derive(Clone, Copy)]
@@ -2590,8 +2547,12 @@ fn node_order_badge(latency_sort_mode: bool) -> &'static str {
     }
 }
 
-fn auto_select_badge(auto_select_enabled: bool) -> &'static str {
-    if auto_select_enabled { "ON" } else { "OFF" }
+fn pick_mode_badge(auto_select_enabled: bool) -> &'static str {
+    if auto_select_enabled {
+        "Auto"
+    } else {
+        "Manual"
+    }
 }
 
 fn background_status_should_publish(status: &str) -> bool {
@@ -7008,7 +6969,7 @@ impl App {
         let active_count = self.connections.connections.len();
         let proxied_count = active_count.saturating_sub(direct_count);
         format!(
-            "connections active={} proxy={} direct={} up={} down={}  c details",
+            "connections active={} proxy={} direct={} up={} down={}",
             active_count,
             proxied_count,
             direct_count,
@@ -10812,19 +10773,91 @@ mod tests {
     }
 
     #[test]
-    fn tun_toggle_is_documented_in_help_and_key_bar() {
+    fn tun_toggle_is_documented_in_help_and_status_bar() {
         let app = test_app();
         assert!(
             super::HELP_BINDINGS
                 .iter()
                 .any(|binding| binding.key == "\\" && binding.summary == "Toggle TUN mode")
         );
-        let key_bar = status_lines(&app)
+        let status_bar = status_lines(&app)
             .into_iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(key_bar.contains(" tun "));
+        assert!(status_bar.contains("System Proxy: disabled"));
+        assert!(status_bar.contains("Tun Mode: disabled"));
+        assert!(!status_bar.contains("Controller:"));
+        assert!(!status_bar.contains("order="));
+        assert!(!status_bar.contains("Arrows/jk"));
+    }
+
+    #[test]
+    fn status_header_combines_proxy_tun_filter_clash_and_pick_mode() {
+        let mut app = test_app();
+        app.auto_select_enabled = false;
+        app.benchmark_filter = "-香港,-广告".to_string();
+        let mut summary = BenchmarkSummary::empty("select".to_string());
+        summary.pattern = "-香港,-广告".to_string();
+        app.benchmarks.insert("select".to_string(), summary);
+
+        let lines = status_lines(&app)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        let header = &lines[0];
+        assert!(header.contains("System Proxy: disabled"));
+        assert!(header.contains("Tun Mode: disabled"));
+        assert!(header.contains("filter='-香港,-广告'"));
+        assert!(header.contains("clash="));
+        assert!(header.contains("Pick=Manual"));
+        assert!(!lines.iter().any(|line| line.contains("tested=")));
+        assert!(!lines.iter().any(|line| line.contains("auto=")));
+    }
+
+    #[test]
+    fn status_header_shows_live_filter_and_auto_pick_without_benchmark_results() {
+        let mut app = test_app();
+        app.auto_select_enabled = true;
+        app.benchmark_filter = "-香港,-广告".to_string();
+
+        let lines = status_lines(&app)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        let header = &lines[0];
+        assert!(header.contains("clash="));
+        assert!(header.contains("Pick=Auto"));
+        assert!(header.contains("filter='-香港,-广告'"));
+        assert!(!lines.iter().any(|line| line.contains("tested=")));
+        assert!(!lines.iter().any(|line| line.contains("auto=")));
+    }
+
+    #[test]
+    fn status_header_keeps_empty_filter_label_in_intranet_details() {
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+        app.left_pane_section = LeftPaneSection::Intranet;
+
+        let header = line_text(status_lines(&app).remove(0));
+        assert!(header.contains("filter=''"));
+        assert!(header.contains("Intranet details are shown in the right panel"));
+    }
+
+    #[test]
+    fn status_message_renders_below_the_box_border() {
+        let mut app = test_app();
+        app.set_status_only("Latency filter edit canceled");
+
+        let lines = rendered_app_lines(&mut app);
+        let message_row = lines
+            .iter()
+            .position(|line| line.contains("Latency filter edit canceled"))
+            .expect("status message row");
+        assert!(message_row > 0);
+        assert!(!lines[message_row].contains('─'));
+        assert!(lines[message_row - 1].contains('└'));
+        assert!(lines[message_row - 1].contains('┘'));
     }
 
     #[test]
@@ -12913,7 +12946,7 @@ mod tests {
 
         assert_eq!(
             app.connections_summary_line(),
-            "connections active=2 proxy=1 direct=1 up=1.5KiB down=2.0MiB  c details"
+            "connections active=2 proxy=1 direct=1 up=1.5KiB down=2.0MiB"
         );
     }
 
