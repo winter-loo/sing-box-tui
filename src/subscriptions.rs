@@ -1,10 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
+use crate::atomic_file::write_atomic;
 use crate::config::{
     DefaultConfigOptions, ProviderNodeSet, build_full_config_with_provider_node_sets_and_options,
-    ensure_bypass_rule_set_file_for_config,
+    ensure_bypass_rule_set_file_for_config, lock_config_mutation,
 };
 use crate::import::extract_mergeable_outbounds_from_singbox_subscription;
 
@@ -157,6 +154,27 @@ pub(crate) fn refresh_subscriptions(
         });
     }
 
+    if cache_changed {
+        cache_store.save(&cache)?;
+    }
+    let backup_path = merge_and_commit_subscription_config(request, provider_node_sets)?;
+    ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
+
+    Ok(SubscriptionRefreshOutput {
+        input_path: request.input.display().to_string(),
+        cache_path: request.cache_path.display().to_string(),
+        interval_days: request.interval_days,
+        merged_config_path: request.merged_path.display().to_string(),
+        backup_config_path: backup_path.map(|path| path.display().to_string()),
+        providers: summaries,
+    })
+}
+
+fn merge_and_commit_subscription_config(
+    request: &SubscriptionRefreshRequest,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+) -> Result<Option<PathBuf>> {
+    let _config_guard = lock_config_mutation();
     let refreshed_config = if request.config_path.exists() {
         let mut config = read_existing_config(&request.config_path)?;
         refresh_provider_node_outbounds_only(
@@ -183,139 +201,18 @@ pub(crate) fn refresh_subscriptions(
         )?
     };
 
-    if cache_changed {
-        cache_store.save(&cache)?;
-    }
-    let temp_path = subscription_config_temp_path(&request.merged_path)?;
-    write_refreshed_config_temp(&temp_path, &request.merged_path, &refreshed_config)?;
+    let contents = serde_json::to_string_pretty(&refreshed_config)
+        .context("failed to serialize refreshed subscription config")?;
     let backup_path = backup_existing_config(&request.merged_path)?;
-    commit_refreshed_config_temp(&temp_path, &request.merged_path)?;
-    ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
-
-    Ok(SubscriptionRefreshOutput {
-        input_path: request.input.display().to_string(),
-        cache_path: request.cache_path.display().to_string(),
-        interval_days: request.interval_days,
-        merged_config_path: request.merged_path.display().to_string(),
-        backup_config_path: backup_path.map(|path| path.display().to_string()),
-        providers: summaries,
-    })
+    write_atomic(&request.merged_path, format!("{contents}\n").as_bytes())
+        .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
+    Ok(backup_path)
 }
 
 fn read_existing_config(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read existing config {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn write_refreshed_config_temp(temp_path: &Path, config_path: &Path, config: &Value) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_path)
-        .with_context(|| format!("failed to create {}", temp_path.display()))?;
-    set_temp_file_permissions(&file, temp_path, config_path)?;
-    file.write_all(
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(config)
-                .context("failed to serialize refreshed subscription config")?
-        )
-        .as_bytes(),
-    )
-    .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush {}", temp_path.display()))
-}
-
-#[cfg(unix)]
-fn set_temp_file_permissions(file: &File, temp_path: &Path, config_path: &Path) -> Result<()> {
-    let mode = match fs::metadata(config_path) {
-        Ok(metadata) => metadata.permissions().mode(),
-        Err(error) if error.kind() == ErrorKind::NotFound => 0o600,
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read metadata for {}", config_path.display()));
-        }
-    };
-    file.set_permissions(fs::Permissions::from_mode(mode))
-        .with_context(|| format!("failed to set permissions on {}", temp_path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_temp_file_permissions(file: &File, temp_path: &Path, config_path: &Path) -> Result<()> {
-    if config_path.exists() {
-        let permissions = fs::metadata(config_path)
-            .with_context(|| format!("failed to read metadata for {}", config_path.display()))?
-            .permissions();
-        file.set_permissions(permissions)
-            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
-    }
-    Ok(())
-}
-
-fn commit_refreshed_config_temp(temp_path: &Path, config_path: &Path) -> Result<()> {
-    atomic_replace(temp_path, config_path).with_context(|| {
-        format!(
-            "failed to atomically replace {} with {}",
-            config_path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(temp_path: &Path, config_path: &Path) -> Result<()> {
-    fs::rename(temp_path, config_path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn atomic_replace(temp_path: &Path, config_path: &Path) -> Result<()> {
-    use std::io;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
-        ) -> i32;
-    }
-
-    let old_path = wide_null(temp_path);
-    let new_path = wide_null(config_path);
-    let result = unsafe {
-        MoveFileExW(
-            old_path.as_ptr(),
-            new_path.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn wide_null(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain([0]).collect()
-}
-
-fn subscription_config_temp_path(path: &Path) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_nanos();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    Ok(path.with_file_name(format!(".{file_name}.tmp.{}.{}", std::process::id(), now)))
 }
 
 #[cfg(test)]
@@ -1017,15 +914,19 @@ fn is_secret_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSubscription, ProviderNodeRefresh, backup_existing_config, cache_entry_is_fresh,
+        CachedSubscription, ProviderNodeRefresh, SubscriptionRefreshRequest,
+        backup_existing_config, cache_entry_is_fresh, merge_and_commit_subscription_config,
         parse_subscription_sources, redact_url, refresh_node_outbounds_only,
         refresh_provider_node_outbounds_only, strip_flag_emoji_from_node_tags,
-        subscription_config_backup_path, subscription_config_temp_path,
-        subscription_source_requires_direct_fetch, subscription_source_strips_flag_emoji,
+        subscription_config_backup_path, subscription_source_requires_direct_fetch,
+        subscription_source_strips_flag_emoji,
     };
+    use crate::config::lock_config_mutation;
     use crate::defaults::default_clash_api_external_controller;
     use serde_json::Value;
     use std::fs;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1638,16 +1539,161 @@ mod tests {
     }
 
     #[test]
-    fn temp_path_uses_hidden_unique_sidecar_name() {
-        let path = std::path::PathBuf::from("/tmp/config.json");
-        let temp_path = subscription_config_temp_path(&path).expect("temp path");
-        let file_name = temp_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("temp file name");
+    fn subscription_commit_waits_for_the_shared_config_mutation_lock() {
+        let dir = temp_dir("subscription-mutation-lock");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "outbounds": [
+                    {
+                        "type": "selector",
+                        "tag": "手动选择",
+                        "outbounds": ["自动选择", "direct"]
+                    },
+                    { "type": "urltest", "tag": "自动选择", "outbounds": [] },
+                    { "type": "direct", "tag": "direct" }
+                ]
+            }))
+            .expect("serializes config"),
+        )
+        .expect("writes config");
+        let request = SubscriptionRefreshRequest {
+            input: dir.join("subscriptions.txt"),
+            cache_path: dir.join("cache.json"),
+            config_path: config_path.clone(),
+            merged_path: config_path.clone(),
+            replace_nodes: false,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            force: true,
+            interval_days: 1,
+        };
+        let providers = vec![ProviderNodeRefresh {
+            provider_name: "provider-a".to_string(),
+            nodes: vec![serde_json::json!({
+                "type": "trojan",
+                "tag": "node-a",
+                "server": "node.example",
+                "server_port": 443,
+                "password": "secret"
+            })],
+        }];
 
-        assert_eq!(temp_path.parent(), path.parent());
-        assert!(file_name.starts_with(&format!(".config.json.tmp.{}.", std::process::id())));
+        let guard = lock_config_mutation();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signals worker start");
+            let result = merge_and_commit_subscription_config(&request, providers);
+            finished_tx.send(result).expect("reports worker result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker starts");
+        assert!(
+            matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "subscription config replacement must wait for an active config mutation"
+        );
+        drop(guard);
+
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker resumes after releasing the mutation lock")
+            .expect("subscription config commit succeeds");
+        worker.join().expect("worker exits cleanly");
+        let updated: Value = serde_json::from_str(
+            &fs::read_to_string(&config_path).expect("reads committed config"),
+        )
+        .expect("parses committed config");
+        assert!(
+            updated["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| outbound["tag"] == "node-a")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscription_commit_preserves_a_symlinked_config_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("subscription-symlink");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let target = dir.join("real-config.json");
+        let link = dir.join("config.json");
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "outbounds": [
+                    {
+                        "type": "selector",
+                        "tag": "手动选择",
+                        "outbounds": ["自动选择", "direct"]
+                    },
+                    { "type": "urltest", "tag": "自动选择", "outbounds": [] },
+                    { "type": "direct", "tag": "direct" }
+                ]
+            }))
+            .expect("serializes config"),
+        )
+        .expect("writes target config");
+        symlink(target.file_name().expect("target has file name"), &link)
+            .expect("creates config symlink");
+        let request = SubscriptionRefreshRequest {
+            input: dir.join("subscriptions.txt"),
+            cache_path: dir.join("cache.json"),
+            config_path: link.clone(),
+            merged_path: link.clone(),
+            replace_nodes: false,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            force: true,
+            interval_days: 1,
+        };
+
+        merge_and_commit_subscription_config(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type": "trojan",
+                    "tag": "node-a",
+                    "server": "node.example",
+                    "server_port": 443,
+                    "password": "secret"
+                })],
+            }],
+        )
+        .expect("subscription commit succeeds");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("reads link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&target).expect("reads target config"))
+                .expect("parses target config");
+        assert!(
+            updated["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| outbound["tag"] == "node-a")
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {

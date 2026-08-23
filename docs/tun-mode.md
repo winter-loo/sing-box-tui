@@ -9,6 +9,15 @@ Internet Proxy TUN mode without editing the config by hand:
 
 - It adds or removes a `tun` inbound (`tag: "tun-in"` with `auto_route`,
   `strict_route`, and `stack: mixed`) in the configured `config.json`.
+- While TUN is enabled, it sets `route.auto_detect_interface` to `true` so
+  sing-box's own node and DNS connections leave through the physical default
+  interface instead of looping back into the TUN. Disabling restores the exact
+  value (including a previously absent field) that existed before enabling.
+- It owns only the `tun-in` inbound. A differently tagged custom TUN is left
+  untouched, and enabling is rejected rather than creating a conflicting
+  second TUN inbound. The `tun-in` tag is reserved globally; enabling is also
+  rejected if a non-TUN inbound already uses that tag, because sing-box inbound
+  tags must be unique.
 - It restarts the managed sing-box process so the change takes effect.
 - Enabling TUN requires elevated permissions: on macOS/Linux the TUI runs
   `sudo -v` first and then restarts sing-box through `sudo -n`; on Windows it
@@ -106,8 +115,22 @@ If the existing config has only one `mixed` inbound, the result should look like
 }
 ```
 
-Keep the rest of the config, including `dns`, `outbounds`, `route`, and
+Keep the rest of the config, including `dns`, `outbounds`, route rules, and
 `experimental`, unchanged unless you are intentionally changing routing behavior.
+When `auto_route` is enabled, the top-level route object must also select a
+physical egress interface. The portable choice used by this project is:
+
+```json
+{
+  "route": {
+    "auto_detect_interface": true
+  }
+}
+```
+
+Without this setting (or the advanced alternatives `route.default_interface`
+and per-outbound `bind_interface`), the connection from sing-box to every proxy
+node can be captured by its own TUN route, making all nodes appear unavailable.
 
 ## 3. Linux Optional Setting
 

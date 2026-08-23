@@ -34,9 +34,10 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::config::{
-    PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
-    config_has_internet_tun_inbound, run_private_access_route_table_config,
-    run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
+    InternetTunModeUpdate, PrivateAccessRouteTableOptions, RouteAutoDetectInterfaceState,
+    china_ip_routing_ruleset_dir, config_has_china_ip_routing, inspect_tun_config,
+    run_private_access_route_table_config, run_private_access_tun_baseline_config,
+    set_china_ip_routing, set_internet_tun_mode,
 };
 use crate::controller::{
     ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkResult,
@@ -4345,6 +4346,7 @@ struct App {
     last_system_proxy_status_refresh: Instant,
     tun_enabled: bool,
     tun_explicit: bool,
+    tun_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
     tun_toggle_job: Option<TunToggleJob>,
     china_ip_routing_enabled: bool,
     china_ip_routing_explicit: bool,
@@ -4382,7 +4384,10 @@ struct SystemProxyJob {
 
 struct TunToggleJob {
     enable: bool,
-    receiver: mpsc::Receiver<Result<String, String>>,
+    previous_tun_explicit: bool,
+    previous_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
+    journal_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
+    receiver: mpsc::Receiver<Result<InternetTunModeUpdate, String>>,
     worker: JoinHandle<()>,
 }
 
@@ -5035,14 +5040,18 @@ impl App {
     ) -> Result<Self> {
         let state_store = TuiStateStore::new(default_tui_state_path());
         let existing_state_file = state_store.exists();
-        let runtime_state = state_store.load()?;
+        let mut runtime_state = state_store.load()?;
         let onboarding_complete = runtime_state.onboarding_complete || existing_state_file;
         let system_proxy_server =
             default_system_proxy_server(&subscription_refresh_options.config_path);
         let system_proxy_enabled = system_proxy_matches(&system_proxy_server);
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
-        let tun_enabled =
-            config_has_internet_tun_inbound(&system_proxy_config_path).unwrap_or(false);
+        let tun_config_state = if system_proxy_config_path.exists() {
+            Some(inspect_tun_config(&system_proxy_config_path)?)
+        } else {
+            None
+        };
+        let tun_enabled = tun_config_state.is_some_and(|state| state.managed_internet_tun);
         let china_ip_routing_enabled =
             config_has_china_ip_routing(&system_proxy_config_path).unwrap_or(false);
         let subscription_refresh =
@@ -5112,6 +5121,7 @@ impl App {
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             tun_enabled,
             tun_explicit: false,
+            tun_auto_detect_interface_before_enable: None,
             tun_toggle_job: None,
             china_ip_routing_enabled,
             china_ip_routing_explicit: false,
@@ -5123,7 +5133,7 @@ impl App {
         };
         app.apply_runtime_state(runtime_state.clone())?;
         if manage_sing_box {
-            app.reconcile_persisted_tun_mode()?;
+            app.reconcile_persisted_tun_mode(&mut runtime_state)?;
             app.reconcile_persisted_china_ip_routing()?;
             app.ensure_private_access_tun_baseline()?;
             app.authorize_tun_elevation_if_needed()?;
@@ -5150,6 +5160,14 @@ impl App {
         if !self.system_proxy_config_path.exists() {
             return Ok(false);
         }
+        if !self
+            .private_access
+            .profiles
+            .iter()
+            .any(|profile| matches!(profile.mode, PrivateAccessMode::Tun))
+        {
+            return Ok(false);
+        }
         let carrier_domains = self
             .private_access
             .profiles
@@ -5165,17 +5183,111 @@ impl App {
         )
     }
 
-    /// Re-applies an explicit TUN toggle choice to the config when it drifted, e.g. after a
-    /// subscription refresh regenerated the config without the TUN inbound. Only runs when the
-    /// user has explicitly toggled TUN in the TUI, so a manually edited config is never touched.
-    fn reconcile_persisted_tun_mode(&self) -> Result<()> {
-        if !self.tun_explicit || !self.system_proxy_config_path.exists() {
+    /// Repairs the required route policy for an existing managed `tun-in`, then re-applies an
+    /// explicit TUN toggle choice when a generated config drifted (for example, after a
+    /// subscription refresh removed the managed inbound). Other/custom TUN inbounds are never
+    /// adopted.
+    fn reconcile_persisted_tun_mode(&mut self, runtime_state: &mut TuiRuntimeState) -> Result<()> {
+        if !self.system_proxy_config_path.exists() {
             return Ok(());
         }
-        let in_config =
-            config_has_internet_tun_inbound(&self.system_proxy_config_path).unwrap_or(false);
-        if in_config != self.tun_enabled {
-            set_internet_tun_mode(&self.system_proxy_config_path, self.tun_enabled)?;
+        let mut config_state = inspect_tun_config(&self.system_proxy_config_path)?;
+        if self.tun_enabled && config_state.has_conflicting_tuns() {
+            bail!(
+                "sing-box config contains both the managed tun-in inbound and another TUN inbound"
+            );
+        }
+        if self.tun_enabled && config_state.reserved_tag_conflict {
+            bail!(
+                "cannot restore Internet TUN mode: inbound tag tun-in is not uniquely owned by the managed TUN"
+            );
+        }
+        if self.tun_enabled
+            && config_state.managed_internet_tun
+            && config_state.auto_detect_interface != RouteAutoDetectInterfaceState::Enabled
+        {
+            // Upgrade repair for configs written by older releases: the managed inbound may
+            // already exist while its required physical-egress binding is still false/missing.
+            if self.tun_auto_detect_interface_before_enable.is_none() {
+                self.tun_auto_detect_interface_before_enable =
+                    Some(config_state.auto_detect_interface);
+                runtime_state.tun_auto_detect_interface_before_enable =
+                    self.tun_auto_detect_interface_before_enable;
+                if let Some(store) = &self.state_store {
+                    store.save(runtime_state)?;
+                }
+            }
+            set_internet_tun_mode(
+                &self.system_proxy_config_path,
+                true,
+                self.tun_auto_detect_interface_before_enable,
+            )?;
+            config_state.auto_detect_interface = RouteAutoDetectInterfaceState::Enabled;
+        }
+        if !self.tun_explicit {
+            if !config_state.managed_internet_tun
+                && self.tun_auto_detect_interface_before_enable.is_some()
+            {
+                self.tun_auto_detect_interface_before_enable = None;
+                runtime_state.tun_auto_detect_interface_before_enable = None;
+                if let Some(store) = &self.state_store {
+                    store.save(runtime_state)?;
+                }
+            }
+            return Ok(());
+        }
+        if self.tun_enabled && !config_state.managed_internet_tun && config_state.other_tun {
+            // Before managed-TUN ownership was explicit, persisted `tun_enabled: true` could refer
+            // to any custom TUN. Migrate that legacy state without adopting or replacing it.
+            self.tun_enabled = false;
+            self.tun_explicit = false;
+            self.tun_auto_detect_interface_before_enable = None;
+            runtime_state.tun_enabled = None;
+            runtime_state.tun_auto_detect_interface_before_enable = None;
+            if let Some(store) = &self.state_store {
+                store.save(runtime_state)?;
+            }
+            return Ok(());
+        }
+        if self.tun_enabled && !config_state.managed_internet_tun {
+            // Persist the rollback target before touching config.json. If startup is interrupted,
+            // the next run can safely replay the enabled intent.
+            self.tun_auto_detect_interface_before_enable = Some(config_state.auto_detect_interface);
+            runtime_state.tun_enabled = Some(true);
+            runtime_state.tun_auto_detect_interface_before_enable =
+                self.tun_auto_detect_interface_before_enable;
+            if let Some(store) = &self.state_store {
+                store.save(runtime_state)?;
+            }
+            let update = set_internet_tun_mode(
+                &self.system_proxy_config_path,
+                true,
+                self.tun_auto_detect_interface_before_enable,
+            )?;
+            if update.auto_detect_interface_before_enable != config_state.auto_detect_interface {
+                self.tun_auto_detect_interface_before_enable =
+                    Some(update.auto_detect_interface_before_enable);
+                runtime_state.tun_auto_detect_interface_before_enable =
+                    self.tun_auto_detect_interface_before_enable;
+                if let Some(store) = &self.state_store {
+                    store.save(runtime_state)?;
+                }
+            }
+        } else if !self.tun_enabled
+            && (config_state.managed_internet_tun
+                || self.tun_auto_detect_interface_before_enable.is_some())
+        {
+            set_internet_tun_mode(
+                &self.system_proxy_config_path,
+                false,
+                self.tun_auto_detect_interface_before_enable,
+            )?;
+            self.tun_auto_detect_interface_before_enable = None;
+            runtime_state.tun_enabled = Some(false);
+            runtime_state.tun_auto_detect_interface_before_enable = None;
+            if let Some(store) = &self.state_store {
+                store.save(runtime_state)?;
+            }
         }
         Ok(())
     }
@@ -5202,7 +5314,8 @@ impl App {
     /// launch sing-box once the cached sudo timestamp expires. Running `sudo -v` here re-authorizes
     /// interactively while the terminal is still in its normal (non-raw) mode.
     fn authorize_tun_elevation_if_needed(&self) -> Result<()> {
-        if !self.tun_enabled || !tun_helper_needs_sudo() {
+        let has_any_tun = self.managed_sing_box_needs_elevation()?;
+        if !has_any_tun || !tun_helper_needs_sudo() {
             return Ok(());
         }
         let status = Command::new("sudo")
@@ -5215,6 +5328,11 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    fn managed_sing_box_needs_elevation(&self) -> Result<bool> {
+        Ok(self.system_proxy_config_path.exists()
+            && inspect_tun_config(&self.system_proxy_config_path)?.has_any_tun())
     }
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
@@ -5260,6 +5378,10 @@ impl App {
             self.tun_enabled = value;
             self.tun_explicit = true;
         }
+        // When `tun_enabled` is false, this optional value is a recovery journal for a disable
+        // that may have been interrupted between persisting intent and updating config.json.
+        self.tun_auto_detect_interface_before_enable =
+            state.tun_auto_detect_interface_before_enable;
         if let Some(value) = state.china_ip_routing_enabled {
             self.china_ip_routing_enabled = value;
             self.china_ip_routing_explicit = true;
@@ -5330,6 +5452,21 @@ impl App {
     }
 
     fn runtime_state(&self) -> TuiRuntimeState {
+        let (persisted_tun_enabled, persisted_tun_restore_state) = self
+            .tun_toggle_job
+            .as_ref()
+            .map(|job| {
+                (
+                    Some(job.enable),
+                    job.journal_auto_detect_interface_before_enable,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.tun_explicit.then_some(self.tun_enabled),
+                    self.tun_auto_detect_interface_before_enable,
+                )
+            });
         TuiRuntimeState {
             benchmark_filter: self.benchmark_filter.clone(),
             auto_pick_enabled: self.auto_select_enabled,
@@ -5355,7 +5492,8 @@ impl App {
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy_server.clone()),
             system_proxy_server_override: self.system_proxy_server_override,
-            tun_enabled: self.tun_explicit.then_some(self.tun_enabled),
+            tun_enabled: persisted_tun_enabled,
+            tun_auto_detect_interface_before_enable: persisted_tun_restore_state,
             china_ip_routing_enabled: self
                 .china_ip_routing_explicit
                 .then_some(self.china_ip_routing_enabled),
@@ -7652,8 +7790,8 @@ impl App {
     }
 
     fn restart_managed_sing_box(&mut self) -> Result<SingBoxRestartSummary> {
+        let elevate = self.managed_sing_box_needs_elevation()?;
         self.stop_managed_sing_box_process()?;
-        let elevate = self.tun_enabled;
         let result = restart_sing_box_for_config(
             &self.sing_box.executable,
             &self.system_proxy_config_path,
@@ -8972,7 +9110,13 @@ impl App {
     }
 
     fn tun_toggle_needs_terminal_prompt(&self) -> bool {
-        self.tun_toggle_job.is_none() && !self.tun_enabled && tun_helper_needs_sudo()
+        let config_allows_enable = self.system_proxy_config_path.exists()
+            && inspect_tun_config(&self.system_proxy_config_path)
+                .is_ok_and(|state| !state.other_tun && !state.reserved_tag_conflict);
+        self.tun_toggle_job.is_none()
+            && !self.tun_enabled
+            && config_allows_enable
+            && tun_helper_needs_sudo()
     }
 
     fn toggle_tun_mode(&mut self) {
@@ -8981,26 +9125,60 @@ impl App {
             return;
         }
         let enable = !self.tun_enabled;
+        let config_state = match inspect_tun_config(&self.system_proxy_config_path) {
+            Ok(state) => state,
+            Err(error) => {
+                self.set_status_with_flash(format!(
+                    "TUN mode update failed: {}",
+                    truncate_for_width(&format!("{error:#}"), 90)
+                ));
+                return;
+            }
+        };
+        if enable && config_state.reserved_tag_conflict {
+            self.set_status_with_flash(
+                "TUN mode update failed: inbound tag tun-in is already used by another inbound",
+            );
+            return;
+        }
+        if enable && (config_state.has_conflicting_tuns() || config_state.other_tun) {
+            self.set_status_with_flash(
+                "TUN mode update failed: another custom TUN inbound is already present",
+            );
+            return;
+        }
+        let journal_auto_detect_interface_before_enable = if enable {
+            Some(config_state.auto_detect_interface)
+        } else {
+            self.tun_auto_detect_interface_before_enable
+        };
+        if let Some(store) = &self.state_store {
+            let mut transition_state = self.runtime_state();
+            transition_state.tun_enabled = Some(enable);
+            transition_state.tun_auto_detect_interface_before_enable =
+                journal_auto_detect_interface_before_enable;
+            if let Err(error) = store.save(&transition_state) {
+                self.set_status_with_flash(format!(
+                    "TUN mode update failed before config change: {}",
+                    truncate_for_width(&format!("{error:#}"), 80)
+                ));
+                return;
+            }
+        }
         let config_path = self.system_proxy_config_path.clone();
+        let restore_auto_detect_interface = journal_auto_detect_interface_before_enable;
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result = set_internet_tun_mode(&config_path, enable)
-                .map(|changed| {
-                    if changed {
-                        if enable {
-                            "enabled".to_string()
-                        } else {
-                            "disabled".to_string()
-                        }
-                    } else {
-                        format!("already {}", if enable { "enabled" } else { "disabled" })
-                    }
-                })
+            let result = set_internet_tun_mode(&config_path, enable, restore_auto_detect_interface)
                 .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
         self.tun_toggle_job = Some(TunToggleJob {
             enable,
+            previous_tun_explicit: self.tun_explicit,
+            previous_auto_detect_interface_before_enable: self
+                .tun_auto_detect_interface_before_enable,
+            journal_auto_detect_interface_before_enable,
             receiver: rx,
             worker,
         });
@@ -9023,15 +9201,69 @@ impl App {
         let job = self.tun_toggle_job.take().expect("TUN toggle job exists");
         let _ = job.worker.join();
         match result {
-            Ok(state) => {
+            Ok(update) => {
+                let state = if update.changed {
+                    if job.enable {
+                        "enabled".to_string()
+                    } else {
+                        "disabled".to_string()
+                    }
+                } else {
+                    format!(
+                        "already {}",
+                        if job.enable { "enabled" } else { "disabled" }
+                    )
+                };
+                self.tun_auto_detect_interface_before_enable = if job.enable {
+                    Some(update.auto_detect_interface_before_enable)
+                } else {
+                    None
+                };
                 self.tun_enabled = job.enable;
                 self.tun_explicit = true;
-                let persist_note = self.save_runtime_state().err().map(|error| {
-                    format!(
-                        "; failed to persist state: {}",
+                let journal_changed = job.enable
+                    && self.tun_auto_detect_interface_before_enable
+                        != job.journal_auto_detect_interface_before_enable;
+                let persist_note = match self.save_runtime_state() {
+                    Ok(()) => None,
+                    Err(error) if job.enable && journal_changed => {
+                        let rollback = set_internet_tun_mode(
+                            &self.system_proxy_config_path,
+                            false,
+                            Some(update.auto_detect_interface_before_enable),
+                        );
+                        self.tun_enabled = false;
+                        self.tun_explicit = job.previous_tun_explicit;
+                        self.tun_auto_detect_interface_before_enable =
+                            job.previous_auto_detect_interface_before_enable;
+                        let state_rollback = self.save_runtime_state();
+                        let detail = match (rollback, state_rollback) {
+                            (Ok(_), Ok(())) => format!(
+                                "failed to persist TUN rollback metadata; config was rolled back: {error:#}"
+                            ),
+                            (config_rollback, state_rollback) => format!(
+                                "failed to persist TUN rollback metadata ({error:#}); config rollback: {}; state rollback: {}",
+                                config_rollback
+                                    .err()
+                                    .map(|value| format!("{value:#}"))
+                                    .unwrap_or_else(|| "ok".to_string()),
+                                state_rollback
+                                    .err()
+                                    .map(|value| format!("{value:#}"))
+                                    .unwrap_or_else(|| "ok".to_string())
+                            ),
+                        };
+                        self.set_status_with_flash(format!(
+                            "TUN mode update failed: {}",
+                            truncate_for_width(&detail, 90)
+                        ));
+                        return;
+                    }
+                    Err(error) => Some(format!(
+                        "; recovery journal retained: {}",
                         truncate_for_width(&format!("{error:#}"), 40)
-                    )
-                });
+                    )),
+                };
                 match self.restart_managed_sing_box() {
                     Ok(summary) => {
                         let restarted = format!(
@@ -9061,9 +9293,16 @@ impl App {
                 }
             }
             Err(error) => {
+                let recovery_note = self.save_runtime_state().err().map(|persist_error| {
+                    format!(
+                        "; failed to clear transition journal: {}",
+                        truncate_for_width(&format!("{persist_error:#}"), 40)
+                    )
+                });
                 self.set_status_with_flash(format!(
-                    "TUN mode update failed: {}",
-                    truncate_for_width(&error, 90)
+                    "TUN mode update failed: {}{}",
+                    truncate_for_width(&error, 90),
+                    recovery_note.as_deref().unwrap_or("")
                 ));
             }
         }
@@ -9188,6 +9427,7 @@ mod tests {
         sonicwall_http_connect_settings, status_lines, subscription_report_badge,
         system_proxy_bypass_entries, truncate_for_width, visible_settings_fields,
     };
+    use crate::config::{RouteAutoDetectInterfaceState, default_tun_inbound, inspect_tun_config};
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
         BenchmarkResult, BenchmarkSummary, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
@@ -9376,6 +9616,7 @@ mod tests {
             last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
             tun_enabled: false,
             tun_explicit: false,
+            tun_auto_detect_interface_before_enable: None,
             tun_toggle_job: None,
             china_ip_routing_enabled: false,
             china_ip_routing_explicit: false,
@@ -9432,6 +9673,8 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("read temp config");
         assert!(text.contains("\"tun\""));
+        let config: serde_json::Value = serde_json::from_str(&text).expect("parse temp config");
+        assert_eq!(config["route"]["auto_detect_interface"], true);
 
         let _ = std::fs::remove_file(path);
     }
@@ -9440,12 +9683,22 @@ mod tests {
     fn runtime_state_persists_tun_only_after_an_explicit_toggle() {
         let mut app = test_app();
         assert_eq!(app.runtime_state().tun_enabled, None);
+        assert_eq!(
+            app.runtime_state().tun_auto_detect_interface_before_enable,
+            None
+        );
 
         app.tun_enabled = true;
         assert_eq!(app.runtime_state().tun_enabled, None);
 
         app.tun_explicit = true;
+        app.tun_auto_detect_interface_before_enable =
+            Some(RouteAutoDetectInterfaceState::FieldMissing);
         assert_eq!(app.runtime_state().tun_enabled, Some(true));
+        assert_eq!(
+            app.runtime_state().tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
     }
 
     #[test]
@@ -9453,12 +9706,546 @@ mod tests {
         let mut app = test_app();
         app.apply_runtime_state(TuiRuntimeState {
             tun_enabled: Some(true),
+            tun_auto_detect_interface_before_enable: Some(
+                RouteAutoDetectInterfaceState::RouteMissing,
+            ),
             ..TuiRuntimeState::default()
         })
         .expect("state applies");
 
         assert!(app.tun_enabled);
         assert!(app.tun_explicit);
+        assert_eq!(
+            app.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::RouteMissing)
+        );
+    }
+
+    #[test]
+    fn apply_runtime_state_keeps_pending_disable_recovery_journal() {
+        let mut app = test_app();
+        app.apply_runtime_state(TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(
+                RouteAutoDetectInterfaceState::FieldMissing,
+            ),
+            ..TuiRuntimeState::default()
+        })
+        .expect("state applies");
+
+        assert!(!app.tun_enabled);
+        assert!(app.tun_explicit);
+        assert_eq!(
+            app.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
+    }
+
+    #[test]
+    fn tun_toggle_persists_recovery_journal_before_editing_config() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            r#"{"inbounds":[{"type":"mixed","listen_port":6780}],"route":{"rules":[]}}"#,
+        )
+        .expect("config writes");
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+
+        app.toggle_tun_mode();
+        app.benchmark_filter = "changed while TUN worker is pending".to_string();
+        app.save_runtime_state()
+            .expect("unrelated save preserves transition journal");
+
+        let persisted = TuiStateStore::new(&state_path)
+            .load()
+            .expect("transition state loads");
+        assert_eq!(persisted.tun_enabled, Some(true));
+        assert_eq!(
+            persisted.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
+        let job = app.tun_toggle_job.take().expect("toggle worker started");
+        job.receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reports")
+            .expect("config update succeeds");
+        let _ = job.worker.join();
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn tun_toggle_stops_before_config_change_when_journal_cannot_be_saved() {
+        let config_path = test_state_path();
+        let state_directory = std::env::temp_dir().join(format!(
+            "sing-box-tui-state-directory-{}",
+            unique_test_suffix()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"inbounds":[{"type":"mixed","listen_port":6780}]}"#,
+        )
+        .expect("config writes");
+        let original = std::fs::read_to_string(&config_path).expect("config reads");
+        std::fs::create_dir(&state_directory).expect("state directory creates");
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_directory));
+
+        app.toggle_tun_mode();
+
+        assert!(app.tun_toggle_job.is_none());
+        assert!(app.status.contains("failed before config change"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config reads"),
+            original
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir(state_directory);
+    }
+
+    #[test]
+    fn custom_tun_requires_elevation_without_becoming_managed() {
+        let config_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [{
+                    "type": "tun",
+                    "tag": "custom-tun",
+                    "address": ["172.20.0.1/30"]
+                }]
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+
+        assert!(!app.tun_enabled);
+        assert!(
+            app.managed_sing_box_needs_elevation()
+                .expect("TUN inspection succeeds")
+        );
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn reconcile_refreshes_rollback_state_after_config_drift() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            r#"{"inbounds":[{"type":"mixed","listen_port":6780}],"route":{"rules":[]}}"#,
+        )
+        .expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(true),
+            tun_auto_detect_interface_before_enable: Some(RouteAutoDetectInterfaceState::Disabled),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.tun_enabled = true;
+        app.tun_explicit = true;
+        app.tun_auto_detect_interface_before_enable = Some(RouteAutoDetectInterfaceState::Disabled);
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("persisted TUN reconciles");
+
+        assert!(
+            inspect_tun_config(&config_path)
+                .expect("config inspects")
+                .managed_internet_tun
+        );
+        assert_eq!(
+            app.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
+        let persisted = TuiStateStore::new(&state_path)
+            .load()
+            .expect("state reloads");
+        assert_eq!(
+            persisted.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_migrates_legacy_enabled_state_without_adopting_custom_tun() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        let original = serde_json::to_string_pretty(&json!({
+            "inbounds": [{
+                "type": "tun",
+                "tag": "custom-tun",
+                "address": ["172.20.0.1/30"]
+            }],
+            "route": { "auto_detect_interface": true }
+        }))
+        .expect("config serializes");
+        std::fs::write(&config_path, &original).expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("legacy state applies");
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("legacy state migrates");
+
+        assert!(!app.tun_enabled);
+        assert!(!app.tun_explicit);
+        assert_eq!(runtime_state.tun_enabled, None);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config reads"),
+            original
+        );
+        let inspected = inspect_tun_config(&config_path).expect("config inspects");
+        assert!(!inspected.managed_internet_tun);
+        assert!(inspected.other_tun);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_completes_interrupted_disable_from_recovery_journal() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [default_tun_inbound()],
+                "route": {
+                    "auto_detect_interface": true,
+                    "rules": []
+                }
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(
+                RouteAutoDetectInterfaceState::FieldMissing,
+            ),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("transition state applies");
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("disable recovery completes");
+
+        let inspected = inspect_tun_config(&config_path).expect("config inspects");
+        assert!(!inspected.managed_internet_tun);
+        assert_eq!(
+            inspected.auto_detect_interface,
+            RouteAutoDetectInterfaceState::FieldMissing
+        );
+        assert_eq!(app.tun_auto_detect_interface_before_enable, None);
+        assert_eq!(runtime_state.tun_auto_detect_interface_before_enable, None);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_pending_disable_cleans_managed_tun_despite_reserved_tag_conflict() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [
+                    default_tun_inbound(),
+                    {
+                        "type": "mixed",
+                        "tag": "tun-in",
+                        "listen": "::",
+                        "listen_port": 6780
+                    }
+                ],
+                "route": { "auto_detect_interface": true }
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(RouteAutoDetectInterfaceState::Disabled),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("pending disable state applies");
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("pending disable repairs duplicate reserved tag");
+
+        let inspected = inspect_tun_config(&config_path).expect("repaired config inspects");
+        assert!(!inspected.managed_internet_tun);
+        assert!(inspected.reserved_tag_conflict);
+        assert_eq!(
+            inspected.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Disabled
+        );
+        let repaired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("repaired config reads"),
+        )
+        .expect("repaired config parses");
+        let inbounds = repaired["inbounds"].as_array().expect("inbounds array");
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["type"], "mixed");
+        assert_eq!(runtime_state.tun_enabled, Some(false));
+        assert_eq!(runtime_state.tun_auto_detect_interface_before_enable, None);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_pending_disable_removes_managed_tun_and_preserves_custom_tun() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [
+                    default_tun_inbound(),
+                    {
+                        "type": "tun",
+                        "tag": "custom-tun",
+                        "address": ["172.20.0.1/30"],
+                        "auto_route": false
+                    }
+                ],
+                "route": { "auto_detect_interface": true }
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(RouteAutoDetectInterfaceState::Disabled),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("pending disable state applies");
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("pending disable removes only the managed TUN");
+
+        let inspected = inspect_tun_config(&config_path).expect("repaired config inspects");
+        assert!(!inspected.managed_internet_tun);
+        assert!(inspected.other_tun);
+        assert_eq!(
+            inspected.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Enabled,
+            "the remaining custom TUN owns the shared route policy"
+        );
+        let repaired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("repaired config reads"),
+        )
+        .expect("repaired config parses");
+        let inbounds = repaired["inbounds"].as_array().expect("inbounds array");
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["tag"], "custom-tun");
+        assert_eq!(runtime_state.tun_enabled, Some(false));
+        assert_eq!(runtime_state.tun_auto_detect_interface_before_enable, None);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_repairs_existing_managed_tun_without_private_access_profiles() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [default_tun_inbound()],
+                "route": { "auto_detect_interface": false }
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut app = test_app_without_private_access();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.tun_enabled = true;
+        app.tun_explicit = false;
+        let mut runtime_state = TuiRuntimeState::default();
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("legacy managed TUN is repaired");
+
+        let inspected = inspect_tun_config(&config_path).expect("config inspects");
+        assert_eq!(
+            inspected.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Enabled
+        );
+        assert_eq!(
+            app.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::Disabled)
+        );
+        let persisted = TuiStateStore::new(&state_path)
+            .load()
+            .expect("repair state reloads");
+        assert_eq!(persisted.tun_enabled, None);
+        assert_eq!(
+            persisted.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::Disabled)
+        );
+
+        let mut restarted = test_app_without_private_access();
+        restarted.system_proxy_config_path = config_path.clone();
+        restarted.state_store = Some(TuiStateStore::new(&state_path));
+        restarted.tun_enabled = true;
+        restarted
+            .apply_runtime_state(persisted)
+            .expect("repair state reapplies");
+        assert_eq!(
+            restarted.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::Disabled)
+        );
+        restarted.toggle_tun_mode();
+        let job = restarted
+            .tun_toggle_job
+            .take()
+            .expect("disable worker starts");
+        job.receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disable worker reports")
+            .expect("disable config update succeeds");
+        let _ = job.worker.join();
+        let disabled = inspect_tun_config(&config_path).expect("disabled config inspects");
+        assert!(!disabled.managed_internet_tun);
+        assert_eq!(
+            disabled.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Disabled
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_clears_stale_disable_journal_without_touching_custom_tun() {
+        let config_path = test_state_path();
+        let state_path = test_state_path();
+        let original = serde_json::to_string_pretty(&json!({
+            "inbounds": [{
+                "type": "tun",
+                "tag": "custom-tun",
+                "address": ["172.20.0.1/30"]
+            }],
+            "route": { "auto_detect_interface": true }
+        }))
+        .expect("config serializes");
+        std::fs::write(&config_path, &original).expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(RouteAutoDetectInterfaceState::Disabled),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.state_store = Some(TuiStateStore::new(&state_path));
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("transition state applies");
+
+        app.reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect("stale journal clears");
+
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config reads"),
+            original
+        );
+        assert_eq!(app.tun_auto_detect_interface_before_enable, None);
+        assert_eq!(runtime_state.tun_auto_detect_interface_before_enable, None);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reconcile_rejects_managed_and_custom_tun_conflict() {
+        let config_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [
+                    default_tun_inbound(),
+                    {
+                        "type": "tun",
+                        "tag": "custom-tun",
+                        "address": ["172.20.0.1/30"]
+                    }
+                ],
+                "route": { "auto_detect_interface": true }
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut runtime_state = TuiRuntimeState {
+            tun_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        };
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.apply_runtime_state(runtime_state.clone())
+            .expect("runtime state applies");
+
+        let error = app
+            .reconcile_persisted_tun_mode(&mut runtime_state)
+            .expect_err("conflicting TUN inbounds must block managed startup");
+
+        assert!(error.to_string().contains("both the managed tun-in"));
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn private_access_baseline_skips_configs_without_tun_profiles() {
+        let config_path = test_state_path();
+        let original = r#"{"route":{"auto_detect_interface":true}}"#;
+        std::fs::write(&config_path, original).expect("config writes");
+        let mut app = test_app_without_private_access();
+        app.system_proxy_config_path = config_path.clone();
+
+        assert!(
+            !app.ensure_private_access_tun_baseline()
+                .expect("irrelevant baseline is skipped")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config reads"),
+            original
+        );
+
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]
@@ -10970,6 +11757,31 @@ mod tests {
             app.private_access_tun_helper_for_connect(app.private_access.focused())
                 .is_some_and(|command| command.get(1).is_some_and(|arg| arg == "-n"))
         );
+    }
+
+    #[test]
+    fn reserved_tun_tag_conflict_does_not_prompt_for_sudo() {
+        let config_path = test_state_path();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [{
+                    "type": "mixed",
+                    "tag": "tun-in",
+                    "listen": "::",
+                    "listen_port": 6780
+                }]
+            }))
+            .expect("config serializes"),
+        )
+        .expect("config writes");
+        let mut app = test_app();
+        app.system_proxy_config_path = config_path.clone();
+        app.tun_enabled = false;
+
+        assert!(!app.tun_toggle_needs_terminal_prompt());
+
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]

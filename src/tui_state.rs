@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::atomic_file::write_atomic;
+use crate::config::RouteAutoDetectInterfaceState;
 use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
 
 const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
@@ -82,6 +84,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) china_ip_routing_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tun_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tun_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) private_access_profiles: Vec<PrivateAccessProfileState>,
 }
@@ -119,7 +123,7 @@ impl TuiStateStore {
 
     pub(crate) fn save(&self, state: &TuiRuntimeState) -> Result<()> {
         let text = serde_json::to_string_pretty(state).context("failed to encode TUI state")?;
-        fs::write(&self.path, format!("{text}\n"))
+        write_atomic(&self.path, format!("{text}\n").as_bytes())
             .with_context(|| format!("failed to write {}", self.path.display()))
     }
 }
@@ -229,6 +233,7 @@ fn is_ip_entry(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{PrivateAccessProfileState, TuiRuntimeState};
+    use crate::config::RouteAutoDetectInterfaceState;
 
     #[test]
     fn state_without_private_access_profiles_uses_empty_profile_list() {
@@ -316,11 +321,36 @@ mod tests {
     fn tun_enabled_persists_when_explicitly_set() {
         let state = TuiRuntimeState {
             tun_enabled: Some(true),
+            tun_auto_detect_interface_before_enable: Some(
+                RouteAutoDetectInterfaceState::FieldMissing,
+            ),
             ..TuiRuntimeState::default()
         };
         let json = serde_json::to_string(&state).expect("serializes");
         let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
         assert_eq!(restored.tun_enabled, Some(true));
+        assert_eq!(
+            restored.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::FieldMissing)
+        );
+    }
+
+    #[test]
+    fn pending_tun_disable_journal_persists_rollback_state() {
+        let state = TuiRuntimeState {
+            tun_enabled: Some(false),
+            tun_auto_detect_interface_before_enable: Some(
+                RouteAutoDetectInterfaceState::RouteMissing,
+            ),
+            ..TuiRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+        assert_eq!(restored.tun_enabled, Some(false));
+        assert_eq!(
+            restored.tun_auto_detect_interface_before_enable,
+            Some(RouteAutoDetectInterfaceState::RouteMissing)
+        );
     }
 
     #[test]

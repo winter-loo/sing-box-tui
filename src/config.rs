@@ -2,10 +2,13 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
-use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 
+use crate::atomic_file::write_atomic;
 use crate::defaults::{
     AUTO_SELECTOR_TAG_ALIASES, BLOCK_TAG_ALIASES, DEFAULT_AD_BLOCK_SELECTOR_TAG,
     DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_BYPASS_RULE_SET_PATH,
@@ -17,6 +20,18 @@ use crate::defaults::{
 // Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
 const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
 const PRIVATE_ACCESS_SYSTEM_DNS_TAG: &str = "private-access-system";
+const INTERNET_TUN_INBOUND_TAG: &str = "tun-in";
+
+// Every config editor performs a read-modify-write cycle. Atomic replacement protects readers
+// from partial files, while this process-wide lock prevents concurrent editors from committing
+// changes derived from the same stale snapshot and silently overwriting each other.
+static CONFIG_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_config_mutation() -> MutexGuard<'static, ()> {
+    CONFIG_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // China split-routing rule-set tags. These are the binary rule-sets the China IP routing
 // toggle adds or removes, distinct from the AdGuard ad-block rule-set.
@@ -78,6 +93,39 @@ pub(crate) struct PrivateAccessRouteTableOptions {
 pub(crate) struct DefaultConfigOptions {
     pub(crate) include_geosite_rules: bool,
     pub(crate) include_tun_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RouteAutoDetectInterfaceState {
+    RouteMissing,
+    FieldMissing,
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InternetTunModeUpdate {
+    pub(crate) changed: bool,
+    pub(crate) auto_detect_interface_before_enable: RouteAutoDetectInterfaceState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TunConfigState {
+    pub(crate) managed_internet_tun: bool,
+    pub(crate) other_tun: bool,
+    pub(crate) reserved_tag_conflict: bool,
+    pub(crate) auto_detect_interface: RouteAutoDetectInterfaceState,
+}
+
+impl TunConfigState {
+    pub(crate) fn has_any_tun(self) -> bool {
+        self.managed_internet_tun || self.other_tun
+    }
+
+    pub(crate) fn has_conflicting_tuns(self) -> bool {
+        self.managed_internet_tun && self.other_tun
+    }
 }
 
 pub(crate) fn build_full_config_with_options(
@@ -281,6 +329,7 @@ pub(crate) fn run_private_access_route_table_config(
     write: bool,
     options: PrivateAccessRouteTableOptions,
 ) -> Result<bool> {
+    let _config_guard = lock_config_mutation();
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
@@ -292,11 +341,11 @@ pub(crate) fn run_private_access_route_table_config(
         serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
 
     if write && changed {
-        fs::write(config_path, format!("{contents}\n"))
+        write_atomic(config_path, format!("{contents}\n").as_bytes())
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     if let Some(output) = output {
-        fs::write(output, format!("{contents}\n"))
+        write_atomic(output, format!("{contents}\n").as_bytes())
             .with_context(|| format!("failed to write {}", output.display()))?;
     }
     Ok(changed)
@@ -307,6 +356,7 @@ pub(crate) fn run_private_access_tun_baseline_config(
     write: bool,
     carrier_domains: &[String],
 ) -> Result<bool> {
+    let _config_guard = lock_config_mutation();
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
@@ -317,7 +367,7 @@ pub(crate) fn run_private_access_tun_baseline_config(
     if write && changed {
         let contents =
             serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
-        fs::write(config_path, format!("{contents}\n"))
+        write_atomic(config_path, format!("{contents}\n").as_bytes())
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     Ok(changed)
@@ -326,7 +376,7 @@ pub(crate) fn run_private_access_tun_baseline_config(
 pub(crate) fn default_tun_inbound() -> Value {
     json!({
         "type": "tun",
-        "tag": "tun-in",
+        "tag": INTERNET_TUN_INBOUND_TAG,
         "address": [
             "172.19.0.1/30",
             "2001:470:f9da:fdfa::1/64"
@@ -343,56 +393,224 @@ pub(crate) fn default_tun_inbound() -> Value {
 ///
 /// This is the sing-box `tun` inbound (system traffic capture) managed by the TUI's
 /// Internet Proxy TUN toggle, distinct from the Private Access TUN data-plane helper.
+#[cfg(test)]
 pub(crate) fn config_has_internet_tun_inbound(config_path: &Path) -> Result<bool> {
+    Ok(inspect_tun_config(config_path)?.managed_internet_tun)
+}
+
+pub(crate) fn inspect_tun_config(config_path: &Path) -> Result<TunConfigState> {
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    Ok(config_has_tun_inbound(&config))
+    tun_config_state(&config)
 }
 
-/// Adds or removes the Internet Proxy TUN inbound in the sing-box config, writing the
-/// result back in place when it changed. Returns whether the config was modified.
-pub(crate) fn set_internet_tun_mode(config_path: &Path, enable: bool) -> Result<bool> {
+/// Adds or removes the Internet Proxy TUN inbound in the sing-box config and keeps the
+/// outbound-interface policy aligned with that mode. The caller supplies the saved route state
+/// when disabling so unrelated user configuration can be restored exactly.
+pub(crate) fn set_internet_tun_mode(
+    config_path: &Path,
+    enable: bool,
+    restore_auto_detect_interface: Option<RouteAutoDetectInterfaceState>,
+) -> Result<InternetTunModeUpdate> {
+    let _config_guard = lock_config_mutation();
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let tun_state = tun_config_state(&config)?;
+    let auto_detect_interface_before_enable = tun_state.auto_detect_interface;
+    let has_managed_internet_tun = tun_state.managed_internet_tun;
+    let has_other_tun = tun_state.other_tun;
+    let has_private_access_baseline = config_has_private_access_tun_baseline(&config);
+    if enable && tun_state.reserved_tag_conflict {
+        bail!(
+            "cannot enable the managed Internet TUN: inbound tag '{INTERNET_TUN_INBOUND_TAG}' is not uniquely available"
+        );
+    }
+    if enable && has_other_tun {
+        bail!(
+            "cannot enable the managed Internet TUN while another TUN inbound is present; preserve or remove the custom TUN explicitly"
+        );
+    }
     let original = config.clone();
     let root = config
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
-    let inbounds = root
-        .entry("inbounds")
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .context("existing config inbounds must be an array")?;
     if enable {
-        if !inbounds.iter().any(is_tun_inbound) {
+        let inbounds = root
+            .entry("inbounds")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("existing config inbounds must be an array")?;
+        if !inbounds.iter().any(is_internet_tun_inbound) {
             inbounds.push(default_tun_inbound());
         }
-    } else {
-        inbounds.retain(|inbound| !is_tun_inbound(inbound));
+    } else if let Some(inbounds) = root.get_mut("inbounds") {
+        let inbounds = inbounds
+            .as_array_mut()
+            .context("existing config inbounds must be an array")?;
+        if has_managed_internet_tun {
+            inbounds.retain(|inbound| !is_internet_tun_inbound(inbound));
+        }
+    }
+    if enable {
+        set_internet_tun_auto_detect_interface(root, true)?;
+    } else if !has_other_tun {
+        // Once the managed inbound is removed, a remaining custom TUN owns the shared route
+        // policy. Otherwise restore the managed toggle's rollback state.
+        if let Some(state) = restore_auto_detect_interface {
+            restore_route_auto_detect_interface(root, state)?;
+        } else if has_private_access_baseline {
+            // Backward compatibility for state written before the original route preference was
+            // persisted. This marker is owned by the managed Private Access baseline.
+            set_internet_tun_auto_detect_interface(root, false)?;
+        }
     }
     let changed = config != original;
     if changed {
         let contents =
             serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
-        fs::write(config_path, format!("{contents}\n"))
+        write_atomic(config_path, format!("{contents}\n").as_bytes())
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
-    Ok(changed)
+    Ok(InternetTunModeUpdate {
+        changed,
+        auto_detect_interface_before_enable,
+    })
 }
 
-fn config_has_tun_inbound(config: &Value) -> bool {
+fn config_has_internet_tun_inbound_value(config: &Value) -> bool {
     config
         .get("inbounds")
         .and_then(Value::as_array)
-        .is_some_and(|inbounds| inbounds.iter().any(is_tun_inbound))
+        .is_some_and(|inbounds| inbounds.iter().any(is_internet_tun_inbound))
+}
+
+fn tun_config_state(config: &Value) -> Result<TunConfigState> {
+    Ok(TunConfigState {
+        managed_internet_tun: config_has_internet_tun_inbound_value(config),
+        other_tun: config_has_other_tun_inbound(config),
+        reserved_tag_conflict: config_has_reserved_internet_tun_tag_conflict(config),
+        auto_detect_interface: route_auto_detect_interface_state(config)?,
+    })
 }
 
 fn is_tun_inbound(inbound: &Value) -> bool {
     inbound.get("type").and_then(Value::as_str) == Some("tun")
+}
+
+fn is_internet_tun_inbound(inbound: &Value) -> bool {
+    is_tun_inbound(inbound)
+        && inbound.get("tag").and_then(Value::as_str) == Some(INTERNET_TUN_INBOUND_TAG)
+}
+
+fn config_has_other_tun_inbound(config: &Value) -> bool {
+    config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|inbounds| {
+            inbounds
+                .iter()
+                .any(|inbound| is_tun_inbound(inbound) && !is_internet_tun_inbound(inbound))
+        })
+}
+
+fn config_has_reserved_internet_tun_tag_conflict(config: &Value) -> bool {
+    config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|inbounds| {
+            let mut reserved = inbounds.iter().filter(|inbound| {
+                inbound.get("tag").and_then(Value::as_str) == Some(INTERNET_TUN_INBOUND_TAG)
+            });
+            reserved
+                .next()
+                .is_some_and(|first| !is_internet_tun_inbound(first) || reserved.next().is_some())
+        })
+}
+
+fn config_has_private_access_tun_baseline(config: &Value) -> bool {
+    config
+        .get("dns")
+        .and_then(|dns| dns.get("servers"))
+        .and_then(Value::as_array)
+        .is_some_and(|servers| {
+            servers.iter().any(|server| {
+                server.get("tag").and_then(Value::as_str) == Some(PRIVATE_ACCESS_SYSTEM_DNS_TAG)
+            })
+        })
+}
+
+fn route_auto_detect_interface_state(config: &Value) -> Result<RouteAutoDetectInterfaceState> {
+    let Some(route) = config.get("route") else {
+        return Ok(RouteAutoDetectInterfaceState::RouteMissing);
+    };
+    let route = route
+        .as_object()
+        .context("existing config route must be an object")?;
+    match route.get("auto_detect_interface") {
+        None => Ok(RouteAutoDetectInterfaceState::FieldMissing),
+        Some(Value::Bool(false)) => Ok(RouteAutoDetectInterfaceState::Disabled),
+        Some(Value::Bool(true)) => Ok(RouteAutoDetectInterfaceState::Enabled),
+        Some(_) => bail!("existing config route.auto_detect_interface must be a boolean"),
+    }
+}
+
+/// `auto_route` sends the system default route through the Internet TUN. The sing-box process
+/// must therefore bind its own node/DNS dials to the physical default interface or those dials
+/// are captured by the same TUN again. When Internet TUN is off, the managed Private Access
+/// baseline deliberately leaves direct dials unbound so its more-specific OS routes can win.
+fn set_internet_tun_auto_detect_interface(
+    root: &mut Map<String, Value>,
+    internet_tun_enabled: bool,
+) -> Result<&mut Map<String, Value>> {
+    let route = root
+        .entry("route")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    route.insert(
+        "auto_detect_interface".to_string(),
+        Value::Bool(internet_tun_enabled),
+    );
+    Ok(route)
+}
+
+fn restore_route_auto_detect_interface(
+    root: &mut Map<String, Value>,
+    state: RouteAutoDetectInterfaceState,
+) -> Result<()> {
+    match state {
+        RouteAutoDetectInterfaceState::Disabled => {
+            set_internet_tun_auto_detect_interface(root, false)?;
+        }
+        RouteAutoDetectInterfaceState::Enabled => {
+            set_internet_tun_auto_detect_interface(root, true)?;
+        }
+        RouteAutoDetectInterfaceState::FieldMissing => {
+            let route = root
+                .entry("route")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .context("existing config route must be an object")?;
+            route.remove("auto_detect_interface");
+        }
+        RouteAutoDetectInterfaceState::RouteMissing => {
+            let Some(route) = root.get_mut("route") else {
+                return Ok(());
+            };
+            let route = route
+                .as_object_mut()
+                .context("existing config route must be an object")?;
+            route.remove("auto_detect_interface");
+            if route.is_empty() {
+                root.remove("route");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn china_ip_routing_rule_set_tags() -> &'static [&'static str] {
@@ -535,6 +753,7 @@ fn config_has_china_ip_routing_value(config: &Value) -> bool {
 /// Adds or removes the China split-routing rule-sets and rules in the sing-box config,
 /// writing the result back in place when it changed. Returns whether the config was modified.
 pub(crate) fn set_china_ip_routing(config_path: &Path, enable: bool) -> Result<bool> {
+    let _config_guard = lock_config_mutation();
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
@@ -546,7 +765,7 @@ pub(crate) fn set_china_ip_routing(config_path: &Path, enable: bool) -> Result<b
     if changed {
         let contents =
             serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
-        fs::write(config_path, format!("{contents}\n"))
+        write_atomic(config_path, format!("{contents}\n").as_bytes())
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     Ok(changed)
@@ -1933,6 +2152,8 @@ fn ensure_private_access_tun_baseline(
     config: &mut Value,
     carrier_domains: &[String],
 ) -> Result<()> {
+    let tun_state = tun_config_state(config)?;
+    let private_access_baseline_already_owned = config_has_private_access_tun_baseline(config);
     ensure_private_access_carrier_route(config, carrier_domains)?;
 
     let root = config
@@ -1959,9 +2180,17 @@ fn ensure_private_access_tun_baseline(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("existing config route must be an object")?;
-    // Private Access TUN mode relies on the OS route table. Pinning direct dials to the physical
-    // default interface bypasses the helper-owned TUN interface.
-    route.insert("auto_detect_interface".to_string(), Value::Bool(false));
+    if tun_state.managed_internet_tun {
+        // Internet TUN needs physical-interface binding to prevent its own proxy/DNS dials from
+        // looping back into the default TUN route.
+        route.insert("auto_detect_interface".to_string(), Value::Bool(true));
+    } else if !tun_state.other_tun && !private_access_baseline_already_owned {
+        // Without a sing-box TUN, leave Private Access dials unbound so its more-specific helper
+        // routes can win on first setup. Once the baseline marker exists, preserve explicit user
+        // edits and values restored by the Internet TUN toggle. A custom TUN always owns its own
+        // routing policy.
+        route.insert("auto_detect_interface".to_string(), Value::Bool(false));
+    }
     let rules = route
         .entry("rules")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -2509,17 +2738,21 @@ fn set_bool_field(outbound: &mut Value, key: &str, value: bool) {
 mod tests {
     use super::{
         DefaultConfigOptions, HillstoneRouteTableOptions, PRIVATE_ACCESS_SYSTEM_DNS_TAG,
-        PrivateAccessRouteTableOptions, ProviderNodeSet, build_default_config,
-        build_default_config_with_options, build_full_config_with_provider_node_sets,
-        config_has_china_ip_routing, config_has_internet_tun_inbound, default_tun_inbound,
+        PrivateAccessRouteTableOptions, ProviderNodeSet, RouteAutoDetectInterfaceState,
+        build_default_config, build_default_config_with_options,
+        build_full_config_with_provider_node_sets, config_has_china_ip_routing,
+        config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
-        ensure_private_access_route_table, merge_into_existing_config,
-        run_private_access_route_table_config, run_private_access_tun_baseline_config,
-        set_china_ip_routing, set_internet_tun_mode,
+        ensure_private_access_route_table, inspect_tun_config, lock_config_mutation,
+        merge_into_existing_config, run_private_access_route_table_config,
+        run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
     };
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
     use std::fs;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2655,6 +2888,7 @@ mod tests {
         assert_eq!(tun["stack"], "mixed");
         assert_eq!(tun["endpoint_independent_nat"], true);
         assert!(tun.get("auto_redirect").is_none());
+        assert_eq!(config["route"]["auto_detect_interface"], true);
     }
 
     #[test]
@@ -3220,6 +3454,148 @@ mod tests {
                     server["tag"] == PRIVATE_ACCESS_SYSTEM_DNS_TAG && server["type"] == "local"
                 }))
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn private_access_baseline_keeps_internet_tun_route_loop_protection() {
+        let path = temp_config_path("private-access-with-internet-tun");
+        let config = json!({
+            "dns": { "servers": [] },
+            "inbounds": [default_tun_inbound()],
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "select", "outbounds": ["direct"] }
+            ],
+            "route": {
+                "auto_detect_interface": false,
+                "rules": [{ "action": "hijack-dns", "protocol": "dns" }]
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).expect("config serializes"),
+        )
+        .expect("temporary config is written");
+
+        assert!(
+            run_private_access_tun_baseline_config(&path, true, &[])
+                .expect("baseline update succeeds")
+        );
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("updated config reads"))
+                .expect("updated config parses");
+        assert_eq!(parsed["route"]["auto_detect_interface"], true);
+        assert!(
+            !run_private_access_tun_baseline_config(&path, true, &[])
+                .expect("repeated baseline update succeeds")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn private_access_baseline_preserves_owned_or_custom_tun_route_policy() {
+        for (name, inbounds, auto_detect_interface) in [
+            ("owned-enabled", json!([]), Some(true)),
+            ("owned-missing", json!([]), None),
+            (
+                "custom-tun",
+                json!([{
+                    "type": "tun",
+                    "tag": "custom-tun",
+                    "address": ["172.20.0.1/30"],
+                    "auto_route": true
+                }]),
+                Some(true),
+            ),
+        ] {
+            let path = temp_config_path(name);
+            let mut route = json!({ "rules": [] });
+            if let Some(value) = auto_detect_interface {
+                route["auto_detect_interface"] = Value::Bool(value);
+            }
+            let config = json!({
+                "dns": {
+                    "servers": [{
+                        "type": "local",
+                        "tag": PRIVATE_ACCESS_SYSTEM_DNS_TAG
+                    }]
+                },
+                "inbounds": inbounds,
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+                "route": route
+            });
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&config).expect("serializes"),
+            )
+            .expect("writes config");
+
+            run_private_access_tun_baseline_config(&path, true, &[])
+                .expect("baseline update succeeds");
+            let parsed: Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("reads config"))
+                    .expect("parses config");
+            assert_eq!(
+                parsed["route"]
+                    .get("auto_detect_interface")
+                    .and_then(Value::as_bool),
+                auto_detect_interface,
+                "{name}"
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn internet_tun_round_trip_survives_private_access_baseline_replay() {
+        let path = temp_config_path("internet-tun-private-access-round-trip");
+        let config = json!({
+            "dns": {
+                "servers": [{
+                    "type": "local",
+                    "tag": PRIVATE_ACCESS_SYSTEM_DNS_TAG
+                }]
+            },
+            "inbounds": [{ "type": "mixed", "listen_port": 6780 }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {
+                "auto_detect_interface": true,
+                "rules": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).expect("serializes"),
+        )
+        .expect("writes config");
+
+        let enabled = set_internet_tun_mode(&path, true, None).expect("enables Internet TUN");
+        run_private_access_tun_baseline_config(&path, true, &[])
+            .expect("enabled startup baseline applies");
+        assert_eq!(
+            inspect_tun_config(&path)
+                .expect("enabled config inspects")
+                .auto_detect_interface,
+            RouteAutoDetectInterfaceState::Enabled
+        );
+
+        set_internet_tun_mode(
+            &path,
+            false,
+            Some(enabled.auto_detect_interface_before_enable),
+        )
+        .expect("disables Internet TUN");
+        run_private_access_tun_baseline_config(&path, true, &[])
+            .expect("disabled startup baseline replays");
+        let disabled = inspect_tun_config(&path).expect("disabled config inspects");
+        assert!(!disabled.managed_internet_tun);
+        assert_eq!(
+            disabled.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Enabled
+        );
+
         let _ = fs::remove_file(path);
     }
 
@@ -3807,6 +4183,56 @@ mod tests {
     }
 
     #[test]
+    fn internet_tun_update_waits_for_the_shared_config_mutation_lock() {
+        let path = temp_config_path("internet-tun-mutation-lock");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [{ "type": "mixed", "listen_port": 6780 }],
+                "outbounds": [{ "type": "direct", "tag": "direct" }]
+            }))
+            .expect("serializes config"),
+        )
+        .expect("writes config");
+
+        let guard = lock_config_mutation();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signals worker start");
+            let result = set_internet_tun_mode(&worker_path, true, None);
+            finished_tx.send(result).expect("reports worker result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker starts");
+        assert!(
+            matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the TUN read-modify-write must wait while another config mutation is active"
+        );
+        drop(guard);
+
+        let update = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker resumes after releasing the mutation lock")
+            .expect("TUN update succeeds");
+        assert!(update.changed);
+        worker.join().expect("worker exits cleanly");
+        let updated: Value = serde_json::from_str(
+            &fs::read_to_string(&path).expect("reads config after serialized update"),
+        )
+        .expect("parses config after serialized update");
+        assert_eq!(updated["route"]["auto_detect_interface"], true);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn set_internet_tun_mode_adds_and_removes_tun_inbound_idempotently() {
         let path = temp_config_path("internet-tun-toggle");
         let base = json!({
@@ -3816,7 +4242,8 @@ mod tests {
                 "listen_port": 6780,
                 "set_system_proxy": false
             }],
-            "outbounds": [{ "type": "direct", "tag": "direct" }]
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "auto_detect_interface": false }
         });
         fs::write(
             &path,
@@ -3826,7 +4253,12 @@ mod tests {
 
         assert!(!config_has_internet_tun_inbound(&path).expect("detects"));
 
-        assert!(set_internet_tun_mode(&path, true).expect("enables"));
+        let enabled_update = set_internet_tun_mode(&path, true, None).expect("enables");
+        assert!(enabled_update.changed);
+        assert_eq!(
+            enabled_update.auto_detect_interface_before_enable,
+            RouteAutoDetectInterfaceState::Disabled
+        );
         assert!(config_has_internet_tun_inbound(&path).expect("detects after enable"));
         let enabled: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
@@ -3839,9 +4271,14 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(enabled["route"]["auto_detect_interface"], true);
 
         // Enabling again is a no-op and keeps the mixed inbound.
-        assert!(!set_internet_tun_mode(&path, true).expect("enables idempotently"));
+        assert!(
+            !set_internet_tun_mode(&path, true, None)
+                .expect("enables idempotently")
+                .changed
+        );
         let again: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
         assert!(
@@ -3852,9 +4289,220 @@ mod tests {
                 .any(|value| value["type"] == "mixed")
         );
 
-        assert!(set_internet_tun_mode(&path, false).expect("disables"));
+        assert!(
+            set_internet_tun_mode(
+                &path,
+                false,
+                Some(enabled_update.auto_detect_interface_before_enable),
+            )
+            .expect("disables")
+            .changed
+        );
         assert!(!config_has_internet_tun_inbound(&path).expect("detects after disable"));
-        assert!(!set_internet_tun_mode(&path, false).expect("disables idempotently"));
+        let disabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert_eq!(disabled["route"]["auto_detect_interface"], false);
+        assert!(
+            !set_internet_tun_mode(&path, false, None)
+                .expect("disables idempotently")
+                .changed
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_internet_tun_mode_restores_the_previous_route_interface_state() {
+        for (name, route) in [
+            ("route-missing", None),
+            ("field-missing", Some(json!({ "rules": [] }))),
+            (
+                "already-enabled",
+                Some(json!({ "auto_detect_interface": true })),
+            ),
+        ] {
+            let path = temp_config_path(name);
+            let mut base = json!({
+                "inbounds": [{ "type": "mixed", "listen_port": 6780 }],
+                "outbounds": [{ "type": "direct", "tag": "direct" }]
+            });
+            if let Some(route) = route {
+                base["route"] = route;
+            }
+            let expected_route = base.get("route").cloned();
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&base).expect("serializes"),
+            )
+            .expect("writes config");
+
+            let enabled = set_internet_tun_mode(&path, true, None).expect("enables");
+            assert!(enabled.changed);
+            let disabled = set_internet_tun_mode(
+                &path,
+                false,
+                Some(enabled.auto_detect_interface_before_enable),
+            )
+            .expect("disables");
+            assert!(disabled.changed);
+
+            let restored: Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("reads restored config"))
+                    .expect("parses restored config");
+            assert_eq!(restored.get("route"), expected_route.as_ref(), "{name}");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn internet_tun_toggle_preserves_custom_tun_inbounds() {
+        let path = temp_config_path("custom-tun");
+        let base = json!({
+            "inbounds": [{
+                "type": "tun",
+                "tag": "custom-tun",
+                "address": ["172.20.0.1/30"],
+                "auto_route": false
+            }],
+            "route": { "auto_detect_interface": true }
+        });
+        let original = serde_json::to_string_pretty(&base).expect("serializes");
+        fs::write(&path, &original).expect("writes config");
+
+        assert!(!config_has_internet_tun_inbound(&path).expect("detects managed TUN"));
+        let error = set_internet_tun_mode(&path, true, None)
+            .expect_err("a second managed TUN must not be added over a custom TUN");
+        assert!(error.to_string().contains("another TUN inbound"));
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
+        assert!(
+            !set_internet_tun_mode(&path, false, None)
+                .expect("disabling managed TUN is a no-op")
+                .changed
+        );
+        let preserved: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads preserved config"))
+                .expect("parses preserved config");
+        assert_eq!(preserved["inbounds"][0]["tag"], "custom-tun");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn enabling_rejects_a_non_tun_inbound_using_the_reserved_tag() {
+        let path = temp_config_path("reserved-tun-tag");
+        let config = json!({
+            "inbounds": [{
+                "type": "mixed",
+                "tag": "tun-in",
+                "listen": "::",
+                "listen_port": 6780
+            }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }]
+        });
+        let original = serde_json::to_string_pretty(&config).expect("serializes");
+        fs::write(&path, &original).expect("writes config");
+
+        let inspected = inspect_tun_config(&path).expect("inspects reserved tag conflict");
+        assert!(!inspected.managed_internet_tun);
+        assert!(inspected.reserved_tag_conflict);
+        let error = set_internet_tun_mode(&path, true, None)
+            .expect_err("reserved tag collision must be rejected");
+        assert!(error.to_string().contains("tag 'tun-in'"));
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
+        assert!(
+            !set_internet_tun_mode(&path, false, None)
+                .expect("disabling an absent managed TUN is safe")
+                .changed
+        );
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn enabling_rejects_duplicate_managed_tun_tags_while_disable_can_recover() {
+        let path = temp_config_path("duplicate-managed-tun-tag");
+        let config = json!({
+            "inbounds": [default_tun_inbound(), default_tun_inbound()],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "auto_detect_interface": true }
+        });
+        let original = serde_json::to_string_pretty(&config).expect("serializes");
+        fs::write(&path, &original).expect("writes config");
+
+        let inspected = inspect_tun_config(&path).expect("inspects duplicate managed tags");
+        assert!(inspected.managed_internet_tun);
+        assert!(inspected.reserved_tag_conflict);
+        let error = set_internet_tun_mode(&path, true, None)
+            .expect_err("duplicate managed tags must be rejected");
+        assert!(error.to_string().contains("tag 'tun-in'"));
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
+
+        let disabled =
+            set_internet_tun_mode(&path, false, Some(RouteAutoDetectInterfaceState::Disabled))
+                .expect("disable removes duplicate managed TUN inbounds");
+        assert!(disabled.changed);
+        let recovered = inspect_tun_config(&path).expect("inspects recovered config");
+        assert!(!recovered.managed_internet_tun);
+        assert!(!recovered.reserved_tag_conflict);
+        assert_eq!(
+            recovered.auto_detect_interface,
+            RouteAutoDetectInterfaceState::Disabled
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn enabling_rejects_existing_managed_and_custom_tuns() {
+        let path = temp_config_path("managed-and-custom-tun");
+        let config = json!({
+            "inbounds": [
+                default_tun_inbound(),
+                {
+                    "type": "tun",
+                    "tag": "custom-tun",
+                    "address": ["172.20.0.1/30"],
+                    "auto_route": false
+                }
+            ],
+            "route": { "auto_detect_interface": true }
+        });
+        let original = serde_json::to_string_pretty(&config).expect("serializes");
+        fs::write(&path, &original).expect("writes config");
+
+        let error =
+            set_internet_tun_mode(&path, true, None).expect_err("managed and custom TUNs conflict");
+        assert!(error.to_string().contains("another TUN inbound"));
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
+
+        assert!(
+            set_internet_tun_mode(&path, false, Some(RouteAutoDetectInterfaceState::Disabled),)
+                .expect("managed TUN can be removed from a conflicting config")
+                .changed
+        );
+        let recovered: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads recovered config"))
+                .expect("parses recovered config");
+        assert_eq!(recovered["inbounds"].as_array().map(Vec::len), Some(1));
+        assert_eq!(recovered["inbounds"][0]["tag"], "custom-tun");
+        assert_eq!(recovered["route"]["auto_detect_interface"], true);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn disabling_absent_internet_tun_does_not_create_inbounds() {
+        let path = temp_config_path("absent-tun-without-inbounds");
+        let original = r#"{"route":{"auto_detect_interface":true}}"#;
+        fs::write(&path, original).expect("writes config");
+
+        assert!(
+            !set_internet_tun_mode(&path, false, None)
+                .expect("disabling absent managed TUN is a no-op")
+                .changed
+        );
+        assert_eq!(fs::read_to_string(&path).expect("reads config"), original);
 
         let _ = fs::remove_file(path);
     }
