@@ -23,6 +23,7 @@ mod ruleset;
 mod sonicwall;
 mod storage;
 mod subscriptions;
+mod system_proxy;
 mod tui;
 mod tui_state;
 mod tun;

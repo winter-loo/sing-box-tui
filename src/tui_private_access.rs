@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 fn command_tokens(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -186,9 +187,7 @@ fn tun_helper_needs_sudo() -> bool {
 struct TuiPrivateAccessNetworkIntegration<'a> {
     config_path: &'a Path,
     sing_box: &'a mut ManagedSingBox,
-    system_proxy_enabled: &'a mut bool,
-    system_proxy_job_running: bool,
-    system_proxy_server: &'a str,
+    system_proxy: &'a mut SystemProxy,
     base_bypass_entries: &'a [String],
 }
 
@@ -254,19 +253,8 @@ impl PrivateAccessNetworkIntegration for TuiPrivateAccessNetworkIntegration<'_> 
     }
 
     fn refresh_system_proxy_bypass(&mut self, dynamic_entries: &[String]) -> Result<bool> {
-        if !*self.system_proxy_enabled || self.system_proxy_job_running {
-            return Ok(false);
-        }
-        let mut entries = self.base_bypass_entries.to_vec();
-        for entry in dynamic_entries {
-            if !entries.contains(entry) {
-                entries.push(entry.clone());
-            }
-        }
-        run_system_proxy_update(self.system_proxy_server, true, &entries)
-            .context("failed to refresh system proxy with Private Access bypass rules")?;
-        *self.system_proxy_enabled = system_proxy_matches(self.system_proxy_server);
-        Ok(true)
+        self.system_proxy
+            .refresh_bypass(self.base_bypass_entries, dynamic_entries)
     }
 }
 
@@ -670,7 +658,7 @@ impl App {
         ) = if service == "sonicwall" {
             sonicwall_http_connect_settings(
                 profile.use_internet_proxy,
-                &self.system_proxy_server,
+                self.system_proxy.server(),
                 self.internet_outbound_context(),
                 &self.client.base_url,
                 self.internet_outbound_root_selector(),
@@ -748,14 +736,11 @@ impl App {
     }
 
     pub(super) fn poll_private_access_updates(&mut self) -> Result<()> {
-        let system_proxy_job_running = self.system_proxy_job.is_some();
         let notices = {
             let mut integration = TuiPrivateAccessNetworkIntegration {
                 config_path: &self.system_proxy_config_path,
                 sing_box: &mut self.sing_box,
-                system_proxy_enabled: &mut self.system_proxy_enabled,
-                system_proxy_job_running,
-                system_proxy_server: &self.system_proxy_server,
+                system_proxy: &mut self.system_proxy,
                 base_bypass_entries: &self.bypass_entries,
             };
             self.private_access.poll(&mut integration)?
