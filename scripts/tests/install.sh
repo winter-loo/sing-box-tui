@@ -141,6 +141,7 @@ run_case() {
       --skip-sing-box \
       --no-path \
       --force \
+      --no-macos-helper \
       --github-proxy https://proxy.test/anywhere >/dev/null
   [ -x "$case_dir/install/sing-box-tui" ] || fail "$scenario did not install an executable"
   [ "$("$case_dir/install/sing-box-tui")" = test-version ] || fail "$scenario installed the wrong payload"

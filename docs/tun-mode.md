@@ -19,9 +19,38 @@ Internet Proxy TUN mode without editing the config by hand:
   rejected if a non-TUN inbound already uses that tag, because sing-box inbound
   tags must be unique.
 - It restarts the managed sing-box process so the change takes effect.
-- Enabling TUN requires elevated permissions: on macOS/Linux the TUI runs
-  `sudo -v` first and then restarts sing-box through `sudo -n`; on Windows it
-  requires an Administrator session. Disabling TUN restarts sing-box normally.
+- TUN requires elevated permissions. On macOS, the installer installs a root-owned
+  LaunchDaemon helper and the ordinary-user TUI asks that helper to restart or stop
+  sing-box over an authenticated Unix socket. Administrator authorization is needed
+  once during installation, not for every toggle. A source build without the helper
+  falls back to `sudo -v` followed by `sudo -n`. Linux uses the sudo path and Windows
+  requires an Administrator session.
+
+### macOS privileged helper
+
+The installer places a root-owned copy of the executable at
+`/Library/PrivilegedHelperTools/com.winterloo.sing-box-tui.helper` and installs
+`/Library/LaunchDaemons/com.winterloo.sing-box-tui.helper.plist`. The daemon accepts
+connections only from the UID that installed it. Its protocol exposes only restart,
+stop, and status operations; it does not accept shell commands. Executable and config
+paths are canonicalized and checked for safe ownership and permissions before use.
+The helper runs only the root-owned sing-box copy installed alongside it; clients cannot
+select an executable or log path.
+
+To deliberately keep the legacy sudo behavior, install with `--no-macos-helper`.
+To remove an installed helper:
+
+```sh
+sudo launchctl bootout system/com.winterloo.sing-box-tui.helper
+sudo rm /Library/LaunchDaemons/com.winterloo.sing-box-tui.helper.plist
+sudo rm /Library/PrivilegedHelperTools/com.winterloo.sing-box-tui.helper
+sudo rm /Library/PrivilegedHelperTools/com.winterloo.sing-box-tui.sing-box
+sudo rm -f /var/run/sing-box-tui-helper.sock /var/run/sing-box-tui-helper.pid
+sudo rm -f /var/log/sing-box-tui-helper.log /var/log/sing-box-tui-managed.log
+```
+
+The first run after upgrading may request sudo once to retire a root sing-box process
+started by an older TUI. Subsequent TUN toggles use the daemon without sudo prompts.
 
 The TUI status bar shows whether TUN is currently enabled (`\` key). This is a
 different mechanism from the Private Access TUN data-plane helper, which is a

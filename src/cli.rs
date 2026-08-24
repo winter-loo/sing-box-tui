@@ -127,6 +127,12 @@ pub(crate) enum CliCommand {
     PrivateAccessTunHelper {
         stdio: bool,
     },
+    #[cfg(target_os = "macos")]
+    MacosPrivilegedHelper {
+        socket: PathBuf,
+        allowed_uid: u32,
+        sing_box: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +179,8 @@ impl CliCommand {
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
             "private-access-service" => Self::parse_private_access_service(&args[1..]),
             "private-access-tun-helper" => Self::parse_private_access_tun_helper(&args[1..]),
+            #[cfg(target_os = "macos")]
+            "macos-privileged-helper" => Self::parse_macos_privileged_helper(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1085,6 +1093,44 @@ impl CliCommand {
             i += 1;
         }
         Ok(Self::PrivateAccessTunHelper { stdio })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn parse_macos_privileged_helper(args: &[String]) -> Result<Self> {
+        let mut socket = PathBuf::from(crate::macos_privileged_helper::DEFAULT_SOCKET_PATH);
+        let mut allowed_uid = None;
+        let mut sing_box = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--socket" => {
+                    i += 1;
+                    socket = PathBuf::from(args.get(i).context("--socket requires a value")?);
+                }
+                "--allowed-uid" => {
+                    i += 1;
+                    allowed_uid = Some(
+                        args.get(i)
+                            .context("--allowed-uid requires a value")?
+                            .parse::<u32>()
+                            .context("--allowed-uid must be an unsigned integer")?,
+                    );
+                }
+                "--sing-box" => {
+                    i += 1;
+                    sing_box = Some(PathBuf::from(
+                        args.get(i).context("--sing-box requires a value")?,
+                    ));
+                }
+                value => bail!("unknown argument for macos-privileged-helper: {value}"),
+            }
+            i += 1;
+        }
+        Ok(Self::MacosPrivilegedHelper {
+            socket,
+            allowed_uid: allowed_uid.context("macos-privileged-helper requires --allowed-uid")?,
+            sing_box: sing_box.context("macos-privileged-helper requires --sing-box")?,
+        })
     }
 }
 

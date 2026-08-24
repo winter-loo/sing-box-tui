@@ -22,6 +22,7 @@ NO_PATH=0
 FORCE=0
 CHECK_ONLY=0
 DRY_RUN=0
+INSTALL_MACOS_HELPER=1
 USER_AGENT=sing-box-tui-installer
 TEMP_DIR=
 
@@ -52,6 +53,7 @@ Options:
   --force                        replace files already in the install directory
   --check-only                   check whether the requested tools are installed
   --dry-run                      print the planned installation without changing it
+  --no-macos-helper              do not install the macOS privileged TUN helper
   -h, --help                     show this help
 
 Defaults can also be overridden with the corresponding uppercase environment
@@ -164,6 +166,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --no-macos-helper)
+      INSTALL_MACOS_HELPER=0
       shift
       ;;
     *)
@@ -330,6 +336,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   fi
   if [ "$NO_PATH" -eq 0 ]; then
     write_step "Would add $INSTALL_DIR to the user PATH"
+  fi
+  if [ "$TARGET_OS" = darwin ] && [ "$INSTALL_MACOS_HELPER" -eq 1 ]; then
+    write_step "Would install the macOS privileged TUN helper (one administrator prompt)"
   fi
   exit 0
 fi
@@ -884,11 +893,63 @@ install_tui() {
   write_step "Installed sing-box-tui to $TUI_EXE"
 }
 
+install_macos_privileged_helper() {
+  [ "$TARGET_OS" = darwin ] || return 0
+  [ "$INSTALL_MACOS_HELPER" -eq 1 ] || return 0
+
+  helper_dir=/Library/PrivilegedHelperTools
+  helper_path=$helper_dir/com.winterloo.sing-box-tui.helper
+  helper_core=$helper_dir/com.winterloo.sing-box-tui.sing-box
+  plist_path=/Library/LaunchDaemons/com.winterloo.sing-box-tui.helper.plist
+  helper_socket=/var/run/sing-box-tui-helper.sock
+  allowed_uid=$(id -u)
+  plist=$TEMP_DIR/com.winterloo.sing-box-tui.helper.plist
+  if [ -x "$CORE_EXE" ]; then
+    helper_core_source=$CORE_EXE
+  elif command -v sing-box >/dev/null 2>&1; then
+    helper_core_source=$(command -v sing-box)
+  else
+    die "macOS privileged helper requires an installed sing-box core"
+  fi
+
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '%s\n' '<key>Label</key><string>com.winterloo.sing-box-tui.helper</string>'
+    printf '%s\n' '<key>ProgramArguments</key><array>'
+    printf '<string>%s</string>\n' "$helper_path"
+    printf '%s\n' '<string>macos-privileged-helper</string><string>--socket</string>'
+    printf '<string>%s</string>\n' "$helper_socket"
+    printf '%s\n' '<string>--allowed-uid</string>'
+    printf '<string>%s</string>\n' "$allowed_uid"
+    printf '%s\n' '<string>--sing-box</string>'
+    printf '<string>%s</string>\n' "$helper_core"
+    printf '%s\n' '</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>'
+    printf '%s\n' '<key>ProcessType</key><string>Interactive</string>'
+    printf '%s\n' '<key>StandardOutPath</key><string>/var/log/sing-box-tui-helper.log</string>'
+    printf '%s\n' '<key>StandardErrorPath</key><string>/var/log/sing-box-tui-helper.log</string>'
+    printf '%s\n' '</dict></plist>'
+  } > "$plist"
+
+  write_step "Installing macOS privileged TUN helper (administrator authorization required)"
+  sudo /usr/bin/install -d -o root -g wheel -m 755 "$helper_dir"
+  sudo /usr/bin/install -o root -g wheel -m 755 "$TUI_EXE" "$helper_path"
+  sudo /usr/bin/install -o root -g wheel -m 755 "$helper_core_source" "$helper_core"
+  sudo /usr/bin/install -o root -g wheel -m 644 "$plist" "$plist_path"
+  sudo /bin/launchctl bootout system/com.winterloo.sing-box-tui.helper 2>/dev/null || true
+  sudo /bin/launchctl bootstrap system "$plist_path"
+  sudo /bin/launchctl enable system/com.winterloo.sing-box-tui.helper
+  sudo /bin/launchctl kickstart system/com.winterloo.sing-box-tui.helper
+  write_step "Installed macOS privileged TUN helper for uid $allowed_uid"
+}
+
 if [ "$SKIP_SING_BOX" -eq 0 ]; then
   install_sing_box_core
 fi
 
 install_tui
+install_macos_privileged_helper
 
 if [ "$NO_PATH" -eq 0 ]; then
   add_user_path "$INSTALL_DIR"

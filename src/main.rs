@@ -11,6 +11,8 @@ mod controller;
 mod defaults;
 mod hillstone;
 mod import;
+#[cfg(target_os = "macos")]
+mod macos_privileged_helper;
 mod private_access;
 mod provider;
 mod ruleset;
@@ -267,6 +269,12 @@ fn main() -> Result<()> {
             run_private_access_service_stdio(&service, stdio)
         }
         CliCommand::PrivateAccessTunHelper { stdio } => run_private_access_tun_helper_stdio(stdio),
+        #[cfg(target_os = "macos")]
+        CliCommand::MacosPrivilegedHelper {
+            socket,
+            allowed_uid,
+            sing_box,
+        } => macos_privileged_helper::serve(&socket, allowed_uid, &sing_box),
     }
 }
 
