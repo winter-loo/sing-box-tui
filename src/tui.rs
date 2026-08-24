@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io;
+use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,9 +19,14 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{DefaultTerminal, Frame};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::auto_pick::{
+    AutoPickConfig, AutoPickDecision, BACKGROUND_TASK_KIND, BackgroundAutoPickManager,
+    BackgroundLatencyResult, BackgroundLatencySnapshot, BackgroundLaunchSpec, BackgroundPollEvent,
+    BackgroundStatusSnapshot, BackgroundWorkerEnsure, HeadlessWorkerCommand, HeadlessWorkerControl,
+    HeadlessWorkerMetadata, registered_status_value, stop_registered_worker,
+};
 use crate::config::{
     PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
     run_private_access_route_table_config, run_private_access_tun_baseline_config,
@@ -90,10 +93,6 @@ const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SYSTEM_PROXY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
-const BACKGROUND_TASK_KIND_AUTO_PICK: &str = "headless-auto-pick";
-const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
-const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep RFC1918 ranges out of the OS-level bypass list. The Hillstone bridge
 // problem showed why this matters: if macOS bypasses 10.* before traffic reaches
 // sing-box, sing-box cannot apply its route override to the local ESP bridge.
@@ -119,173 +118,6 @@ pub(crate) struct TuiSubscriptionRefreshOptions {
     pub(crate) include_geosite_rules: bool,
     pub(crate) include_tun_mode: bool,
     pub(crate) interval_days: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundAutoPickConfig {
-    enabled: bool,
-    selector: Option<String>,
-    filter: String,
-    benchmark_url: String,
-    timeout_ms: u64,
-    request_timeout: f64,
-    max_concurrency: usize,
-    threshold_ms: u64,
-    interval_secs: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum BackgroundWorkerCommand {
-    Status,
-    ApplyConfig { config: BackgroundAutoPickConfig },
-    Stop,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundControlRequest {
-    token: String,
-    #[serde(flatten)]
-    command: BackgroundWorkerCommand,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundControlResponse {
-    ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    status: Option<BackgroundStatusSnapshot>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundStatusSnapshot {
-    kind: String,
-    pid: u32,
-    controller: String,
-    config_path: PathBuf,
-    max_concurrency: usize,
-    started_at_unix: u64,
-    status_generation: u64,
-    worker_status: String,
-    updated_at_unix: u64,
-    auto_pick_enabled: bool,
-    auto_pick_selector: Option<String>,
-    filter: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    latency: Option<BackgroundLatencySnapshot>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundLatencySnapshot {
-    selector: String,
-    current: Option<String>,
-    pattern: String,
-    url: String,
-    timeout_ms: u64,
-    max_concurrency: usize,
-    results: Vec<BackgroundLatencyResult>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundLatencyResult {
-    name: String,
-    delay: Option<u64>,
-    completed: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct BackgroundTaskState {
-    #[allow(dead_code)]
-    version: u8,
-    kind: String,
-    pid: u32,
-    #[allow(dead_code)]
-    controller: String,
-    #[allow(dead_code)]
-    config_path: PathBuf,
-    #[allow(dead_code)]
-    max_concurrency: usize,
-    #[allow(dead_code)]
-    started_at_unix: u64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    status_generation: u64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    status: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    updated_at_unix: Option<u64>,
-    bind_addr: String,
-    token: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum BackgroundTaskEnsureResult {
-    AlreadyRunning(u32),
-    Started(u32),
-}
-
-impl BackgroundTaskEnsureResult {
-    fn pid(&self) -> u32 {
-        match self {
-            Self::AlreadyRunning(pid) | Self::Started(pid) => *pid,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::AlreadyRunning(_) => "running",
-            Self::Started(_) => "started",
-        }
-    }
-}
-
-struct BackgroundWorkerRuntime {
-    pid: u32,
-    bind_addr: String,
-    token: String,
-    child: Option<Child>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BackgroundStatusTarget {
-    pid: u32,
-    bind_addr: String,
-    token: String,
-}
-
-struct BackgroundStatusPollOutcome {
-    result: Result<BackgroundStatusSnapshot, String>,
-    process_alive: bool,
-}
-
-enum BackgroundStatusPollResolution {
-    Snapshot(Box<BackgroundStatusSnapshot>),
-    Retry(String),
-    Reconnect(String),
-}
-
-struct BackgroundStatusPollJob {
-    target: BackgroundStatusTarget,
-    receiver: mpsc::Receiver<BackgroundStatusPollOutcome>,
-    worker: JoinHandle<()>,
-}
-
-fn resolve_background_status_poll(
-    outcome: BackgroundStatusPollOutcome,
-) -> BackgroundStatusPollResolution {
-    match outcome.result {
-        Ok(snapshot) => BackgroundStatusPollResolution::Snapshot(Box::new(snapshot)),
-        Err(error) if outcome.process_alive => BackgroundStatusPollResolution::Retry(error),
-        Err(error) => BackgroundStatusPollResolution::Reconnect(error),
-    }
-}
-
-struct BackgroundWorkerRequest {
-    command: BackgroundWorkerCommand,
-    response: mpsc::Sender<BackgroundControlResponse>,
 }
 
 pub(crate) fn run_tui(
@@ -346,35 +178,7 @@ pub(crate) fn run_headless_auto_pick(
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) fn run_background_status() -> Result<()> {
-    let Some(state) = read_background_task_state()? else {
-        print_json(serde_json::json!({
-            "status": "none",
-        }))?;
-        return Ok(());
-    };
-    let snapshot =
-        match send_background_control_request_to_state(&state, BackgroundWorkerCommand::Status) {
-            Ok(snapshot) => snapshot,
-            Err(_) if !process_exists(state.pid) => {
-                remove_background_task_state_file();
-                print_json(serde_json::json!({
-                    "status": "stale",
-                    "kind": state.kind,
-                    "pid": state.pid,
-                }))?;
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(error).context("failed to query live background worker over TCP");
-            }
-        };
-    let mut value = serde_json::to_value(snapshot).context("failed to encode background status")?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("status".to_string(), Value::String("running".to_string()));
-        object.insert("bind_addr".to_string(), Value::String(state.bind_addr));
-    }
-    print_json(value)?;
-    Ok(())
+    print_json(registered_status_value()?)
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -384,7 +188,7 @@ pub(crate) fn run_background_status() -> Result<()> {
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) fn run_background_stop() -> Result<()> {
-    let Some(pid) = stop_registered_background_auto_pick_task()? else {
+    let Some(pid) = stop_registered_worker()? else {
         disable_persisted_auto_pick()?;
         print_json(serde_json::json!({ "status": "none" }))?;
         return Ok(());
@@ -392,7 +196,7 @@ pub(crate) fn run_background_stop() -> Result<()> {
     disable_persisted_auto_pick()?;
     print_json(serde_json::json!({
         "status": "stopped",
-        "kind": BACKGROUND_TASK_KIND_AUTO_PICK,
+        "kind": BACKGROUND_TASK_KIND,
         "pid": pid,
         "was_running": true,
     }))?;
@@ -415,136 +219,6 @@ fn disable_persisted_auto_pick() -> Result<()> {
     store.save(&state)
 }
 
-fn background_task_state_path() -> PathBuf {
-    env::var("SING_BOX_TUI_BACKGROUND")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(BACKGROUND_TASK_PATH))
-}
-
-fn background_task_log_path() -> PathBuf {
-    background_task_state_path().with_extension("log")
-}
-
-fn read_text_tail(path: &Path, max_bytes: usize) -> Option<String> {
-    if max_bytes == 0 {
-        return None;
-    }
-    let mut file = File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    if length == 0 {
-        return None;
-    }
-    let read_len = length.min(max_bytes as u64) as usize;
-    file.seek(SeekFrom::Start(length.saturating_sub(read_len as u64)))
-        .ok()?;
-    let mut buffer = vec![0; read_len];
-    file.read_exact(&mut buffer).ok()?;
-    let text = String::from_utf8_lossy(&buffer).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-fn background_log_tail_context(log_path: &Path) -> String {
-    read_text_tail(log_path, 16 * 1024)
-        .map(|tail| format!("; background worker stderr tail: {tail}"))
-        .unwrap_or_default()
-}
-
-fn read_background_task_state() -> Result<Option<BackgroundTaskState>> {
-    let path = background_task_state_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read background state {}", path.display()))?;
-    let state = serde_json::from_str::<BackgroundTaskState>(&text)
-        .with_context(|| format!("failed to parse background state {}", path.display()))?;
-    if state.kind != BACKGROUND_TASK_KIND_AUTO_PICK {
-        bail!(
-            "unsupported background task kind '{}' in {}",
-            state.kind,
-            path.display()
-        );
-    }
-    Ok(Some(state))
-}
-
-fn remove_background_task_state_file() {
-    let path = background_task_state_path();
-    let _ = fs::remove_file(path);
-}
-
-fn write_background_task_state(state: &BackgroundTaskState) -> Result<()> {
-    let path = background_task_state_path();
-    write_background_task_state_to_path(&path, state)
-}
-
-fn write_background_task_state_to_path(path: &Path, state: &BackgroundTaskState) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create background task state directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    let text =
-        serde_json::to_string_pretty(state).context("failed to encode background task state")?;
-    if fs::symlink_metadata(&path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        bail!(
-            "refusing to write background task state through symlink {}",
-            path.display()
-        );
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("failed to open background task state {}", path.display()))?;
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| {
-            format!(
-                "failed to restrict background task state permissions {}",
-                path.display()
-            )
-        })?;
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("failed to write background task state {}", path.display()))
-}
-
-fn stop_background_auto_pick_task() -> Result<()> {
-    stop_registered_background_auto_pick_task().map(|_| ())
-}
-
-fn stop_registered_background_auto_pick_task() -> Result<Option<u32>> {
-    let Some(state) = read_background_task_state()? else {
-        return Ok(None);
-    };
-    let pid = state.pid;
-    if process_exists(state.pid) {
-        let stopped =
-            send_background_control_request_to_state(&state, BackgroundWorkerCommand::Stop)
-                .and_then(|_| {
-                    wait_for_background_process_to_exit(state.pid, Duration::from_secs(3))
-                })
-                .is_ok();
-        if !stopped {
-            stop_background_pid(state.pid).with_context(|| {
-                format!("failed to stop background auto-pick pid {}", state.pid)
-            })?;
-        }
-    }
-    remove_background_task_state_file();
-    Ok(Some(pid))
-}
-
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -558,236 +232,6 @@ fn print_json(value: Value) -> Result<()> {
         serde_json::to_string(&value).context("failed to encode JSON output")?
     );
     Ok(())
-}
-
-fn background_bind_addr() -> String {
-    env::var("SING_BOX_TUI_BACKGROUND_BIND")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "127.0.0.1:0".to_string())
-}
-
-fn background_remote_bind_allowed() -> bool {
-    env::var("SING_BOX_TUI_BACKGROUND_ALLOW_REMOTE")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn background_token_from_env() -> String {
-    env::var("SING_BOX_TUI_BACKGROUND_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(random_background_token)
-}
-
-fn random_background_token() -> String {
-    let bytes: [u8; 32] = rand::random();
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn spawn_background_tcp_server(
-    bind_addr: &str,
-    token: String,
-) -> Result<(SocketAddr, mpsc::Receiver<BackgroundWorkerRequest>)> {
-    validate_background_bind_addr(bind_addr)?;
-    let listener = TcpListener::bind(bind_addr)
-        .with_context(|| format!("failed to bind background TCP control listener {bind_addr}"))?;
-    let local_addr = listener
-        .local_addr()
-        .context("failed to read background TCP listener address")?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                break;
-            };
-            let tx = tx.clone();
-            let token = token.clone();
-            thread::spawn(move || {
-                let _ = handle_background_tcp_connection(stream, &token, tx);
-            });
-        }
-    });
-    Ok((local_addr, rx))
-}
-
-fn validate_background_bind_addr(bind_addr: &str) -> Result<()> {
-    validate_background_bind_addr_with_remote(bind_addr, background_remote_bind_allowed())
-}
-
-fn validate_background_bind_addr_with_remote(bind_addr: &str, allow_remote: bool) -> Result<()> {
-    let addr = bind_addr
-        .parse::<SocketAddr>()
-        .with_context(|| format!("invalid background TCP bind address: {bind_addr}"))?;
-    if addr.ip().is_loopback() || allow_remote {
-        return Ok(());
-    }
-    bail!(
-        "refusing non-loopback background TCP bind address {bind_addr}; set SING_BOX_TUI_BACKGROUND_ALLOW_REMOTE=1 to allow remote management"
-    )
-}
-
-fn handle_background_tcp_connection(
-    mut stream: TcpStream,
-    token: &str,
-    tx: mpsc::Sender<BackgroundWorkerRequest>,
-) -> Result<()> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .context("failed to set background TCP read timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .context("failed to set background TCP write timeout")?;
-    let mut line = String::new();
-    BufReader::new(stream.try_clone().context("failed to clone TCP stream")?)
-        .read_line(&mut line)
-        .context("failed to read background TCP request")?;
-    let request = serde_json::from_str::<BackgroundControlRequest>(&line)
-        .context("failed to parse background TCP request")?;
-    if request.token != token {
-        let response = BackgroundControlResponse {
-            ok: false,
-            error: Some("unauthorized".to_string()),
-            status: None,
-        };
-        write_background_control_response(&mut stream, &response)?;
-        return Ok(());
-    }
-    let (response_tx, response_rx) = mpsc::channel();
-    tx.send(BackgroundWorkerRequest {
-        command: request.command,
-        response: response_tx,
-    })
-    .context("background worker control loop is not available")?;
-    let response = response_rx
-        .recv_timeout(Duration::from_secs(5))
-        .context("timed out waiting for background control response")?;
-    write_background_control_response(&mut stream, &response)
-}
-
-fn write_background_control_response(
-    stream: &mut TcpStream,
-    response: &BackgroundControlResponse,
-) -> Result<()> {
-    let text = serde_json::to_string(response).context("failed to encode background response")?;
-    writeln!(stream, "{text}").context("failed to write background response")?;
-    stream
-        .flush()
-        .context("failed to flush background response")
-}
-
-fn send_background_control_request(
-    bind_addr: &str,
-    token: &str,
-    command: BackgroundWorkerCommand,
-) -> Result<BackgroundStatusSnapshot> {
-    let addr = bind_addr
-        .parse::<SocketAddr>()
-        .with_context(|| format!("invalid background TCP address: {bind_addr}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .with_context(|| format!("failed to connect background TCP control {bind_addr}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .context("failed to set background TCP read timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .context("failed to set background TCP write timeout")?;
-    let request = BackgroundControlRequest {
-        token: token.to_string(),
-        command,
-    };
-    let text = serde_json::to_string(&request).context("failed to encode background request")?;
-    writeln!(stream, "{text}").context("failed to write background request")?;
-    stream
-        .flush()
-        .context("failed to flush background request")?;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .context("failed to read background response")?;
-    let response = serde_json::from_str::<BackgroundControlResponse>(&line)
-        .context("failed to parse background response")?;
-    if !response.ok {
-        bail!(
-            "background worker rejected request: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
-    }
-    response
-        .status
-        .context("background response missing status")
-}
-
-fn send_background_control_request_to_state(
-    state: &BackgroundTaskState,
-    command: BackgroundWorkerCommand,
-) -> Result<BackgroundStatusSnapshot> {
-    send_background_control_request(&state.bind_addr, &state.token, command)
-}
-
-fn spawn_background_status_poll(target: BackgroundStatusTarget) -> BackgroundStatusPollJob {
-    let worker_target = target.clone();
-    let (tx, rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let result = send_background_control_request(
-            &worker_target.bind_addr,
-            &worker_target.token,
-            BackgroundWorkerCommand::Status,
-        )
-        .map_err(|error| format!("{error:#}"));
-        // A successful control response already proves that the process is alive. Only use the
-        // slower platform process lookup after a TCP failure, and keep it off the TUI thread.
-        let process_alive = result.is_ok() || process_exists(worker_target.pid);
-        let _ = tx.send(BackgroundStatusPollOutcome {
-            result,
-            process_alive,
-        });
-    });
-    BackgroundStatusPollJob {
-        target,
-        receiver: rx,
-        worker,
-    }
-}
-
-fn wait_for_background_registry(child: &mut Child, log_path: &Path) -> Result<BackgroundTaskState> {
-    let pid = child.id();
-    let state_path = background_task_state_path();
-    let deadline = Instant::now() + BACKGROUND_REGISTRY_WAIT_TIMEOUT;
-    while Instant::now() < deadline {
-        match read_background_task_state()? {
-            Some(state)
-                if state.pid == pid && !state.bind_addr.is_empty() && !state.token.is_empty() =>
-            {
-                return Ok(state);
-            }
-            Some(_) | None => {}
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                bail!(
-                    "background worker process {pid} exited with {status} before publishing TCP registry {}{}",
-                    state_path.display(),
-                    background_log_tail_context(log_path)
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to query background worker process {pid} status")
-                });
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let still_running = child.try_wait().ok().flatten().is_none();
-    bail!(
-        "timed out waiting for background worker process {pid} to publish TCP registry {} (still_running={still_running}){}",
-        state_path.display(),
-        background_log_tail_context(log_path)
-    )
 }
 
 fn setup_terminal() -> Result<DefaultTerminal> {
@@ -1139,12 +583,6 @@ fn parse_verification_target(input: &str) -> Result<VerificationTarget> {
         name: name.to_string(),
         url: url.to_string(),
     })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AutoSelectSwitchPlan {
-    target_node: Option<String>,
-    parent_switch: Option<(String, String)>,
 }
 
 fn background_status_should_publish(status: &str) -> bool {
@@ -1531,20 +969,6 @@ fn command_program_name_matches(program: &str, expected: &str) -> bool {
             .is_some_and(|base| name.eq_ignore_ascii_case(base))
 }
 
-#[cfg_attr(windows, allow(dead_code))]
-fn command_matches_headless_auto_pick(command: &str) -> bool {
-    let args = command_tokens(command);
-    if args.len() < 3 {
-        return false;
-    }
-    let program_is_sing_box_tui = args
-        .first()
-        .is_some_and(|program| command_program_name_matches(program, "sing-box-tui"));
-    program_is_sing_box_tui
-        && args.iter().any(|arg| arg == "run")
-        && args.iter().any(|arg| arg == "--headless-auto-pick")
-}
-
 fn command_matches_private_access_service(
     command: &str,
     manifest: &PrivateAccessServiceManifest,
@@ -1595,73 +1019,6 @@ fn background_process_command(pid: u32) -> Result<String> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn ensure_background_pid_matches_worker(pid: u32) -> Result<()> {
-    let command = background_process_command(pid)?;
-    if command_matches_headless_auto_pick(&command) {
-        return Ok(());
-    }
-    bail!("background pid {pid} is not a sing-box-tui headless auto-pick worker")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
-    wait_for_processes_to_exit_with_timeout(pids, Duration::from_secs(3))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn wait_for_processes_to_exit_with_timeout(pids: &[u32], timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if pids.iter().all(|pid| !process_alive_via_ps(*pid)) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!("timed out waiting for sing-box process(es) to exit: {pids:?}")
-}
-
-#[cfg(windows)]
-fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if pids.iter().all(|pid| !process_exists(*pid)) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!("timed out waiting for sing-box process(es) to exit: {pids:?}")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn wait_for_background_process_to_exit(pid: u32, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !process_exists(pid) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("timed out waiting for background process {pid} to exit")
-}
-
-#[cfg(windows)]
-fn wait_for_background_process_to_exit(pid: u32, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !process_exists(pid) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("timed out waiting for background process {pid} to exit")
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn wait_for_background_process_to_exit(_pid: u32, _timeout: Duration) -> Result<()> {
-    bail!("background worker shutdown is only available on macOS and Linux")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_exists(pid: u32) -> bool {
     let exists = Command::new("kill")
         .arg("-0")
@@ -1689,7 +1046,7 @@ fn process_is_zombie(pid: u32) -> bool {
         .starts_with('Z')
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn process_alive_via_ps(pid: u32) -> bool {
     let Ok(output) = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -1785,49 +1142,6 @@ fn format_official_sonicwall_client_warning(processes: &[String]) -> String {
         "检测到官方 SonicWall 客户端仍在运行: {}。请先退出官方客户端，再启动 TUI 的 SonicWall 连接。",
         processes.join(", ")
     )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_background_pid(pid: u32) -> Result<()> {
-    ensure_background_pid_matches_worker(pid)?;
-    let status = Command::new("kill")
-        .arg(pid.to_string())
-        .status()
-        .with_context(|| format!("failed to stop background process {pid}"))?;
-    if !status.success() {
-        bail!("failed to stop background process {pid}: kill exited with {status}");
-    }
-    if wait_for_processes_to_exit(&[pid]).is_ok() {
-        return Ok(());
-    }
-    let status = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .status()
-        .with_context(|| format!("failed to force stop background process {pid}"))?;
-    if !status.success() {
-        bail!("failed to force stop background process {pid}: kill -9 exited with {status}");
-    }
-    wait_for_processes_to_exit(&[pid])
-}
-
-#[cfg(windows)]
-fn stop_background_pid(pid: u32) -> Result<()> {
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .status()
-        .with_context(|| format!("failed to force stop background process {pid}"))?;
-    if !status.success() && process_exists(pid) {
-        bail!("failed to force stop background process {pid}: taskkill exited with {status}");
-    }
-    wait_for_background_process_to_exit(pid, Duration::from_secs(3))
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn stop_background_pid(_pid: u32) -> Result<()> {
-    bail!("background worker shutdown is only available on macOS and Linux")
 }
 
 #[cfg(windows)]
@@ -2159,11 +1473,8 @@ struct App {
     auto_select_threshold_ms: u64,
     auto_select_interval: Duration,
     last_auto_select_benchmark: Option<Instant>,
-    last_background_status_refresh: Instant,
-    last_background_status_generation: u64,
     background_started_at_unix: u64,
-    background_worker: Option<BackgroundWorkerRuntime>,
-    background_status_job: Option<BackgroundStatusPollJob>,
+    background_auto_pick: BackgroundAutoPickManager,
     benchmark_store: Option<BenchmarkStore>,
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
@@ -2588,11 +1899,8 @@ impl App {
             auto_select_threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             auto_select_interval: AUTO_SELECT_INTERVAL,
             last_auto_select_benchmark: None,
-            last_background_status_refresh: Instant::now() - BACKGROUND_STATUS_REFRESH_INTERVAL,
-            last_background_status_generation: 0,
             background_started_at_unix: current_unix_timestamp(),
-            background_worker: None,
-            background_status_job: None,
+            background_auto_pick: Default::default(),
             benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
@@ -2788,7 +2096,7 @@ impl App {
         Ok(())
     }
 
-    fn apply_background_auto_pick_config(&mut self, config: BackgroundAutoPickConfig) {
+    fn apply_background_auto_pick_config(&mut self, config: AutoPickConfig) {
         let before = self.auto_pick_runtime_signature();
         self.benchmark_filter = config.filter;
         self.auto_select_enabled = config.enabled;
@@ -2878,8 +2186,8 @@ impl App {
         }
     }
 
-    fn background_auto_pick_config(&self) -> BackgroundAutoPickConfig {
-        BackgroundAutoPickConfig {
+    fn auto_pick_config(&self) -> AutoPickConfig {
+        AutoPickConfig {
             enabled: self.auto_select_enabled,
             selector: self.auto_select_selector.clone(),
             filter: self.benchmark_filter.clone(),
@@ -2890,6 +2198,14 @@ impl App {
             threshold_ms: self.auto_select_threshold_ms,
             interval_secs: self.auto_select_interval.as_secs(),
         }
+    }
+
+    fn background_launch_spec(&self) -> BackgroundLaunchSpec {
+        BackgroundLaunchSpec::new(
+            self.client.base_url.clone(),
+            self.system_proxy_config_path.clone(),
+            self.benchmark_max_concurrency,
+        )
     }
 
     fn save_runtime_state(&self) -> Result<()> {
@@ -3419,135 +2735,44 @@ impl App {
         }
     }
 
-    fn current_background_status_target(&self) -> Result<Option<BackgroundStatusTarget>> {
-        if let Some(worker) = self.background_worker.as_ref() {
-            return Ok(Some(BackgroundStatusTarget {
-                pid: worker.pid,
-                bind_addr: worker.bind_addr.clone(),
-                token: worker.token.clone(),
-            }));
-        }
-        Ok(
-            read_background_task_state()?.map(|state| BackgroundStatusTarget {
-                pid: state.pid,
-                bind_addr: state.bind_addr,
-                token: state.token,
-            }),
-        )
-    }
-
-    fn clear_failed_background_status_target(
-        &mut self,
-        target: &BackgroundStatusTarget,
-    ) -> Result<()> {
-        if self
-            .background_worker
-            .as_ref()
-            .is_some_and(|worker| worker.pid == target.pid)
-        {
-            let mut worker = self.background_worker.take().expect("worker exists");
-            if let Some(child) = worker.child.as_mut() {
-                let _ = child.try_wait();
-            }
-        }
-        if read_background_task_state()?.is_some_and(|state| state.pid == target.pid) {
-            remove_background_task_state_file();
-        }
-        Ok(())
-    }
-
-    fn apply_background_status_snapshot(
-        &mut self,
-        snapshot: BackgroundStatusSnapshot,
-    ) -> Result<()> {
-        self.apply_background_latency_snapshot(snapshot.latency.as_ref());
-        if snapshot.status_generation > self.last_background_status_generation {
-            self.last_background_status_generation = snapshot.status_generation;
-            let status = snapshot.worker_status;
-            if background_status_requires_selector_refresh(&status) {
-                self.refresh()?;
-            }
-            self.set_status_only(format!("Auto-pick worker: {status}"));
-        }
-        Ok(())
-    }
-
     fn poll_background_auto_pick_status(&mut self) -> Result<()> {
         if !self.background_worker_management_enabled() {
             return Ok(());
         }
-
-        if let Some(job) = self.background_status_job.as_ref() {
-            let outcome = match job.receiver.try_recv() {
-                Ok(outcome) => Some(outcome),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(BackgroundStatusPollOutcome {
-                    result: Err("background status poll thread disconnected".to_string()),
-                    // Do not create a replacement from an ambiguous polling failure. The next
-                    // poll can retry without risking a second live worker.
-                    process_alive: true,
-                }),
-            };
-            if let Some(outcome) = outcome {
-                let job = self
-                    .background_status_job
-                    .take()
-                    .expect("background status job exists");
-                let target = job.target;
-                let _ = job.worker.join();
-                if self.current_background_status_target()?.as_ref() == Some(&target) {
-                    match resolve_background_status_poll(outcome) {
-                        BackgroundStatusPollResolution::Snapshot(snapshot) => {
-                            if self.background_worker.is_none() {
-                                self.background_worker = Some(BackgroundWorkerRuntime {
-                                    pid: target.pid,
-                                    bind_addr: target.bind_addr.clone(),
-                                    token: target.token.clone(),
-                                    child: None,
-                                });
-                            }
-                            self.apply_background_status_snapshot(*snapshot)?;
-                        }
-                        BackgroundStatusPollResolution::Retry(error) => {
-                            self.set_status_only(format!(
-                                "Auto-pick worker TCP error; process is still alive, retrying: {error}"
-                            ));
-                        }
-                        BackgroundStatusPollResolution::Reconnect(error) => {
-                            self.set_status_only(format!(
-                                "Auto-pick worker exited after TCP error: {error}"
-                            ));
-                            self.clear_failed_background_status_target(&target)?;
-                            if self.auto_select_enabled {
-                                let worker = self.ensure_auto_pick_background_worker()?;
-                                self.set_status_only(format!(
-                                    "Auto-pick background worker {} pid {} after previous worker exited",
-                                    worker.label(),
-                                    worker.pid()
-                                ));
-                            }
-                        }
+        let config = self.auto_pick_config();
+        let launch = self.background_launch_spec();
+        let Some(event) =
+            self.background_auto_pick
+                .poll(self.auto_select_enabled, &config, &launch)?
+        else {
+            return Ok(());
+        };
+        match event {
+            BackgroundPollEvent::Update(update) => {
+                self.apply_background_latency_snapshot(update.latency.as_ref());
+                if let Some(status) = update.status {
+                    if background_status_requires_selector_refresh(&status) {
+                        self.refresh()?;
                     }
+                    self.set_status_only(format!("Auto-pick worker: {status}"));
                 }
             }
-        }
-
-        if self.background_status_job.is_some()
-            || self.last_background_status_refresh.elapsed() < BACKGROUND_STATUS_REFRESH_INTERVAL
-        {
-            return Ok(());
-        }
-
-        if let Some(target) = self.current_background_status_target()? {
-            self.last_background_status_refresh = Instant::now();
-            self.background_status_job = Some(spawn_background_status_poll(target));
-        } else if self.auto_select_enabled {
-            let worker = self.ensure_auto_pick_background_worker()?;
-            self.set_status_only(format!(
+            BackgroundPollEvent::Retry(error) => self.set_status_only(format!(
+                "Auto-pick worker TCP error; process is still alive, retrying: {error}"
+            )),
+            BackgroundPollEvent::Exited(error) => {
+                self.set_status_only(format!("Auto-pick worker exited after TCP error: {error}"))
+            }
+            BackgroundPollEvent::Restarted(worker) => self.set_status_only(format!(
+                "Auto-pick background worker {} pid {} after previous worker exited",
+                worker.label(),
+                worker.pid()
+            )),
+            BackgroundPollEvent::Ensured(worker) => self.set_status_only(format!(
                 "Auto-pick background worker {} pid {}",
                 worker.label(),
                 worker.pid()
-            ));
+            )),
         }
         Ok(())
     }
@@ -4732,9 +3957,6 @@ impl App {
         self.save_runtime_state()?;
         if self.background_worker_management_enabled() {
             let worker = self.ensure_auto_pick_background_worker()?;
-            if matches!(worker, BackgroundTaskEnsureResult::AlreadyRunning(_)) {
-                self.send_background_auto_pick_config()?;
-            }
             self.set_status_only(format!(
                 "Auto-pick enabled for {} via background worker pid {} ({}, {}ms threshold, every {}s)",
                 group_name,
@@ -4756,11 +3978,8 @@ impl App {
     }
 
     fn auto_select_benchmark_due(&self, now: Instant) -> bool {
-        if !self.auto_select_enabled {
-            return false;
-        }
-        self.last_auto_select_benchmark
-            .is_none_or(|last| now.duration_since(last) >= self.auto_select_interval)
+        self.auto_pick_config()
+            .benchmark_due(self.last_auto_select_benchmark, now)
     }
 
     fn maybe_start_auto_select_benchmark(&mut self) -> Result<()> {
@@ -4815,11 +4034,7 @@ impl App {
     }
 
     fn benchmark_scope_label(&self) -> String {
-        if self.benchmark_filter.is_empty() {
-            "all nodes".to_string()
-        } else {
-            format!("filter '{}'", self.benchmark_filter)
-        }
+        self.auto_pick_config().scope_label()
     }
 
     fn auto_select_group(&self) -> Option<&ProxyGroup> {
@@ -4829,34 +4044,16 @@ impl App {
             .or_else(|| self.selected_group())
     }
 
-    fn auto_select_target(&self, group: &ProxyGroup, summary: &BenchmarkSummary) -> Option<String> {
-        let best = summary.best_success_matching_filter()?;
-        let current = group.current.as_deref();
-        let current_matches_filter =
-            current.is_some_and(|name| matches_filter(name, &summary.pattern));
-        let current_result = current.and_then(|name| summary.find_result(name));
-        let current_is_acceptable = current_matches_filter
-            && current_result
-                .and_then(|result| result.delay)
-                .is_some_and(|delay| delay <= self.auto_select_threshold_ms);
-        if current_is_acceptable {
-            return None;
-        }
-        if current == Some(best.name.as_str()) {
-            return None;
-        }
-        Some(best.name.clone())
-    }
-
     fn auto_select_switch_plan(
         &self,
         group: &ProxyGroup,
         summary: &BenchmarkSummary,
-    ) -> AutoSelectSwitchPlan {
-        AutoSelectSwitchPlan {
-            target_node: self.auto_select_target(group, summary),
-            parent_switch: self.implicit_root_parent_switch_for_group(&group.name),
-        }
+    ) -> AutoPickDecision {
+        self.auto_pick_config().switch_decision(
+            group,
+            summary,
+            self.implicit_root_parent_switch_for_group(&group.name),
+        )
     }
 
     fn finish_auto_select_benchmark(
@@ -5224,13 +4421,8 @@ impl App {
     }
 
     fn ensure_auto_pick_background_worker_after_state_change(&mut self) -> Result<()> {
-        if self.auto_select_enabled {
-            if self.background_worker_management_enabled() {
-                let worker = self.ensure_auto_pick_background_worker()?;
-                if matches!(worker, BackgroundTaskEnsureResult::AlreadyRunning(_)) {
-                    self.send_background_auto_pick_config()?;
-                }
-            }
+        if self.auto_select_enabled && self.background_worker_management_enabled() {
+            self.ensure_auto_pick_background_worker()?;
         }
         Ok(())
     }
@@ -5239,172 +4431,14 @@ impl App {
         self.state_store.is_some() && !cfg!(test)
     }
 
-    fn ensure_auto_pick_background_worker(&mut self) -> Result<BackgroundTaskEnsureResult> {
-        let config = self.background_auto_pick_config();
-        if let Some(worker) = self.background_worker.as_ref() {
-            match send_background_control_request(
-                &worker.bind_addr,
-                &worker.token,
-                BackgroundWorkerCommand::ApplyConfig {
-                    config: config.clone(),
-                },
-            ) {
-                Ok(_) => return Ok(BackgroundTaskEnsureResult::AlreadyRunning(worker.pid)),
-                Err(error) if process_exists(worker.pid) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "background auto-pick worker {} is alive but its control channel is unavailable",
-                            worker.pid
-                        )
-                    });
-                }
-                Err(_) => {}
-            }
-            self.background_worker = None;
-        }
-        if let Some(state) = read_background_task_state()? {
-            let bind_addr = state.bind_addr.clone();
-            let token = state.token.clone();
-            match send_background_control_request(
-                &bind_addr,
-                &token,
-                BackgroundWorkerCommand::ApplyConfig {
-                    config: config.clone(),
-                },
-            ) {
-                Ok(_) => {
-                    self.background_worker = Some(BackgroundWorkerRuntime {
-                        pid: state.pid,
-                        bind_addr,
-                        token,
-                        child: None,
-                    });
-                    return Ok(BackgroundTaskEnsureResult::AlreadyRunning(state.pid));
-                }
-                Err(error) if process_exists(state.pid) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "registered background auto-pick worker {} is alive but its control channel is unavailable",
-                            state.pid
-                        )
-                    });
-                }
-                Err(_) => {
-                    remove_background_task_state_file();
-                }
-            }
-        }
-        self.spawn_headless_auto_pick_process()
-            .map(BackgroundTaskEnsureResult::Started)
-    }
-
-    fn spawn_headless_auto_pick_process(&mut self) -> Result<u32> {
-        let exe = env::current_exe().context("failed to locate current executable")?;
-        let log_path = background_task_log_path();
-        if let Some(parent) = log_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create background worker log directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let stderr = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .with_context(|| {
-                format!(
-                    "failed to open background worker log {}",
-                    log_path.display()
-                )
-            })?;
-        let mut command = Command::new(exe);
-        command
-            .arg("run")
-            .arg("--headless-auto-pick")
-            .arg("--controller")
-            .arg(self.client.base_url.as_str())
-            .arg("--max-concurrency")
-            .arg(self.benchmark_max_concurrency.to_string())
-            .arg("--config")
-            .arg(&self.system_proxy_config_path)
-            .arg("--no-subscription-refresh")
-            .env("SING_BOX_TUI_BACKGROUND_TOKEN", random_background_token())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr));
-        let mut child = command
-            .spawn()
-            .context("failed to spawn headless auto-pick process")?;
-        let pid = child.id();
-        let state = match wait_for_background_registry(&mut child, &log_path) {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = child.kill();
-                return Err(error).context("background auto-pick worker did not initialize");
-            }
-        };
-        let bind_addr = state.bind_addr.clone();
-        let token = state.token.clone();
-        send_background_control_request(
-            &bind_addr,
-            &token,
-            BackgroundWorkerCommand::ApplyConfig {
-                config: self.background_auto_pick_config(),
-            },
-        )
-        .with_context(|| {
-            format!(
-                "failed to apply initial background auto-pick config{}",
-                background_log_tail_context(&log_path)
-            )
-        })?;
-        self.background_worker = Some(BackgroundWorkerRuntime {
-            pid,
-            bind_addr,
-            token,
-            child: Some(child),
-        });
-        Ok(pid)
-    }
-
-    fn send_background_auto_pick_config(&mut self) -> Result<()> {
-        let config = self.background_auto_pick_config();
-        if let Some(worker) = self.background_worker.as_ref() {
-            send_background_control_request(
-                &worker.bind_addr,
-                &worker.token,
-                BackgroundWorkerCommand::ApplyConfig { config },
-            )?;
-        }
-        Ok(())
+    fn ensure_auto_pick_background_worker(&mut self) -> Result<BackgroundWorkerEnsure> {
+        let config = self.auto_pick_config();
+        let launch = self.background_launch_spec();
+        self.background_auto_pick.ensure(&config, &launch)
     }
 
     fn stop_live_background_auto_pick_task(&mut self) -> Result<()> {
-        let Some(mut worker) = self.background_worker.take() else {
-            return stop_background_auto_pick_task();
-        };
-        let _ = send_background_control_request(
-            &worker.bind_addr,
-            &worker.token,
-            BackgroundWorkerCommand::Stop,
-        );
-        if wait_for_background_process_to_exit(worker.pid, Duration::from_secs(3)).is_err() {
-            if let Some(mut child) = worker.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            } else {
-                let _ = stop_background_pid(worker.pid);
-            }
-        } else if let Some(mut child) = worker.child.take() {
-            let _ = child.wait();
-        }
-        remove_background_task_state_file();
-        Ok(())
+        self.background_auto_pick.stop()
     }
 
     fn background_status_snapshot(
@@ -5413,7 +4447,7 @@ impl App {
         generation: u64,
     ) -> BackgroundStatusSnapshot {
         BackgroundStatusSnapshot {
-            kind: BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
+            kind: BACKGROUND_TASK_KIND.to_string(),
             pid: std::process::id(),
             controller: self.client.base_url.clone(),
             config_path: self.system_proxy_config_path.clone(),
@@ -5452,69 +4486,41 @@ impl App {
     }
 
     fn run_headless_auto_pick_loop(&mut self) -> Result<()> {
-        let token = background_token_from_env();
-        let (bind_addr, commands) =
-            spawn_background_tcp_server(&background_bind_addr(), token.clone())?;
-        write_background_task_state(&BackgroundTaskState {
-            version: 2,
-            kind: BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
-            pid: std::process::id(),
-            controller: self.client.base_url.clone(),
-            config_path: self.system_proxy_config_path.clone(),
-            max_concurrency: self.benchmark_max_concurrency,
-            started_at_unix: self.background_started_at_unix,
-            status_generation: 0,
-            status: Some("starting".to_string()),
-            updated_at_unix: Some(current_unix_timestamp()),
-            bind_addr: bind_addr.to_string(),
-            token,
-        })?;
+        let control = HeadlessWorkerControl::start(HeadlessWorkerMetadata::new(
+            self.client.base_url.clone(),
+            self.system_proxy_config_path.clone(),
+            self.benchmark_max_concurrency,
+            self.background_started_at_unix,
+        ))?;
         self.auto_select_enabled = false;
         let mut last_published_status = String::new();
         let mut status_generation = 0;
         loop {
-            loop {
-                match commands.try_recv() {
-                    Ok(request) => match request.command {
-                        BackgroundWorkerCommand::Status => {
-                            let _ = request.response.send(BackgroundControlResponse {
-                                ok: true,
-                                error: None,
-                                status: Some(self.background_status_snapshot(
-                                    self.status.clone(),
-                                    status_generation,
-                                )),
-                            });
-                        }
-                        BackgroundWorkerCommand::ApplyConfig { config } => {
-                            self.apply_background_auto_pick_config(config);
-                            last_published_status.clear();
-                            status_generation = status_generation.saturating_add(1);
-                            let _ = request.response.send(BackgroundControlResponse {
-                                ok: true,
-                                error: None,
-                                status: Some(self.background_status_snapshot(
-                                    "configuration applied".to_string(),
-                                    status_generation,
-                                )),
-                            });
-                        }
-                        BackgroundWorkerCommand::Stop => {
-                            status_generation = status_generation.saturating_add(1);
-                            let _ = request.response.send(BackgroundControlResponse {
-                                ok: true,
-                                error: None,
-                                status: Some(self.background_status_snapshot(
-                                    "stopping".to_string(),
-                                    status_generation,
-                                )),
-                            });
-                            remove_background_task_state_file();
-                            return Ok(());
-                        }
-                    },
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
+            while let Some(request) = control.try_request() {
+                match request.command.clone() {
+                    HeadlessWorkerCommand::Status => request.respond(
+                        self.background_status_snapshot(self.status.clone(), status_generation),
+                    ),
+                    HeadlessWorkerCommand::ApplyConfig(config) => {
+                        self.apply_background_auto_pick_config(config);
+                        last_published_status.clear();
+                        status_generation = status_generation.saturating_add(1);
+                        request.respond(self.background_status_snapshot(
+                            "configuration applied".to_string(),
+                            status_generation,
+                        ));
+                    }
+                    HeadlessWorkerCommand::Stop => {
+                        status_generation = status_generation.saturating_add(1);
+                        request.respond(
+                            self.background_status_snapshot(
+                                "stopping".to_string(),
+                                status_generation,
+                            ),
+                        );
+                        control.unregister();
+                        return Ok(());
+                    }
                 }
             }
 
@@ -6143,17 +5149,17 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::process_alive_via_ps;
     use super::{
-        AUTO_SELECT_THRESHOLD_MS, App, AutoSelectSwitchPlan, BackgroundLatencyResult,
+        AUTO_SELECT_THRESHOLD_MS, App, AutoPickDecision, BackgroundLatencyResult,
         BackgroundLatencySnapshot, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
         GLOBAL_CLASH_MODE, IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW,
         LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LeftPaneSection, PrivateAccessMode,
         PrivateAccessProfileRuntime, PrivateAccessProgressTone, PrivateAccessRuntime,
         PrivateAccessState, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
-        SettingsEditState, SettingsField, command_matches_headless_auto_pick, connection_is_direct,
-        is_private_access_settings_field, next_clash_mode, normalize_http_connect_proxy,
-        private_access_auth_display_value, private_access_auth_initial_value,
-        settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
-        system_proxy_bypass_entries, truncate_for_width, visible_settings_fields,
+        SettingsEditState, SettingsField, connection_is_direct, is_private_access_settings_field,
+        next_clash_mode, normalize_http_connect_proxy, private_access_auth_display_value,
+        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
+        sonicwall_http_connect_settings, system_proxy_bypass_entries, truncate_for_width,
+        visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -6172,8 +5178,6 @@ mod tests {
     use reqwest::Client as AsyncClient;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -6307,12 +5311,8 @@ mod tests {
             auto_select_threshold_ms: 600,
             auto_select_interval: Duration::from_secs(30),
             last_auto_select_benchmark: None,
-            last_background_status_refresh: Instant::now()
-                - super::BACKGROUND_STATUS_REFRESH_INTERVAL,
-            last_background_status_generation: 0,
             background_started_at_unix: super::current_unix_timestamp(),
-            background_worker: None,
-            background_status_job: None,
+            background_auto_pick: Default::default(),
             benchmark_store: None,
             state_store: None,
             bypass_rule_set_store: None,
@@ -6747,35 +5747,6 @@ mod tests {
     }
 
     #[test]
-    fn headless_auto_pick_process_matcher_accepts_worker_command() {
-        assert!(command_matches_headless_auto_pick(
-            "/Users/ldd/proj/rust/sing-box-tui/target/debug/sing-box-tui run --headless-auto-pick --controller http://127.0.0.1:9992"
-        ));
-        assert!(command_matches_headless_auto_pick(
-            "target/debug/sing-box-tui run --controller http://127.0.0.1:9992 --headless-auto-pick"
-        ));
-        assert!(command_matches_headless_auto_pick(
-            r#""C:\Program Files\sing-box-tui\sing-box-tui.exe" run --headless-auto-pick --controller http://127.0.0.1:9992"#
-        ));
-        assert!(command_matches_headless_auto_pick(
-            r#"C:\tools\sing-box-tui.exe run --controller http://127.0.0.1:9992 --headless-auto-pick"#
-        ));
-    }
-
-    #[test]
-    fn headless_auto_pick_process_matcher_rejects_non_workers() {
-        assert!(!command_matches_headless_auto_pick(
-            "target/debug/sing-box-tui"
-        ));
-        assert!(!command_matches_headless_auto_pick(
-            "target/debug/sing-box-tui run --controller http://127.0.0.1:9992"
-        ));
-        assert!(!command_matches_headless_auto_pick(
-            "sing-box run --headless-auto-pick"
-        ));
-    }
-
-    #[test]
     fn private_access_process_matcher_requires_expected_service_command() {
         let manifest = default_hillstone_manifest().expect("manifest builds");
         let executable = &manifest.executable;
@@ -6791,115 +5762,6 @@ mod tests {
             &format!("{executable} run --headless-auto-pick"),
             &manifest
         ));
-    }
-
-    #[test]
-    fn background_bind_rejects_remote_addresses_without_explicit_allow() {
-        assert!(super::validate_background_bind_addr_with_remote("127.0.0.1:0", false).is_ok());
-        assert!(super::validate_background_bind_addr_with_remote("[::1]:0", false).is_ok());
-
-        let error = super::validate_background_bind_addr_with_remote("0.0.0.0:9999", false)
-            .expect_err("remote bind requires explicit allow");
-        assert!(format!("{error:#}").contains("refusing non-loopback"));
-        assert!(super::validate_background_bind_addr_with_remote("0.0.0.0:9999", true).is_ok());
-    }
-
-    #[test]
-    fn read_text_tail_handles_missing_empty_small_and_large_files() {
-        let missing = std::env::temp_dir().join(format!(
-            "sing-box-tui-missing-log-{}.log",
-            unique_test_suffix()
-        ));
-        assert_eq!(super::read_text_tail(&missing, 16), None);
-
-        let path = std::env::temp_dir().join(format!(
-            "sing-box-tui-tail-log-{}.log",
-            unique_test_suffix()
-        ));
-        std::fs::write(&path, "").expect("empty log writes");
-        assert_eq!(super::read_text_tail(&path, 16), None);
-
-        std::fs::write(&path, "first\nsecond\n").expect("small log writes");
-        assert_eq!(
-            super::read_text_tail(&path, 1024),
-            Some("first\nsecond".to_string())
-        );
-
-        std::fs::write(&path, "0123456789abcdef").expect("large log writes");
-        assert_eq!(super::read_text_tail(&path, 6), Some("abcdef".to_string()));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn background_task_state_is_written_with_private_permissions() {
-        let path = std::env::temp_dir().join(format!(
-            "sing-box-tui-background-test-{}.json",
-            unique_test_suffix()
-        ));
-        let state = super::BackgroundTaskState {
-            version: 2,
-            kind: super::BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
-            pid: 42,
-            controller: DEFAULT_CONTROLLER.to_string(),
-            config_path: PathBuf::from("config.json"),
-            max_concurrency: 16,
-            started_at_unix: 1,
-            status_generation: 0,
-            status: Some("starting".to_string()),
-            updated_at_unix: Some(1),
-            bind_addr: "127.0.0.1:9999".to_string(),
-            token: "secret".to_string(),
-        };
-
-        super::write_background_task_state_to_path(&path, &state).expect("state writes");
-
-        let mode = std::fs::metadata(&path)
-            .expect("state metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn background_task_state_refuses_symlink_path() {
-        let target = std::env::temp_dir().join(format!(
-            "sing-box-tui-background-target-{}.json",
-            unique_test_suffix()
-        ));
-        let link = std::env::temp_dir().join(format!(
-            "sing-box-tui-background-link-{}.json",
-            unique_test_suffix()
-        ));
-        std::fs::write(&target, "{}").expect("target writes");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink writes");
-
-        let state = super::BackgroundTaskState {
-            version: 2,
-            kind: super::BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
-            pid: 42,
-            controller: DEFAULT_CONTROLLER.to_string(),
-            config_path: PathBuf::from("config.json"),
-            max_concurrency: 16,
-            started_at_unix: 1,
-            status_generation: 0,
-            status: Some("starting".to_string()),
-            updated_at_unix: Some(1),
-            bind_addr: "127.0.0.1:9999".to_string(),
-            token: "secret".to_string(),
-        };
-
-        let error = super::write_background_task_state_to_path(&link, &state)
-            .expect_err("symlink is rejected");
-        assert!(format!("{error:#}").contains("refusing to write"));
-
-        let _ = std::fs::remove_file(link);
-        let _ = std::fs::remove_file(target);
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
@@ -8452,29 +7314,6 @@ mod tests {
     }
 
     #[test]
-    fn live_background_worker_poll_failure_retries_without_reconnect() {
-        let retry = super::resolve_background_status_poll(super::BackgroundStatusPollOutcome {
-            result: Err("temporary TCP timeout".to_string()),
-            process_alive: true,
-        });
-        assert!(matches!(
-            retry,
-            super::BackgroundStatusPollResolution::Retry(error)
-                if error == "temporary TCP timeout"
-        ));
-
-        let reconnect = super::resolve_background_status_poll(super::BackgroundStatusPollOutcome {
-            result: Err("worker exited".to_string()),
-            process_alive: false,
-        });
-        assert!(matches!(
-            reconnect,
-            super::BackgroundStatusPollResolution::Reconnect(error)
-                if error == "worker exited"
-        ));
-    }
-
-    #[test]
     fn process_exists_recognizes_current_process() {
         assert!(super::process_exists(std::process::id()));
     }
@@ -8495,123 +7334,6 @@ mod tests {
         child.wait().expect("short-lived child exits");
 
         assert!(!process_alive_via_ps(exited_pid));
-    }
-
-    #[test]
-    fn background_tcp_control_round_trips_status_with_token() {
-        let (addr, rx) = super::spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
-            .expect("tcp server starts");
-        let worker = thread::spawn(move || {
-            let request = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("request received");
-            assert!(matches!(
-                request.command,
-                super::BackgroundWorkerCommand::Status
-            ));
-            request
-                .response
-                .send(super::BackgroundControlResponse {
-                    ok: true,
-                    error: None,
-                    status: Some(super::BackgroundStatusSnapshot {
-                        kind: super::BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
-                        pid: 42,
-                        controller: DEFAULT_CONTROLLER.to_string(),
-                        config_path: PathBuf::from("config.json"),
-                        max_concurrency: 4,
-                        started_at_unix: 1,
-                        status_generation: 7,
-                        worker_status: "running".to_string(),
-                        updated_at_unix: 2,
-                        auto_pick_enabled: true,
-                        auto_pick_selector: Some("select".to_string()),
-                        filter: "香港".to_string(),
-                        latency: None,
-                    }),
-                })
-                .expect("response sends");
-        });
-
-        let snapshot = super::send_background_control_request(
-            &addr.to_string(),
-            "secret",
-            super::BackgroundWorkerCommand::Status,
-        )
-        .expect("status request succeeds");
-
-        assert_eq!(snapshot.pid, 42);
-        assert_eq!(snapshot.status_generation, 7);
-        assert_eq!(snapshot.filter, "香港");
-        worker.join().expect("worker joins");
-    }
-
-    #[test]
-    fn background_status_poll_starts_without_blocking_the_caller() {
-        let (addr, rx) = super::spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
-            .expect("tcp server starts");
-        let responder = thread::spawn(move || {
-            let request = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("request received");
-            thread::sleep(Duration::from_millis(300));
-            request
-                .response
-                .send(super::BackgroundControlResponse {
-                    ok: true,
-                    error: None,
-                    status: Some(super::BackgroundStatusSnapshot {
-                        kind: super::BACKGROUND_TASK_KIND_AUTO_PICK.to_string(),
-                        pid: 42,
-                        controller: DEFAULT_CONTROLLER.to_string(),
-                        config_path: PathBuf::from("config.json"),
-                        max_concurrency: 4,
-                        started_at_unix: 1,
-                        status_generation: 7,
-                        worker_status: "running".to_string(),
-                        updated_at_unix: 2,
-                        auto_pick_enabled: true,
-                        auto_pick_selector: Some("select".to_string()),
-                        filter: "香港".to_string(),
-                        latency: None,
-                    }),
-                })
-                .expect("response sends");
-        });
-
-        let started = Instant::now();
-        let job = super::spawn_background_status_poll(super::BackgroundStatusTarget {
-            pid: std::process::id(),
-            bind_addr: addr.to_string(),
-            token: "secret".to_string(),
-        });
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "starting the poll must not wait for the response"
-        );
-        let outcome = job
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("poll completes");
-        assert!(outcome.result.is_ok());
-        assert!(outcome.process_alive);
-        job.worker.join().expect("poll worker joins");
-        responder.join().expect("responder joins");
-    }
-
-    #[test]
-    fn background_tcp_control_rejects_wrong_token() {
-        let (addr, _rx) = super::spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
-            .expect("tcp server starts");
-
-        let error = super::send_background_control_request(
-            &addr.to_string(),
-            "wrong",
-            super::BackgroundWorkerCommand::Status,
-        )
-        .expect_err("wrong token is rejected");
-
-        assert!(format!("{error:#}").contains("unauthorized"), "{error:#}");
     }
 
     #[test]
@@ -8675,140 +7397,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_select_keeps_current_when_latency_is_under_threshold() {
-        let app = test_app();
-        let group = ProxyGroup {
-            name: "select".to_string(),
-            kind: "Selector".to_string(),
-            current: Some("美国-a".to_string()),
-            members: vec!["美国-a".to_string(), "美国-b".to_string()],
-        };
-        let summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("美国-a".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![
-                BenchmarkResult {
-                    name: "美国-a".to_string(),
-                    delay: Some(500),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "美国-b".to_string(),
-                    delay: Some(80),
-                    completed: true,
-                },
-            ],
-        };
-
-        assert_eq!(app.auto_select_target(&group, &summary), None);
-    }
-
-    #[test]
-    fn auto_select_switches_to_best_when_current_latency_is_high() {
-        let app = test_app();
-        let group = ProxyGroup {
-            name: "select".to_string(),
-            kind: "Selector".to_string(),
-            current: Some("美国-a".to_string()),
-            members: vec!["美国-a".to_string(), "美国-b".to_string()],
-        };
-        let summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("美国-a".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![
-                BenchmarkResult {
-                    name: "美国-a".to_string(),
-                    delay: Some(650),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "美国-b".to_string(),
-                    delay: Some(80),
-                    completed: true,
-                },
-            ],
-        };
-
-        assert_eq!(
-            app.auto_select_target(&group, &summary),
-            Some("美国-b".to_string())
-        );
-    }
-
-    #[test]
-    fn auto_select_switches_to_best_when_current_is_outside_filter() {
-        let app = test_app();
-        let group = ProxyGroup {
-            name: "select".to_string(),
-            kind: "Selector".to_string(),
-            current: Some("香港-a".to_string()),
-            members: vec!["香港-a".to_string(), "美国-b".to_string()],
-        };
-        let summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("香港-a".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![BenchmarkResult {
-                name: "美国-b".to_string(),
-                delay: Some(80),
-                completed: true,
-            }],
-        };
-
-        assert_eq!(
-            app.auto_select_target(&group, &summary),
-            Some("美国-b".to_string())
-        );
-    }
-
-    #[test]
-    fn auto_select_ignores_stale_results_outside_filter() {
-        let app = test_app();
-        let group = ProxyGroup {
-            name: "select".to_string(),
-            kind: "Selector".to_string(),
-            current: Some("hk-a".to_string()),
-            members: vec!["hk-a".to_string(), "us-b".to_string()],
-        };
-        let summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("hk-a".to_string()),
-            pattern: "us".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![
-                BenchmarkResult {
-                    name: "hk-a".to_string(),
-                    delay: Some(10),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "us-b".to_string(),
-                    delay: Some(80),
-                    completed: true,
-                },
-            ],
-        };
-
-        assert_eq!(
-            app.auto_select_target(&group, &summary),
-            Some("us-b".to_string())
-        );
-    }
-
-    #[test]
     fn auto_select_plan_selects_internet_route_even_when_node_is_kept() {
         let app = internet_routes_app();
         let group = app.group_by_name("AirTCP").expect("Internet Route").clone();
@@ -8835,27 +7423,11 @@ mod tests {
 
         assert_eq!(
             app.auto_select_switch_plan(&group, &summary),
-            AutoSelectSwitchPlan {
+            AutoPickDecision {
                 target_node: None,
                 parent_switch: Some(("手动选择".to_string(), "AirTCP".to_string())),
             }
         );
-    }
-
-    #[test]
-    fn auto_select_benchmark_waits_for_interval() {
-        let mut app = test_app();
-        app.auto_select_enabled = true;
-        let now = Instant::now();
-        app.last_auto_select_benchmark = Some(now - Duration::from_secs(29));
-
-        assert!(!app.auto_select_benchmark_due(now));
-
-        app.last_auto_select_benchmark = Some(now - Duration::from_secs(30));
-        assert!(app.auto_select_benchmark_due(now));
-
-        app.benchmark_filter.clear();
-        assert!(app.auto_select_benchmark_due(now));
     }
 
     #[test]
