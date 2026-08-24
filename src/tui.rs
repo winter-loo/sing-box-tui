@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io;
@@ -21,11 +21,16 @@ use crossterm::terminal::{
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 
+#[cfg(test)]
+use crate::auto_pick::BackgroundLatencyResult;
 use crate::auto_pick::{
     AutoPickConfig, AutoPickDecision, BACKGROUND_TASK_KIND, BackgroundAutoPickManager,
-    BackgroundLatencyResult, BackgroundLatencySnapshot, BackgroundLaunchSpec, BackgroundPollEvent,
-    BackgroundStatusSnapshot, BackgroundWorkerEnsure, HeadlessWorkerCommand, HeadlessWorkerControl,
-    HeadlessWorkerMetadata, registered_status_value, stop_registered_worker,
+    BackgroundLatencySnapshot, BackgroundLaunchSpec, BackgroundPollEvent, BackgroundStatusSnapshot,
+    BackgroundWorkerEnsure, HeadlessWorkerCommand, HeadlessWorkerControl, HeadlessWorkerMetadata,
+    registered_status_value, stop_registered_worker,
+};
+use crate::benchmark_workflow::{
+    BenchmarkCompletion, BenchmarkStart, BenchmarkUpdate, BenchmarkWorkflow,
 };
 use crate::config::{
     PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
@@ -33,14 +38,12 @@ use crate::config::{
     set_china_ip_routing,
 };
 use crate::controller::{
-    ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest, BenchmarkResult,
-    BenchmarkSummary, ConnectionInfo, ConnectionsSnapshot, ProxyGroup, VerificationReport,
-    VerificationTarget, matches_filter, run_verification, spawn_benchmark_worker,
+    ApiClient, BenchmarkRequest, BenchmarkSummary, ConnectionInfo, ConnectionsSnapshot, ProxyGroup,
+    VerificationReport, VerificationTarget, matches_filter, run_verification,
 };
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL,
     DEFAULT_SELECTOR_TAG, DEFAULT_VERIFICATION_TARGETS, REFRESH_DEBOUNCE,
-    SINGLE_NODE_RETEST_DEBOUNCE,
 };
 use crate::internet_tun::{
     InternetTunTarget, InternetTunToggleOutcome, InternetTunTransaction, PersistedInternetTun,
@@ -59,7 +62,6 @@ use crate::private_access_session::{
     PrivateAccessSessionNotice, load_manifest_for_profile, parse_private_access_mode,
 };
 use crate::ruleset::download_china_ip_routing_rulesets;
-use crate::storage::{BenchmarkRecord, BenchmarkStore, default_benchmark_db_path};
 use crate::subscriptions::{
     DEFAULT_SUBSCRIPTION_SOURCE_PATH, SubscriptionRefreshOutput, SubscriptionRefreshRequest,
     refresh_subscriptions,
@@ -563,14 +565,6 @@ fn is_direct_chain_name(value: &str) -> bool {
     value.eq_ignore_ascii_case("direct") || value == "国内直连"
 }
 
-fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
-    match kind {
-        BenchmarkJobKind::Group => "group",
-        BenchmarkJobKind::AutoSelect => "auto",
-        BenchmarkJobKind::SingleNode { .. } => "single",
-    }
-}
-
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
     let modes = if mode_list.is_empty() {
         [GLOBAL_CLASH_MODE, DIRECT_CLASH_MODE, RULE_CLASH_MODE]
@@ -676,10 +670,7 @@ struct App {
     benchmark_request_timeout: f64,
     benchmark_max_concurrency: usize,
     verify_targets: String,
-    benchmarks: BTreeMap<String, BenchmarkSummary>,
-    benchmark_jobs: Vec<BenchmarkJob>,
-    latency_sort_mode: bool,
-    last_single_node_benchmark: Option<(String, String, Instant)>,
+    benchmark_workflow: BenchmarkWorkflow,
     filter_input: Option<String>,
     bypass_input: Option<String>,
     bypass_entries: Vec<String>,
@@ -690,7 +681,6 @@ struct App {
     last_auto_select_benchmark: Option<Instant>,
     background_started_at_unix: u64,
     background_auto_pick: BackgroundAutoPickManager,
-    benchmark_store: Option<BenchmarkStore>,
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
     latency_chart: Option<LatencyChartState>,
@@ -858,11 +848,14 @@ impl App {
                 format!(
                     "Candidates for {} [{}]",
                     group.name,
-                    node_order_badge(self.latency_sort_mode)
+                    node_order_badge(self.benchmark_workflow.latency_order())
                 )
             })
             .unwrap_or_else(|| {
-                format!("Candidates [{}]", node_order_badge(self.latency_sort_mode))
+                format!(
+                    "Candidates [{}]",
+                    node_order_badge(self.benchmark_workflow.latency_order())
+                )
             });
 
         let showing_intranet_details = self.showing_intranet_details();
@@ -984,6 +977,8 @@ impl App {
             config_has_china_ip_routing(&system_proxy_config_path).unwrap_or(false);
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
+        let benchmark_workflow =
+            BenchmarkWorkflow::open(client.base_url.clone(), client.client.clone())?;
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -1002,10 +997,7 @@ impl App {
             benchmark_request_timeout: 12.0,
             benchmark_max_concurrency,
             verify_targets: default_verification_targets_setting(),
-            benchmarks: BTreeMap::new(),
-            benchmark_jobs: Vec::new(),
-            latency_sort_mode: false,
-            last_single_node_benchmark: None,
+            benchmark_workflow,
             filter_input: None,
             bypass_input: None,
             bypass_entries: Vec::new(),
@@ -1016,7 +1008,6 @@ impl App {
             last_auto_select_benchmark: None,
             background_started_at_unix: current_unix_timestamp(),
             background_auto_pick: Default::default(),
-            benchmark_store: Some(BenchmarkStore::open(default_benchmark_db_path())?),
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
             latency_chart: None,
@@ -1549,7 +1540,7 @@ impl App {
 
     fn selected_benchmark(&self) -> Option<&BenchmarkSummary> {
         let group = self.selected_member_panel_group()?;
-        self.benchmarks.get(&group.name)
+        self.benchmark_workflow.summary(&group.name)
     }
 
     fn member_matches_filter(&self, member: &str) -> bool {
@@ -1578,7 +1569,7 @@ impl App {
                 .cloned()
                 .collect();
         };
-        if !self.latency_sort_mode {
+        if !self.benchmark_workflow.latency_order() {
             return group
                 .members
                 .iter()
@@ -1865,30 +1856,8 @@ impl App {
         let Some(latency) = latency else {
             return;
         };
-        if latency.pattern != self.benchmark_filter {
-            return;
-        }
-        if self.benchmark_jobs.iter().any(|job| {
-            job.group == latency.selector && !matches!(job.kind, BenchmarkJobKind::AutoSelect)
-        }) {
-            return;
-        }
-        let summary = self
-            .benchmarks
-            .entry(latency.selector.clone())
-            .or_insert_with(|| BenchmarkSummary::empty(latency.selector.clone()));
-        summary.current = latency.current.clone();
-        summary.pattern = latency.pattern.clone();
-        summary.url = latency.url.clone();
-        summary.timeout_ms = latency.timeout_ms;
-        summary.max_concurrency = latency.max_concurrency;
-        for result in &latency.results {
-            summary.update_result(BenchmarkResult {
-                name: result.name.clone(),
-                delay: result.delay,
-                completed: result.completed,
-            });
-        }
+        self.benchmark_workflow
+            .apply_background_snapshot(latency, &self.benchmark_filter);
     }
 
     fn set_status_only(&mut self, status: impl Into<String>) {
@@ -2370,11 +2339,13 @@ impl App {
             self.set_status_only("No node selected for latency history");
             return Ok(());
         };
-        let Some(store) = &self.benchmark_store else {
+        let Some(samples) =
+            self.benchmark_workflow
+                .node_latency_history(&group_name, &node, 200)?
+        else {
             self.set_status_only("SQLite latency history is unavailable");
             return Ok(());
         };
-        let samples = store.node_latency_history(&group_name, &node, 200)?;
         if samples.iter().all(|sample| sample.delay_ms.is_none()) {
             self.set_status_only(format!("No latency history for {}", node));
             return Ok(());
@@ -2417,10 +2388,13 @@ impl App {
         if chart.last_refresh.elapsed() < LATENCY_CHART_REFRESH_INTERVAL {
             return Ok(());
         }
-        let Some(store) = &self.benchmark_store else {
+        let Some(samples) =
+            self.benchmark_workflow
+                .node_latency_history(&chart.selector, &chart.node, 200)?
+        else {
             return Ok(());
         };
-        chart.samples = store.node_latency_history(&chart.selector, &chart.node, 200)?;
+        chart.samples = samples;
         chart.last_refresh = Instant::now();
         Ok(())
     }
@@ -2712,14 +2686,6 @@ impl App {
         let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
-        if self
-            .benchmark_jobs
-            .iter()
-            .any(|job| job.group == group.name)
-        {
-            self.set_status_only(format!("Latency test already running for {}", group.name));
-            return Ok(());
-        }
         let candidate_names = self.benchmark_candidates_for_group(&group);
         let request = BenchmarkRequest {
             selector: group.name.clone(),
@@ -2730,24 +2696,20 @@ impl App {
             max_concurrency: self.benchmark_max_concurrency,
             nodes: Some(candidate_names.clone()),
         };
-        if candidate_names.is_empty() {
-            self.set_status_only(format!(
+        match self.benchmark_workflow.start_group(request) {
+            BenchmarkStart::Started => self.set_status_only(format!(
+                "Testing latency for {} with filter '{}' in background (max {} concurrent)...",
+                group.name, self.benchmark_filter, self.benchmark_max_concurrency
+            )),
+            BenchmarkStart::AlreadyRunning => {
+                self.set_status_only(format!("Latency test already running for {}", group.name))
+            }
+            BenchmarkStart::NoCandidates => self.set_status_only(format!(
                 "No nodes in {} matched filter '{}'",
                 group.name, self.benchmark_filter
-            ));
-            return Ok(());
+            )),
+            BenchmarkStart::Debounced => {}
         }
-        self.prepare_group_benchmark(&group.name, candidate_names.clone());
-        self.spawn_benchmark_job(
-            group.name.clone(),
-            candidate_names,
-            request,
-            BenchmarkJobKind::Group,
-        );
-        self.set_status_only(format!(
-            "Testing latency for {} with filter '{}' in background (max {} concurrent)...",
-            group.name, self.benchmark_filter, self.benchmark_max_concurrency
-        ));
         Ok(())
     }
 
@@ -2767,28 +2729,6 @@ impl App {
         else {
             bail!("no proxy available in selected group");
         };
-        if let Some((last_group, last_member, last_started)) = &self.last_single_node_benchmark
-            && last_group == &group.name
-            && last_member == &member
-            && last_started.elapsed() < SINGLE_NODE_RETEST_DEBOUNCE
-        {
-            self.set_status_only(format!(
-                "Ignoring repeated retest for {} / {} (debounced)",
-                group.name, member
-            ));
-            return Ok(());
-        }
-        if self
-            .benchmark_jobs
-            .iter()
-            .any(|job| job.group == group.name && job.nodes.iter().any(|node| node == &member))
-        {
-            self.set_status_only(format!(
-                "Latency test already running for {} / {}",
-                group.name, member
-            ));
-            return Ok(());
-        }
         let request = BenchmarkRequest {
             selector: group.name.clone(),
             pattern: self.benchmark_filter.clone(),
@@ -2798,76 +2738,29 @@ impl App {
             max_concurrency: 1,
             nodes: Some(vec![member.clone()]),
         };
-        self.prepare_node_benchmark(&group.name, &member);
-        self.spawn_benchmark_job(
-            group.name.clone(),
-            vec![member.clone()],
-            request,
-            BenchmarkJobKind::SingleNode {
-                node: member.clone(),
-            },
-        );
-        self.last_single_node_benchmark =
-            Some((group.name.clone(), member.clone(), Instant::now()));
-        self.set_status_only(format!(
-            "Testing latency for {} / {} in background...",
-            group.name, member
-        ));
+        match self
+            .benchmark_workflow
+            .start_single_node(request, member.clone())
+        {
+            BenchmarkStart::Started => self.set_status_only(format!(
+                "Testing latency for {} / {} in background...",
+                group.name, member
+            )),
+            BenchmarkStart::AlreadyRunning => self.set_status_only(format!(
+                "Latency test already running for {} / {}",
+                group.name, member
+            )),
+            BenchmarkStart::Debounced => self.set_status_only(format!(
+                "Ignoring repeated retest for {} / {} (debounced)",
+                group.name, member
+            )),
+            BenchmarkStart::NoCandidates => {}
+        }
         Ok(())
     }
 
-    fn prepare_group_benchmark(&mut self, group: &str, candidates: Vec<String>) {
-        let summary = self
-            .benchmarks
-            .entry(group.to_string())
-            .or_insert_with(|| BenchmarkSummary::empty(group.to_string()));
-        summary.selector = group.to_string();
-        summary.pattern = self.benchmark_filter.clone();
-        summary.url = self.benchmark_url.clone();
-        summary.timeout_ms = self.benchmark_timeout_ms;
-        summary.max_concurrency = self.benchmark_max_concurrency.max(1);
-        summary.reset_pending(candidates);
-    }
-
-    fn prepare_node_benchmark(&mut self, group: &str, node: &str) {
-        let summary = self
-            .benchmarks
-            .entry(group.to_string())
-            .or_insert_with(|| BenchmarkSummary::empty(group.to_string()));
-        summary.selector = group.to_string();
-        summary.pattern = self.benchmark_filter.clone();
-        summary.url = self.benchmark_url.clone();
-        summary.timeout_ms = self.benchmark_timeout_ms;
-        summary.max_concurrency = 1;
-        summary.upsert_pending(node.to_string());
-    }
-
-    fn spawn_benchmark_job(
-        &mut self,
-        group: String,
-        nodes: Vec<String>,
-        request: BenchmarkRequest,
-        kind: BenchmarkJobKind,
-    ) {
-        let (tx, rx) = mpsc::channel();
-        let worker = spawn_benchmark_worker(
-            self.client.base_url.clone(),
-            self.client.client.clone(),
-            request,
-            tx,
-        );
-        self.benchmark_jobs.push(BenchmarkJob {
-            group,
-            nodes,
-            kind,
-            receiver: rx,
-            worker,
-        });
-    }
-
     fn toggle_latency_sort_mode(&mut self) {
-        self.latency_sort_mode = !self.latency_sort_mode;
-        let status = if self.latency_sort_mode {
+        let status = if self.benchmark_workflow.toggle_latency_order() {
             "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
                 .to_string()
         } else {
@@ -2931,14 +2824,6 @@ impl App {
         let Some(group) = self.auto_select_group().cloned() else {
             return Ok(());
         };
-        if self
-            .benchmark_jobs
-            .iter()
-            .any(|job| job.group == group.name)
-        {
-            return Ok(());
-        }
-
         let candidate_names = self.benchmark_candidates_for_group(&group);
         let request = BenchmarkRequest {
             selector: group.name.clone(),
@@ -2949,28 +2834,25 @@ impl App {
             max_concurrency: self.benchmark_max_concurrency,
             nodes: Some(candidate_names.clone()),
         };
-        self.last_auto_select_benchmark = Some(now);
-        if candidate_names.is_empty() {
-            self.set_status_only(format!(
-                "Auto-pick found no nodes in {} for {}",
-                group.name,
-                self.benchmark_scope_label()
-            ));
-            return Ok(());
+        match self.benchmark_workflow.start_auto_select(request) {
+            BenchmarkStart::Started => {
+                self.last_auto_select_benchmark = Some(now);
+                self.set_status_only(format!(
+                    "Auto-pick testing latency for {} ({})...",
+                    group.name,
+                    self.benchmark_scope_label()
+                ));
+            }
+            BenchmarkStart::NoCandidates => {
+                self.last_auto_select_benchmark = Some(now);
+                self.set_status_only(format!(
+                    "Auto-pick found no nodes in {} for {}",
+                    group.name,
+                    self.benchmark_scope_label()
+                ));
+            }
+            BenchmarkStart::AlreadyRunning | BenchmarkStart::Debounced => {}
         }
-
-        self.prepare_group_benchmark(&group.name, candidate_names.clone());
-        self.spawn_benchmark_job(
-            group.name.clone(),
-            candidate_names,
-            request,
-            BenchmarkJobKind::AutoSelect,
-        );
-        self.set_status_only(format!(
-            "Auto-pick testing latency for {} ({})...",
-            group.name,
-            self.benchmark_scope_label()
-        ));
         Ok(())
     }
 
@@ -3064,128 +2946,57 @@ impl App {
         Ok(())
     }
 
-    fn record_benchmark_result(
-        &self,
-        group: &str,
-        filter: &str,
-        job_kind: &BenchmarkJobKind,
-        result: &crate::controller::BenchmarkResult,
-    ) -> Result<()> {
-        let Some(store) = &self.benchmark_store else {
-            return Ok(());
-        };
-        store
-            .record_benchmark(&BenchmarkRecord {
-                selector: group,
-                node: &result.name,
-                filter,
-                delay_ms: result.delay,
-                completed: result.completed,
-                job_kind: benchmark_job_kind_label(job_kind),
-            })
-            .with_context(|| format!("failed to record benchmark result for {}", result.name))
-            .unwrap_or_else(|error| {
-                eprintln!("warning: {error:#}");
-            });
+    fn poll_benchmark_updates(&mut self) -> Result<()> {
+        for update in self.benchmark_workflow.poll() {
+            self.apply_benchmark_update(update)?;
+        }
         Ok(())
     }
 
-    fn poll_benchmark_updates(&mut self) -> Result<()> {
-        let mut finished_indexes = Vec::new();
-
-        for index in 0..self.benchmark_jobs.len() {
-            let mut finished = false;
-            loop {
-                match self.benchmark_jobs[index].receiver.try_recv() {
-                    Ok(BenchmarkEvent::Progress(result)) => {
-                        let group = self.benchmark_jobs[index].group.clone();
-                        let kind = self.benchmark_jobs[index].kind.clone();
-                        let mut filter = self.benchmark_filter.clone();
-                        if let Some(summary) =
-                            self.benchmarks.get_mut(&self.benchmark_jobs[index].group)
-                        {
-                            filter = summary.pattern.clone();
-                            summary.update_result(result.clone());
-                            self.status = format!(
-                                "Testing latency for {}... best so far: {}",
-                                self.benchmark_jobs[index].group,
-                                summary.best_label()
-                            );
-                        }
-                        self.record_benchmark_result(&group, &filter, &kind, &result)?;
-                    }
-                    Ok(BenchmarkEvent::Finished) => {
-                        finished = true;
-                        let group = self.benchmark_jobs[index].group.clone();
-                        let kind = self.benchmark_jobs[index].kind.clone();
-                        if let Some(summary) = self.benchmarks.get(&group) {
-                            match kind {
-                                BenchmarkJobKind::Group => {
-                                    if let Some(best) = summary.best_success() {
-                                        self.set_status_only(format!(
-                                            "Latency tested {}: best is {} ({})",
-                                            group,
-                                            best.name,
-                                            best.display_delay()
-                                        ));
-                                    } else {
-                                        self.set_status_only(format!(
-                                            "Latency tested {} but no healthy node matched",
-                                            group
-                                        ));
-                                    }
-                                }
-                                BenchmarkJobKind::AutoSelect => {
-                                    let summary = summary.clone();
-                                    self.finish_auto_select_benchmark(&group, &summary)?;
-                                }
-                                BenchmarkJobKind::SingleNode { node } => {
-                                    let result = summary.find_result(&node);
-                                    let status = match result {
-                                        Some(result) if result.delay.is_some() => format!(
-                                            "Latency tested {} / {}: {}",
-                                            group,
-                                            node,
-                                            result.display_delay()
-                                        ),
-                                        Some(_) => {
-                                            format!("Latency tested {} / {}: failed", group, node)
-                                        }
-                                        None => {
-                                            format!(
-                                                "Latency test finished for {} / {}",
-                                                group, node
-                                            )
-                                        }
-                                    };
-                                    self.set_status_only(status);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        finished = true;
-                        let group = self.benchmark_jobs[index].group.clone();
-                        self.set_status_only(format!(
-                            "Latency test worker for {} disconnected",
-                            group
-                        ));
-                        break;
-                    }
+    fn apply_benchmark_update(&mut self, update: BenchmarkUpdate) -> Result<()> {
+        match update {
+            BenchmarkUpdate::Progress { group, best_label } => {
+                self.status = format!("Testing latency for {group}... best so far: {best_label}");
+            }
+            BenchmarkUpdate::Disconnected { group } => {
+                self.set_status_only(format!("Latency test worker for {group} disconnected"));
+            }
+            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, best }) => {
+                if let Some(best) = best {
+                    self.set_status_only(format!(
+                        "Latency tested {}: best is {} ({})",
+                        group,
+                        best.name,
+                        best.display_delay()
+                    ));
+                } else {
+                    self.set_status_only(format!(
+                        "Latency tested {} but no healthy node matched",
+                        group
+                    ));
                 }
             }
-            if finished {
-                finished_indexes.push(index);
+            BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect { group, summary }) => {
+                self.finish_auto_select_benchmark(&group, &summary)?;
+            }
+            BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
+                group,
+                node,
+                result,
+            }) => {
+                let status = match result {
+                    Some(result) if result.delay.is_some() => format!(
+                        "Latency tested {} / {}: {}",
+                        group,
+                        node,
+                        result.display_delay()
+                    ),
+                    Some(_) => format!("Latency tested {} / {}: failed", group, node),
+                    None => format!("Latency test finished for {} / {}", group, node),
+                };
+                self.set_status_only(status);
             }
         }
-
-        for index in finished_indexes.into_iter().rev() {
-            let job = self.benchmark_jobs.swap_remove(index);
-            let _ = job.worker.join();
-        }
-
         Ok(())
     }
 
@@ -3367,24 +3178,7 @@ impl App {
 
     fn background_latency_snapshot(&self) -> Option<BackgroundLatencySnapshot> {
         let group = self.auto_select_group()?;
-        let summary = self.benchmarks.get(&group.name)?;
-        Some(BackgroundLatencySnapshot {
-            selector: summary.selector.clone(),
-            current: summary.current.clone(),
-            pattern: summary.pattern.clone(),
-            url: summary.url.clone(),
-            timeout_ms: summary.timeout_ms,
-            max_concurrency: summary.max_concurrency,
-            results: summary
-                .results
-                .iter()
-                .map(|result| BackgroundLatencyResult {
-                    name: result.name.clone(),
-                    delay: result.delay,
-                    completed: result.completed,
-                })
-                .collect(),
-        })
+        self.benchmark_workflow.background_snapshot(&group.name)
     }
 
     fn run_headless_auto_pick_loop(&mut self) -> Result<()> {
@@ -3678,20 +3472,19 @@ mod tests {
     use super::process_alive_via_ps;
     use super::{
         AUTO_SELECT_THRESHOLD_MS, App, AutoPickDecision, BackgroundLatencyResult,
-        BackgroundLatencySnapshot, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
-        GLOBAL_CLASH_MODE, IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW,
-        LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LeftPaneSection, PrivateAccessMode,
-        PrivateAccessProfileRuntime, PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE,
-        SettingsEditState, SettingsField, SystemProxy, connection_is_direct,
-        is_private_access_settings_field, next_clash_mode, normalize_http_connect_proxy,
-        private_access_auth_display_value, private_access_auth_initial_value,
-        settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
-        truncate_for_width, visible_settings_fields,
+        BackgroundLatencySnapshot, BenchmarkCompletion, BenchmarkUpdate, BenchmarkWorkflow,
+        CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
+        IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
+        LatencyChartState, LeftPaneSection, PrivateAccessMode, PrivateAccessProfileRuntime,
+        PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE, SettingsEditState,
+        SettingsField, SystemProxy, connection_is_direct, is_private_access_settings_field,
+        next_clash_mode, normalize_http_connect_proxy, private_access_auth_display_value,
+        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
+        sonicwall_http_connect_settings, truncate_for_width, visible_settings_fields,
     };
     use crate::controller::{
-        ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
-        BenchmarkResult, BenchmarkSummary, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
-        ProxyGroup,
+        ApiClient, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionInfo,
+        ConnectionMetadata, ConnectionsSnapshot, ProxyGroup,
     };
     use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
     use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
@@ -3702,11 +3495,9 @@ mod tests {
     use crossterm::event::MouseEventKind;
     use reqwest::Client as AsyncClient;
     use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -3796,13 +3587,16 @@ mod tests {
             .no_proxy()
             .build()
             .expect("test HTTP client");
+        let api_client = ApiClient {
+            base_url: DEFAULT_CONTROLLER.to_string(),
+            runtime,
+            client,
+        };
+        let benchmark_workflow =
+            BenchmarkWorkflow::for_test(api_client.base_url.clone(), api_client.client.clone());
 
         App {
-            client: ApiClient {
-                base_url: DEFAULT_CONTROLLER.to_string(),
-                runtime,
-                client,
-            },
+            client: api_client,
             groups: vec![ProxyGroup {
                 name: "select".to_string(),
                 kind: "Selector".to_string(),
@@ -3824,10 +3618,7 @@ mod tests {
             benchmark_request_timeout: 12.0,
             benchmark_max_concurrency: DEFAULT_BENCHMARK_MAX_CONCURRENCY,
             verify_targets: super::default_verification_targets_setting(),
-            benchmarks: BTreeMap::new(),
-            benchmark_jobs: Vec::new(),
-            latency_sort_mode: false,
-            last_single_node_benchmark: None,
+            benchmark_workflow,
             filter_input: None,
             bypass_input: None,
             bypass_entries: Vec::new(),
@@ -3838,7 +3629,6 @@ mod tests {
             last_auto_select_benchmark: None,
             background_started_at_unix: super::current_unix_timestamp(),
             background_auto_pick: Default::default(),
-            benchmark_store: None,
             state_store: None,
             bypass_rule_set_store: None,
             latency_chart: None,
@@ -4861,42 +4651,19 @@ mod tests {
     #[test]
     fn single_node_benchmark_finish_does_not_flash() {
         let mut app = test_app();
-        app.benchmarks.insert(
-            "select".to_string(),
-            BenchmarkSummary {
-                selector: "select".to_string(),
-                current: Some("node-a".to_string()),
-                pattern: "美国".to_string(),
-                url: "https://www.gstatic.com/generate_204".to_string(),
-                timeout_ms: 5000,
-                max_concurrency: 1,
-                results: vec![BenchmarkResult {
-                    name: "node-a".to_string(),
-                    delay: Some(42),
-                    completed: true,
-                }],
-            },
-        );
-
-        let (tx, rx) = mpsc::channel();
-        tx.send(BenchmarkEvent::Finished)
-            .expect("send finish event");
-        let worker = thread::spawn(|| {});
-        app.benchmark_jobs.push(BenchmarkJob {
+        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
             group: "select".to_string(),
-            nodes: vec!["node-a".to_string()],
-            kind: BenchmarkJobKind::SingleNode {
-                node: "node-a".to_string(),
-            },
-            receiver: rx,
-            worker,
-        });
-
-        app.poll_benchmark_updates().expect("poll succeeds");
+            node: "node-a".to_string(),
+            result: Some(BenchmarkResult {
+                name: "node-a".to_string(),
+                delay: Some(42),
+                completed: true,
+            }),
+        }))
+        .expect("apply completion");
 
         assert_eq!(app.status, "Latency tested select / node-a: 42ms");
         assert!(app.flash.is_none());
-        assert!(app.benchmark_jobs.is_empty());
     }
 
     #[test]
@@ -4906,7 +4673,7 @@ mod tests {
 
         app.toggle_latency_sort_mode();
 
-        assert!(app.latency_sort_mode);
+        assert!(app.benchmark_workflow.latency_order());
         assert_eq!(
             app.status,
             "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
@@ -4917,84 +4684,18 @@ mod tests {
     #[test]
     fn group_benchmark_finish_does_not_flash() {
         let mut app = test_app();
-        app.benchmarks.insert(
-            "select".to_string(),
-            BenchmarkSummary {
-                selector: "select".to_string(),
-                current: Some("node-a".to_string()),
-                pattern: "美国".to_string(),
-                url: "https://www.gstatic.com/generate_204".to_string(),
-                timeout_ms: 5000,
-                max_concurrency: 4,
-                results: vec![
-                    BenchmarkResult {
-                        name: "node-a".to_string(),
-                        delay: Some(42),
-                        completed: true,
-                    },
-                    BenchmarkResult {
-                        name: "node-b".to_string(),
-                        delay: Some(80),
-                        completed: true,
-                    },
-                ],
-            },
-        );
-
-        let (tx, rx) = mpsc::channel();
-        tx.send(BenchmarkEvent::Finished)
-            .expect("send finish event");
-        let worker = thread::spawn(|| {});
-        app.benchmark_jobs.push(BenchmarkJob {
+        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
             group: "select".to_string(),
-            nodes: vec!["node-a".to_string(), "node-b".to_string()],
-            kind: BenchmarkJobKind::Group,
-            receiver: rx,
-            worker,
-        });
-
-        app.poll_benchmark_updates().expect("poll succeeds");
+            best: Some(BenchmarkResult {
+                name: "node-a".to_string(),
+                delay: Some(42),
+                completed: true,
+            }),
+        }))
+        .expect("apply completion");
 
         assert_eq!(app.status, "Latency tested select: best is node-a (42ms)");
         assert!(app.flash.is_none());
-        assert!(app.benchmark_jobs.is_empty());
-    }
-
-    #[test]
-    fn benchmark_progress_is_recorded_to_sqlite() {
-        let path = test_db_path();
-        let mut app = test_app();
-        app.benchmark_store = Some(BenchmarkStore::open(&path).expect("open benchmark store"));
-
-        let (tx, rx) = mpsc::channel();
-        tx.send(BenchmarkEvent::Progress(BenchmarkResult {
-            name: "美国-a".to_string(),
-            delay: Some(88),
-            completed: true,
-        }))
-        .expect("send progress event");
-        let worker = thread::spawn(|| {});
-        app.benchmark_jobs.push(BenchmarkJob {
-            group: "select".to_string(),
-            nodes: vec!["美国-a".to_string()],
-            kind: BenchmarkJobKind::AutoSelect,
-            receiver: rx,
-            worker,
-        });
-
-        app.poll_benchmark_updates().expect("poll succeeds");
-
-        let store = BenchmarkStore::open(&path).expect("reopen benchmark store");
-        let rows = store.recent_benchmarks(10).expect("read rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].selector, "select");
-        assert_eq!(rows[0].node, "美国-a");
-        assert_eq!(rows[0].filter, "美国");
-        assert_eq!(rows[0].delay_ms, Some(88));
-        assert!(rows[0].completed);
-        assert_eq!(rows[0].job_kind, "auto");
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -5014,7 +4715,7 @@ mod tests {
                 job_kind: "single",
             })
             .expect("record benchmark");
-        app.benchmark_store = Some(store);
+        app.benchmark_workflow.replace_store(Some(store));
 
         app.handle_key(KeyCode::Char('i')).expect("open chart");
 
@@ -5070,7 +4771,7 @@ mod tests {
                 job_kind: "auto",
             })
             .expect("record benchmark");
-        app.benchmark_store = Some(store);
+        app.benchmark_workflow.replace_store(Some(store));
         app.latency_chart = Some(LatencyChartState {
             selector: "select".to_string(),
             node: "node-a".to_string(),
@@ -5093,7 +4794,9 @@ mod tests {
     fn pressing_i_without_history_updates_status() {
         let path = test_db_path();
         let mut app = test_app();
-        app.benchmark_store = Some(BenchmarkStore::open(&path).expect("open benchmark store"));
+        app.benchmark_workflow.replace_store(Some(
+            BenchmarkStore::open(&path).expect("open benchmark store"),
+        ));
 
         app.handle_key(KeyCode::Char('i')).expect("open chart");
 
@@ -5295,22 +4998,19 @@ mod tests {
     #[test]
     fn implicit_root_benchmark_summary_is_scoped_to_selected_choice() {
         let mut app = internet_routes_app();
-        app.benchmarks.insert(
-            "宝贝云".to_string(),
-            BenchmarkSummary {
-                selector: "宝贝云".to_string(),
-                current: Some("bby-2".to_string()),
-                pattern: String::new(),
-                url: "https://www.gstatic.com/generate_204".to_string(),
-                timeout_ms: 5000,
-                max_concurrency: 4,
-                results: vec![BenchmarkResult {
-                    name: "bby-1".to_string(),
-                    delay: Some(88),
-                    completed: true,
-                }],
-            },
-        );
+        app.benchmark_workflow.set_summary(BenchmarkSummary {
+            selector: "宝贝云".to_string(),
+            current: Some("bby-2".to_string()),
+            pattern: String::new(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            timeout_ms: 5000,
+            max_concurrency: 4,
+            results: vec![BenchmarkResult {
+                name: "bby-1".to_string(),
+                delay: Some(88),
+                completed: true,
+            }],
+        });
 
         assert_eq!(
             app.selected_benchmark()
@@ -5382,44 +5082,6 @@ mod tests {
         }));
 
         assert!(app.selected_benchmark().is_none());
-    }
-
-    #[test]
-    fn background_latency_snapshot_does_not_overwrite_manual_latency_test() {
-        let mut app = test_app();
-        app.benchmark_filter = "node".to_string();
-        app.prepare_node_benchmark("select", "node-a");
-        let (_tx, rx) = mpsc::channel();
-        app.benchmark_jobs.push(BenchmarkJob {
-            group: "select".to_string(),
-            nodes: vec!["node-a".to_string()],
-            kind: BenchmarkJobKind::SingleNode {
-                node: "node-a".to_string(),
-            },
-            receiver: rx,
-            worker: thread::spawn(|| {}),
-        });
-
-        app.apply_background_latency_snapshot(Some(&BackgroundLatencySnapshot {
-            selector: "select".to_string(),
-            current: Some("node-a".to_string()),
-            pattern: "node".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![BackgroundLatencyResult {
-                name: "node-a".to_string(),
-                delay: Some(88),
-                completed: true,
-            }],
-        }));
-
-        let result = app
-            .selected_benchmark()
-            .and_then(|summary| summary.find_result("node-a"))
-            .expect("node result");
-        assert_eq!(result.delay, None);
-        assert!(!result.completed);
     }
 
     #[test]
@@ -5564,10 +5226,14 @@ mod tests {
         app.maybe_start_auto_select_benchmark()
             .expect("auto select starts");
 
-        assert_eq!(app.benchmark_jobs.len(), 1);
-        assert_eq!(app.benchmark_jobs[0].group, "airtcp");
-        assert_eq!(app.benchmark_jobs[0].nodes, vec!["美国-b".to_string()]);
-        let summary = app.benchmarks.get("airtcp").expect("airtcp summary");
+        assert_eq!(
+            app.benchmark_workflow.active_nodes("airtcp"),
+            Some(["美国-b".to_string()].as_slice())
+        );
+        let summary = app
+            .benchmark_workflow
+            .summary("airtcp")
+            .expect("airtcp summary");
         assert_eq!(summary.selector, "airtcp");
         assert_eq!(
             summary
