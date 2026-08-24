@@ -15,3 +15,7 @@ _Avoid_: Process alive, startup success
 **Internet TUN transition**:
 A recoverable change between enabled and disabled Internet traffic capture, including its persisted intent and the route state required to restore user configuration.
 _Avoid_: TUN toggle, config edit, TUN job
+
+**Private Access session**:
+A live connection attempt for one configured intranet profile, including authentication state and the network resources granted by its remote gateway.
+_Avoid_: VPN process, connector job, profile runtime

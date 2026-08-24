@@ -16,6 +16,7 @@ mod internet_tun;
 mod macos_privileged_helper;
 mod managed_sing_box;
 mod private_access;
+mod private_access_session;
 mod provider;
 mod ruleset;
 mod sonicwall;

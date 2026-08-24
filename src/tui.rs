@@ -56,10 +56,13 @@ use crate::managed_sing_box::{
     wait_for_controller_ready,
 };
 use crate::private_access::{
-    ExternalPrivateAccessService, PrivateAccessAuthField, PrivateAccessBridge,
-    PrivateAccessCommand, PrivateAccessEvent, PrivateAccessRoute, PrivateAccessSecret,
-    PrivateAccessServiceManifest, PrivateAccessState, default_hillstone_manifest,
-    default_sonicwall_manifest, load_private_access_manifest,
+    PrivateAccessAuthField, PrivateAccessSecret, PrivateAccessServiceManifest, PrivateAccessState,
+};
+use crate::private_access_session::{
+    PrivateAccessBridgeRouteUpdate, PrivateAccessCarrierRestart, PrivateAccessConnectOptions,
+    PrivateAccessDisconnectOutcome, PrivateAccessMode, PrivateAccessNetworkIntegration,
+    PrivateAccessNoticeTone, PrivateAccessProfileRuntime, PrivateAccessRuntime,
+    PrivateAccessSessionNotice, load_manifest_for_profile, parse_private_access_mode,
 };
 use crate::ruleset::download_china_ip_routing_rulesets;
 use crate::storage::{
@@ -70,8 +73,8 @@ use crate::subscriptions::{
     refresh_subscriptions,
 };
 use crate::tui_state::{
-    BypassRuleSetStore, PrivateAccessProfileState, TuiRuntimeState, TuiStateStore,
-    default_bypass_rule_set_path, default_tui_state_path, parse_bypass_entries,
+    BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
+    default_tui_state_path, parse_bypass_entries,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -87,7 +90,6 @@ const BACKGROUND_TASK_KIND_AUTO_PICK: &str = "headless-auto-pick";
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const PRIVATE_ACCESS_EVENTS_PER_POLL: usize = 64;
 // Keep RFC1918 ranges out of the OS-level bypass list. The Hillstone bridge
 // problem showed why this matters: if macOS bypasses 10.* before traffic reaches
 // sing-box, sing-box cannot apply its route override to the local ESP bridge.
@@ -1317,7 +1319,7 @@ fn private_access_detail_view(
             "Process",
             &format!("background pid {pid}"),
         ));
-    } else if profile.process.is_some() {
+    } else if profile.owns_process() {
         lines.push(private_access_detail_line("Process", "owned by this TUI"));
     }
 
@@ -3714,29 +3716,6 @@ enum SettingsField {
     PrivateAccessTlsVerify,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PrivateAccessMode {
-    Bridge,
-    Tun,
-}
-
-impl PrivateAccessMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Bridge => "bridge",
-            Self::Tun => "tun",
-        }
-    }
-}
-
-fn parse_private_access_mode(value: &str) -> Result<PrivateAccessMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "bridge" | "http_bridge" | "http-bridge" => Ok(PrivateAccessMode::Bridge),
-        "tun" => Ok(PrivateAccessMode::Tun),
-        _ => bail!("private access mode must be bridge or tun"),
-    }
-}
-
 fn helper_command_uses_sudo(command: &[String]) -> bool {
     command
         .first()
@@ -3953,345 +3932,90 @@ impl PrivateAccessProgressTone {
     }
 }
 
-struct PrivateAccessProfileRuntime {
-    id: String,
-    manifest_path: Option<String>,
-    mode: PrivateAccessMode,
-    manifest: PrivateAccessServiceManifest,
-    process: Option<ExternalPrivateAccessService>,
-    state: PrivateAccessState,
-    server: String,
-    port: u16,
-    username: String,
-    password: String,
-    password_env: String,
-    bridge_listen: String,
-    tun_helper: Vec<String>,
-    tls_verify: bool,
-    use_internet_proxy: bool,
-    routes: Vec<PrivateAccessRoute>,
-    dns: Vec<String>,
-    domains: Vec<String>,
-    domain_suffixes: Vec<String>,
-    bridge: Option<PrivateAccessBridge>,
-    last_error: Option<String>,
-    integration_failed: bool,
-    background_pid: Option<u32>,
+struct TuiPrivateAccessNetworkIntegration<'a> {
+    config_path: &'a Path,
+    sing_box: &'a mut ManagedSingBox,
+    system_proxy_enabled: &'a mut bool,
+    system_proxy_job_running: bool,
+    system_proxy_server: &'a str,
+    base_bypass_entries: &'a [String],
 }
 
-impl PrivateAccessProfileRuntime {
-    #[cfg(test)]
-    fn default_hillstone() -> Result<Self> {
-        let manifest_path = env::var("SING_BOX_TUI_PRIVATE_ACCESS_MANIFEST")
-            .ok()
-            .filter(|path| !path.trim().is_empty());
-        let manifest =
-            load_private_access_manifest_for_profile("hillstone", manifest_path.as_deref())?;
-        Ok(Self {
-            id: "hillstone".to_string(),
-            manifest_path,
-            mode: PrivateAccessMode::Tun,
-            manifest,
-            process: None,
-            state: PrivateAccessState::Disconnected,
-            server: env::var("HILLSTONE_SERVER").unwrap_or_default(),
-            port: 4433,
-            username: env::var("HILLSTONE_USERNAME").unwrap_or_default(),
-            password: String::new(),
-            password_env: "HILLSTONE_PASSWORD".to_string(),
-            bridge_listen: "127.0.0.1:16780".to_string(),
-            tun_helper: Vec::new(),
-            tls_verify: false,
-            use_internet_proxy: false,
-            routes: Vec::new(),
-            dns: Vec::new(),
-            domains: Vec::new(),
-            domain_suffixes: Vec::new(),
-            bridge: None,
-            last_error: None,
-            integration_failed: false,
-            background_pid: None,
-        })
-    }
-
-    #[cfg(test)]
-    fn default_sonicwall() -> Result<Self> {
-        let manifest_path = env::var("SING_BOX_TUI_SONICWALL_MANIFEST")
-            .ok()
-            .filter(|path| !path.trim().is_empty());
-        let manifest =
-            load_private_access_manifest_for_profile("sonicwall", manifest_path.as_deref())?;
-        Ok(Self {
-            id: "sonicwall".to_string(),
-            manifest_path,
-            mode: PrivateAccessMode::Tun,
-            manifest,
-            process: None,
-            state: PrivateAccessState::Disconnected,
-            server: "sslvpn.hundsun.com".to_string(),
-            port: 443,
-            username: String::new(),
-            password: String::new(),
-            password_env: String::new(),
-            bridge_listen: String::new(),
-            tun_helper: Vec::new(),
-            tls_verify: true,
-            use_internet_proxy: false,
-            routes: Vec::new(),
-            dns: Vec::new(),
-            domains: Vec::new(),
-            domain_suffixes: Vec::new(),
-            bridge: None,
-            last_error: None,
-            integration_failed: false,
-            background_pid: None,
-        })
-    }
-
-    fn from_state(state: PrivateAccessProfileState) -> Result<Self> {
-        let id = normalize_optional_setting(Some(state.id.clone()))
-            .unwrap_or_else(|| "hillstone".to_string());
-        let manifest_path = normalize_optional_setting(state.manifest_path.clone());
-        let manifest = load_private_access_manifest_for_profile(&id, manifest_path.as_deref())?;
-        let is_sonicwall = manifest.id == "sonicwall";
-        let mut profile = Self {
-            id,
-            manifest_path,
-            mode: PrivateAccessMode::Tun,
-            manifest,
-            process: None,
-            state: PrivateAccessState::Disconnected,
-            server: if is_sonicwall {
-                "sslvpn.hundsun.com".to_string()
-            } else {
-                String::new()
+impl PrivateAccessNetworkIntegration for TuiPrivateAccessNetworkIntegration<'_> {
+    fn apply_bridge_routes(&mut self, update: &PrivateAccessBridgeRouteUpdate) -> Result<bool> {
+        if update.routes.is_empty()
+            && update.domains.is_empty()
+            && update.domain_suffixes.is_empty()
+            && update.carrier_domains.is_empty()
+        {
+            return Ok(false);
+        }
+        let listen = update
+            .bridge
+            .as_ref()
+            .map(|bridge| bridge.listen.as_str())
+            .unwrap_or(update.fallback_listen.as_str());
+        let proxy = listen
+            .parse::<SocketAddrV4>()
+            .with_context(|| format!("private access bridge listen must be IPv4:PORT: {listen}"))?;
+        run_private_access_route_table_config(
+            self.config_path,
+            None,
+            true,
+            PrivateAccessRouteTableOptions {
+                profile_id: update.profile_id.clone(),
+                cidrs: update
+                    .routes
+                    .iter()
+                    .map(|route| route.cidr.clone())
+                    .collect(),
+                domains: update.domains.clone(),
+                domain_suffixes: update.domain_suffixes.clone(),
+                previous_cidrs: update
+                    .previous_routes
+                    .iter()
+                    .map(|route| route.cidr.clone())
+                    .collect(),
+                previous_domains: update.previous_domains.clone(),
+                previous_domain_suffixes: update.previous_domain_suffixes.clone(),
+                carrier_domains: update.carrier_domains.clone(),
+                proxy: Some(proxy),
             },
-            port: if is_sonicwall { 443 } else { 4433 },
-            username: String::new(),
-            password: String::new(),
-            password_env: String::new(),
-            bridge_listen: if is_sonicwall {
-                String::new()
-            } else {
-                "127.0.0.1:16780".to_string()
-            },
-            tun_helper: Vec::new(),
-            tls_verify: is_sonicwall,
-            use_internet_proxy: false,
-            routes: Vec::new(),
-            dns: Vec::new(),
-            domains: Vec::new(),
-            domain_suffixes: Vec::new(),
-            bridge: None,
-            last_error: None,
-            integration_failed: false,
-            background_pid: None,
-        };
-        profile.apply_state(state)?;
-        if profile.manifest.id == "sonicwall" {
-            profile.mode = PrivateAccessMode::Tun;
-        }
-        Ok(profile)
+        )
     }
 
-    fn apply_state(&mut self, state: PrivateAccessProfileState) -> Result<()> {
-        if let Some(value) = normalize_optional_setting(state.mode) {
-            self.mode = parse_private_access_mode(&value)?;
-        }
-        if let Some(value) = normalize_optional_setting(state.server) {
-            self.server = value;
-        }
-        if let Some(value) = state.port.filter(|value| *value > 0) {
-            self.port = value;
-        }
-        if let Some(value) = normalize_optional_setting(state.username) {
-            self.username = value;
-        }
-        if let Some(value) = normalize_optional_setting(state.password) {
-            self.password = value;
-        }
-        if let Some(value) = normalize_optional_setting(state.password_env) {
-            self.password_env = value;
-        }
-        if let Some(value) = normalize_optional_setting(state.bridge_listen) {
-            self.bridge_listen = value;
-        }
-        if let Some(values) = state.tun_helper {
-            self.tun_helper = values
-                .into_iter()
-                .filter(|value| !value.trim().is_empty())
-                .collect();
-        }
-        self.tls_verify = state.tls_verify;
-        self.use_internet_proxy = state.use_internet_proxy;
-        self.background_pid = state
-            .background_pid
-            .filter(|pid| private_access_process_exists(*pid, &self.manifest));
-        if self.background_pid.is_some() {
-            self.state = PrivateAccessState::Connected;
-        }
-        Ok(())
-    }
-
-    fn runtime_state(&self) -> PrivateAccessProfileState {
-        PrivateAccessProfileState {
-            id: self.id.clone(),
-            manifest_path: self.manifest_path.clone(),
-            mode: Some(self.mode.as_str().to_string()),
-            server: normalize_optional_setting(Some(self.server.clone())),
-            port: Some(self.port),
-            username: normalize_optional_setting(Some(self.username.clone())),
-            password: normalize_optional_setting(Some(self.password.clone())),
-            password_env: normalize_optional_setting(Some(self.password_env.clone())),
-            bridge_listen: normalize_optional_setting(Some(self.bridge_listen.clone())),
-            tun_helper: if self.tun_helper.is_empty() {
-                None
-            } else {
-                Some(self.tun_helper.clone())
-            },
-            tls_verify: self.tls_verify,
-            use_internet_proxy: self.use_internet_proxy,
-            background_pid: self.background_pid.filter(|pid| process_exists(*pid)),
+    fn restart_carrier(&mut self) -> Result<PrivateAccessCarrierRestart> {
+        let receipt = self.sing_box.restart()?;
+        if receipt.report().replaced_existing() {
+            Ok(PrivateAccessCarrierRestart {
+                progress_message: format!("sing-box 重启成功: {}", receipt.report().transition()),
+                summary: format!("restarted sing-box {}", receipt.report().transition()),
+            })
+        } else {
+            Ok(PrivateAccessCarrierRestart {
+                progress_message: format!(
+                    "sing-box 启动成功: {}",
+                    receipt.report().started_process()
+                ),
+                summary: format!("started sing-box {}", receipt.report().started_process()),
+            })
         }
     }
-}
 
-struct PrivateAccessRuntime {
-    profiles: Vec<PrivateAccessProfileRuntime>,
-    focused_index: usize,
-}
-
-impl PrivateAccessRuntime {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            profiles: Vec::new(),
-            focused_index: 0,
-        })
-    }
-
-    #[cfg(test)]
-    fn with_default_hillstone() -> Result<Self> {
-        Ok(Self {
-            profiles: vec![PrivateAccessProfileRuntime::default_hillstone()?],
-            focused_index: 0,
-        })
-    }
-
-    fn is_configured(&self) -> bool {
-        !self.profiles.is_empty()
-    }
-
-    fn focused(&self) -> &PrivateAccessProfileRuntime {
-        &self.profiles[self.focused_index]
-    }
-
-    fn focused_mut(&mut self) -> &mut PrivateAccessProfileRuntime {
-        &mut self.profiles[self.focused_index]
-    }
-
-    fn focused_opt(&self) -> Option<&PrivateAccessProfileRuntime> {
-        self.profiles.get(self.focused_index)
-    }
-
-    #[cfg(test)]
-    fn focused_id(&self) -> &str {
-        self.focused().id.as_str()
-    }
-
-    fn set_focus_by_id(&mut self, id: &str) -> Result<bool> {
-        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
-            bail!("unknown private access profile: {id}");
-        };
-        let changed = self.focused_index != index;
-        self.focused_index = index;
-        Ok(changed)
-    }
-
-    fn apply_state(&mut self, state: &TuiRuntimeState) -> Result<()> {
-        let mut profiles = Vec::new();
-        if !state.private_access_profiles.is_empty() {
-            for profile_state in state.private_access_profiles.clone() {
-                profiles.push(PrivateAccessProfileRuntime::from_state(profile_state)?);
+    fn refresh_system_proxy_bypass(&mut self, dynamic_entries: &[String]) -> Result<bool> {
+        if !*self.system_proxy_enabled || self.system_proxy_job_running {
+            return Ok(false);
+        }
+        let mut entries = self.base_bypass_entries.to_vec();
+        for entry in dynamic_entries {
+            if !entries.contains(entry) {
+                entries.push(entry.clone());
             }
         }
-        self.profiles = profiles;
-        self.focused_index = self
-            .focused_index
-            .min(self.profiles.len().saturating_sub(1));
-        Ok(())
-    }
-
-    fn runtime_states(&self) -> Vec<PrivateAccessProfileState> {
-        self.profiles
-            .iter()
-            .map(PrivateAccessProfileRuntime::runtime_state)
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn summary_line(&self) -> Option<Line<'static>> {
-        let focused = self.focused_opt()?;
-        let mut spans = vec![Span::styled(
-            "private access: ",
-            Style::default().fg(Color::DarkGray),
-        )];
-        for (index, profile) in self.profiles.iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::raw(" "));
-            }
-            spans.extend(private_access_profile_badge(
-                profile,
-                index == self.focused_index,
-            ));
-        }
-        if !focused.routes.is_empty() {
-            spans.push(Span::styled(
-                format!(" routes={}", focused.routes.len()),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
-        spans.push(Span::styled(
-            format!(" mode={}", focused.mode.as_str()),
-            Style::default().fg(Color::DarkGray),
-        ));
-        if matches!(
-            focused.state,
-            PrivateAccessState::Connected | PrivateAccessState::Connecting
-        ) {
-            match focused.mode {
-                PrivateAccessMode::Bridge => {
-                    let bridge = focused
-                        .bridge
-                        .as_ref()
-                        .map(|bridge| bridge.listen.as_str())
-                        .unwrap_or(focused.bridge_listen.as_str());
-                    spans.push(Span::styled(
-                        format!(" bridge={bridge}"),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                PrivateAccessMode::Tun => {
-                    spans.push(Span::styled(
-                        " data=tun",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-            }
-        }
-        if let Some(error) = focused.last_error.as_ref() {
-            spans.push(Span::raw(" error="));
-            spans.push(Span::styled(
-                truncate_for_width(error, 48),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if let Some(pid) = focused.background_pid {
-            spans.push(Span::styled(
-                format!(" pid={pid}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        Some(Line::from(spans))
+        run_system_proxy_update(self.system_proxy_server, true, &entries)
+            .context("failed to refresh system proxy with Private Access bypass rules")?;
+        *self.system_proxy_enabled = system_proxy_matches(self.system_proxy_server);
+        Ok(true)
     }
 }
 
@@ -4324,6 +4048,70 @@ fn private_access_profile_badge(
         Span::styled(label, state_style),
         Span::styled("]", Style::default().fg(Color::DarkGray)),
     ]
+}
+
+#[cfg(test)]
+fn private_access_summary_line(runtime: &PrivateAccessRuntime) -> Option<Line<'static>> {
+    let focused = runtime.focused_opt()?;
+    let mut spans = vec![Span::styled(
+        "private access: ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (index, profile) in runtime.profiles.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.extend(private_access_profile_badge(
+            profile,
+            index == runtime.focused_index,
+        ));
+    }
+    if !focused.routes.is_empty() {
+        spans.push(Span::styled(
+            format!(" routes={}", focused.routes.len()),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" mode={}", focused.mode.as_str()),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if matches!(
+        focused.state,
+        PrivateAccessState::Connected | PrivateAccessState::Connecting
+    ) {
+        match focused.mode {
+            PrivateAccessMode::Bridge => {
+                let bridge = focused
+                    .bridge
+                    .as_ref()
+                    .map(|bridge| bridge.listen.as_str())
+                    .unwrap_or(focused.bridge_listen.as_str());
+                spans.push(Span::styled(
+                    format!(" bridge={bridge}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            PrivateAccessMode::Tun => spans.push(Span::styled(
+                " data=tun",
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
+    }
+    if let Some(error) = focused.last_error.as_ref() {
+        spans.push(Span::raw(" error="));
+        spans.push(Span::styled(
+            truncate_for_width(error, 48),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(pid) = focused.background_pid {
+        spans.push(Span::styled(
+            format!(" pid={pid}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Some(Line::from(spans))
 }
 
 fn private_access_progress_title(profile: &PrivateAccessProfileRuntime) -> String {
@@ -4360,113 +4148,9 @@ fn private_access_state_style(state: &PrivateAccessState) -> Style {
     }
 }
 
-fn should_apply_private_access_state_after_integration(
-    profile: &PrivateAccessProfileRuntime,
-    state: &PrivateAccessState,
-) -> bool {
-    !profile.integration_failed
-        || matches!(
-            state,
-            PrivateAccessState::Error
-                | PrivateAccessState::Disconnecting
-                | PrivateAccessState::Disconnected
-        )
-}
-
 fn private_access_profile_settings_locked(profile: &PrivateAccessProfileRuntime) -> bool {
-    profile.process.is_some()
-        || matches!(
-            profile.state,
-            PrivateAccessState::Connecting
-                | PrivateAccessState::Connected
-                | PrivateAccessState::Disconnecting
-        )
+    profile.settings_locked()
 }
-
-fn private_access_progress_for_state(
-    state: &PrivateAccessState,
-    message: &str,
-) -> Option<(PrivateAccessProgressTone, String, bool)> {
-    let normalized = message.to_ascii_lowercase();
-    // Service events are intentionally low-level, so the TUI maps them into user-facing
-    // milestones. This keeps the V flow readable without leaking protocol logs into the UI.
-    match state {
-        PrivateAccessState::Connecting => {
-            if normalized.contains("authentication accepted")
-                || normalized.contains("auth accepted")
-            {
-                Some((
-                    PrivateAccessProgressTone::Success,
-                    "认证成功".to_string(),
-                    false,
-                ))
-            } else if normalized.contains("data tunnel") || normalized.contains("tun data plane") {
-                Some((
-                    PrivateAccessProgressTone::Success,
-                    user_private_access_message(message, "数据通道已建立"),
-                    false,
-                ))
-            } else if normalized.contains("gateway") || normalized.contains("connecting") {
-                Some((
-                    PrivateAccessProgressTone::Info,
-                    "正在连接内网服务器...".to_string(),
-                    false,
-                ))
-            } else {
-                Some((
-                    PrivateAccessProgressTone::Info,
-                    user_private_access_message(message, "正在连接内网服务器..."),
-                    false,
-                ))
-            }
-        }
-        PrivateAccessState::Connected => Some((
-            PrivateAccessProgressTone::Success,
-            user_private_access_message(message, "连接成功"),
-            false,
-        )),
-        PrivateAccessState::Disconnecting => Some((
-            PrivateAccessProgressTone::Info,
-            "正在断开内网连接...".to_string(),
-            false,
-        )),
-        PrivateAccessState::Disconnected => Some((
-            PrivateAccessProgressTone::Success,
-            "内网连接已断开".to_string(),
-            true,
-        )),
-        PrivateAccessState::Error => Some((
-            PrivateAccessProgressTone::Error,
-            user_private_access_message(message, "连接失败"),
-            true,
-        )),
-        PrivateAccessState::Disabled => None,
-    }
-}
-
-fn user_private_access_message(message: &str, fallback: &str) -> String {
-    let message = message.trim();
-    if message.is_empty() {
-        fallback.to_string()
-    } else {
-        message.to_string()
-    }
-}
-
-fn load_private_access_manifest_for_profile(
-    profile_id: &str,
-    manifest_path: Option<&str>,
-) -> Result<PrivateAccessServiceManifest> {
-    if let Some(path) = manifest_path.filter(|path| !path.trim().is_empty()) {
-        return load_private_access_manifest(Path::new(path));
-    }
-    if profile_id.eq_ignore_ascii_case("sonicwall") {
-        default_sonicwall_manifest()
-    } else {
-        default_hillstone_manifest()
-    }
-}
-
 impl SubscriptionRefreshState {
     fn from_options(options: TuiSubscriptionRefreshOptions) -> Result<Option<Self>> {
         if options.disabled || !options.input.exists() {
@@ -4707,7 +4391,8 @@ impl App {
     }
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
-        self.private_access.apply_state(&state)?;
+        self.private_access
+            .apply_state(&state, private_access_process_exists)?;
         if !self.private_access.is_configured() {
             self.left_pane_section = LeftPaneSection::Internet;
             self.intranet_detail_scroll = 0;
@@ -4846,7 +4531,7 @@ impl App {
             china_ip_routing_enabled: self
                 .china_ip_routing_explicit
                 .then_some(self.china_ip_routing_enabled),
-            private_access_profiles: self.private_access.runtime_states(),
+            private_access_profiles: self.private_access.runtime_states(process_exists),
         }
     }
 
@@ -5796,27 +5481,24 @@ impl App {
             })
             .cloned()
             .unwrap_or_else(|| "ok".to_string());
-        let command = PrivateAccessCommand::AuthReply {
-            id: "tui-auth-reply".to_string(),
-            service: auth.service.clone(),
-            session_id: auth.session_id.clone(),
-            challenge_id: auth.challenge_id.clone(),
+        let submitted = match self.private_access.submit_authentication(
+            auth.profile_index,
+            auth.service.clone(),
+            auth.session_id.clone(),
+            auth.challenge_id.clone(),
             button,
             replies,
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                self.set_status_only(format!(
+                    "Failed to submit Private Access authentication: {error}"
+                ));
+                return Ok(());
+            }
         };
-        let Some(process) = self
-            .private_access
-            .profiles
-            .get_mut(auth.profile_index)
-            .and_then(|profile| profile.process.as_mut())
-        else {
+        if !submitted {
             self.set_status_only("Private Access authentication session closed");
-            return Ok(());
-        };
-        if let Err(error) = process.send(&command) {
-            self.set_status_only(format!(
-                "Failed to submit Private Access authentication: {error}"
-            ));
             return Ok(());
         }
         self.set_status_only("Private Access authentication submitted");
@@ -5827,20 +5509,12 @@ impl App {
         let Some(auth) = self.private_access_auth.take() else {
             return Ok(());
         };
-        let command = PrivateAccessCommand::CancelAuth {
-            id: "tui-auth-cancel".to_string(),
-            service: auth.service.clone(),
-            session_id: auth.session_id.clone(),
-            challenge_id: auth.challenge_id.clone(),
-        };
-        if let Some(process) = self
-            .private_access
-            .profiles
-            .get_mut(auth.profile_index)
-            .and_then(|profile| profile.process.as_mut())
-        {
-            process.send(&command)?;
-        }
+        self.private_access.cancel_authentication(
+            auth.profile_index,
+            auth.service.clone(),
+            auth.session_id.clone(),
+            auth.challenge_id.clone(),
+        )?;
         self.set_status_only("Private Access authentication cancelled");
         Ok(())
     }
@@ -6108,10 +5782,7 @@ impl App {
                 }
                 let profile_id = self.private_access.focused().id.clone();
                 let manifest_path = normalize_optional_setting(Some(value.to_string()));
-                let manifest = load_private_access_manifest_for_profile(
-                    &profile_id,
-                    manifest_path.as_deref(),
-                )?;
+                let manifest = load_manifest_for_profile(&profile_id, manifest_path.as_deref())?;
                 let focused = self.private_access.focused_mut();
                 focused.manifest_path = manifest_path;
                 focused.manifest = manifest;
@@ -7191,28 +6862,8 @@ impl App {
     }
 
     fn detach_private_access_for_background(&mut self) -> Result<usize> {
-        let mut detached = 0;
-        for profile in &mut self.private_access.profiles {
-            if profile
-                .background_pid
-                .is_some_and(|pid| private_access_process_exists(pid, &profile.manifest))
-            {
-                detached += 1;
-                continue;
-            }
-            let Some(process) = profile.process.as_mut() else {
-                continue;
-            };
-            let pid = process.pid();
-            process.detach().with_context(|| {
-                format!("failed to detach Private Access profile {}", profile.id)
-            })?;
-            profile.background_pid = Some(pid);
-            profile.state = PrivateAccessState::Connected;
-            profile.last_error = None;
-            detached += 1;
-        }
-        Ok(detached)
+        self.private_access
+            .detach_for_background(private_access_process_exists)
     }
 
     fn ensure_auto_pick_background_worker_if_enabled(&mut self) -> Result<()> {
@@ -7686,76 +7337,10 @@ impl App {
             self.set_status_only("Private Access is not configured");
             return Ok(());
         }
-        if self.private_access.focused().server.trim().is_empty() {
-            let message = "请先在 settings 中配置 Private Access server".to_string();
-            self.fail_private_access_progress(message.clone());
-            self.set_status_only(message);
-            return Ok(());
-        }
-        if self.private_access.focused().manifest.id != "sonicwall"
-            && self.private_access.focused().username.trim().is_empty()
-        {
-            let message = "请先在 settings 中配置 Private Access username".to_string();
-            self.fail_private_access_progress(message.clone());
-            self.set_status_only(message);
-            return Ok(());
-        }
-        if matches!(
-            self.private_access.focused().mode,
-            PrivateAccessMode::Bridge
-        ) {
-            if let Err(error) = self
-                .private_access
-                .focused()
-                .bridge_listen
-                .parse::<SocketAddrV4>()
-            {
-                let message = format!("Private Access bridge listen 无效: {error}");
-                self.fail_private_access_progress(message.clone());
-                self.set_status_only(message);
-                return Ok(());
-            }
-        }
-        if self.private_access.focused().manifest.id == "sonicwall" {
-            let official_processes = running_official_sonicwall_client_processes();
-            if !official_processes.is_empty() {
-                let message = format_official_sonicwall_client_warning(&official_processes);
-                self.fail_private_access_progress(message.clone());
-                self.set_status_only(message);
-                return Ok(());
-            }
-        }
 
-        if self.private_access.focused().process.is_none() {
-            match ExternalPrivateAccessService::spawn(
-                self.private_access.focused().manifest.clone(),
-            ) {
-                Ok(process) => {
-                    self.private_access.focused_mut().process = Some(process);
-                }
-                Err(error) => {
-                    self.private_access.focused_mut().state = PrivateAccessState::Error;
-                    self.private_access.focused_mut().last_error = Some(error.to_string());
-                    let message = format!("启动 Private Access service 失败: {error}");
-                    self.fail_private_access_progress(message.clone());
-                    self.set_status_only(message);
-                    return Ok(());
-                }
-            }
-        }
-        let profile_id = self.private_access.focused().id.clone();
-        let service = self.private_access.focused().manifest.id.clone();
-        let (password, password_env) = if service == "sonicwall" {
-            (None, None)
-        } else {
-            (
-                normalize_optional_setting(Some(self.private_access.focused().password.clone())),
-                normalize_optional_setting(Some(
-                    self.private_access.focused().password_env.clone(),
-                )),
-            )
-        };
-        let tun_helper = self.private_access_tun_helper_for_connect(self.private_access.focused());
+        let profile = self.private_access.focused();
+        let service = profile.manifest.id.clone();
+        let tun_helper = self.private_access_tun_helper_for_connect(profile);
         let (
             http_connect_proxy,
             http_connect_proxy_context,
@@ -7763,7 +7348,7 @@ impl App {
             http_connect_selector,
         ) = if service == "sonicwall" {
             sonicwall_http_connect_settings(
-                self.private_access.focused().use_internet_proxy,
+                profile.use_internet_proxy,
                 &self.system_proxy_server,
                 self.internet_outbound_context(),
                 &self.client.base_url,
@@ -7772,45 +7357,35 @@ impl App {
         } else {
             (None, None, None, None)
         };
-        // Direct passwords are deliberately supported for a simpler local workflow. The value is
-        // sent only to the service process; the settings list displays the configured value.
-        let command = PrivateAccessCommand::Connect {
-            id: "tui-connect".to_string(),
-            service: service.clone(),
-            config: serde_json::json!({
-                "server": self.private_access.focused().server,
-                "mode": self.private_access.focused().mode.as_str(),
-                "port": self.private_access.focused().port,
-                "username": self.private_access.focused().username,
-                "password": password,
-                "password_env": password_env,
-                "bridge_listen": self.private_access.focused().bridge_listen,
-                "tun_helper": tun_helper,
-                "http_connect_proxy": http_connect_proxy,
-                "http_connect_proxy_context": http_connect_proxy_context,
-                "http_connect_controller": http_connect_controller,
-                "http_connect_selector": http_connect_selector,
-                "tls_verify": self.private_access.focused().tls_verify,
-            }),
+        let blocker = if service == "sonicwall" {
+            let processes = running_official_sonicwall_client_processes();
+            (!processes.is_empty()).then(|| format_official_sonicwall_client_warning(&processes))
+        } else {
+            None
         };
-        if let Some(process) = self.private_access.focused_mut().process.as_mut() {
-            if let Err(error) = process.send(&command) {
-                self.private_access.focused_mut().state = PrivateAccessState::Error;
-                self.private_access.focused_mut().last_error = Some(error.to_string());
-                let message = format!("发送 Private Access 连接命令失败: {error}");
+        let options = PrivateAccessConnectOptions {
+            tun_helper,
+            http_connect_proxy,
+            http_connect_proxy_context,
+            http_connect_controller,
+            http_connect_selector,
+            blocker,
+        };
+
+        match self.private_access.connect(options) {
+            Ok(started) => {
+                self.set_status_only(format!(
+                    "Private Access {} ({}) connecting...",
+                    started.profile_id, started.service
+                ));
+                self.save_runtime_state()?;
+            }
+            Err(error) => {
+                let message = error.to_string();
                 self.fail_private_access_progress(message.clone());
                 self.set_status_only(message);
-                return Ok(());
             }
         }
-        self.private_access.focused_mut().state = PrivateAccessState::Connecting;
-        self.private_access.focused_mut().last_error = None;
-        self.private_access.focused_mut().integration_failed = false;
-        self.private_access.focused_mut().background_pid = None;
-        self.set_status_only(format!(
-            "Private Access {profile_id} ({service}) connecting..."
-        ));
-        self.save_runtime_state()?;
         Ok(())
     }
 
@@ -7819,492 +7394,120 @@ impl App {
             self.set_status_only("Private Access is not configured");
             return Ok(());
         }
-        if self.private_access.focused().process.is_none()
-            && let Some(pid) = self.private_access.focused().background_pid
-        {
-            let message = format!(
-                "Private Access is running in background pid {pid}; this TUI no longer owns its service session"
-            );
-            self.push_private_access_progress(PrivateAccessProgressTone::Info, message.clone());
-            self.finish_private_access_progress();
-            self.set_status_only(message);
-            return Ok(());
+        match self.private_access.disconnect() {
+            Ok(PrivateAccessDisconnectOutcome::Started {
+                profile_id,
+                service,
+            }) => self.set_status_only(format!(
+                "Private Access {profile_id} ({service}) disconnecting..."
+            )),
+            Ok(PrivateAccessDisconnectOutcome::AlreadyDisconnected) => {
+                self.push_private_access_progress(
+                    PrivateAccessProgressTone::Success,
+                    "内网连接已断开".to_string(),
+                );
+                self.finish_private_access_progress();
+                self.set_status_only("Private Access is already disconnected");
+            }
+            Ok(PrivateAccessDisconnectOutcome::BackgroundOwned(pid)) => {
+                let message = format!(
+                    "Private Access is running in background pid {pid}; this TUI no longer owns its service session"
+                );
+                self.push_private_access_progress(PrivateAccessProgressTone::Info, message.clone());
+                self.finish_private_access_progress();
+                self.set_status_only(message);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.fail_private_access_progress(message.clone());
+                self.set_status_only(message);
+            }
         }
-        let Some(process) = self.private_access.focused_mut().process.as_mut() else {
-            self.private_access.focused_mut().state = PrivateAccessState::Disconnected;
-            self.push_private_access_progress(
-                PrivateAccessProgressTone::Success,
-                "内网连接已断开".to_string(),
-            );
-            self.finish_private_access_progress();
-            self.set_status_only("Private Access is already disconnected");
-            return Ok(());
+        Ok(())
+    }
+
+    fn poll_private_access_updates(&mut self) -> Result<()> {
+        let system_proxy_job_running = self.system_proxy_job.is_some();
+        let notices = {
+            let mut integration = TuiPrivateAccessNetworkIntegration {
+                config_path: &self.system_proxy_config_path,
+                sing_box: &mut self.sing_box,
+                system_proxy_enabled: &mut self.system_proxy_enabled,
+                system_proxy_job_running,
+                system_proxy_server: &self.system_proxy_server,
+                base_bypass_entries: &self.bypass_entries,
+            };
+            self.private_access.poll(&mut integration)?
         };
-        let service = process.service_id().to_string();
-        if let Err(error) = process.send(&PrivateAccessCommand::Disconnect {
-            id: "tui-disconnect".to_string(),
-            service: service.clone(),
-            session_id: None,
-        }) {
-            self.private_access.focused_mut().state = PrivateAccessState::Error;
-            self.private_access.focused_mut().last_error = Some(error.to_string());
-            let message = format!("发送 Private Access 断开命令失败: {error}");
-            self.fail_private_access_progress(message.clone());
-            self.set_status_only(message);
-            return Ok(());
-        }
-        self.private_access.focused_mut().state = PrivateAccessState::Disconnecting;
-        let profile_id = self.private_access.focused().id.clone();
-        self.set_status_only(format!(
-            "Private Access {profile_id} ({service}) disconnecting..."
-        ));
+        self.apply_private_access_session_notices(notices);
         Ok(())
     }
 
-    fn poll_private_access_updates(&mut self) -> Result<()> {
-        for profile_index in 0..self.private_access.profiles.len() {
-            let mut stop_process = false;
-            // Keep protocol chatter from monopolizing the TUI loop. Any remaining events stay in
-            // the channel for the next frame, so keyboard input is serviced between batches.
-            for _ in 0..PRIVATE_ACCESS_EVENTS_PER_POLL {
-                let profile_id = self.private_access.profiles[profile_index].id.clone();
-                let event = match self.private_access.profiles[profile_index].process.as_ref() {
-                    Some(process) => match process.try_recv() {
-                        Ok(Some(event)) => event,
-                        Ok(None) => break,
-                        Err(error) => {
-                            self.private_access.profiles[profile_index].last_error =
-                                Some(error.clone());
-                            self.private_access.profiles[profile_index].state =
-                                PrivateAccessState::Error;
-                            self.clear_private_access_dynamic_network_state(profile_index);
-                            self.set_status_with_flash(format!(
-                                "Private Access {profile_id} failed: {error}"
-                            ));
-                            stop_process = true;
-                            break;
-                        }
-                    },
-                    None => break,
-                };
-                match event.event {
-                    PrivateAccessEvent::StateChanged {
-                        service,
-                        state,
-                        message,
-                    } => {
-                        if !should_apply_private_access_state_after_integration(
-                            &self.private_access.profiles[profile_index],
-                            &state,
-                        ) {
-                            continue;
-                        }
-                        self.private_access.profiles[profile_index].state = state.clone();
-                        if matches!(state, PrivateAccessState::Disconnected) {
-                            if self
-                                .private_access_auth
-                                .as_ref()
-                                .is_some_and(|auth| auth.profile_index == profile_index)
-                            {
-                                self.private_access_auth = None;
-                            }
-                            self.clear_private_access_dynamic_network_state(profile_index);
-                            stop_process = true;
-                        }
-                        if let Some((tone, text, done)) =
-                            private_access_progress_for_state(&state, &message)
-                        {
-                            self.append_private_access_progress_for_profile(
-                                profile_index,
-                                tone,
-                                text,
-                            );
-                            if done {
-                                self.finish_private_access_progress_for_profile(profile_index);
-                            }
-                        }
-                        self.set_status_only(format!(
-                            "Private Access {profile_id} ({service}) {}",
-                            state.label()
-                        ));
+    fn apply_private_access_session_notices(&mut self, notices: Vec<PrivateAccessSessionNotice>) {
+        for notice in notices {
+            match notice {
+                PrivateAccessSessionNotice::Progress {
+                    profile_index,
+                    tone,
+                    text,
+                    done,
+                    append_only,
+                } => {
+                    let tone = match tone {
+                        PrivateAccessNoticeTone::Info => PrivateAccessProgressTone::Info,
+                        PrivateAccessNoticeTone::Success => PrivateAccessProgressTone::Success,
+                        PrivateAccessNoticeTone::Error => PrivateAccessProgressTone::Error,
+                    };
+                    if append_only {
+                        self.append_private_access_progress_for_profile(profile_index, tone, text);
+                    } else {
+                        self.push_private_access_progress_for_profile(profile_index, tone, text);
                     }
-                    PrivateAccessEvent::RoutesPushed {
-                        service,
-                        routes,
-                        dns,
-                        domains,
-                        domain_suffixes,
-                        bridge,
-                        ..
-                    } => {
-                        let previous_routes =
-                            self.private_access.profiles[profile_index].routes.clone();
-                        let previous_domains =
-                            self.private_access.profiles[profile_index].domains.clone();
-                        let previous_domain_suffixes = self.private_access.profiles[profile_index]
-                            .domain_suffixes
-                            .clone();
-                        self.append_private_access_progress_for_profile(
-                            profile_index,
-                            PrivateAccessProgressTone::Info,
-                            format!("收到内网路由: {} 条", routes.len()),
-                        );
-                        self.private_access.profiles[profile_index].routes = routes.clone();
-                        self.private_access.profiles[profile_index].dns = dns;
-                        self.private_access.profiles[profile_index].domains = domains.clone();
-                        self.private_access.profiles[profile_index].domain_suffixes =
-                            domain_suffixes.clone();
-                        let carrier_domains = vec![
-                            self.private_access.profiles[profile_index]
-                                .server
-                                .trim()
-                                .to_ascii_lowercase(),
-                        ];
-                        if matches!(
-                            self.private_access.profiles[profile_index].mode,
-                            PrivateAccessMode::Bridge
-                        ) {
-                            self.append_private_access_progress_for_profile(
-                                profile_index,
-                                PrivateAccessProgressTone::Info,
-                                "修改 config.json 中...".to_string(),
-                            );
-                            self.private_access.profiles[profile_index].bridge = bridge.clone();
-                            let fallback_listen = self.private_access.profiles[profile_index]
-                                .bridge_listen
-                                .clone();
-                            match self.apply_private_access_routes(
-                                &profile_id,
-                                &routes,
-                                &domains,
-                                &domain_suffixes,
-                                &previous_routes,
-                                &previous_domains,
-                                &previous_domain_suffixes,
-                                &carrier_domains,
-                                bridge,
-                                &fallback_listen,
-                            ) {
-                                Ok(true) => {
-                                    self.append_private_access_progress_for_profile(
-                                        profile_index,
-                                        PrivateAccessProgressTone::Success,
-                                        "config.json 已更新".to_string(),
-                                    );
-                                    match self
-                                        .restart_sing_box_for_private_access_progress(profile_index)
-                                    {
-                                        Ok(restart) => {
-                                            self.set_status_only(format!(
-                                                "Private Access {profile_id} ({service}) applied {} bridge route(s); {restart}",
-                                                routes.len()
-                                            ));
-                                        }
-                                        Err(error) => {
-                                            let message = format!(
-                                                "sing-box 重启失败，Private Access 不可用: {error:#}"
-                                            );
-                                            self.mark_private_access_integration_failed(
-                                                profile_index,
-                                                message.clone(),
-                                            );
-                                            self.set_status_only(message);
-                                            stop_process = true;
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    self.append_private_access_progress_for_profile(
-                                        profile_index,
-                                        PrivateAccessProgressTone::Info,
-                                        "没有需要写入的内网路由".to_string(),
-                                    );
-                                }
-                                Err(error) => {
-                                    self.private_access.profiles[profile_index].last_error =
-                                        Some(error.to_string());
-                                    self.private_access.profiles[profile_index].state =
-                                        PrivateAccessState::Error;
-                                    let message = format!("修改 config.json 失败: {error}");
-                                    self.fail_private_access_progress_for_profile(
-                                        profile_index,
-                                        message.clone(),
-                                    );
-                                    self.set_status_only(message);
-                                }
-                            }
-                        } else {
-                            self.private_access.profiles[profile_index].bridge = None;
-                            match self.refresh_private_access_system_proxy_bypass() {
-                                Ok(true) => self.append_private_access_progress_for_profile(
-                                    profile_index,
-                                    PrivateAccessProgressTone::Success,
-                                    format!(
-                                        "已临时应用 {} 条 Private Access 域名绕过规则",
-                                        domains.len() + domain_suffixes.len()
-                                    ),
-                                ),
-                                Ok(false) => {}
-                                Err(error) => self.append_private_access_progress_for_profile(
-                                    profile_index,
-                                    PrivateAccessProgressTone::Error,
-                                    format!("更新系统代理域名绕过失败: {error:#}"),
-                                ),
-                            }
-                            // The privileged helper has already installed the pushed OS routes and
-                            // Windows split-DNS policy before emitting RoutesPushed. The common
-                            // sing-box baseline was written before core startup, so this path never
-                            // edits config.json or restarts the carrier process.
-                            self.append_private_access_progress_for_profile(
-                                profile_index,
-                                PrivateAccessProgressTone::Success,
-                                "TUN 路由和按域名分流 DNS 已生效".to_string(),
-                            );
-                            self.finish_private_access_progress_for_profile(profile_index);
-                            self.set_status_only(format!(
-                                "Private Access {profile_id} ({service}) connected with {} OS TUN route(s), without restarting sing-box",
-                                routes.len()
-                            ));
-                        }
-                    }
-                    PrivateAccessEvent::AuthChallenge {
-                        service,
-                        session_id,
-                        challenge_id,
-                        title,
-                        message,
-                        fields,
-                        buttons,
-                    } => {
-                        self.private_access.profiles[profile_index].state =
-                            PrivateAccessState::Connecting;
-                        let profile = &self.private_access.profiles[profile_index];
-                        let inputs = fields
-                            .iter()
-                            .map(|field| private_access_auth_initial_value(profile, field))
-                            .collect();
-                        self.private_access_auth = Some(PrivateAccessAuthModal {
-                            profile_index,
-                            service: service.clone(),
-                            session_id,
-                            challenge_id,
-                            title: user_private_access_message(&title, "Private Access login"),
-                            message,
-                            fields,
-                            buttons,
-                            inputs,
-                            field_index: 0,
-                            error: None,
-                        });
-                        self.set_status_only(format!(
-                            "Private Access {profile_id} ({service}) is waiting for authentication"
-                        ));
-                    }
-                    PrivateAccessEvent::Error {
-                        service,
-                        code,
-                        message,
-                    } => {
-                        let error = format!("{code}: {message}");
-                        self.private_access.profiles[profile_index].last_error =
-                            Some(error.clone());
-                        self.private_access.profiles[profile_index].state =
-                            PrivateAccessState::Error;
-                        self.clear_private_access_dynamic_network_state(profile_index);
-                        if self
-                            .private_access_auth
-                            .as_ref()
-                            .is_some_and(|auth| auth.profile_index == profile_index)
-                        {
-                            self.private_access_auth = None;
-                        }
-                        self.fail_private_access_progress_for_profile(
-                            profile_index,
-                            format!("连接失败: {error}"),
-                        );
-                        if service == "sonicwall" {
-                            self.push_private_access_progress_for_profile(
-                                profile_index,
-                                PrivateAccessProgressTone::Info,
-                                "完整诊断已写入 sonicwall-private-access.log".to_string(),
-                            );
-                        } else if service == "hillstone" {
-                            self.push_private_access_progress_for_profile(
-                                profile_index,
-                                PrivateAccessProgressTone::Info,
-                                "完整诊断已写入 hillstone-private-access.log".to_string(),
-                            );
-                        }
-                        self.set_status_only(format!(
-                            "Private Access {profile_id} ({service}) error"
-                        ));
-                        stop_process = true;
-                    }
-                    PrivateAccessEvent::Log {
-                        service: _,
-                        message: _,
-                    } => {
-                        // Low-level service logs are intentionally not surfaced in the TUI flow.
+                    if done {
+                        self.finish_private_access_progress_for_profile(profile_index);
                     }
                 }
-            }
-            if stop_process
-                && let Some(process) = self.private_access.profiles[profile_index].process.take()
-            {
-                process.stop()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn effective_system_proxy_bypass_entries(&self) -> Vec<String> {
-        let mut entries = self.bypass_entries.clone();
-        for profile in &self.private_access.profiles {
-            if !matches!(profile.mode, PrivateAccessMode::Tun)
-                || matches!(
-                    profile.state,
-                    PrivateAccessState::Disconnected | PrivateAccessState::Error
-                )
-            {
-                continue;
-            }
-            for entry in profile.domains.iter().chain(&profile.domain_suffixes) {
-                for entry in parse_bypass_entries(entry) {
-                    if !entries.contains(&entry) {
-                        entries.push(entry);
+                PrivateAccessSessionNotice::Status(message) => self.set_status_only(message),
+                PrivateAccessSessionNotice::Flash(message) => {
+                    self.set_status_with_flash(truncate_for_width(&message, 100));
+                }
+                PrivateAccessSessionNotice::ClearAuthentication { profile_index } => {
+                    if self
+                        .private_access_auth
+                        .as_ref()
+                        .is_some_and(|auth| auth.profile_index == profile_index)
+                    {
+                        self.private_access_auth = None;
                     }
+                }
+                PrivateAccessSessionNotice::Authentication(request) => {
+                    let inputs = request
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            private_access_auth_initial_value(
+                                &self.private_access.profiles[request.profile_index],
+                                field,
+                            )
+                        })
+                        .collect();
+                    self.private_access_auth = Some(PrivateAccessAuthModal {
+                        profile_index: request.profile_index,
+                        service: request.service,
+                        session_id: request.session_id,
+                        challenge_id: request.challenge_id,
+                        title: request.title,
+                        message: request.message,
+                        fields: request.fields,
+                        buttons: request.buttons,
+                        inputs,
+                        field_index: 0,
+                        error: None,
+                    });
                 }
             }
         }
-        entries
     }
-
-    fn refresh_private_access_system_proxy_bypass(&mut self) -> Result<bool> {
-        if !self.system_proxy_enabled || self.system_proxy_job.is_some() {
-            return Ok(false);
-        }
-        let bypass_entries = self.effective_system_proxy_bypass_entries();
-        run_system_proxy_update(&self.system_proxy_server, true, &bypass_entries)
-            .context("failed to refresh system proxy with Private Access bypass rules")?;
-        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
-        Ok(true)
-    }
-
-    fn clear_private_access_dynamic_network_state(&mut self, profile_index: usize) {
-        let profile = &mut self.private_access.profiles[profile_index];
-        profile.routes.clear();
-        profile.dns.clear();
-        profile.domains.clear();
-        profile.domain_suffixes.clear();
-        profile.bridge = None;
-        if let Err(error) = self.refresh_private_access_system_proxy_bypass() {
-            self.set_status_with_flash(format!(
-                "Failed to remove Private Access system proxy bypass: {}",
-                truncate_for_width(&format!("{error:#}"), 90)
-            ));
-        }
-    }
-
-    fn apply_private_access_routes(
-        &self,
-        profile_id: &str,
-        routes: &[PrivateAccessRoute],
-        domains: &[String],
-        domain_suffixes: &[String],
-        previous_routes: &[PrivateAccessRoute],
-        previous_domains: &[String],
-        previous_domain_suffixes: &[String],
-        carrier_domains: &[String],
-        bridge: Option<PrivateAccessBridge>,
-        fallback_listen: &str,
-    ) -> Result<bool> {
-        if routes.is_empty()
-            && domains.is_empty()
-            && domain_suffixes.is_empty()
-            && carrier_domains.is_empty()
-        {
-            return Ok(false);
-        }
-        let listen = bridge
-            .as_ref()
-            .map(|bridge| bridge.listen.as_str())
-            .unwrap_or(fallback_listen);
-        let proxy = listen
-            .parse::<SocketAddrV4>()
-            .with_context(|| format!("private access bridge listen must be IPv4:PORT: {listen}"))?;
-        // SET_ROUTE is pushed by the private-access gateway, so the TUI applies it as a profile
-        // owned sing-box rule without a port matcher. That keeps one system proxy/TUN entry point
-        // while still sending all matching intranet ports through the local bridge.
-        let changed = run_private_access_route_table_config(
-            &self.system_proxy_config_path,
-            None,
-            true,
-            PrivateAccessRouteTableOptions {
-                profile_id: profile_id.to_string(),
-                cidrs: routes.iter().map(|route| route.cidr.clone()).collect(),
-                domains: domains.to_vec(),
-                domain_suffixes: domain_suffixes.to_vec(),
-                previous_cidrs: previous_routes
-                    .iter()
-                    .map(|route| route.cidr.clone())
-                    .collect(),
-                previous_domains: previous_domains.to_vec(),
-                previous_domain_suffixes: previous_domain_suffixes.to_vec(),
-                carrier_domains: carrier_domains.to_vec(),
-                proxy: Some(proxy),
-            },
-        )?;
-        Ok(changed)
-    }
-
-    fn mark_private_access_integration_failed(&mut self, profile_index: usize, message: String) {
-        let profile = &mut self.private_access.profiles[profile_index];
-        profile.integration_failed = true;
-        profile.state = PrivateAccessState::Error;
-        profile.last_error = Some(message.clone());
-        self.fail_private_access_progress_for_profile(profile_index, message);
-    }
-
-    fn restart_sing_box_for_private_access_progress(
-        &mut self,
-        profile_index: usize,
-    ) -> Result<String> {
-        self.push_private_access_progress_for_profile(
-            profile_index,
-            PrivateAccessProgressTone::Info,
-            "重启 sing-box 中...".to_string(),
-        );
-        match self.restart_managed_sing_box() {
-            Ok(receipt) if !receipt.report().replaced_existing() => {
-                let message = format!("sing-box 启动成功: {}", receipt.report().started_process());
-                self.push_private_access_progress_for_profile(
-                    profile_index,
-                    PrivateAccessProgressTone::Success,
-                    message,
-                );
-                self.finish_private_access_progress_for_profile(profile_index);
-                Ok(format!(
-                    "started sing-box {}",
-                    receipt.report().started_process()
-                ))
-            }
-            Ok(receipt) => {
-                let message = format!("sing-box 重启成功: {}", receipt.report().transition());
-                self.push_private_access_progress_for_profile(
-                    profile_index,
-                    PrivateAccessProgressTone::Success,
-                    message,
-                );
-                self.finish_private_access_progress_for_profile(profile_index);
-                Ok(format!(
-                    "restarted sing-box {}",
-                    receipt.report().transition()
-                ))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     fn set_system_proxy(&mut self) {
         if self.system_proxy_job.is_some() {
             self.set_status_only("System proxy update is already running");
@@ -8316,7 +7519,9 @@ impl App {
         self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
         let enable = !self.system_proxy_enabled;
         let server = self.system_proxy_server.clone();
-        let bypass_entries = self.effective_system_proxy_bypass_entries();
+        let bypass_entries = self
+            .private_access
+            .system_proxy_bypass_entries(&self.bypass_entries);
         let (tx, rx) = mpsc::channel();
         let worker_server = server.clone();
         let worker = thread::spawn(move || {
@@ -8606,8 +7811,8 @@ mod tests {
         latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
         latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
         normalize_http_connect_proxy, private_access_auth_display_value,
-        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
-        should_apply_private_access_state_after_integration, sonicwall_http_connect_settings,
+        private_access_auth_initial_value, private_access_summary_line,
+        settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
         status_lines, subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
         visible_settings_fields,
     };
@@ -8619,7 +7824,9 @@ mod tests {
     use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
     use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
     use crate::managed_sing_box::ManagedSingBox;
-    use crate::private_access::{PrivateAccessAuthField, PrivateAccessBridge, PrivateAccessRoute};
+    use crate::private_access::{
+        PrivateAccessAuthField, PrivateAccessBridge, PrivateAccessRoute, default_hillstone_manifest,
+    };
     use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
@@ -9301,7 +8508,8 @@ mod tests {
         app.private_access.profiles.push(sonicwall);
 
         assert_eq!(
-            app.effective_system_proxy_bypass_entries(),
+            app.private_access
+                .system_proxy_bypass_entries(&app.bypass_entries),
             vec![
                 "deeloo.cn".to_string(),
                 "service.hundsun.com".to_string(),
@@ -9312,16 +8520,20 @@ mod tests {
         assert_eq!(app.bypass_entries, vec!["deeloo.cn".to_string()]);
 
         app.private_access.focused_mut().state = PrivateAccessState::Disconnected;
-        app.clear_private_access_dynamic_network_state(0);
+        app.private_access.focused_mut().domains.clear();
+        app.private_access.focused_mut().domain_suffixes.clear();
         assert_eq!(
-            app.effective_system_proxy_bypass_entries(),
+            app.private_access
+                .system_proxy_bypass_entries(&app.bypass_entries),
             vec!["deeloo.cn".to_string(), "hundsun.com".to_string()]
         );
 
         app.private_access.profiles[1].state = PrivateAccessState::Disconnected;
-        app.clear_private_access_dynamic_network_state(1);
+        app.private_access.profiles[1].domains.clear();
+        app.private_access.profiles[1].domain_suffixes.clear();
         assert_eq!(
-            app.effective_system_proxy_bypass_entries(),
+            app.private_access
+                .system_proxy_bypass_entries(&app.bypass_entries),
             vec!["deeloo.cn".to_string()]
         );
     }
@@ -9378,7 +8590,7 @@ mod tests {
 
     #[test]
     fn private_access_process_matcher_requires_expected_service_command() {
-        let manifest = super::default_hillstone_manifest().expect("manifest builds");
+        let manifest = default_hillstone_manifest().expect("manifest builds");
         let executable = &manifest.executable;
         assert!(super::command_matches_private_access_service(
             &format!("{executable} private-access-service hillstone --stdio"),
@@ -9682,7 +8894,7 @@ mod tests {
         let app = test_app_without_private_access();
 
         assert!(!app.private_access.is_configured());
-        assert!(app.private_access.summary_line().is_none());
+        assert!(private_access_summary_line(&app.private_access).is_none());
         assert!(app.runtime_state().private_access_profiles.is_empty());
         assert!(
             visible_settings_fields(&app)
@@ -9722,7 +8934,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|progress| progress.done)
         );
-        assert!(app.private_access.focused().process.is_none());
+        assert!(!app.private_access.focused().owns_process());
     }
 
     #[test]
@@ -9790,7 +9002,7 @@ mod tests {
             app.private_access.focused().state,
             PrivateAccessState::Error
         );
-        assert!(app.private_access.focused().process.is_none());
+        assert!(!app.private_access.focused().owns_process());
         assert!(private_access_progress_text(&app).contains("启动 Private Access service 失败"));
         assert!(
             app.private_access_progress
@@ -9818,32 +9030,6 @@ mod tests {
              \"SnwlConnect.exe\",\"8604\",\"Console\",\"1\",\"80,120 K\"\r\n",
         );
         assert_eq!(names, vec!["SnwlVpn.exe", "SnwlConnect.exe"]);
-    }
-
-    #[test]
-    fn private_access_integration_failure_blocks_late_success_state() {
-        let mut app = test_app();
-        let profile = app.private_access.focused_mut();
-        profile.integration_failed = true;
-        profile.state = PrivateAccessState::Error;
-        profile.last_error = Some("sing-box restart failed".to_string());
-
-        assert!(!should_apply_private_access_state_after_integration(
-            app.private_access.focused(),
-            &PrivateAccessState::Connected
-        ));
-        assert!(!should_apply_private_access_state_after_integration(
-            app.private_access.focused(),
-            &PrivateAccessState::Connecting
-        ));
-        assert!(should_apply_private_access_state_after_integration(
-            app.private_access.focused(),
-            &PrivateAccessState::Error
-        ));
-        assert!(should_apply_private_access_state_after_integration(
-            app.private_access.focused(),
-            &PrivateAccessState::Disconnected
-        ));
     }
 
     #[test]
@@ -9935,121 +9121,6 @@ mod tests {
     }
 
     #[test]
-    fn private_access_route_application_writes_pushed_cidrs_without_port_matcher() {
-        let mut app = test_app();
-        let config_path = test_state_path();
-        let config = json!({
-            "outbounds": [{ "type": "direct", "tag": "direct" }],
-            "route": {
-                "rules": [
-                    { "ip_is_private": true, "outbound": "direct" }
-                ]
-            }
-        });
-        std::fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&config).expect("config serializes"),
-        )
-        .expect("config writes");
-        app.system_proxy_config_path = config_path.clone();
-
-        let applied = app
-            .apply_private_access_routes(
-                "hillstone",
-                &[PrivateAccessRoute {
-                    cidr: "10.1.0.0/16".to_string(),
-                }],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                Some(PrivateAccessBridge {
-                    kind: "http".to_string(),
-                    listen: "127.0.0.1:16780".to_string(),
-                }),
-                "127.0.0.1:16780",
-            )
-            .expect("private access routes apply");
-
-        assert!(applied);
-        let text = std::fs::read_to_string(&config_path).expect("config reads");
-        let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
-        let rules = config["route"]["rules"].as_array().expect("route rules");
-        let rule = rules
-            .iter()
-            .find(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
-            .expect("private access rule exists");
-        assert!(rule.get("port").is_none());
-        assert_eq!(rule["override_address"], "127.0.0.1");
-        assert_eq!(rule["override_port"], 16780);
-        let _ = std::fs::remove_file(config_path);
-    }
-
-    #[test]
-    fn private_access_route_application_keeps_profile_bridges_separate() {
-        let mut app = test_app();
-        let config_path = test_state_path();
-        let config = json!({
-            "outbounds": [{ "type": "direct", "tag": "direct" }],
-            "route": { "rules": [] }
-        });
-        std::fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&config).expect("config serializes"),
-        )
-        .expect("config writes");
-        app.system_proxy_config_path = config_path.clone();
-
-        app.apply_private_access_routes(
-            "office",
-            &[PrivateAccessRoute {
-                cidr: "10.1.0.0/16".to_string(),
-            }],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            "127.0.0.1:16780",
-        )
-        .expect("office routes apply");
-        app.apply_private_access_routes(
-            "lab",
-            &[PrivateAccessRoute {
-                cidr: "10.2.0.0/16".to_string(),
-            }],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            "127.0.0.1:18081",
-        )
-        .expect("lab routes apply");
-
-        let text = std::fs::read_to_string(&config_path).expect("config reads");
-        let config: serde_json::Value = serde_json::from_str(&text).expect("config parses");
-        let rules = config["route"]["rules"].as_array().expect("route rules");
-        let office = rules
-            .iter()
-            .find(|rule| rule["ip_cidr"] == json!(["10.1.0.0/16"]))
-            .expect("office route exists");
-        let lab = rules
-            .iter()
-            .find(|rule| rule["ip_cidr"] == json!(["10.2.0.0/16"]))
-            .expect("lab route exists");
-        assert_eq!(office["override_port"], 16780);
-        assert_eq!(lab["override_port"], 18081);
-        let _ = std::fs::remove_file(config_path);
-    }
-
-    #[test]
     fn private_access_tun_baseline_does_not_write_dynamic_routes() {
         let mut app = test_app();
         app.private_access.focused_mut().mode = PrivateAccessMode::Tun;
@@ -10094,7 +9165,8 @@ mod tests {
             listen: "127.0.0.1:16780".to_string(),
         });
 
-        let connected = line_text(app.private_access.summary_line().expect("summary line"));
+        let connected =
+            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
         assert!(connected.contains("[>hillstone CONNECTED]"));
         assert!(connected.contains("routes=1"));
         assert!(connected.contains("mode=bridge"));
@@ -10104,7 +9176,8 @@ mod tests {
         focused.state = PrivateAccessState::Error;
         focused.last_error = Some("session_failed: auth rejected".to_string());
 
-        let errored = line_text(app.private_access.summary_line().expect("summary line"));
+        let errored =
+            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
         assert!(errored.contains("[>hillstone ERROR]"));
         assert!(errored.contains("error=session_failed: auth rejected"));
     }
@@ -10119,7 +9192,8 @@ mod tests {
             cidr: "10.1.0.0/16".to_string(),
         }];
 
-        let summary = line_text(app.private_access.summary_line().expect("summary line"));
+        let summary =
+            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
 
         assert!(summary.contains("mode=tun"));
         assert!(summary.contains("data=tun"));
@@ -10141,7 +9215,8 @@ mod tests {
             PrivateAccessState::Connected
         );
         assert_eq!(app.private_access.focused().background_pid, Some(pid));
-        let summary = line_text(app.private_access.summary_line().expect("summary line"));
+        let summary =
+            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
         assert!(summary.contains("BACKGROUND"), "{summary}");
         assert!(summary.contains(&format!("pid={pid}")), "{summary}");
         assert_eq!(
@@ -10217,7 +9292,8 @@ mod tests {
                 .as_deref(),
             Some("tun")
         );
-        let summary = line_text(app.private_access.summary_line().expect("summary line"));
+        let summary =
+            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
         assert!(summary.contains("mode=tun"));
     }
 
@@ -11879,15 +10955,22 @@ mod tests {
             "123456"
         );
 
-        let profile = PrivateAccessProfileRuntime::from_state(PrivateAccessProfileState {
-            id: "sonicwall".to_string(),
-            server: Some("sslvpn.example.com".to_string()),
-            username: Some("alice".to_string()),
-            password: Some("static-secret".to_string()),
-            password_env: Some("SONICWALL_PASSWORD".to_string()),
-            ..PrivateAccessProfileState::default()
-        })
-        .expect("SonicWall profile loads");
+        let persisted = TuiRuntimeState {
+            private_access_profiles: vec![PrivateAccessProfileState {
+                id: "sonicwall".to_string(),
+                server: Some("sslvpn.example.com".to_string()),
+                username: Some("alice".to_string()),
+                password: Some("static-secret".to_string()),
+                password_env: Some("SONICWALL_PASSWORD".to_string()),
+                ..PrivateAccessProfileState::default()
+            }],
+            ..TuiRuntimeState::default()
+        };
+        let mut runtime = PrivateAccessRuntime::new().expect("runtime builds");
+        runtime
+            .apply_state(&persisted, |_, _| false)
+            .expect("SonicWall profile loads");
+        let profile = runtime.focused();
 
         let username_field = PrivateAccessAuthField {
             id: "reply-0".to_string(),
@@ -11906,19 +10989,19 @@ mod tests {
             options: Vec::new(),
         };
         assert_eq!(
-            private_access_auth_initial_value(&profile, &username_field),
+            private_access_auth_initial_value(profile, &username_field),
             "alice"
         );
         assert_eq!(
-            private_access_auth_initial_value(&profile, &password_field),
+            private_access_auth_initial_value(profile, &password_field),
             "static-secret"
         );
         assert_eq!(
-            private_access_auth_initial_value(&profile, &secret_field),
+            private_access_auth_initial_value(profile, &secret_field),
             ""
         );
 
-        let state = profile.runtime_state();
+        let state = runtime.runtime_states(|_| false).remove(0);
         assert_eq!(state.username.as_deref(), Some("alice"));
         assert_eq!(state.password.as_deref(), Some("static-secret"));
         assert_eq!(state.password_env.as_deref(), Some("SONICWALL_PASSWORD"));
