@@ -11,6 +11,7 @@ mod controller;
 mod defaults;
 mod hillstone;
 mod import;
+mod internet_tun;
 #[cfg(target_os = "macos")]
 mod macos_privileged_helper;
 mod managed_sing_box;

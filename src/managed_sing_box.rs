@@ -1694,6 +1694,14 @@ pub(crate) struct LifecycleReport {
 }
 
 impl LifecycleReport {
+    #[cfg(test)]
+    pub(crate) fn for_test(restarted_pids: Vec<u32>, started_pid: u32) -> Self {
+        Self {
+            restarted_pids,
+            started_pid,
+        }
+    }
+
     pub(crate) fn replaced_existing(&self) -> bool {
         !self.restarted_pids.is_empty()
     }
@@ -1739,6 +1747,10 @@ impl RestartReceipt {
 
     pub(crate) fn observe_controller(&self, probe: &dyn ControllerProbe) -> Result<()> {
         wait_for_controller_ready(probe)
+    }
+
+    pub(crate) fn into_report(self) -> LifecycleReport {
+        self.report
     }
 }
 

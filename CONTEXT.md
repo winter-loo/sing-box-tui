@@ -11,3 +11,7 @@ _Avoid_: Managed child, adopted process, sing-box service
 **Controller readiness**:
 The state in which sing-box's controller accepts requests; an operating-system process can be running without being controller-ready.
 _Avoid_: Process alive, startup success
+
+**Internet TUN transition**:
+A recoverable change between enabled and disabled Internet traffic capture, including its persisted intent and the route state required to restore user configuration.
+_Avoid_: TUN toggle, config edit, TUN job
