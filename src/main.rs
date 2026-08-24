@@ -13,6 +13,7 @@ mod hillstone;
 mod import;
 #[cfg(target_os = "macos")]
 mod macos_privileged_helper;
+mod managed_sing_box;
 mod private_access;
 mod provider;
 mod ruleset;
