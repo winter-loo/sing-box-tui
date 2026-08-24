@@ -20,18 +20,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
-    Wrap,
-};
 use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zeroize::Zeroize;
 
 use crate::config::{
     PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
@@ -56,7 +47,7 @@ use crate::managed_sing_box::{
     wait_for_controller_ready,
 };
 use crate::private_access::{
-    PrivateAccessAuthField, PrivateAccessSecret, PrivateAccessServiceManifest, PrivateAccessState,
+    PrivateAccessSecret, PrivateAccessServiceManifest, PrivateAccessState,
 };
 use crate::private_access_session::{
     PrivateAccessBridgeRouteUpdate, PrivateAccessCarrierRestart, PrivateAccessConnectOptions,
@@ -65,9 +56,7 @@ use crate::private_access_session::{
     PrivateAccessSessionNotice, load_manifest_for_profile, parse_private_access_mode,
 };
 use crate::ruleset::download_china_ip_routing_rulesets;
-use crate::storage::{
-    BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
-};
+use crate::storage::{BenchmarkRecord, BenchmarkStore, default_benchmark_db_path};
 use crate::subscriptions::{
     DEFAULT_SUBSCRIPTION_SOURCE_PATH, SubscriptionRefreshOutput, SubscriptionRefreshRequest,
     refresh_subscriptions,
@@ -77,6 +66,23 @@ use crate::tui_state::{
     default_tui_state_path, parse_bypass_entries,
 };
 
+#[path = "tui_presentation.rs"]
+mod presentation;
+#[cfg(test)]
+use presentation::private_access_auth_display_value;
+use presentation::{
+    CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
+    IntranetDetailSection, IntranetDetailSnapshot, IntranetDetailView, IntranetRow,
+    LatencyChartState, LeftPaneSection, OnboardingState, PrivateAccessAuthModal,
+    PrivateAccessProgressEntry, PrivateAccessProgressModal, PrivateAccessProgressTone,
+    SETTINGS_FIELDS, SettingRow, SettingsEditState, SettingsField, SettingsPanelSnapshot,
+    StatusFooter, StatusSnapshot, format_bytes_opt, format_duration_badge, help_binding_count,
+    latency_chart_window_label, latency_chart_zoom_in, latency_chart_zoom_out, node_order_badge,
+    pick_mode_badge, private_access_auth_initial_value, private_access_detail_view,
+    private_access_progress_title, settings_field_label, subscription_report_badge,
+    truncate_for_width,
+};
+
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -84,8 +90,6 @@ const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SYSTEM_PROXY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
-const LATENCY_CHART_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
-const LATENCY_CHART_MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const BACKGROUND_TASK_KIND_AUTO_PICK: &str = "headless-auto-pick";
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -104,29 +108,6 @@ impl ControllerProbe for ApiClient {
         self.fetch_config().map(|_| ())
     }
 }
-
-const SETTINGS_FIELDS: &[SettingsField] = &[
-    SettingsField::BenchmarkUrl,
-    SettingsField::BenchmarkTimeoutMs,
-    SettingsField::RequestTimeoutSec,
-    SettingsField::MaxConcurrency,
-    SettingsField::VerifyTargets,
-    SettingsField::AutoPickThresholdMs,
-    SettingsField::AutoPickIntervalSec,
-    SettingsField::SystemProxyServer,
-    SettingsField::ChinaIpRouting,
-    SettingsField::PrivateAccessProfile,
-    SettingsField::PrivateAccessManifestPath,
-    SettingsField::PrivateAccessMode,
-    SettingsField::PrivateAccessServer,
-    SettingsField::PrivateAccessPort,
-    SettingsField::PrivateAccessUsername,
-    SettingsField::PrivateAccessPassword,
-    SettingsField::PrivateAccessPasswordEnv,
-    SettingsField::PrivateAccessBridgeListen,
-    SettingsField::PrivateAccessUseInternetProxy,
-    SettingsField::PrivateAccessTlsVerify,
-];
 
 #[derive(Clone, Debug)]
 pub(crate) struct TuiSubscriptionRefreshOptions {
@@ -950,903 +931,8 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let implicit_root_mode = app.implicit_root_mode();
-    let status_lines = status_lines(app);
-    let status_footer = status_footer_line(app);
-    let status_line_count = status_lines.len() as u16;
-    let status_box_height = status_line_count.saturating_add(2).max(3);
-    let status_region_height = status_box_height.saturating_add(1);
-    let [main, status_region] = Layout::vertical([
-        Constraint::Min(10),
-        Constraint::Length(status_region_height),
-    ])
-    .areas(frame.area());
-    let [status_area, status_footer_area] =
-        Layout::vertical([Constraint::Length(status_box_height), Constraint::Length(1)])
-            .areas(status_region);
-    let [groups_area, members_area] =
-        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
-    let (internet_area, intranet_area) = if app.private_access.is_configured() {
-        let [internet_area, intranet_area] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(groups_area);
-        (internet_area, Some(intranet_area))
-    } else {
-        (groups_area, None)
-    };
-
-    let groups = app
-        .displayed_group_names()
-        .iter()
-        .map(|group_name| {
-            let group = app.group_by_name(group_name);
-            let current = group
-                .and_then(|group| group.current.as_deref())
-                .map_or(String::from("unset"), ToString::to_string);
-            let is_current = app
-                .implicit_root_group()
-                .and_then(|root| root.current.as_deref())
-                == Some(group_name.as_str());
-            let mut style = Style::default().fg(Color::Cyan);
-            if implicit_root_mode && is_current {
-                style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
-            }
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    truncate_for_width(group_name, internet_area.width.saturating_sub(18) as usize),
-                    style,
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("[{}]", truncate_for_width(&current, 14)),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::raw(if implicit_root_mode && is_current {
-                    "  *"
-                } else {
-                    ""
-                }),
-            ]))
-        })
-        .collect::<Vec<_>>();
-
-    let groups_title = "Internet Proxy";
-    let groups_block = Block::default()
-        .title(groups_title)
-        .borders(Borders::ALL)
-        .border_style(border_style(
-            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Internet,
-        ));
-    let groups_widget = List::new(groups)
-        .block(groups_block)
-        .highlight_style(selected_style(
-            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Internet,
-        ))
-        .highlight_symbol("> ");
-    let mut groups_state = ListState::default().with_selected(
-        (app.left_pane_section == LeftPaneSection::Internet).then_some(app.displayed_group_index()),
-    );
-    frame.render_stateful_widget(groups_widget, internet_area, &mut groups_state);
-
-    if let Some(intranet_area) = intranet_area {
-        let profiles = app
-            .private_access
-            .profiles
-            .iter()
-            .map(|profile| {
-                let state_label = if profile.background_pid.is_some() {
-                    "BACKGROUND"
-                } else {
-                    private_access_state_badge(profile.state.clone())
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        truncate_for_width(
-                            &profile.id,
-                            intranet_area.width.saturating_sub(18) as usize,
-                        ),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(state_label, private_access_state_style(&profile.state)),
-                ]))
-            })
-            .collect::<Vec<_>>();
-        let intranet_active =
-            app.focus == Focus::Groups && app.left_pane_section == LeftPaneSection::Intranet;
-        let intranet_block = Block::default()
-            .title("Intranet Proxy")
-            .borders(Borders::ALL)
-            .border_style(border_style(intranet_active));
-        let intranet_widget = List::new(profiles)
-            .block(intranet_block)
-            .highlight_style(selected_style(intranet_active))
-            .highlight_symbol("> ");
-        let mut intranet_state = ListState::default().with_selected(
-            (app.left_pane_section == LeftPaneSection::Intranet)
-                .then_some(app.private_access.focused_index),
-        );
-        frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
-    }
-
-    let displayed_members = app.displayed_members();
-    let members = app
-        .selected_member_panel_group()
-        .map(|group| {
-            displayed_members
-                .iter()
-                .map(|member| {
-                    let is_current = group.current.as_deref() == Some(member.as_str());
-                    let bench = app
-                        .selected_benchmark()
-                        .and_then(|summary| summary.find_result(member));
-                    let mut style = Style::default();
-                    if is_current {
-                        style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
-                    }
-                    let (marker, marker_style, loading_suffix) = match bench {
-                        Some(result) if !result.completed => (
-                            result.display_delay(),
-                            Style::default()
-                                .fg(Color::LightYellow)
-                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                            "  ⟳",
-                        ),
-                        Some(result) if result.delay.is_some() => (
-                            result.display_delay(),
-                            Style::default().fg(Color::Magenta),
-                            "",
-                        ),
-                        Some(result) => (
-                            result.display_delay(),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                            "",
-                        ),
-                        None => ("-".to_string(), Style::default().fg(Color::DarkGray), ""),
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            truncate_for_width(
-                                member,
-                                members_area.width.saturating_sub(16) as usize,
-                            ),
-                            style,
-                        ),
-                        Span::raw("  "),
-                        Span::styled(marker, marker_style),
-                        Span::raw(loading_suffix),
-                        Span::raw(if is_current { "  *" } else { "" }),
-                    ]))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let members_title = app
-        .selected_member_panel_group()
-        .map(|group| {
-            format!(
-                "Candidates for {} [{}]",
-                group.name,
-                node_order_badge(app.latency_sort_mode)
-            )
-        })
-        .unwrap_or_else(|| format!("Candidates [{}]", node_order_badge(app.latency_sort_mode)));
-    let members_block = Block::default()
-        .title(members_title)
-        .borders(Borders::ALL)
-        .border_style(border_style(app.focus == Focus::Members));
-    let members_widget = List::new(members)
-        .block(members_block)
-        .highlight_style(selected_style(app.focus == Focus::Members))
-        .highlight_symbol("> ");
-    let mut members_state = ListState::default().with_selected(app.displayed_member_index());
-    frame.render_stateful_widget(members_widget, members_area, &mut members_state);
-
-    if app.showing_intranet_details()
-        && let Some(profile) = app.private_access.focused_opt()
-    {
-        frame.render_widget(Clear, members_area);
-        let detail_view = app.intranet_detail_view(profile);
-        let details_block = Block::default()
-            .title(if app.intranet_detail_scroll == 0 {
-                format!("Intranet: {}", profile.id)
-            } else {
-                format!(
-                    "Intranet: {} [line {}]",
-                    profile.id,
-                    app.intranet_detail_scroll + 1
-                )
-            })
-            .borders(Borders::ALL)
-            .border_style(border_style(app.focus == Focus::Members));
-        let details_inner = details_block.inner(members_area);
-        frame.render_widget(details_block, members_area);
-        let [details_area, footer_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(details_inner);
-        let details = Paragraph::new(detail_view.lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.intranet_detail_scroll, 0));
-        frame.render_widget(details, details_area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            footer_area,
-        );
-    }
-
-    let help =
-        Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
-    frame.render_widget(help, status_area);
-    frame.render_widget(Paragraph::new(status_footer), status_footer_area);
-
-    if let Some(message) = app.flash_message() {
-        let estimated_width = frame
-            .area()
-            .width
-            .saturating_mul(80)
-            .saturating_div(100)
-            .max(1);
-        let wrapped_lines = message
-            .lines()
-            .map(|line| {
-                let width = unicode_width::UnicodeWidthStr::width(line) as u16;
-                width
-                    .saturating_add(estimated_width - 1)
-                    .saturating_div(estimated_width)
-                    .max(1)
-            })
-            .sum::<u16>();
-        let height = wrapped_lines
-            .saturating_add(2)
-            .max(7)
-            .min(frame.area().height);
-        let area = centered_rect(80, height, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
-            area,
-        );
-    }
-    if let Some(chart) = app.latency_chart.as_ref() {
-        draw_latency_chart(frame, chart);
-    }
-    if app.show_connections {
-        draw_connections_panel(frame, app);
-    }
-    if app.show_help {
-        draw_help_panel(frame, app);
-    }
-    if app.show_settings {
-        draw_settings_panel(frame, app);
-    }
-    if app.onboarding.is_some() {
-        draw_onboarding_panel(frame, app);
-    }
-    if let Some(progress) = app.private_access_progress.as_ref() {
-        draw_private_access_progress_panel(frame, progress);
-    }
-    if let Some(auth) = app.private_access_auth.as_ref() {
-        draw_private_access_auth_panel(frame, auth);
-    }
-    if let Some(input) = app.filter_input.as_deref() {
-        let cursor_x = status_area
-            .x
-            .saturating_add(1)
-            .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(input) as u16);
-        let cursor_y = status_area.y.saturating_add(status_line_count);
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
-fn private_access_detail_view(
-    profile: &PrivateAccessProfileRuntime,
-    is_expanded: impl Fn(IntranetDetailSection) -> bool,
-) -> IntranetDetailView {
-    let state_label = if profile.background_pid.is_some() {
-        "BACKGROUND"
-    } else {
-        private_access_state_badge(profile.state.clone())
-    };
-    let gateway = if profile.server.trim().is_empty() {
-        "not configured".to_string()
-    } else {
-        format!("{}:{}", profile.server, profile.port)
-    };
-    let data_plane = match profile.mode {
-        PrivateAccessMode::Tun => "TUN".to_string(),
-        PrivateAccessMode::Bridge => profile
-            .bridge
-            .as_ref()
-            .map(|bridge| format!("{} at {}", bridge.kind, bridge.listen))
-            .unwrap_or_else(|| format!("HTTP bridge at {}", profile.bridge_listen)),
-    };
-    let capabilities = [
-        profile
-            .manifest
-            .capabilities
-            .pushed_routes
-            .then_some("routes"),
-        profile.manifest.capabilities.pushed_dns.then_some("DNS"),
-        profile
-            .manifest
-            .capabilities
-            .local_http_bridge
-            .then_some("HTTP bridge"),
-        profile
-            .manifest
-            .capabilities
-            .graceful_disconnect
-            .then_some("graceful disconnect"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(", ");
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("State: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(state_label, private_access_state_style(&profile.state)),
-        ]),
-        private_access_detail_line("Service", &profile.manifest.name),
-        private_access_detail_line(
-            "Protocol",
-            &format!(
-                "{} (service v{})",
-                profile.manifest.protocol, profile.manifest.version
-            ),
-        ),
-        private_access_detail_line("Gateway", &gateway),
-        private_access_detail_line(
-            "TLS verification",
-            if profile.tls_verify {
-                "enabled"
-            } else {
-                "disabled"
-            },
-        ),
-        private_access_detail_line("Data plane", &data_plane),
-    ];
-    if !capabilities.is_empty() {
-        lines.push(private_access_detail_line("Capabilities", &capabilities));
-    }
-    if let Some(pid) = profile.background_pid {
-        lines.push(private_access_detail_line(
-            "Process",
-            &format!("background pid {pid}"),
-        ));
-    } else if profile.owns_process() {
-        lines.push(private_access_detail_line("Process", "owned by this TUI"));
-    }
-
-    let mut sections = Vec::new();
-    append_private_access_detail_section(
-        &mut lines,
-        &mut sections,
-        IntranetDetailSection::Dns,
-        "DNS servers",
-        profile.dns.clone(),
-        "No DNS servers have been pushed.",
-        is_expanded(IntranetDetailSection::Dns),
-    );
-    append_private_access_detail_section(
-        &mut lines,
-        &mut sections,
-        IntranetDetailSection::Routes,
-        "Routes",
-        profile
-            .routes
-            .iter()
-            .map(|route| route.cidr.clone())
-            .collect(),
-        "No routes have been pushed.",
-        is_expanded(IntranetDetailSection::Routes),
-    );
-    let domains = profile
-        .domains
-        .iter()
-        .map(|domain| format!("exact  {domain}"))
-        .chain(
-            profile
-                .domain_suffixes
-                .iter()
-                .map(|domain| format!("suffix *.{domain}")),
-        )
-        .collect();
-    append_private_access_detail_section(
-        &mut lines,
-        &mut sections,
-        IntranetDetailSection::Domains,
-        "Internal domains",
-        domains,
-        "No internal domains have been pushed.",
-        is_expanded(IntranetDetailSection::Domains),
-    );
-
-    if let Some(error) = profile.last_error.as_deref() {
-        lines.push(Line::default());
-        lines.push(private_access_detail_heading("Last error"));
-        lines.push(Line::from(Span::styled(
-            error.to_string(),
-            Style::default().fg(Color::Red),
-        )));
-    }
-
-    IntranetDetailView { lines, sections }
-}
-
-fn append_private_access_detail_section(
-    lines: &mut Vec<Line<'static>>,
-    sections: &mut Vec<IntranetDetailSectionRange>,
-    section: IntranetDetailSection,
-    label: &str,
-    items: Vec<String>,
-    empty_message: &str,
-    expanded: bool,
-) {
-    const FOLDED_ITEM_LIMIT: usize = 10;
-
-    lines.push(Line::default());
-    let start = lines.len();
-    let item_count = items.len();
-    let foldable = item_count > FOLDED_ITEM_LIMIT;
-    let visible_count = if foldable && !expanded {
-        FOLDED_ITEM_LIMIT
-    } else {
-        item_count
-    };
-    let heading = match (foldable, expanded) {
-        (true, true) => format!("▼ {label} ({item_count}) [Enter to fold]"),
-        (true, false) => {
-            format!("▶ {label} ({item_count}) [showing {FOLDED_ITEM_LIMIT}; Enter to expand]")
-        }
-        (false, _) => format!("{label} ({item_count})"),
-    };
-    lines.push(private_access_detail_heading(heading));
-    if items.is_empty() {
-        lines.push(private_access_detail_empty(empty_message));
-    } else {
-        lines.extend(
-            items
-                .into_iter()
-                .take(visible_count)
-                .map(|item| Line::from(format!("  {item}"))),
-        );
-        if foldable && !expanded {
-            lines.push(Line::from(Span::styled(
-                format!("  … {} more item(s)", item_count - visible_count),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-    sections.push(IntranetDetailSectionRange {
-        section,
-        start,
-        end: lines.len(),
-        foldable,
-    });
-}
-
-fn private_access_detail_line(label: &str, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(value.to_string()),
-    ])
-}
-
-fn private_access_detail_heading(value: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(
-        value.into(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
-fn private_access_detail_empty(value: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("  {value}"),
-        Style::default().fg(Color::DarkGray),
-    ))
-}
-
-fn status_lines(app: &App) -> Vec<Line<'_>> {
-    let mut selection_context = format!(
-        "clash={}  Pick={}  filter='{}'",
-        app.clash_mode_label(),
-        pick_mode_badge(app.auto_select_enabled),
-        app.benchmark_filter
-    );
-    if app.showing_intranet_details() {
-        selection_context.push_str("  Intranet details are shown in the right panel");
-    }
-
-    vec![
-        Line::from(vec![
-            Span::styled("System Proxy: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if app.system_proxy_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                Style::default().fg(if app.system_proxy_enabled {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::raw("  "),
-            Span::styled("Tun Mode: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if app.internet_tun.is_enabled() {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                Style::default().fg(if app.internet_tun.is_enabled() {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::raw("  "),
-            Span::raw(selection_context),
-        ]),
-        Line::from(app.connections_summary_line()),
-        Line::from(app.subscription_summary_line()),
-        Line::from(app.sing_box_summary_line()),
-    ]
-}
-
-fn status_footer_line(app: &App) -> Line<'_> {
-    let line = if let Some(input) = app.filter_input.as_deref() {
-        Line::from(vec![
-            Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input),
-            Span::styled(
-                "  Enter apply  Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else if let Some(input) = app.bypass_input.as_deref() {
-        Line::from(vec![
-            Span::styled("Bypass: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input),
-            Span::styled(
-                "  domains/IPs/CIDRs comma-separated  Enter save  Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else {
-        Line::from(app.status_line())
-    };
-    line.patch_style(Style::default().fg(Color::DarkGray))
-}
-
-#[derive(Clone, Copy)]
-struct HelpBinding {
-    key: &'static str,
-    summary: &'static str,
-    detail: &'static str,
-}
-
-const HELP_BINDINGS: &[HelpBinding] = &[
-    HelpBinding {
-        key: "up",
-        summary: "Move up / scroll details",
-        detail: "Move the highlighted row up, or scroll Intranet Proxy details when the right pane is focused.",
-    },
-    HelpBinding {
-        key: "k",
-        summary: "Move selection up",
-        detail: "Vim-style shortcut for moving the highlighted row up.",
-    },
-    HelpBinding {
-        key: "down",
-        summary: "Move down / scroll details",
-        detail: "Move the highlighted row down, crossing from Internet Proxy into Intranet Proxy, or scroll right-pane details.",
-    },
-    HelpBinding {
-        key: "j",
-        summary: "Move selection down",
-        detail: "Vim-style shortcut for moving the highlighted row down.",
-    },
-    HelpBinding {
-        key: "tab",
-        summary: "Switch pane",
-        detail: "Move focus between the selector/group pane and the candidate node pane.",
-    },
-    HelpBinding {
-        key: "h",
-        summary: "Switch to left pane",
-        detail: "Move focus to the pane on the left.",
-    },
-    HelpBinding {
-        key: "l",
-        summary: "Switch to right pane",
-        detail: "Move focus to the pane on the right.",
-    },
-    HelpBinding {
-        key: "g",
-        summary: "Move to first item",
-        detail: "Jump to the first item in the focused list.",
-    },
-    HelpBinding {
-        key: "G",
-        summary: "Move to last item",
-        detail: "Jump to the last item in the focused list.",
-    },
-    HelpBinding {
-        key: "space",
-        summary: "Activate selection",
-        detail: "Apply an Internet Proxy selection, or open the selected Intranet Proxy profile details.",
-    },
-    HelpBinding {
-        key: "m",
-        summary: "Cycle Clash mode",
-        detail: "Switch the controller between available Clash modes.",
-    },
-    HelpBinding {
-        key: "s",
-        summary: "Toggle latency sort order",
-        detail: "Toggle candidate display between selector order and successful latency order.",
-    },
-    HelpBinding {
-        key: "T",
-        summary: "Test current group latency",
-        detail: "Start an asynchronous latency test for all visible candidates in the selected group.",
-    },
-    HelpBinding {
-        key: "t",
-        summary: "Test selected node latency",
-        detail: "Start an asynchronous latency test for only the highlighted node.",
-    },
-    HelpBinding {
-        key: "/",
-        summary: "Edit latency filter",
-        detail: "Open the filter editor. Comma-separated values include matches; prefix with ! or - to exclude.",
-    },
-    HelpBinding {
-        key: "a",
-        summary: "Toggle auto-pick",
-        detail: "Enable or disable periodic latency tests and automatic switching for the current filter, or all nodes when the filter is empty.",
-    },
-    HelpBinding {
-        key: "i",
-        summary: "Open latency chart",
-        detail: "Show SQLite-backed latency history for the highlighted node.",
-    },
-    HelpBinding {
-        key: "z",
-        summary: "Zoom latency chart in",
-        detail: "When the latency chart is open, narrow the displayed time window.",
-    },
-    HelpBinding {
-        key: "Z",
-        summary: "Zoom latency chart out",
-        detail: "When the latency chart is open, widen the displayed time window.",
-    },
-    HelpBinding {
-        key: "c",
-        summary: "Show active connections",
-        detail: "Open a panel with active connection targets, outbound chains, and matched rules.",
-    },
-    HelpBinding {
-        key: "b",
-        summary: "Edit bypass rules",
-        detail: "Edit direct-bypass domains, IPs, and CIDRs written to the local rule-set.",
-    },
-    HelpBinding {
-        key: "B",
-        summary: "Keep sing-box running",
-        detail: "Exit the TUI while leaving sing-box, auto-pick, and active Private Access sessions running in the background.",
-    },
-    HelpBinding {
-        key: "p",
-        summary: "Toggle system proxy",
-        detail: "Enable or disable the OS system proxy for the detected sing-box mixed inbound.",
-    },
-    HelpBinding {
-        key: "\\",
-        summary: "Toggle TUN mode",
-        detail: "Add or remove the sing-box TUN inbound and restart sing-box to capture system traffic. Needs administrator/root privileges on macOS and Linux.",
-    },
-    HelpBinding {
-        key: "u",
-        summary: "Update subscriptions",
-        detail: "Force a background subscription refresh when subscription refresh is configured.",
-    },
-    HelpBinding {
-        key: "v",
-        summary: "Verify network",
-        detail: "Run configured connectivity checks in the background.",
-    },
-    HelpBinding {
-        key: "V",
-        summary: "Toggle Private Access",
-        detail: "Connect or disconnect the selected Intranet Proxy profile.",
-    },
-    HelpBinding {
-        key: "o",
-        summary: "Open settings",
-        detail: "Edit TUI latency, auto-pick, and system proxy settings.",
-    },
-    HelpBinding {
-        key: "r",
-        summary: "Refresh groups",
-        detail: "Reload selector groups, mode, and connection state from the controller.",
-    },
-    HelpBinding {
-        key: "?",
-        summary: "Close help",
-        detail: "Close this keybindings panel.",
-    },
-    HelpBinding {
-        key: "esc",
-        summary: "Close help",
-        detail: "Close this keybindings panel.",
-    },
-    HelpBinding {
-        key: "enter",
-        summary: "Close help",
-        detail: "Close this keybindings panel.",
-    },
-    HelpBinding {
-        key: "q",
-        summary: "Quit",
-        detail: "Exit the TUI. When help is open, q still exits the application.",
-    },
-];
-
-fn draw_help_panel(frame: &mut Frame, app: &App) {
-    let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(4).min(108);
-    let height = frame_area.height.saturating_sub(4).min(34);
-    let area = centered_rect(width.max(56), height.max(18), frame_area);
-    frame.render_widget(Clear, area);
-    let [list_area, detail_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(area);
-    let selected = app.help_index.min(HELP_BINDINGS.len().saturating_sub(1));
-    let visible_rows = list_area.height.saturating_sub(2).max(1) as usize;
-    let first = selected.saturating_sub(visible_rows.saturating_sub(1));
-
-    let lines = HELP_BINDINGS
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(visible_rows)
-        .map(|(index, binding)| help_binding(*binding, index == selected))
-        .collect::<Vec<_>>();
-
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .title("Keybindings")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
-    );
-    frame.render_widget(widget, list_area);
-
-    let count = format!("{} of {}", selected + 1, HELP_BINDINGS.len());
-    let count_width = unicode_width::UnicodeWidthStr::width(count.as_str()) as u16;
-    let count_area = ratatui::layout::Rect {
-        x: list_area.x + list_area.width.saturating_sub(count_width + 1),
-        y: list_area.y + list_area.height.saturating_sub(1),
-        width: count_width,
-        height: 1,
-    };
-    frame.render_widget(
-        Paragraph::new(count).style(Style::default().fg(Color::Green)),
-        count_area,
-    );
-
-    let detail = HELP_BINDINGS
-        .get(selected)
-        .map(|binding| binding.detail)
-        .unwrap_or("");
-    frame.render_widget(
-        Paragraph::new(detail)
-            .style(Style::default().fg(Color::Gray))
-            .block(Block::default().borders(Borders::ALL)),
-        detail_area,
-    );
-}
-
-fn help_binding(binding: HelpBinding, selected: bool) -> Line<'static> {
-    let line_style = if selected {
-        Style::default().bg(Color::Blue)
-    } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            format!("{:>7}", binding.key),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(binding.summary, Style::default().fg(Color::Gray)),
-    ])
-    .style(line_style)
-}
-
-fn draw_settings_panel(frame: &mut Frame, app: &App) {
-    let frame_area = frame.area();
-    let area = centered_rect(96, 26, frame_area);
-    frame.render_widget(Clear, area);
-    let fields = visible_settings_fields(app);
-    let selected = app.settings_index.min(fields.len().saturating_sub(1));
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" edit  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
-        Span::raw(" close"),
-    ]));
-    lines.push(Line::raw(""));
-    for (index, field) in fields.iter().enumerate() {
-        let marker = if index == selected { "> " } else { "  " };
-        let style = if index == selected {
-            Style::default().bg(Color::Blue)
-        } else {
-            Style::default()
-        };
-        lines.push(
-            Line::from(vec![
-                Span::raw(marker),
-                Span::styled(
-                    settings_field_label(*field),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-                Span::raw(settings_field_display_value(app, *field)),
-            ])
-            .style(style),
-        );
-    }
-    if let Some(edit) = &app.settings_edit {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("Editing ", Style::default().fg(Color::Yellow)),
-            Span::raw(settings_field_label(edit.field)),
-            Span::raw(": "),
-            Span::raw(edit.input.as_str()),
-        ]));
-    }
-    let settings_error = app
-        .settings_edit
-        .as_ref()
-        .and_then(|edit| edit.error.as_deref())
-        .or(app.settings_error.as_deref());
-    if let Some(error) = settings_error {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Error: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate_for_width(error, area.width.saturating_sub(12) as usize),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title("Settings")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        ),
-        area,
-    );
+    let snapshot = app.presentation_snapshot();
+    presentation::render(frame, &snapshot);
 }
 
 fn visible_settings_fields(app: &App) -> Vec<SettingsField> {
@@ -1881,228 +967,6 @@ fn is_private_access_settings_field(field: SettingsField) -> bool {
             | SettingsField::PrivateAccessUseInternetProxy
             | SettingsField::PrivateAccessTlsVerify
     )
-}
-
-fn draw_onboarding_panel(frame: &mut Frame, app: &App) {
-    let frame_area = frame.area();
-    let area = centered_rect(86, 13, frame_area);
-    frame.render_widget(Clear, area);
-    let Some(onboarding) = &app.onboarding else {
-        return;
-    };
-    let lines = vec![
-        Line::from("First run setup"),
-        Line::raw(""),
-        Line::from("Paste one sing-box subscription URL and press Enter to save it to .suburl."),
-        Line::from("Press s to skip, or Esc to keep this wizard for next time."),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("URL: ", Style::default().fg(Color::Cyan)),
-            Span::raw(onboarding.input.as_str()),
-        ]),
-        Line::raw(""),
-        Line::from(onboarding.message.as_str()),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title("Welcome")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        ),
-        area,
-    );
-}
-
-fn draw_private_access_progress_panel(frame: &mut Frame, progress: &PrivateAccessProgressModal) {
-    let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(6).min(88).max(56);
-    let height = (progress.entries.len() as u16 + 4)
-        .min(frame_area.height.saturating_sub(4))
-        .max(8);
-    let area = centered_rect(width, height, frame_area);
-    frame.render_widget(Clear, area);
-
-    let max_entries = area.height.saturating_sub(4) as usize;
-    let start = progress.entries.len().saturating_sub(max_entries);
-    let mut lines = progress
-        .entries
-        .iter()
-        .skip(start)
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(entry.tone.prefix(), entry.tone.style()),
-                Span::raw(truncate_for_width(
-                    &entry.text,
-                    area.width.saturating_sub(8) as usize,
-                )),
-            ])
-        })
-        .collect::<Vec<_>>();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        if progress.done {
-            "Enter/Esc close"
-        } else {
-            "Private Access is running..."
-        },
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(progress.title.clone())
-                .borders(Borders::ALL)
-                .border_style(if progress.done {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                }),
-        ),
-        area,
-    );
-}
-
-fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAccessAuthModal) {
-    let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(6).min(82).max(52);
-    let message_rows = usize::from(!auth.message.trim().is_empty());
-    let height = (auth.fields.len() + message_rows + 6) as u16;
-    let area = centered_rect(
-        width,
-        height.min(frame_area.height.saturating_sub(4)).max(9),
-        frame_area,
-    );
-    frame.render_widget(Clear, area);
-
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" next/submit  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
-        Span::raw(" cancel"),
-    ])];
-    if !auth.message.trim().is_empty() {
-        lines.push(Line::from(auth.message.as_str()));
-    }
-    lines.push(Line::raw(""));
-    let field_start = lines.len();
-    for (index, field) in auth.fields.iter().enumerate() {
-        let selected = index == auth.field_index;
-        let marker = if selected { "> " } else { "  " };
-        let value = private_access_auth_display_value(field, &auth.inputs[index]);
-        let style = if selected {
-            Style::default().bg(Color::Blue)
-        } else {
-            Style::default()
-        };
-        lines.push(
-            Line::from(vec![
-                Span::raw(marker),
-                Span::styled(field.label.as_str(), Style::default().fg(Color::Cyan)),
-                Span::raw("  "),
-                Span::raw(value),
-            ])
-            .style(style),
-        );
-    }
-    if let Some(error) = auth.error.as_deref() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(error, Style::default().fg(Color::Red)));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(auth.title.as_str())
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        ),
-        area,
-    );
-
-    if let Some(field) = auth.fields.get(auth.field_index) {
-        let display = private_access_auth_display_value(field, &auth.inputs[auth.field_index]);
-        let cursor_x = area
-            .x
-            .saturating_add(1)
-            .saturating_add(2)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(field.label.as_str()) as u16)
-            .saturating_add(2)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(display.as_str()) as u16)
-            .min(area.x.saturating_add(area.width.saturating_sub(2)));
-        let cursor_y = area
-            .y
-            .saturating_add(1)
-            .saturating_add(field_start as u16)
-            .saturating_add(auth.field_index as u16)
-            .min(area.y.saturating_add(area.height.saturating_sub(2)));
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
-fn private_access_auth_display_value(_field: &PrivateAccessAuthField, input: &str) -> String {
-    input.to_string()
-}
-
-fn private_access_auth_initial_value(
-    profile: &PrivateAccessProfileRuntime,
-    field: &PrivateAccessAuthField,
-) -> String {
-    if let Some(option) = field.options.first() {
-        return option.value.clone();
-    }
-    if profile.manifest.id != "sonicwall" {
-        return String::new();
-    }
-
-    let has_kind_marker = |expected: &str| {
-        field
-            .kind
-            .split(|character: char| {
-                character.is_ascii_whitespace() || matches!(character, ',' | ';')
-            })
-            .any(|marker| marker.eq_ignore_ascii_case(expected))
-    };
-    if has_kind_marker("is-username") {
-        return profile.username.clone();
-    }
-    if has_kind_marker("is-password") {
-        if !profile.password.is_empty() {
-            return profile.password.clone();
-        }
-        if !profile.password_env.is_empty() {
-            return env::var(&profile.password_env).unwrap_or_default();
-        }
-    }
-
-    // A generic sensitive/password field may be an OTP or another dynamic reply.
-    // Only the gateway's explicit is-password marker is safe to prefill.
-    String::new()
-}
-
-fn settings_field_label(field: SettingsField) -> &'static str {
-    match field {
-        SettingsField::BenchmarkUrl => "Latency URL",
-        SettingsField::BenchmarkTimeoutMs => "Latency timeout ms",
-        SettingsField::RequestTimeoutSec => "Request timeout sec",
-        SettingsField::MaxConcurrency => "Max concurrency",
-        SettingsField::VerifyTargets => "Verification targets",
-        SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
-        SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
-        SettingsField::SystemProxyServer => "System proxy server",
-        SettingsField::ChinaIpRouting => "China IP routing",
-        SettingsField::PrivateAccessProfile => "Private Access profile",
-        SettingsField::PrivateAccessManifestPath => "Private Access service manifest",
-        SettingsField::PrivateAccessMode => "Private Access mode",
-        SettingsField::PrivateAccessServer => "Private Access server",
-        SettingsField::PrivateAccessPort => "Private Access port",
-        SettingsField::PrivateAccessUsername => "Private Access username",
-        SettingsField::PrivateAccessPassword => "Private Access password",
-        SettingsField::PrivateAccessPasswordEnv => "Private Access password env",
-        SettingsField::PrivateAccessBridgeListen => "Private Access bridge listen",
-        SettingsField::PrivateAccessUseInternetProxy => "SonicWall use Internet proxy",
-        SettingsField::PrivateAccessTlsVerify => "Private Access TLS verify",
-    }
 }
 
 fn settings_field_value(app: &App, field: SettingsField) -> String {
@@ -2277,293 +1141,10 @@ fn parse_verification_target(input: &str) -> Result<VerificationTarget> {
     })
 }
 
-fn draw_connections_panel(frame: &mut Frame, app: &App) {
-    let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(4).min(120);
-    let height = frame_area.height.saturating_sub(4).min(24);
-    let area = centered_rect(width.max(20), height.max(8), frame_area);
-    frame.render_widget(Clear, area);
-
-    let inner_width = area.width.saturating_sub(4) as usize;
-    let max_rows = area.height.saturating_sub(6) as usize;
-    let mut lines = vec![
-        Line::from(app.connections_summary_line()),
-        Line::from(vec![
-            Span::styled("Source", Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled("Target", Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled("Chain", Style::default().fg(Color::Cyan)),
-        ]),
-    ];
-
-    if let Some(error) = &app.connection_error {
-        lines.push(Line::from(format!(
-            "error: {}",
-            truncate_for_width(error, inner_width.saturating_sub(7))
-        )));
-    } else if app.connections.connections.is_empty() {
-        lines.push(Line::from("No active connections"));
-    } else {
-        lines.extend(
-            app.connections
-                .connections
-                .iter()
-                .take(max_rows)
-                .map(|connection| Line::from(format_connection_line(connection, inner_width))),
-        );
-        let hidden = app.connections.connections.len().saturating_sub(max_rows);
-        if hidden > 0 {
-            lines.push(Line::from(format!("... {hidden} more connections")));
-        }
-    }
-
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .title("Active Connections (c/Esc close, r refresh)")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    frame.render_widget(widget, area);
-}
-
-fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
-    let area = centered_rect(90, 20, frame.area());
-    frame.render_widget(Clear, area);
-
-    let visible_samples = latency_chart_windowed_samples(&chart.samples, chart.window);
-    let segments = latency_chart_segments(&visible_samples);
-    let Some(start_ms) = latency_chart_window_start_ms(&chart.samples, chart.window) else {
-        frame.render_widget(
-            Paragraph::new("No latency history")
-                .block(Block::default().title("Latency").borders(Borders::ALL)),
-            area,
-        );
-        return;
-    };
-    let time_unit = latency_chart_time_unit(chart.window);
-    let scale = match time_unit {
-        LatencyChartTimeUnit::Minutes => 60_000.0,
-        LatencyChartTimeUnit::Hours => 3_600_000.0,
-    };
-    let segment_data = segments
-        .iter()
-        .map(|segment| {
-            segment
-                .iter()
-                .map(|point| {
-                    (
-                        point.0.saturating_sub(start_ms) as f64 / scale,
-                        point.1 as f64,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    if segment_data.iter().all(Vec::is_empty) {
-        frame.render_widget(
-            Paragraph::new("No successful latency samples in this window")
-                .block(Block::default().title("Latency").borders(Borders::ALL)),
-            area,
-        );
-        return;
-    }
-
-    let (min_y, max_y) = segment_data
-        .iter()
-        .flatten()
-        .fold((f64::MAX, f64::MIN), |(min_y, max_y), (_, y)| {
-            (min_y.min(*y), max_y.max(*y))
-        });
-    let x_max = chart.window.as_millis() as f64 / scale;
-    let x_bounds = [0.0, x_max.max(1.0)];
-    let y_bounds = latency_chart_y_bounds(min_y, max_y, AUTO_SELECT_THRESHOLD_MS);
-    let title = format!(
-        "Latency: {} / {} ({} samples, window {}, z/Z zoom)",
-        chart.selector,
-        truncate_for_width(&chart.node, 36),
-        visible_samples.len(),
-        latency_chart_window_label(chart.window)
-    );
-    let mut datasets = segment_data
-        .iter()
-        .enumerate()
-        .map(|(index, data)| {
-            Dataset::default()
-                .name(format!("latency-{index}"))
-                .marker(symbols::Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Magenta))
-                .data(data)
-        })
-        .collect::<Vec<_>>();
-    let threshold_data = latency_chart_threshold_line(x_bounds[1], AUTO_SELECT_THRESHOLD_MS);
-    datasets.push(
-        Dataset::default()
-            .name(format!("{AUTO_SELECT_THRESHOLD_MS}ms limit"))
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Yellow))
-            .data(&threshold_data),
-    );
-    let chart_widget = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .x_axis(
-            Axis::default()
-                .title(match time_unit {
-                    LatencyChartTimeUnit::Minutes => "time (minutes)",
-                    LatencyChartTimeUnit::Hours => "time (hours)",
-                })
-                .style(Style::default().fg(Color::Gray))
-                .bounds(x_bounds)
-                .labels(vec![
-                    Span::raw(format!("{} ago", latency_chart_window_label(chart.window))),
-                    Span::raw("now"),
-                ]),
-        )
-        .y_axis(
-            Axis::default()
-                .title("latency (ms)")
-                .style(Style::default().fg(Color::Gray))
-                .bounds(y_bounds)
-                .labels(vec![
-                    Span::raw(format!("{:.0}", y_bounds[0])),
-                    Span::raw(format!("{:.0}", y_bounds[1])),
-                ]),
-        );
-    frame.render_widget(chart_widget, area);
-}
-
-fn latency_chart_segments(samples: &[NodeLatencySample]) -> Vec<Vec<(u64, u64)>> {
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
-    for sample in samples {
-        if let Some(delay_ms) = sample.delay_ms {
-            current.push((sample.recorded_at_ms, delay_ms));
-        } else if !current.is_empty() {
-            segments.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-    segments
-}
-
-fn latency_chart_threshold_line(x_max: f64, threshold_ms: u64) -> Vec<(f64, f64)> {
-    vec![
-        (0.0, threshold_ms as f64),
-        (x_max.max(1.0), threshold_ms as f64),
-    ]
-}
-
-fn latency_chart_y_bounds(min_y: f64, max_y: f64, threshold_ms: u64) -> [f64; 2] {
-    let min_y = min_y.min(threshold_ms as f64);
-    let max_y = max_y.max(threshold_ms as f64);
-    let padding = ((max_y - min_y) * 0.05).max(10.0);
-    [0.0_f64.max(min_y - padding), max_y + padding]
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AutoSelectSwitchPlan {
     target_node: Option<String>,
     parent_switch: Option<(String, String)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LatencyChartTimeUnit {
-    Minutes,
-    Hours,
-}
-
-fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
-    if window >= Duration::from_secs(2 * 60 * 60) {
-        LatencyChartTimeUnit::Hours
-    } else {
-        LatencyChartTimeUnit::Minutes
-    }
-}
-
-fn latency_chart_window_label(window: Duration) -> String {
-    if window >= Duration::from_secs(60 * 60) {
-        format!("{}h", window.as_secs() / 3600)
-    } else {
-        format!("{}m", window.as_secs() / 60)
-    }
-}
-
-fn latency_chart_zoom_in(window: Duration) -> Duration {
-    (window / 2).max(LATENCY_CHART_MIN_WINDOW)
-}
-
-fn latency_chart_zoom_out(window: Duration) -> Duration {
-    (window * 2).min(LATENCY_CHART_MAX_WINDOW)
-}
-
-fn latency_chart_latest_ms(samples: &[NodeLatencySample]) -> Option<u64> {
-    samples.iter().map(|sample| sample.recorded_at_ms).max()
-}
-
-fn latency_chart_window_start_ms(samples: &[NodeLatencySample], window: Duration) -> Option<u64> {
-    let latest = latency_chart_latest_ms(samples)?;
-    Some(latest.saturating_sub(window.as_millis() as u64))
-}
-
-fn latency_chart_windowed_samples(
-    samples: &[NodeLatencySample],
-    window: Duration,
-) -> Vec<NodeLatencySample> {
-    let Some(start) = latency_chart_window_start_ms(samples, window) else {
-        return Vec::new();
-    };
-    samples
-        .iter()
-        .filter(|sample| sample.recorded_at_ms >= start)
-        .cloned()
-        .collect()
-}
-
-fn border_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
-}
-
-fn selected_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    }
-}
-
-fn node_order_badge(latency_sort_mode: bool) -> &'static str {
-    if latency_sort_mode {
-        "LATENCY ORDER"
-    } else {
-        "SELECTOR ORDER"
-    }
-}
-
-fn pick_mode_badge(auto_select_enabled: bool) -> &'static str {
-    if auto_select_enabled {
-        "Auto"
-    } else {
-        "Manual"
-    }
 }
 
 fn background_status_should_publish(status: &str) -> bool {
@@ -2572,41 +1153,6 @@ fn background_status_should_publish(status: &str) -> bool {
 
 fn background_status_requires_selector_refresh(status: &str) -> bool {
     status.starts_with("Auto-pick switched") || status.starts_with("Auto-pick selected")
-}
-
-fn format_connection_line(connection: &ConnectionInfo, max_width: usize) -> String {
-    let source = format_connection_source(connection);
-    let target = format_connection_target(connection);
-    let chain = if connection.chains.is_empty() {
-        "-".to_string()
-    } else {
-        connection.chains.join(" -> ")
-    };
-    let rule = connection.rule.as_deref().unwrap_or("-");
-    truncate_for_width(
-        &format!("{source:<14} {target:<28} {chain}  {rule}"),
-        max_width,
-    )
-}
-
-fn format_connection_source(connection: &ConnectionInfo) -> String {
-    let kind = connection.metadata.kind.as_deref().unwrap_or("-");
-    let network = connection.metadata.network.as_deref().unwrap_or("-");
-    format!("{kind}/{network}")
-}
-
-fn format_connection_target(connection: &ConnectionInfo) -> String {
-    let target = connection
-        .metadata
-        .host
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .or(connection.metadata.destination_ip.as_deref())
-        .unwrap_or("-");
-    match connection.metadata.destination_port.as_deref() {
-        Some(port) if !port.is_empty() => format!("{target}:{port}"),
-        _ => target.to_string(),
-    }
 }
 
 fn connection_is_direct(connection: &ConnectionInfo) -> bool {
@@ -2620,107 +1166,12 @@ fn is_direct_chain_name(value: &str) -> bool {
     value.eq_ignore_ascii_case("direct") || value == "国内直连"
 }
 
-fn format_bytes_opt(bytes: Option<u64>) -> String {
-    bytes.map(format_bytes).unwrap_or_else(|| "-".to_string())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit_index = 0;
-    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit_index += 1;
-    }
-    if unit_index == 0 {
-        format!("{bytes}B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit_index])
-    }
-}
-
-fn subscription_report_badge(report: &SubscriptionRefreshOutput) -> String {
-    report
-        .providers
-        .iter()
-        .map(|provider| {
-            let warning = provider
-                .warning
-                .as_ref()
-                .map(|warning| format!(" {}", truncate_for_width(warning, 24)))
-                .unwrap_or_default();
-            format!(
-                "{}:{}:{} nodes{}",
-                provider.provider, provider.status, provider.imported_nodes, warning
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_duration_badge(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs >= 24 * 60 * 60 {
-        let days = secs / (24 * 60 * 60);
-        let hours = (secs % (24 * 60 * 60)) / 3600;
-        if hours == 0 {
-            format!("{days}d")
-        } else {
-            format!("{days}d{hours}h")
-        }
-    } else if secs >= 3600 {
-        let hours = secs / 3600;
-        let minutes = (secs % 3600) / 60;
-        if minutes == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h{minutes}m")
-        }
-    } else if secs >= 60 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
 fn benchmark_job_kind_label(kind: &BenchmarkJobKind) -> &'static str {
     match kind {
         BenchmarkJobKind::Group => "group",
         BenchmarkJobKind::AutoSelect => "auto",
         BenchmarkJobKind::SingleNode { .. } => "single",
     }
-}
-
-fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let [vertical] = Layout::vertical([Constraint::Length(height)])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(area);
-    let [horizontal] = Layout::horizontal([Constraint::Length(width)])
-        .flex(ratatui::layout::Flex::Center)
-        .areas(vertical);
-    horizontal
-}
-
-fn truncate_for_width(value: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let width = unicode_width::UnicodeWidthStr::width(value);
-    if width <= max_width {
-        return value.to_string();
-    }
-    let mut output = String::new();
-    let mut current_width = 0;
-    for ch in value.chars() {
-        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + char_width + 1 > max_width {
-            break;
-        }
-        output.push(ch);
-        current_width += char_width;
-    }
-    output.push('…');
-    output
 }
 
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
@@ -3636,86 +2087,6 @@ fn windows_system_proxy_script_path() -> Option<PathBuf> {
     None
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Focus {
-    Groups,
-    Members,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LeftPaneSection {
-    Internet,
-    Intranet,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum IntranetDetailSection {
-    Dns,
-    Routes,
-    Domains,
-}
-
-impl IntranetDetailSection {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Dns => "dns",
-            Self::Routes => "routes",
-            Self::Domains => "domains",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct IntranetDetailSectionRange {
-    section: IntranetDetailSection,
-    start: usize,
-    end: usize,
-    foldable: bool,
-}
-
-struct IntranetDetailView {
-    lines: Vec<Line<'static>>,
-    sections: Vec<IntranetDetailSectionRange>,
-}
-
-#[derive(Clone, Debug)]
-struct LatencyChartState {
-    selector: String,
-    node: String,
-    samples: Vec<NodeLatencySample>,
-    window: Duration,
-    last_refresh: Instant,
-}
-
-struct OnboardingState {
-    input: String,
-    message: String,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SettingsField {
-    BenchmarkUrl,
-    BenchmarkTimeoutMs,
-    RequestTimeoutSec,
-    MaxConcurrency,
-    VerifyTargets,
-    AutoPickThresholdMs,
-    AutoPickIntervalSec,
-    SystemProxyServer,
-    ChinaIpRouting,
-    PrivateAccessProfile,
-    PrivateAccessManifestPath,
-    PrivateAccessMode,
-    PrivateAccessServer,
-    PrivateAccessPort,
-    PrivateAccessUsername,
-    PrivateAccessPassword,
-    PrivateAccessPasswordEnv,
-    PrivateAccessBridgeListen,
-    PrivateAccessUseInternetProxy,
-    PrivateAccessTlsVerify,
-}
-
 fn helper_command_uses_sudo(command: &[String]) -> bool {
     command
         .first()
@@ -3756,12 +2127,6 @@ pub(crate) fn tun_helper_needs_sudo() -> bool {
 #[cfg(not(unix))]
 pub(crate) fn tun_helper_needs_sudo() -> bool {
     false
-}
-
-struct SettingsEditState {
-    field: SettingsField,
-    input: String,
-    error: Option<String>,
 }
 
 struct App {
@@ -3864,72 +2229,9 @@ struct VerifyJob {
     worker: JoinHandle<()>,
 }
 
-#[derive(Clone, Debug)]
-struct PrivateAccessProgressModal {
-    profile_index: usize,
-    title: String,
-    entries: Vec<PrivateAccessProgressEntry>,
-    done: bool,
-}
-
-struct PrivateAccessAuthModal {
-    profile_index: usize,
-    service: String,
-    session_id: String,
-    challenge_id: String,
-    title: String,
-    message: String,
-    fields: Vec<PrivateAccessAuthField>,
-    buttons: Vec<String>,
-    inputs: Vec<String>,
-    field_index: usize,
-    error: Option<String>,
-}
-
-impl Drop for PrivateAccessAuthModal {
-    fn drop(&mut self) {
-        self.session_id.zeroize();
-        self.challenge_id.zeroize();
-        self.inputs.zeroize();
-    }
-}
-
 fn apply_internet_tun_persistence(state: &mut TuiRuntimeState, persisted: PersistedInternetTun) {
     state.tun_enabled = persisted.enabled();
     state.tun_auto_detect_interface_before_enable = persisted.restore_auto_detect_interface();
-}
-
-#[derive(Clone, Debug)]
-struct PrivateAccessProgressEntry {
-    tone: PrivateAccessProgressTone,
-    text: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrivateAccessProgressTone {
-    Info,
-    Success,
-    Error,
-}
-
-impl PrivateAccessProgressTone {
-    fn prefix(self) -> &'static str {
-        match self {
-            Self::Info => "[..] ",
-            Self::Success => "[OK] ",
-            Self::Error => "[ERR] ",
-        }
-    }
-
-    fn style(self) -> Style {
-        match self {
-            Self::Info => Style::default().fg(Color::Cyan),
-            Self::Success => Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        }
-    }
 }
 
 struct TuiPrivateAccessNetworkIntegration<'a> {
@@ -4019,135 +2321,6 @@ impl PrivateAccessNetworkIntegration for TuiPrivateAccessNetworkIntegration<'_> 
     }
 }
 
-#[cfg(test)]
-fn private_access_profile_badge(
-    profile: &PrivateAccessProfileRuntime,
-    focused: bool,
-) -> Vec<Span<'static>> {
-    let label = if profile.background_pid.is_some() {
-        "BACKGROUND"
-    } else {
-        private_access_state_badge(profile.state.clone())
-    };
-    let state_style = private_access_state_style(&profile.state);
-    let id_style = if focused {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    vec![
-        Span::styled("[", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            if focused { ">" } else { "" },
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(profile.id.clone(), id_style),
-        Span::raw(" "),
-        Span::styled(label, state_style),
-        Span::styled("]", Style::default().fg(Color::DarkGray)),
-    ]
-}
-
-#[cfg(test)]
-fn private_access_summary_line(runtime: &PrivateAccessRuntime) -> Option<Line<'static>> {
-    let focused = runtime.focused_opt()?;
-    let mut spans = vec![Span::styled(
-        "private access: ",
-        Style::default().fg(Color::DarkGray),
-    )];
-    for (index, profile) in runtime.profiles.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
-        }
-        spans.extend(private_access_profile_badge(
-            profile,
-            index == runtime.focused_index,
-        ));
-    }
-    if !focused.routes.is_empty() {
-        spans.push(Span::styled(
-            format!(" routes={}", focused.routes.len()),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-    spans.push(Span::styled(
-        format!(" mode={}", focused.mode.as_str()),
-        Style::default().fg(Color::DarkGray),
-    ));
-    if matches!(
-        focused.state,
-        PrivateAccessState::Connected | PrivateAccessState::Connecting
-    ) {
-        match focused.mode {
-            PrivateAccessMode::Bridge => {
-                let bridge = focused
-                    .bridge
-                    .as_ref()
-                    .map(|bridge| bridge.listen.as_str())
-                    .unwrap_or(focused.bridge_listen.as_str());
-                spans.push(Span::styled(
-                    format!(" bridge={bridge}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            PrivateAccessMode::Tun => spans.push(Span::styled(
-                " data=tun",
-                Style::default().fg(Color::DarkGray),
-            )),
-        }
-    }
-    if let Some(error) = focused.last_error.as_ref() {
-        spans.push(Span::raw(" error="));
-        spans.push(Span::styled(
-            truncate_for_width(error, 48),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-    }
-    if let Some(pid) = focused.background_pid {
-        spans.push(Span::styled(
-            format!(" pid={pid}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Some(Line::from(spans))
-}
-
-fn private_access_progress_title(profile: &PrivateAccessProfileRuntime) -> String {
-    format!(
-        "Private Access - {} ({})",
-        profile.id,
-        profile.mode.as_str()
-    )
-}
-
-fn private_access_state_badge(state: PrivateAccessState) -> &'static str {
-    match state {
-        PrivateAccessState::Disabled => "DISABLED",
-        PrivateAccessState::Disconnected => "DISCONNECTED",
-        PrivateAccessState::Connecting => "CONNECTING",
-        PrivateAccessState::Connected => "CONNECTED",
-        PrivateAccessState::Disconnecting => "DISCONNECTING",
-        PrivateAccessState::Error => "ERROR",
-    }
-}
-
-fn private_access_state_style(state: &PrivateAccessState) -> Style {
-    match state {
-        PrivateAccessState::Connected => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        PrivateAccessState::Connecting | PrivateAccessState::Disconnecting => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        PrivateAccessState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        PrivateAccessState::Disabled | PrivateAccessState::Disconnected => {
-            Style::default().fg(Color::DarkGray)
-        }
-    }
-}
-
 fn private_access_profile_settings_locked(profile: &PrivateAccessProfileRuntime) -> bool {
     profile.settings_locked()
 }
@@ -4188,6 +2361,176 @@ impl SubscriptionRefreshState {
 }
 
 impl App {
+    fn presentation_snapshot(&mut self) -> DashboardSnapshot<'_> {
+        let flash = self.flash_message();
+        let implicit_root_mode = self.implicit_root_mode();
+        let implicit_current = self
+            .implicit_root_group()
+            .and_then(|root| root.current.as_deref());
+        let internet_rows = self
+            .displayed_group_names()
+            .into_iter()
+            .map(|name| {
+                let current = self
+                    .group_by_name(&name)
+                    .and_then(|group| group.current.as_deref())
+                    .unwrap_or("unset")
+                    .to_string();
+                let is_current = implicit_root_mode && implicit_current == Some(name.as_str());
+                InternetRow {
+                    name,
+                    current,
+                    is_current,
+                }
+            })
+            .collect();
+        let intranet_rows = self
+            .private_access
+            .profiles
+            .iter()
+            .map(|profile| IntranetRow {
+                id: profile.id.clone(),
+                state: profile.state.clone(),
+                background: profile.background_pid.is_some(),
+            })
+            .collect();
+
+        let displayed_members = self.displayed_members();
+        let selected_group = self.selected_member_panel_group();
+        let selected_benchmark = self.selected_benchmark();
+        let candidate_rows = selected_group
+            .map(|group| {
+                displayed_members
+                    .iter()
+                    .map(|member| {
+                        let result =
+                            selected_benchmark.and_then(|summary| summary.find_result(member));
+                        let (marker, tone) = match result {
+                            Some(result) if !result.completed => {
+                                (result.display_delay(), CandidateTone::Pending)
+                            }
+                            Some(result) if result.delay.is_some() => {
+                                (result.display_delay(), CandidateTone::Success)
+                            }
+                            Some(result) => (result.display_delay(), CandidateTone::Error),
+                            None => ("-".to_string(), CandidateTone::Missing),
+                        };
+                        CandidateRow {
+                            name: member.clone(),
+                            is_current: group.current.as_deref() == Some(member.as_str()),
+                            marker,
+                            tone,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let candidate_title = selected_group
+            .map(|group| {
+                format!(
+                    "Candidates for {} [{}]",
+                    group.name,
+                    node_order_badge(self.latency_sort_mode)
+                )
+            })
+            .unwrap_or_else(|| {
+                format!("Candidates [{}]", node_order_badge(self.latency_sort_mode))
+            });
+
+        let showing_intranet_details = self.showing_intranet_details();
+        let intranet_detail = if showing_intranet_details {
+            self.private_access
+                .focused_opt()
+                .map(|profile| IntranetDetailSnapshot {
+                    profile,
+                    expanded_sections: &self.expanded_intranet_sections,
+                    scroll: self.intranet_detail_scroll,
+                    active: self.focus == Focus::Members,
+                })
+        } else {
+            None
+        };
+
+        let mut selection_context = format!(
+            "clash={}  Pick={}  filter='{}'",
+            self.clash_mode_label(),
+            pick_mode_badge(self.auto_select_enabled),
+            self.benchmark_filter
+        );
+        if showing_intranet_details {
+            selection_context.push_str("  Intranet details are shown in the right panel");
+        }
+        let footer = if let Some(input) = self.filter_input.as_ref() {
+            StatusFooter::Filter(input.clone())
+        } else if let Some(input) = self.bypass_input.as_ref() {
+            StatusFooter::Bypass(input.clone())
+        } else {
+            StatusFooter::Status(self.status_line())
+        };
+        let status = StatusSnapshot {
+            system_proxy_enabled: self.system_proxy_enabled,
+            tun_enabled: self.internet_tun.is_enabled(),
+            selection_context,
+            connections: self.connections_summary_line(),
+            subscription: self.subscription_summary_line(),
+            sing_box: self.sing_box_summary_line(),
+            footer,
+        };
+
+        let connections = self.show_connections.then(|| ConnectionsPanelSnapshot {
+            summary: self.connections_summary_line(),
+            connections: &self.connections,
+            error: self.connection_error.as_deref(),
+        });
+        let settings = self.show_settings.then(|| {
+            let fields = visible_settings_fields(self);
+            let rows = fields
+                .iter()
+                .map(|field| SettingRow {
+                    label: settings_field_label(*field),
+                    value: settings_field_display_value(self, *field),
+                })
+                .collect::<Vec<_>>();
+            let editing = self
+                .settings_edit
+                .as_ref()
+                .map(|edit| (settings_field_label(edit.field), edit.input.clone()));
+            let error = self
+                .settings_edit
+                .as_ref()
+                .and_then(|edit| edit.error.clone())
+                .or_else(|| self.settings_error.clone());
+            SettingsPanelSnapshot {
+                selected: self.settings_index.min(rows.len().saturating_sub(1)),
+                rows,
+                editing,
+                error,
+            }
+        });
+
+        DashboardSnapshot {
+            focus: self.focus,
+            left_pane_section: self.left_pane_section,
+            internet_rows,
+            internet_selected: self.displayed_group_index(),
+            intranet_rows,
+            intranet_selected: self.private_access.focused_index,
+            candidate_title,
+            candidate_rows,
+            candidate_selected: self.displayed_member_index(),
+            intranet_detail,
+            status,
+            flash,
+            latency_chart: self.latency_chart.as_ref(),
+            connections,
+            help_index: self.show_help.then_some(self.help_index),
+            settings,
+            onboarding: self.onboarding.as_ref(),
+            private_access_progress: self.private_access_progress.as_ref(),
+            private_access_auth: self.private_access_auth.as_ref(),
+        }
+    }
+
     fn new(
         client: ApiClient,
         benchmark_max_concurrency: usize,
@@ -5299,7 +3642,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_help_previous(),
                 KeyCode::Char('g') => self.help_index = 0,
-                KeyCode::Char('G') => self.help_index = HELP_BINDINGS.len().saturating_sub(1),
+                KeyCode::Char('G') => self.help_index = help_binding_count().saturating_sub(1),
                 KeyCode::Char('q') => return Ok(false),
                 _ => {}
             }
@@ -5841,7 +4184,7 @@ impl App {
     }
 
     fn move_help_next(&mut self) {
-        self.help_index = (self.help_index + 1).min(HELP_BINDINGS.len().saturating_sub(1));
+        self.help_index = (self.help_index + 1).min(help_binding_count().saturating_sub(1));
     }
 
     fn move_help_previous(&mut self) {
@@ -5876,6 +4219,7 @@ impl App {
             node: node.clone(),
             samples,
             window: LATENCY_CHART_DEFAULT_WINDOW,
+            threshold_ms: self.auto_select_threshold_ms,
             last_refresh: Instant::now(),
         });
         self.set_status_only(format!("Showing {} latency samples for {}", count, node));
@@ -7799,22 +6143,17 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::process_alive_via_ps;
     use super::{
-        App, AutoSelectSwitchPlan, BackgroundLatencyResult, BackgroundLatencySnapshot,
-        CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
-        IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LatencyChartTimeUnit, LeftPaneSection, PrivateAccessMode,
+        AUTO_SELECT_THRESHOLD_MS, App, AutoSelectSwitchPlan, BackgroundLatencyResult,
+        BackgroundLatencySnapshot, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
+        GLOBAL_CLASH_MODE, IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW,
+        LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LeftPaneSection, PrivateAccessMode,
         PrivateAccessProfileRuntime, PrivateAccessProgressTone, PrivateAccessRuntime,
         PrivateAccessState, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
         SettingsEditState, SettingsField, command_matches_headless_auto_pick, connection_is_direct,
-        format_bytes, format_connection_line, format_duration_badge,
-        is_private_access_settings_field, latency_chart_segments, latency_chart_threshold_line,
-        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
-        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
-        normalize_http_connect_proxy, private_access_auth_display_value,
-        private_access_auth_initial_value, private_access_summary_line,
+        is_private_access_settings_field, next_clash_mode, normalize_http_connect_proxy,
+        private_access_auth_display_value, private_access_auth_initial_value,
         settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
-        status_lines, subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
-        visible_settings_fields,
+        system_proxy_bypass_entries, truncate_for_width, visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -7825,14 +6164,11 @@ mod tests {
     use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
     use crate::managed_sing_box::ManagedSingBox;
     use crate::private_access::{
-        PrivateAccessAuthField, PrivateAccessBridge, PrivateAccessRoute, default_hillstone_manifest,
+        PrivateAccessAuthField, PrivateAccessRoute, default_hillstone_manifest,
     };
-    use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState, TuiStateStore};
     use crossterm::event::KeyCode;
     use crossterm::event::MouseEventKind;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
     use reqwest::Client as AsyncClient;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -8028,63 +6364,33 @@ mod tests {
 
     #[test]
     fn tun_toggle_is_documented_in_help_and_status_bar() {
-        let app = test_app();
-        assert!(
-            super::HELP_BINDINGS
-                .iter()
-                .any(|binding| binding.key == "\\" && binding.summary == "Toggle TUN mode")
-        );
-        let status_bar = status_lines(&app)
-            .into_iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(status_bar.contains("System Proxy: disabled"));
-        assert!(status_bar.contains("Tun Mode: disabled"));
-        assert!(!status_bar.contains("Controller:"));
-        assert!(!status_bar.contains("order="));
-        assert!(!status_bar.contains("Arrows/jk"));
+        let mut app = test_app();
+        let snapshot = app.presentation_snapshot();
+        assert!(!snapshot.status.system_proxy_enabled);
+        assert!(!snapshot.status.tun_enabled);
+        assert!(!snapshot.status.selection_context.contains("Controller:"));
+        assert!(!snapshot.status.selection_context.contains("order="));
+        assert!(!snapshot.status.selection_context.contains("Arrows/jk"));
     }
 
     #[test]
-    fn status_header_combines_proxy_tun_filter_clash_and_pick_mode() {
+    fn status_header_tracks_filter_clash_and_pick_mode() {
         let mut app = test_app();
         app.auto_select_enabled = false;
         app.benchmark_filter = "-香港,-广告".to_string();
-        let mut summary = BenchmarkSummary::empty("select".to_string());
-        summary.pattern = "-香港,-广告".to_string();
-        app.benchmarks.insert("select".to_string(), summary);
 
-        let lines = status_lines(&app)
-            .into_iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        let header = &lines[0];
-        assert!(header.contains("System Proxy: disabled"));
-        assert!(header.contains("Tun Mode: disabled"));
-        assert!(header.contains("filter='-香港,-广告'"));
-        assert!(header.contains("clash="));
-        assert!(header.contains("Pick=Manual"));
-        assert!(!lines.iter().any(|line| line.contains("tested=")));
-        assert!(!lines.iter().any(|line| line.contains("auto=")));
-    }
-
-    #[test]
-    fn status_header_shows_live_filter_and_auto_pick_without_benchmark_results() {
-        let mut app = test_app();
+        let snapshot = app.presentation_snapshot();
+        let context = &snapshot.status.selection_context;
+        assert!(context.contains("filter='-香港,-广告'"));
+        assert!(context.contains("clash="));
+        assert!(context.contains("Pick=Manual"));
+        assert!(!context.contains("tested="));
+        assert!(!context.contains("auto="));
         app.auto_select_enabled = true;
-        app.benchmark_filter = "-香港,-广告".to_string();
 
-        let lines = status_lines(&app)
-            .into_iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        let header = &lines[0];
-        assert!(header.contains("clash="));
-        assert!(header.contains("Pick=Auto"));
-        assert!(header.contains("filter='-香港,-广告'"));
-        assert!(!lines.iter().any(|line| line.contains("tested=")));
-        assert!(!lines.iter().any(|line| line.contains("auto=")));
+        let snapshot = app.presentation_snapshot();
+        let context = &snapshot.status.selection_context;
+        assert!(context.contains("Pick=Auto"));
     }
 
     #[test]
@@ -8093,25 +6399,14 @@ mod tests {
         app.benchmark_filter.clear();
         app.left_pane_section = LeftPaneSection::Intranet;
 
-        let header = line_text(status_lines(&app).remove(0));
-        assert!(header.contains("filter=''"));
-        assert!(header.contains("Intranet details are shown in the right panel"));
-    }
-
-    #[test]
-    fn status_message_renders_below_the_box_border() {
-        let mut app = test_app();
-        app.set_status_only("Latency filter edit canceled");
-
-        let lines = rendered_app_lines(&mut app);
-        let message_row = lines
-            .iter()
-            .position(|line| line.contains("Latency filter edit canceled"))
-            .expect("status message row");
-        assert!(message_row > 0);
-        assert!(!lines[message_row].contains('─'));
-        assert!(lines[message_row - 1].contains('└'));
-        assert!(lines[message_row - 1].contains('┘'));
+        let snapshot = app.presentation_snapshot();
+        assert!(snapshot.status.selection_context.contains("filter=''"));
+        assert!(
+            snapshot
+                .status
+                .selection_context
+                .contains("Intranet details are shown in the right panel")
+        );
     }
 
     #[test]
@@ -8195,13 +6490,6 @@ mod tests {
         assert!(visible_settings_fields(&app).contains(&SettingsField::ChinaIpRouting));
     }
 
-    fn line_text(line: ratatui::text::Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-    }
-
     fn private_access_progress_text(app: &App) -> String {
         app.private_access_progress
             .as_ref()
@@ -8214,25 +6502,6 @@ mod tests {
                     .join("\n")
             })
             .unwrap_or_default()
-    }
-
-    fn rendered_app_lines(app: &mut App) -> Vec<String> {
-        let backend = TestBackend::new(140, 52);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        terminal
-            .draw(|frame| super::draw(frame, app))
-            .expect("draw TUI");
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(140)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect()
-    }
-
-    fn rendered_app_text(app: &mut App) -> String {
-        rendered_app_lines(app).join("\n")
     }
 
     fn internet_routes_app() -> App {
@@ -8285,47 +6554,14 @@ mod tests {
     }
 
     #[test]
-    fn left_pane_hides_intranet_section_without_configured_profiles() {
-        let mut app = test_app_without_private_access();
-
-        let screen = rendered_app_text(&mut app);
-
-        assert!(screen.contains("Internet Proxy"));
-        assert!(!screen.contains("Intranet Proxy"));
-    }
-
-    #[test]
-    fn selected_private_access_profile_renders_intranet_details() {
+    fn intranet_detail_navigation_scrolls() {
         let mut app = test_app();
-        let profile = app.private_access.focused_mut();
-        profile.server = "vpn.example.com".to_string();
-        profile.state = PrivateAccessState::Connected;
-        profile.routes = vec![
-            PrivateAccessRoute {
-                cidr: "10.20.0.0/16".to_string(),
-            },
-            PrivateAccessRoute {
-                cidr: "172.20.4.0/24".to_string(),
-            },
-        ];
-        profile.dns = vec!["10.20.0.53".to_string()];
-        profile.domains = vec!["portal.internal.example".to_string()];
-        profile.domain_suffixes = vec!["corp.example".to_string()];
-        app.focus = Focus::Groups;
+        app.private_access.focused_mut().routes = vec![PrivateAccessRoute {
+            cidr: "10.20.0.0/16".to_string(),
+        }];
+        app.focus = Focus::Members;
         app.left_pane_section = LeftPaneSection::Intranet;
 
-        let screen = rendered_app_text(&mut app);
-
-        assert!(screen.contains("Internet Proxy"));
-        assert!(screen.contains("Intranet Proxy"));
-        assert!(screen.contains("Intranet: hillstone"));
-        assert!(screen.contains("vpn.example.com:4433"));
-        assert!(screen.contains("10.20.0.0/16"));
-        assert!(screen.contains("10.20.0.53"));
-        assert!(screen.contains("portal.internal.example"));
-        assert!(screen.contains("*.corp.example"));
-
-        app.focus = Focus::Members;
         app.move_next();
         assert_eq!(app.intranet_detail_scroll, 1);
         app.move_previous();
@@ -8343,74 +6579,25 @@ mod tests {
         app.focus = Focus::Members;
         app.left_pane_section = LeftPaneSection::Intranet;
 
-        let collapsed = app.intranet_detail_view(app.private_access.focused());
-        let route_range = collapsed
+        let route_range = app
+            .intranet_detail_view(app.private_access.focused())
             .sections
             .iter()
             .find(|range| range.section == IntranetDetailSection::Routes)
             .copied()
             .expect("routes section");
         assert!(route_range.foldable);
-        let collapsed_text = collapsed
-            .lines
-            .iter()
-            .cloned()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(collapsed_text.contains("▶ Routes (103)"));
-        assert!(collapsed_text.contains("… 93 more item(s)"));
-        assert!(collapsed_text.contains("10.20.9.0/24"));
-        assert!(!collapsed_text.contains("10.20.10.0/24"));
 
         app.intranet_detail_scroll = route_range.start as u16;
         app.handle_key(KeyCode::Enter).expect("expand routes");
-        let expanded = app.intranet_detail_view(app.private_access.focused());
-        assert_eq!(expanded.lines.len(), collapsed.lines.len() + 92);
-        assert!(
-            expanded
-                .lines
-                .iter()
-                .cloned()
-                .map(line_text)
-                .any(|line| line.contains("▼ Routes (103)"))
+        let section_key = App::intranet_detail_section_key(
+            &app.private_access.focused().id,
+            IntranetDetailSection::Routes,
         );
+        assert!(app.expanded_intranet_sections.contains(&section_key));
 
         app.handle_key(KeyCode::Enter).expect("fold routes");
-        let folded_again = app.intranet_detail_view(app.private_access.focused());
-        assert_eq!(folded_again.lines.len(), collapsed.lines.len());
-    }
-
-    #[test]
-    fn intranet_footer_stays_fixed_and_status_omits_private_access_summary() {
-        let mut app = test_app();
-        app.private_access.focused_mut().routes = (0..40)
-            .map(|index| PrivateAccessRoute {
-                cidr: format!("172.20.{index}.0/24"),
-            })
-            .collect();
-        app.focus = Focus::Members;
-        app.left_pane_section = LeftPaneSection::Intranet;
-
-        let first = rendered_app_lines(&mut app);
-        let footer_row = first
-            .iter()
-            .position(|line| line.contains("Enter expand/fold"))
-            .expect("fixed intranet footer");
-        app.intranet_detail_scroll = 8;
-        let scrolled = rendered_app_lines(&mut app);
-        assert_eq!(
-            scrolled
-                .iter()
-                .position(|line| line.contains("Enter expand/fold")),
-            Some(footer_row)
-        );
-        assert!(
-            status_lines(&app)
-                .into_iter()
-                .map(line_text)
-                .all(|line| !line.starts_with("private access:"))
-        );
+        assert!(!app.expanded_intranet_sections.contains(&section_key));
     }
 
     #[test]
@@ -8757,67 +6944,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_helpers_format_active_rows() {
+    fn connection_helpers_classify_active_rows() {
         let direct = test_connection("example.cn", vec!["国内直连"]);
         let proxied = test_connection("www.google.com", vec!["node-a", "airtcp", "手动选择"]);
 
         assert!(connection_is_direct(&direct));
         assert!(!connection_is_direct(&proxied));
-        assert_eq!(format_bytes(512), "512B");
-        assert_eq!(format_bytes(2048), "2.0KiB");
-        assert!(format_connection_line(&proxied, 120).contains("www.google.com:443"));
-        assert!(format_connection_line(&proxied, 120).contains("node-a -> airtcp"));
-    }
-
-    #[test]
-    fn subscription_report_badge_summarizes_provider_counts() {
-        let report = SubscriptionRefreshOutput {
-            input_path: ".suburl".to_string(),
-            cache_path: ".suburl.cache.json".to_string(),
-            interval_days: 1,
-            merged_config_path: "/usr/local/etc/sing-box/config.json".to_string(),
-            backup_config_path: Some(
-                "/usr/local/etc/sing-box/config.json.sing-box-tui-subscription-backup".to_string(),
-            ),
-            providers: vec![
-                ProviderRefreshSummary {
-                    provider: "宝贝云".to_string(),
-                    subscription_url: "https://example.com?token=REDACTED".to_string(),
-                    status: "fetched".to_string(),
-                    imported_nodes: 67,
-                    fetched_at_unix: 10,
-                    warning: None,
-                },
-                ProviderRefreshSummary {
-                    provider: "airtcp".to_string(),
-                    subscription_url: "https://example.com/link/REDACTED".to_string(),
-                    status: "cached".to_string(),
-                    imported_nodes: 0,
-                    fetched_at_unix: 10,
-                    warning: Some("no mergeable nodes found".to_string()),
-                },
-            ],
-        };
-
-        let badge = subscription_report_badge(&report);
-
-        assert!(badge.contains("宝贝云:fetched:67 nodes"));
-        assert!(badge.contains("airtcp:cached:0 nodes"));
-        assert!(badge.contains("no mergeable nodes found"));
-    }
-
-    #[test]
-    fn duration_badge_uses_day_hour_minute_units() {
-        assert_eq!(format_duration_badge(Duration::from_secs(42)), "42s");
-        assert_eq!(format_duration_badge(Duration::from_secs(5 * 60)), "5m");
-        assert_eq!(
-            format_duration_badge(Duration::from_secs(2 * 3600 + 30 * 60)),
-            "2h30m"
-        );
-        assert_eq!(
-            format_duration_badge(Duration::from_secs(24 * 3600 + 3600)),
-            "1d1h"
-        );
     }
 
     #[test]
@@ -8894,7 +7026,6 @@ mod tests {
         let app = test_app_without_private_access();
 
         assert!(!app.private_access.is_configured());
-        assert!(private_access_summary_line(&app.private_access).is_none());
         assert!(app.runtime_state().private_access_profiles.is_empty());
         assert!(
             visible_settings_fields(&app)
@@ -9152,55 +7283,6 @@ mod tests {
     }
 
     #[test]
-    fn private_access_summary_shows_explicit_state_and_details() {
-        let mut app = test_app();
-        let focused = app.private_access.focused_mut();
-        focused.mode = PrivateAccessMode::Bridge;
-        focused.state = PrivateAccessState::Connected;
-        focused.routes = vec![PrivateAccessRoute {
-            cidr: "10.1.0.0/16".to_string(),
-        }];
-        focused.bridge = Some(PrivateAccessBridge {
-            kind: "http".to_string(),
-            listen: "127.0.0.1:16780".to_string(),
-        });
-
-        let connected =
-            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
-        assert!(connected.contains("[>hillstone CONNECTED]"));
-        assert!(connected.contains("routes=1"));
-        assert!(connected.contains("mode=bridge"));
-        assert!(connected.contains("bridge=127.0.0.1:16780"));
-
-        let focused = app.private_access.focused_mut();
-        focused.state = PrivateAccessState::Error;
-        focused.last_error = Some("session_failed: auth rejected".to_string());
-
-        let errored =
-            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
-        assert!(errored.contains("[>hillstone ERROR]"));
-        assert!(errored.contains("error=session_failed: auth rejected"));
-    }
-
-    #[test]
-    fn private_access_tun_summary_does_not_show_bridge_listener() {
-        let mut app = test_app();
-        let focused = app.private_access.focused_mut();
-        focused.mode = PrivateAccessMode::Tun;
-        focused.state = PrivateAccessState::Connected;
-        focused.routes = vec![PrivateAccessRoute {
-            cidr: "10.1.0.0/16".to_string(),
-        }];
-
-        let summary =
-            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
-
-        assert!(summary.contains("mode=tun"));
-        assert!(summary.contains("data=tun"));
-        assert!(!summary.contains("bridge=127.0.0.1:16780"));
-    }
-
-    #[test]
     fn private_access_background_session_is_shown_as_background() {
         let mut app = test_app();
         let pid = std::process::id();
@@ -9215,10 +7297,6 @@ mod tests {
             PrivateAccessState::Connected
         );
         assert_eq!(app.private_access.focused().background_pid, Some(pid));
-        let summary =
-            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
-        assert!(summary.contains("BACKGROUND"), "{summary}");
-        assert!(summary.contains(&format!("pid={pid}")), "{summary}");
         assert_eq!(
             app.runtime_state().private_access_profiles[0].background_pid,
             Some(pid)
@@ -9292,9 +7370,6 @@ mod tests {
                 .as_deref(),
             Some("tun")
         );
-        let summary =
-            line_text(private_access_summary_line(&app.private_access).expect("summary line"));
-        assert!(summary.contains("mode=tun"));
     }
 
     #[test]
@@ -9982,96 +8057,6 @@ mod tests {
     }
 
     #[test]
-    fn latency_chart_segments_break_on_failed_samples() {
-        let samples = vec![
-            NodeLatencySample {
-                recorded_at_ms: 1_000,
-                delay_ms: Some(90),
-            },
-            NodeLatencySample {
-                recorded_at_ms: 2_000,
-                delay_ms: None,
-            },
-            NodeLatencySample {
-                recorded_at_ms: 3_000,
-                delay_ms: Some(120),
-            },
-        ];
-
-        assert_eq!(
-            latency_chart_segments(&samples),
-            vec![vec![(1_000, 90)], vec![(3_000, 120)]]
-        );
-    }
-
-    #[test]
-    fn latency_chart_uses_minutes_for_short_windows_and_hours_for_long_windows() {
-        assert_eq!(
-            latency_chart_time_unit(Duration::from_secs(30 * 60)),
-            LatencyChartTimeUnit::Minutes
-        );
-        assert_eq!(
-            latency_chart_time_unit(Duration::from_secs(3 * 60 * 60)),
-            LatencyChartTimeUnit::Hours
-        );
-    }
-
-    #[test]
-    fn latency_chart_zoom_adjusts_window() {
-        assert_eq!(
-            latency_chart_zoom_in(Duration::from_secs(60 * 60)),
-            Duration::from_secs(30 * 60)
-        );
-        assert_eq!(
-            latency_chart_zoom_out(Duration::from_secs(60 * 60)),
-            Duration::from_secs(2 * 60 * 60)
-        );
-    }
-
-    #[test]
-    fn latency_chart_threshold_line_spans_the_visible_window() {
-        assert_eq!(
-            latency_chart_threshold_line(30.0, 600),
-            vec![(0.0, 600.0), (30.0, 600.0)]
-        );
-    }
-
-    #[test]
-    fn latency_chart_y_bounds_include_threshold() {
-        let low_latency_bounds = latency_chart_y_bounds(80.0, 120.0, 600);
-        assert!(low_latency_bounds[0] <= 80.0);
-        assert!(low_latency_bounds[1] > 600.0);
-
-        let high_latency_bounds = latency_chart_y_bounds(700.0, 900.0, 600);
-        assert!(high_latency_bounds[0] < 600.0);
-        assert!(high_latency_bounds[1] >= 900.0);
-    }
-
-    #[test]
-    fn latency_chart_window_keeps_recent_samples() {
-        let samples = vec![
-            NodeLatencySample {
-                recorded_at_ms: 0,
-                delay_ms: Some(90),
-            },
-            NodeLatencySample {
-                recorded_at_ms: 45 * 60 * 1000,
-                delay_ms: Some(120),
-            },
-            NodeLatencySample {
-                recorded_at_ms: 60 * 60 * 1000,
-                delay_ms: Some(80),
-            },
-        ];
-
-        let visible = latency_chart_windowed_samples(&samples, Duration::from_secs(30 * 60));
-
-        assert_eq!(visible.len(), 2);
-        assert_eq!(visible[0].recorded_at_ms, 45 * 60 * 1000);
-        assert_eq!(visible[1].recorded_at_ms, 60 * 60 * 1000);
-    }
-
-    #[test]
     fn z_and_shift_z_zoom_latency_chart() {
         let mut app = test_app();
         app.latency_chart = Some(LatencyChartState {
@@ -10082,6 +8067,7 @@ mod tests {
                 delay_ms: Some(90),
             }],
             window: LATENCY_CHART_DEFAULT_WINDOW,
+            threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now(),
         });
 
@@ -10119,6 +8105,7 @@ mod tests {
             node: "node-a".to_string(),
             samples: Vec::new(),
             window: LATENCY_CHART_DEFAULT_WINDOW,
+            threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
         });
 
