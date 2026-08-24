@@ -803,21 +803,6 @@ pub(crate) struct BenchmarkSummary {
     pub(crate) results: Vec<BenchmarkResult>,
 }
 
-#[derive(Clone)]
-pub(crate) enum BenchmarkJobKind {
-    Group,
-    AutoSelect,
-    SingleNode { node: String },
-}
-
-pub(crate) struct BenchmarkJob {
-    pub(crate) group: String,
-    pub(crate) nodes: Vec<String>,
-    pub(crate) kind: BenchmarkJobKind,
-    pub(crate) receiver: std::sync::mpsc::Receiver<BenchmarkEvent>,
-    pub(crate) worker: JoinHandle<()>,
-}
-
 pub(crate) enum BenchmarkEvent {
     Progress(BenchmarkResult),
     Finished,
