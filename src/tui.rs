@@ -4,8 +4,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -51,8 +49,10 @@ use crate::defaults::{
     DEFAULT_SELECTOR_TAG, DEFAULT_VERIFICATION_TARGETS, REFRESH_DEBOUNCE,
     SINGLE_NODE_RETEST_DEBOUNCE,
 };
-#[cfg(target_os = "macos")]
-use crate::macos_privileged_helper;
+use crate::managed_sing_box::{
+    AuthorizationRequirement, ControllerProbe, ManagedSingBox, RestartReceipt,
+    wait_for_controller_ready,
+};
 use crate::private_access::{
     ExternalPrivateAccessService, PrivateAccessAuthField, PrivateAccessBridge,
     PrivateAccessCommand, PrivateAccessEvent, PrivateAccessRoute, PrivateAccessSecret,
@@ -94,6 +94,13 @@ const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &["localhost", "127.*"];
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
+
+impl ControllerProbe for ApiClient {
+    fn probe_controller(&self) -> Result<()> {
+        self.fetch_config().map(|_| ())
+    }
+}
+
 const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::BenchmarkUrl,
     SettingsField::BenchmarkTimeoutMs,
@@ -3036,1312 +3043,6 @@ fn run_system_proxy_update(
     bail!("system proxy toggle is only available on Windows, macOS, and Linux")
 }
 
-struct SingBoxRestartResult {
-    restarted_pids: Vec<u32>,
-    started_pid: u32,
-    child: Option<Child>,
-    elevated: bool,
-    privileged_helper: bool,
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-const SING_BOX_START_MAX_ATTEMPTS: usize = 9;
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-const SING_BOX_START_RETRY_BACKOFF: Duration = Duration::from_millis(200);
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(500);
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-const SING_BOX_STOP_GRACE: Duration = Duration::from_secs(3);
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn resolve_sing_box_executable(executable: &Path) -> Result<PathBuf> {
-    resolve_sing_box_executable_from_path(executable, env::var_os("PATH").as_deref())
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn resolve_sing_box_executable_from_path(
-    executable: &Path,
-    search_path: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
-    let executable_text = executable.to_string_lossy();
-    let explicit_path = executable.is_absolute()
-        || path_text_has_directory(&executable_text)
-        || executable
-            .parent()
-            .is_some_and(|parent| !parent.as_os_str().is_empty());
-    if explicit_path {
-        return executable.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve sing-box executable {}",
-                executable.display()
-            )
-        });
-    }
-
-    let search_path = search_path.with_context(|| {
-        format!(
-            "cannot resolve {} because PATH is not set",
-            executable.display()
-        )
-    })?;
-    for directory in env::split_paths(search_path) {
-        for candidate in executable_candidates_in_directory(&directory, executable) {
-            if executable_candidate_is_runnable(&candidate) {
-                return candidate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to resolve sing-box executable candidate {}",
-                        candidate.display()
-                    )
-                });
-            }
-        }
-    }
-    bail!(
-        "failed to resolve sing-box executable {}: program was not found in PATH",
-        executable.display()
-    )
-}
-
-#[cfg(windows)]
-fn executable_candidates_in_directory(directory: &Path, executable: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![directory.join(executable)];
-    if executable.extension().is_none() {
-        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        for extension in extensions.split(';').filter(|value| !value.is_empty()) {
-            let mut name = executable.as_os_str().to_os_string();
-            name.push(extension);
-            candidates.push(directory.join(name));
-        }
-    }
-    candidates
-}
-
-#[cfg(not(windows))]
-fn executable_candidates_in_directory(directory: &Path, executable: &Path) -> Vec<PathBuf> {
-    vec![directory.join(executable)]
-}
-
-#[cfg(unix)]
-fn executable_candidate_is_runnable(candidate: &Path) -> bool {
-    candidate
-        .metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn executable_candidate_is_runnable(candidate: &Path) -> bool {
-    candidate.is_file()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SingBoxRestartSummary {
-    restarted_pids: Vec<u32>,
-    started_pid: u32,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn restart_sing_box_for_config(
-    executable: &Path,
-    config_path: &Path,
-    elevate: bool,
-) -> Result<SingBoxRestartResult> {
-    let executable = resolve_sing_box_executable(executable)?;
-    let config_path = config_path.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve sing-box config {}",
-            config_path.display()
-        )
-    })?;
-    #[cfg(target_os = "macos")]
-    if should_use_macos_privileged_helper(macos_privileged_helper::helper_available()) {
-        let started_pid = macos_privileged_helper::restart(&config_path)?;
-        return Ok(SingBoxRestartResult {
-            restarted_pids: Vec::new(),
-            started_pid,
-            child: None,
-            elevated: true,
-            privileged_helper: true,
-        });
-    }
-    let pids = find_sing_box_run_pids_for_config(&executable, &config_path)?;
-    for pid in &pids {
-        if ensure_managed_sing_box_pid_identity(*pid, &executable, &config_path)? {
-            stop_sing_box_pid_escalating_for_config(*pid, &executable, &config_path)
-                .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
-        }
-    }
-
-    let use_sudo = elevate && tun_helper_needs_sudo();
-    let log_path = sing_box_process_log_path(&config_path);
-    let mut child = spawn_sing_box_with_bind_retry(&executable, &config_path, &log_path, || {
-        sing_box_run_command(&executable, &config_path, use_sudo)
-    })?;
-    // When elevated through sudo, the direct child is the sudo wrapper. Resolve the actual
-    // sing-box pid so shutdown can signal it directly (a root-owned process cannot be killed
-    // by a non-root TUI without going through sudo).
-    let started_pid = if use_sudo {
-        resolve_new_sing_box_pid_or_cleanup(&executable, &config_path, &pids, &mut child)?
-    } else {
-        child.id()
-    };
-    Ok(SingBoxRestartResult {
-        restarted_pids: pids,
-        started_pid,
-        child: Some(child),
-        elevated: use_sudo,
-        privileged_helper: false,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn should_use_macos_privileged_helper(helper_available: bool) -> bool {
-    helper_available
-}
-
-#[cfg(windows)]
-fn restart_sing_box_for_config(
-    executable: &Path,
-    config_path: &Path,
-    _elevate: bool,
-) -> Result<SingBoxRestartResult> {
-    let executable = resolve_sing_box_executable(executable)?;
-    let config_path = config_path.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve sing-box config {}",
-            config_path.display()
-        )
-    })?;
-    let pids = find_sing_box_run_pids_for_config(&executable, &config_path)?;
-    for pid in &pids {
-        if ensure_managed_sing_box_pid_identity(*pid, &executable, &config_path)? {
-            stop_sing_box_pid(*pid)
-                .with_context(|| format!("failed to stop existing sing-box process {pid}"))?;
-        }
-    }
-
-    let log_path = sing_box_process_log_path(&config_path);
-    let child = spawn_sing_box_with_bind_retry(&executable, &config_path, &log_path, || {
-        let mut command = Command::new(&executable);
-        command.arg("run").arg("--config").arg(&config_path);
-        command
-    })?;
-    let started_pid = child.id();
-    Ok(SingBoxRestartResult {
-        restarted_pids: pids,
-        started_pid,
-        child: Some(child),
-        elevated: false,
-        privileged_helper: false,
-    })
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn restart_sing_box_for_config(
-    _executable: &Path,
-    _config_path: &Path,
-    _elevate: bool,
-) -> Result<SingBoxRestartResult> {
-    bail!("automatic sing-box restart is only available on Windows, macOS, and Linux")
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn spawn_sing_box_with_bind_retry<F>(
-    executable: &Path,
-    config_path: &Path,
-    log_path: &Path,
-    mut make_command: F,
-) -> Result<Child>
-where
-    F: FnMut() -> Command,
-{
-    for attempt in 1..=SING_BOX_START_MAX_ATTEMPTS {
-        let log_offset = fs::metadata(log_path).map(|value| value.len()).unwrap_or(0);
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| {
-                format!("failed to open sing-box process log {}", log_path.display())
-            })?;
-        let stderr = log.try_clone().with_context(|| {
-            format!(
-                "failed to clone sing-box process log {}",
-                log_path.display()
-            )
-        })?;
-        let mut command = make_command();
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start {} run --config {}",
-                    executable.display(),
-                    config_path.display()
-                )
-            })?;
-        std::thread::sleep(SING_BOX_STARTUP_GRACE);
-        let status = match child.try_wait() {
-            Ok(Some(status)) => status,
-            Ok(None) => return Ok(child),
-            Err(error) => {
-                let error = anyhow::Error::new(error)
-                    .context("failed to inspect restarted sing-box process");
-                let cleanup = cleanup_uncommitted_sing_box_child(&mut child);
-                return Err(startup_error_with_cleanup(error, cleanup));
-            }
-        };
-
-        let attempt_log = read_text_from_offset(log_path, log_offset).with_context(|| {
-            format!(
-                "failed to inspect attempt {attempt} output after {executable:?} exited with {status}"
-            )
-        })?;
-        let bind_conflict = sing_box_log_reports_bind_conflict(&attempt_log);
-        if bind_conflict && attempt < SING_BOX_START_MAX_ATTEMPTS {
-            std::thread::sleep(SING_BOX_START_RETRY_BACKOFF);
-            continue;
-        }
-
-        let log_excerpt = sing_box_start_log_excerpt(&attempt_log)
-            .map(|value| format!("; last log line: {value}"))
-            .unwrap_or_default();
-        let retry_note = if bind_conflict {
-            format!(" after {attempt} startup attempts")
-        } else {
-            String::new()
-        };
-        bail!(
-            "{} exited immediately with {status}{retry_note}{log_excerpt}; see {}",
-            executable.display(),
-            log_path.display()
-        );
-    }
-    unreachable!("sing-box startup loop returns or fails on every attempt")
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn read_text_from_offset(path: &Path, offset: u64) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to read process log {}", path.display()))?;
-    let length = file.metadata()?.len();
-    file.seek(SeekFrom::Start(offset.min(length)))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn sing_box_log_reports_bind_conflict(log: &str) -> bool {
-    let log = log.to_ascii_lowercase();
-    log.contains("bind:")
-        && (log.contains("address already in use")
-            || log.contains("only one usage of each socket address"))
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn sing_box_start_log_excerpt(log: &str) -> Option<String> {
-    let line = log.lines().rev().find(|line| !line.trim().is_empty())?;
-    let mut escaped = String::new();
-    for character in line.trim().chars() {
-        escaped.extend(character.escape_default());
-        if escaped.len() >= 240 {
-            escaped.truncate(240);
-            escaped.push('…');
-            break;
-        }
-    }
-    (!escaped.is_empty()).then_some(escaped)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sing_box_run_command(executable: &Path, config_path: &Path, use_sudo: bool) -> Command {
-    if use_sudo {
-        let mut command = Command::new("sudo");
-        command
-            .arg("-n")
-            .arg(executable)
-            .arg("run")
-            .arg("--config")
-            .arg(config_path);
-        command
-    } else {
-        let mut command = Command::new(executable);
-        command.arg("run").arg("--config").arg(config_path);
-        command
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn resolve_new_sing_box_pid(
-    executable: &Path,
-    config_path: &Path,
-    exclude: &[u32],
-    wrapper_pid: u32,
-) -> Result<u32> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let pids = find_sing_box_run_pids_for_config(executable, config_path)?;
-        let descendants = process_descendant_pids(wrapper_pid)?;
-        if let Some(pid) = select_owned_sing_box_pid(&pids, exclude, wrapper_pid, &descendants) {
-            return Ok(pid);
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "sing-box did not appear in the process list after an elevated start; see {}",
-                sing_box_process_log_path(config_path).display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn select_owned_sing_box_pid(
-    matching_pids: &[u32],
-    excluded_pids: &[u32],
-    wrapper_pid: u32,
-    descendant_pids: &[u32],
-) -> Option<u32> {
-    matching_pids.iter().copied().find(|pid| {
-        !excluded_pids.contains(pid) && (*pid == wrapper_pid || descendant_pids.contains(pid))
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn resolve_new_sing_box_pid_or_cleanup(
-    executable: &Path,
-    config_path: &Path,
-    previous_pids: &[u32],
-    child: &mut Child,
-) -> Result<u32> {
-    match resolve_new_sing_box_pid(executable, config_path, previous_pids, child.id()) {
-        Ok(pid) => Ok(pid),
-        Err(error) => {
-            let cleanup = cleanup_uncommitted_sing_box_child(child);
-            Err(startup_error_with_cleanup(error, cleanup))
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_descendant_pids(root_pid: u32) -> Result<Vec<u32>> {
-    let output = Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()
-        .context("failed to list process relationships with ps")?;
-    if !output.status.success() {
-        bail!(
-            "ps exited with {} while listing process relationships",
-            output.status
-        );
-    }
-
-    let relationships = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let parent_pid = fields.next()?.parse::<u32>().ok()?;
-            Some((pid, parent_pid))
-        })
-        .collect::<Vec<_>>();
-    let mut descendants = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut frontier = vec![root_pid];
-    while !frontier.is_empty() {
-        let mut next = Vec::new();
-        for (pid, parent_pid) in &relationships {
-            if frontier.contains(parent_pid) && seen.insert(*pid) {
-                descendants.push(*pid);
-                next.push(*pid);
-            }
-        }
-        frontier = next;
-    }
-    Ok(descendants)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_child_descendants(child_pid: u32) -> Result<()> {
-    let descendants = process_descendant_pids(child_pid)?;
-    let mut failures = Vec::new();
-    for pid in descendants.into_iter().rev() {
-        if let Err(error) = stop_sing_box_pid_escalating(pid) {
-            failures.push(format!("failed to stop descendant pid {pid}: {error:#}"));
-        }
-    }
-    let remaining = process_descendant_pids(child_pid)?;
-    if !remaining.is_empty() {
-        failures.push(format!("descendant process(es) still alive: {remaining:?}"));
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!(failures.join("; "))
-    }
-}
-
-#[cfg(windows)]
-fn stop_sing_box_child_descendants(_child_pid: u32) -> Result<()> {
-    // `taskkill /T` in `stop_sing_box_pid` terminates the whole child process tree.
-    Ok(())
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn cleanup_uncommitted_sing_box_child(child: &mut Child) -> Result<()> {
-    let child_pid = child.id();
-    let mut failures = Vec::new();
-    let child_already_exited = child.try_wait().ok().flatten().is_some();
-
-    if let Err(error) = stop_sing_box_child_descendants(child_pid) {
-        failures.push(format!(
-            "failed to stop startup child descendants: {error:#}"
-        ));
-    }
-
-    if !child_already_exited {
-        match stop_sing_box_pid_escalating(child_pid) {
-            Ok(()) => {
-                if let Err(error) = child.wait() {
-                    failures.push(format!(
-                        "failed to reap startup child pid {child_pid}: {error}"
-                    ));
-                }
-            }
-            Err(error) => {
-                if child.try_wait().ok().flatten().is_none() {
-                    failures.push(format!(
-                        "failed to stop startup child pid {child_pid}: {error:#}"
-                    ));
-                }
-            }
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!(failures.join("; "))
-    }
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn startup_error_with_cleanup(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
-    match cleanup {
-        Ok(()) => error,
-        Err(cleanup_error) => error.context(format!(
-            "failed to clean up an uncommitted sing-box start: {cleanup_error:#}"
-        )),
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid_escalating(pid: u32) -> Result<()> {
-    match stop_sing_box_pid(pid) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // `process_exists` uses `kill -0`, which reports EPERM (and therefore false) for a
-            // root-owned process from a non-root user, so it cannot tell "already gone" apart from
-            // "still running but owned by root". Use `ps` instead, which lists processes regardless
-            // of ownership, so an elevated sing-box is still killed through sudo.
-            if !process_alive_via_ps(pid) {
-                return Ok(());
-            }
-            stop_sing_box_pid_sudo(pid)
-                .with_context(|| format!("unprivileged stop attempt failed first: {error:#}"))
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid_escalating_for_config(
-    pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<()> {
-    match stop_sing_box_pid(pid) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if !process_alive_via_ps(pid) {
-                return Ok(());
-            }
-            stop_sing_box_pid_sudo_verified(pid, |pid| {
-                ensure_managed_sing_box_pid_identity(pid, executable, config_path)
-            })
-            .with_context(|| format!("unprivileged stop attempt failed first: {error:#}"))
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid_sudo(pid: u32) -> Result<()> {
-    stop_sing_box_pid_sudo_verified(pid, |_| Ok(true))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid_sudo_verified<F>(pid: u32, mut verify_identity: F) -> Result<()>
-where
-    F: FnMut(u32) -> Result<bool>,
-{
-    stop_sing_box_pid_with_escalation(
-        pid,
-        SING_BOX_STOP_GRACE,
-        &mut verify_identity,
-        sudo_signal_sing_box_process,
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid_with_escalation<V, S>(
-    pid: u32,
-    grace: Duration,
-    mut verify_identity: V,
-    mut send_signal: S,
-) -> Result<()>
-where
-    V: FnMut(u32) -> Result<bool>,
-    S: FnMut(u32, bool) -> Result<()>,
-{
-    if !process_alive_via_ps(pid) {
-        return Ok(());
-    }
-    let start_token = process_start_token(pid);
-    if verify_process_instance_before_force_stop(pid, start_token, &mut verify_identity)
-        .context("refusing to signal an unverified elevated sing-box process")?
-        == ProcessInstanceVerification::Gone
-    {
-        return Ok(());
-    }
-    send_signal(pid, false)?;
-    if !process_alive_via_ps(pid) {
-        return Ok(());
-    }
-    if wait_for_processes_to_exit_with_timeout(&[pid], grace).is_ok() {
-        return Ok(());
-    }
-    if !process_alive_via_ps(pid) {
-        return Ok(());
-    }
-
-    let Some(start_token) = start_token else {
-        bail!(
-            "elevated sing-box process {pid} did not exit after SIGTERM; refusing to force stop because its process instance could not be recorded"
-        );
-    };
-    if verify_process_instance_before_force_stop(pid, Some(start_token), &mut verify_identity)
-        .context("refusing to force stop an unverified elevated sing-box process")?
-        == ProcessInstanceVerification::Gone
-    {
-        return Ok(());
-    }
-
-    send_signal(pid, true)?;
-    wait_for_processes_to_exit_with_timeout(&[pid], grace)
-        .with_context(|| format!("elevated sing-box process {pid} did not exit after SIGKILL"))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sudo_signal_sing_box_process(pid: u32, force: bool) -> Result<()> {
-    let mut command = Command::new("sudo");
-    command.args(["-n", "kill"]);
-    if force {
-        command.arg("-9");
-    }
-    let output = command.arg(pid.to_string()).output().with_context(|| {
-        format!(
-            "failed to {} elevated sing-box process {pid}",
-            if force { "force stop" } else { "stop" }
-        )
-    })?;
-    if !output.status.success() && process_alive_via_ps(pid) {
-        bail!(
-            "failed to {} elevated sing-box process {pid}: sudo kill{} exited with {}{}",
-            if force { "force stop" } else { "stop" },
-            if force { " -9" } else { "" },
-            output.status,
-            process_command_stderr(&output)
-        );
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProcessInstanceVerification {
-    Gone,
-    Verified,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn verify_process_instance_before_force_stop<F>(
-    pid: u32,
-    expected_start: Option<ProcessStartToken>,
-    verify_identity: &mut F,
-) -> Result<ProcessInstanceVerification>
-where
-    F: FnMut(u32) -> Result<bool>,
-{
-    let Some(expected_start) = expected_start else {
-        if !process_alive_via_ps(pid) {
-            return Ok(ProcessInstanceVerification::Gone);
-        }
-        bail!("process instance token is unavailable for pid {pid}");
-    };
-    match process_start_token(pid) {
-        Some(actual_start) if actual_start == expected_start => {}
-        Some(_) => bail!("PID {pid} now identifies a different process instance"),
-        None if !process_alive_via_ps(pid) => {
-            return Ok(ProcessInstanceVerification::Gone);
-        }
-        None => bail!("process instance token is unavailable for pid {pid}"),
-    }
-    if !verify_identity(pid)? {
-        if !process_alive_via_ps(pid) {
-            return Ok(ProcessInstanceVerification::Gone);
-        }
-        bail!("process identity no longer matches pid {pid}");
-    }
-    match process_start_token(pid) {
-        Some(actual_start) if actual_start == expected_start => {}
-        Some(_) => bail!("PID {pid} changed process instance during identity verification"),
-        None if !process_alive_via_ps(pid) => {
-            return Ok(ProcessInstanceVerification::Gone);
-        }
-        None => bail!(
-            "process instance token became unavailable during identity verification for pid {pid}"
-        ),
-    }
-    Ok(ProcessInstanceVerification::Verified)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_command_stderr(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn stop_sing_box_pid_escalating(pid: u32) -> Result<()> {
-    // Elevated restart is never requested outside macOS/Linux, so this just falls
-    // back to the platform stop path (taskkill on Windows). It keeps the elevated
-    // branch in `stop_managed_sing_box_process` compilable on every platform.
-    stop_sing_box_pid(pid)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_known_elevated_sing_box_pid(pid: u32, executable: &Path, config_path: &Path) -> Result<()> {
-    stop_sing_box_pid_sudo_verified(pid, |pid| {
-        ensure_managed_sing_box_pid_identity(pid, executable, config_path)
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn stop_known_elevated_sing_box_pid(
-    pid: u32,
-    _executable: &Path,
-    _config_path: &Path,
-) -> Result<()> {
-    stop_sing_box_pid_escalating(pid)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_owned_elevated_sing_box_pid(
-    pid: u32,
-    wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<()> {
-    stop_sing_box_pid_sudo_verified(pid, |pid| {
-        ensure_owned_elevated_sing_box_pid_identity(pid, wrapper_pid, executable, config_path)
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn stop_owned_elevated_sing_box_pid(
-    pid: u32,
-    _wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<()> {
-    stop_known_elevated_sing_box_pid(pid, executable, config_path)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn managed_sing_box_pid_is_alive(pid: u32) -> bool {
-    process_alive_via_ps(pid)
-}
-
-#[cfg(windows)]
-fn managed_sing_box_pid_is_alive(pid: u32) -> bool {
-    process_exists(pid)
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn managed_sing_box_pid_is_alive(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn ensure_managed_sing_box_pid_identity(
-    pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<bool> {
-    if !managed_sing_box_pid_is_alive(pid) {
-        return Ok(false);
-    }
-    let executable = resolve_sing_box_executable(executable).with_context(|| {
-        format!(
-            "failed to verify managed sing-box executable {} before stopping pid {pid}",
-            executable.display()
-        )
-    })?;
-    let config_path = config_path.canonicalize().with_context(|| {
-        format!(
-            "failed to verify managed sing-box config {} before stopping pid {pid}",
-            config_path.display()
-        )
-    })?;
-    if find_sing_box_run_pids_for_config(&executable, &config_path)?.contains(&pid) {
-        return Ok(true);
-    }
-    if !managed_sing_box_pid_is_alive(pid) {
-        return Ok(false);
-    }
-    bail!(
-        "refusing to stop managed sing-box pid {pid}: process identity no longer matches {} run --config {}",
-        executable.display(),
-        config_path.display()
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn ensure_owned_elevated_sing_box_pid_identity(
-    pid: u32,
-    wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<bool> {
-    if !managed_sing_box_pid_is_alive(pid) {
-        return Ok(false);
-    }
-    let descendants = process_descendant_pids(wrapper_pid)?;
-    if pid != wrapper_pid && !descendants.contains(&pid) {
-        if !managed_sing_box_pid_is_alive(pid) {
-            return Ok(false);
-        }
-        bail!(
-            "refusing to stop elevated sing-box pid {pid}: it is no longer owned by wrapper pid {wrapper_pid}"
-        );
-    }
-    ensure_managed_sing_box_pid_identity(pid, executable, config_path)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn ensure_owned_elevated_sing_box_pid_identity(
-    pid: u32,
-    _wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<bool> {
-    ensure_managed_sing_box_pid_identity(pid, executable, config_path)
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn ensure_managed_sing_box_pid_identity(
-    _pid: u32,
-    _executable: &Path,
-    _config_path: &Path,
-) -> Result<bool> {
-    Ok(false)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn find_sing_box_run_pids_for_config(executable: &Path, config_path: &Path) -> Result<Vec<u32>> {
-    let output = Command::new("ps")
-        .args(["-axo", "pid=,command="])
-        .output()
-        .context("failed to list processes with ps")?;
-    if !output.status.success() {
-        bail!("ps exited with {}", output.status);
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut pids = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((pid, command)) = parse_ps_pid_command(line) else {
-            continue;
-        };
-        if process_matches_sing_box_run_for_config(pid, command, executable, config_path) {
-            pids.push(pid);
-        }
-    }
-    Ok(pids)
-}
-
-#[cfg(windows)]
-fn find_sing_box_run_pids_for_config(executable: &Path, config_path: &Path) -> Result<Vec<u32>> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
-        ])
-        .output()
-        .context("failed to list sing-box processes with PowerShell")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "PowerShell process query exited with {}: {}",
-            output.status,
-            stderr.trim()
-        );
-    }
-    parse_windows_process_json(
-        &String::from_utf8_lossy(&output.stdout),
-        executable,
-        config_path,
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn parse_ps_pid_command(line: &str) -> Option<(u32, &str)> {
-    let mut parts = line.trim().splitn(2, char::is_whitespace);
-    let pid = parts.next()?.parse::<u32>().ok()?;
-    let command = parts.next()?.trim();
-    Some((pid, command))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_matches_sing_box_run_for_config(
-    pid: u32,
-    command: &str,
-    executable: &Path,
-    config_path: &Path,
-) -> bool {
-    process_matches_sing_box_run_for_config_with_probes(
-        pid,
-        command,
-        executable,
-        config_path,
-        process_executable_path,
-        process_working_directory,
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_matches_sing_box_run_for_config_with_probes<E, C>(
-    pid: u32,
-    command: &str,
-    executable: &Path,
-    config_path: &Path,
-    executable_path_for_pid: E,
-    working_directory_for_pid: C,
-) -> bool
-where
-    E: FnOnce(u32) -> Option<PathBuf>,
-    C: FnOnce(u32) -> Option<PathBuf>,
-{
-    if command_matches_sing_box_run_for_config(command, executable, config_path) {
-        return true;
-    }
-
-    let args = command_tokens(command);
-    if args.len() < 3 || !args.iter().any(|arg| arg == "run") {
-        return false;
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let config_values = sing_box_config_args(&arg_refs);
-    if config_values.is_empty() {
-        return false;
-    }
-
-    let Some(actual_executable) = executable_path_for_pid(pid) else {
-        return false;
-    };
-    let (Ok(actual_executable), Ok(expected_executable)) =
-        (actual_executable.canonicalize(), executable.canonicalize())
-    else {
-        return false;
-    };
-    if actual_executable != expected_executable {
-        return false;
-    }
-
-    if config_values
-        .iter()
-        .any(|value| path_text_is_absolute(value) && config_arg_matches_path(value, config_path))
-    {
-        return true;
-    }
-    if config_values
-        .iter()
-        .all(|value| path_text_is_absolute(value))
-    {
-        return false;
-    }
-
-    let Some(cwd) = working_directory_for_pid(pid) else {
-        return false;
-    };
-    legacy_command_matches_sing_box_run_for_config(
-        command,
-        &actual_executable,
-        &cwd,
-        executable,
-        config_path,
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn legacy_command_matches_sing_box_run_for_config(
-    command: &str,
-    actual_executable: &Path,
-    process_cwd: &Path,
-    executable: &Path,
-    config_path: &Path,
-) -> bool {
-    let args = command_tokens(command);
-    if args.len() < 3 || !args.iter().any(|arg| arg == "run") {
-        return false;
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let config_values = sing_box_config_args(&arg_refs);
-    if config_values.is_empty() {
-        return false;
-    }
-
-    let Ok(actual_executable) = actual_executable.canonicalize() else {
-        return false;
-    };
-    let Ok(expected_executable) = executable.canonicalize() else {
-        return false;
-    };
-    if actual_executable != expected_executable {
-        return false;
-    }
-    let Ok(expected_config) = config_path.canonicalize() else {
-        return false;
-    };
-    config_values.iter().any(|value| {
-        let path = Path::new(value);
-        let candidate = if path_text_is_absolute(value) {
-            path.to_path_buf()
-        } else {
-            process_cwd.join(path)
-        };
-        candidate
-            .canonicalize()
-            .is_ok_and(|candidate| candidate == expected_config)
-    })
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffer_size: u32) -> i32;
-    fn proc_pidinfo(
-        pid: libc::c_int,
-        flavor: libc::c_int,
-        arg: u64,
-        buffer: *mut libc::c_void,
-        buffer_size: libc::c_int,
-    ) -> libc::c_int;
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosVnodeInfoPath {
-    vnode_info: [u8; 152],
-    path: [libc::c_char; libc::PATH_MAX as usize],
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosProcVnodePathInfo {
-    current_directory: MacosVnodeInfoPath,
-    root_directory: MacosVnodeInfoPath,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosProcBsdInfo {
-    pbi_flags: u32,
-    pbi_status: u32,
-    pbi_xstatus: u32,
-    pbi_pid: u32,
-    pbi_ppid: u32,
-    pbi_uid: libc::uid_t,
-    pbi_gid: libc::gid_t,
-    pbi_ruid: libc::uid_t,
-    pbi_rgid: libc::gid_t,
-    pbi_svuid: libc::uid_t,
-    pbi_svgid: libc::gid_t,
-    rfu_1: u32,
-    pbi_comm: [libc::c_char; 16],
-    pbi_name: [libc::c_char; 32],
-    pbi_nfiles: u32,
-    pbi_pgid: u32,
-    pbi_pjobc: u32,
-    e_tdev: u32,
-    e_tpgid: u32,
-    pbi_nice: i32,
-    pbi_start_tvsec: u64,
-    pbi_start_tvusec: u64,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProcessStartToken {
-    primary: u64,
-    secondary: u64,
-}
-
-#[cfg(target_os = "macos")]
-fn process_start_token(pid: u32) -> Option<ProcessStartToken> {
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-    let mut info = std::mem::MaybeUninit::<MacosProcBsdInfo>::zeroed();
-    let expected_size = std::mem::size_of::<MacosProcBsdInfo>();
-    let returned_size = unsafe {
-        proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            expected_size as libc::c_int,
-        )
-    };
-    if returned_size != expected_size as libc::c_int {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    Some(ProcessStartToken {
-        primary: info.pbi_start_tvsec,
-        secondary: info.pbi_start_tvusec,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn process_start_token(pid: u32) -> Option<ProcessStartToken> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields_after_name = stat.rsplit_once(')')?.1.split_whitespace();
-    let start_time = fields_after_name.skip(19).next()?.parse().ok()?;
-    Some(ProcessStartToken {
-        primary: start_time,
-        secondary: 0,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn process_executable_path(pid: u32) -> Option<PathBuf> {
-    let mut buffer = [0_u8; 4096];
-    let length = unsafe {
-        proc_pidpath(
-            pid as libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
-    if length <= 0 {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(
-        &buffer[..length as usize],
-    )))
-}
-
-#[cfg(target_os = "linux")]
-fn process_executable_path(pid: u32) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn process_working_directory(pid: u32) -> Option<PathBuf> {
-    process_working_directory_via_proc_pidinfo(pid)
-        .or_else(|| process_working_directory_via_lsof(pid, false))
-        .or_else(|| process_working_directory_via_lsof(pid, true))
-}
-
-#[cfg(target_os = "macos")]
-fn process_working_directory_via_proc_pidinfo(pid: u32) -> Option<PathBuf> {
-    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
-    let mut info = std::mem::MaybeUninit::<MacosProcVnodePathInfo>::zeroed();
-    let expected_size = std::mem::size_of::<MacosProcVnodePathInfo>();
-    let returned_size = unsafe {
-        proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            expected_size as libc::c_int,
-        )
-    };
-    if returned_size != expected_size as libc::c_int {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    let path = unsafe { std::ffi::CStr::from_ptr(info.current_directory.path.as_ptr()) };
-    if path.to_bytes().is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
-}
-
-#[cfg(target_os = "macos")]
-fn process_working_directory_via_lsof(pid: u32, sudo: bool) -> Option<PathBuf> {
-    let mut command = if sudo {
-        let mut command = Command::new("sudo");
-        command.args(["-n", "/usr/sbin/lsof"]);
-        command
-    } else {
-        Command::new("/usr/sbin/lsof")
-    };
-    let output = command
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix('n'))
-        .filter(|path| Path::new(path).is_absolute())
-        .map(PathBuf::from)
-}
-
-#[cfg(target_os = "linux")]
-fn process_working_directory(pid: u32) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/cwd")).ok().or_else(|| {
-        let output = Command::new("sudo")
-            .args(["-n", "readlink", &format!("/proc/{pid}/cwd")])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Path::new(&path).is_absolute().then(|| PathBuf::from(path))
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn legacy_elevated_sing_box_process_needs_authorization(
-    executable: &Path,
-    config_path: &Path,
-) -> Result<bool> {
-    let executable = resolve_sing_box_executable(executable)?;
-    let config_path = config_path.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve sing-box config {} while checking legacy processes",
-            config_path.display()
-        )
-    })?;
-    let output = Command::new("ps")
-        .args(["-axo", "pid=,uid=,command="])
-        .output()
-        .context("failed to inspect elevated sing-box processes with ps")?;
-    if !output.status.success() {
-        bail!(
-            "ps exited with {} while inspecting legacy sing-box processes",
-            output.status
-        );
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((pid, uid, command)) = parse_ps_pid_uid_command(line) else {
-            continue;
-        };
-        if uid != 0 {
-            continue;
-        }
-        let Some(actual_executable) =
-            process_executable_path(pid).and_then(|path| path.canonicalize().ok())
-        else {
-            continue;
-        };
-        if actual_executable != executable {
-            continue;
-        }
-
-        let args = command_tokens(command);
-        if !args.iter().any(|arg| arg == "run") {
-            continue;
-        }
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let target_name = config_path.file_name();
-        if sing_box_config_args(&arg_refs).iter().any(|value| {
-            let path = Path::new(value);
-            (path_text_is_absolute(value) && config_arg_matches_path(value, &config_path))
-                || (!path_text_is_absolute(value) && path.file_name() == target_name)
-        }) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn parse_ps_pid_uid_command(line: &str) -> Option<(u32, u32, &str)> {
-    let line = line.trim();
-    let pid_end = line.find(char::is_whitespace)?;
-    let pid = line[..pid_end].parse::<u32>().ok()?;
-    let remainder = line[pid_end..].trim_start();
-    let uid_end = remainder.find(char::is_whitespace)?;
-    let uid = remainder[..uid_end].parse::<u32>().ok()?;
-    let command = remainder[uid_end..].trim_start();
-    (!command.is_empty()).then_some((pid, uid, command))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn legacy_elevated_sing_box_process_needs_authorization(
-    _executable: &Path,
-    _config_path: &Path,
-) -> Result<bool> {
-    Ok(false)
-}
-
-#[cfg(windows)]
-fn parse_windows_process_json(
-    text: &str,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<Vec<u32>> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    let value: Value =
-        serde_json::from_str(text).context("failed to parse PowerShell process JSON")?;
-    let processes = match &value {
-        Value::Array(processes) => processes.iter().collect::<Vec<_>>(),
-        Value::Object(_) => vec![&value],
-        _ => bail!("PowerShell process JSON had unexpected shape"),
-    };
-    let mut pids = Vec::new();
-    for process in processes {
-        let command = process
-            .get("CommandLine")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if command_matches_sing_box_run_for_config(command, executable, config_path)
-            && let Some(pid) = process.get("ProcessId").and_then(Value::as_u64)
-        {
-            pids.push(pid as u32);
-        }
-    }
-    Ok(pids)
-}
-
 fn command_tokens(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -4373,159 +3074,6 @@ fn command_program_name_matches(program: &str, expected: &str) -> bool {
         || expected
             .strip_suffix(".exe")
             .is_some_and(|base| name.eq_ignore_ascii_case(base))
-}
-
-fn path_text_has_directory(path: &str) -> bool {
-    path.rsplit_once(['/', '\\'])
-        .is_some_and(|(parent, _)| !parent.is_empty())
-}
-
-fn path_text_is_absolute(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    Path::new(path).is_absolute()
-        || path.starts_with(r"\\")
-        || (bytes.get(1) == Some(&b':') && matches!(bytes.get(2), Some(b'/' | b'\\')))
-}
-
-fn executable_basename(executable: &Path) -> String {
-    let text = executable.to_string_lossy();
-    text.rsplit(['/', '\\']).next().unwrap_or(&text).to_string()
-}
-
-#[cfg(windows)]
-fn command_path_text_matches(actual: &str, expected: &str) -> bool {
-    actual.eq_ignore_ascii_case(expected)
-        || actual
-            .strip_suffix(".exe")
-            .is_some_and(|base| base.eq_ignore_ascii_case(expected))
-        || expected
-            .strip_suffix(".exe")
-            .is_some_and(|base| actual.eq_ignore_ascii_case(base))
-}
-
-#[cfg(not(windows))]
-fn command_path_text_matches(actual: &str, expected: &str) -> bool {
-    actual == expected
-}
-
-fn command_program_matches_executable(program: &str, executable: &Path) -> bool {
-    let executable_text = executable.to_string_lossy();
-    let expected_name = executable_basename(executable);
-    let executable_has_directory = path_text_has_directory(&executable_text);
-    let program_has_directory = path_text_has_directory(program);
-
-    if executable_has_directory {
-        if path_text_is_absolute(&executable_text) && !path_text_is_absolute(program) {
-            return false;
-        }
-        if !program_has_directory {
-            return false;
-        }
-        match (Path::new(program).canonicalize(), executable.canonicalize()) {
-            (Ok(actual), Ok(expected)) => return actual == expected,
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => return false,
-            (Err(_), Err(_)) => {}
-        }
-        return command_path_text_matches(program, &executable_text);
-    }
-
-    command_program_name_matches(program, &expected_name)
-}
-
-fn command_args_for_executable(command: &str, executable: &Path) -> Vec<String> {
-    let executable_text = executable.to_string_lossy();
-    let expected_program = executable_basename(executable);
-    let mut prefixes = vec![executable_text.to_string(), expected_program];
-    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
-    prefixes.dedup();
-
-    for prefix in prefixes {
-        let Some(rest) = command.strip_prefix(&prefix) else {
-            continue;
-        };
-        if !rest.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let mut args = vec![prefix];
-        args.extend(command_tokens(rest.trim_start()));
-        return args;
-    }
-
-    command_tokens(command)
-}
-
-fn command_matches_sing_box_run_for_config(
-    command: &str,
-    executable: &Path,
-    config_path: &Path,
-) -> bool {
-    let args = command_args_for_executable(command, executable);
-    if args.len() < 3 {
-        return false;
-    }
-    let program_is_sing_box = args
-        .first()
-        .is_some_and(|program| command_program_matches_executable(program, executable));
-    if !program_is_sing_box || !args.iter().any(|arg| arg == "run") {
-        return false;
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let config_values = sing_box_config_args(&arg_refs);
-    !config_values.is_empty()
-        && config_values
-            .iter()
-            .any(|value| config_arg_matches_path(value, config_path))
-}
-
-fn sing_box_config_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
-    let mut values = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i] {
-            "--config" | "-c" => {
-                if let Some(value) = args.get(i + 1) {
-                    values.push(*value);
-                    i += 1;
-                }
-            }
-            value if value.starts_with("--config=") => {
-                values.push(value.trim_start_matches("--config="));
-            }
-            value if value.starts_with("-c=") => {
-                values.push(value.trim_start_matches("-c="));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    values
-}
-
-fn config_arg_matches_path(value: &str, config_path: &Path) -> bool {
-    let value_path = Path::new(value);
-    if path_text_is_absolute(&config_path.to_string_lossy()) && !path_text_is_absolute(value) {
-        return false;
-    }
-    if value_path == config_path {
-        return true;
-    }
-    match (config_path.canonicalize(), value_path.canonicalize()) {
-        (Ok(canonical_config), Ok(canonical_value)) => {
-            return canonical_value == canonical_config;
-        }
-        // If only one side resolves, falling back to a basename could match a different config
-        // from another working directory. Process termination must fail closed here.
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => return false,
-        (Err(_), Err(_)) => {}
-    }
-    let config_is_bare = config_path
-        .parent()
-        .is_none_or(|parent| parent.as_os_str().is_empty() || parent == Path::new("."));
-    config_is_bare
-        && config_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|file_name| value == file_name || value == format!("./{file_name}"))
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -4602,7 +3150,7 @@ fn ensure_background_pid_matches_worker(pid: u32) -> Result<()> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
-    wait_for_processes_to_exit_with_timeout(pids, SING_BOX_STOP_GRACE)
+    wait_for_processes_to_exit_with_timeout(pids, Duration::from_secs(3))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4825,110 +3373,6 @@ fn stop_background_pid(pid: u32) -> Result<()> {
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn stop_background_pid(_pid: u32) -> Result<()> {
     bail!("background worker shutdown is only available on macOS and Linux")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_pid(pid: u32) -> Result<()> {
-    let output = Command::new("kill")
-        .arg(pid.to_string())
-        .output()
-        .with_context(|| format!("failed to stop sing-box process {pid}"))?;
-    if !output.status.success() {
-        if !process_alive_via_ps(pid) {
-            return Ok(());
-        }
-        bail!(
-            "failed to stop sing-box process {pid}: kill exited with {}{}",
-            output.status,
-            process_command_stderr(&output)
-        );
-    }
-    wait_for_processes_to_exit(&[pid])
-        .with_context(|| format!("sing-box process {pid} did not exit after SIGTERM"))
-}
-
-#[cfg(windows)]
-fn stop_sing_box_pid(pid: u32) -> Result<()> {
-    let output = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T"])
-        .output()
-        .with_context(|| format!("failed to stop sing-box process {pid}"))?;
-    if !output.status.success() {
-        if !process_exists(pid) {
-            return Ok(());
-        }
-        bail!(
-            "failed to stop sing-box process {pid}: taskkill exited with {}",
-            output.status
-        );
-    }
-    if !process_exists(pid) {
-        return Ok(());
-    }
-    wait_for_processes_to_exit(&[pid])
-        .with_context(|| format!("sing-box process {pid} did not exit after taskkill"))
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn stop_sing_box_pid(_pid: u32) -> Result<()> {
-    bail!("managed sing-box shutdown is only available on macOS and Linux")
-}
-
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn stop_sing_box_child(child: &mut Child) -> Result<()> {
-    if child
-        .try_wait()
-        .context("failed to inspect managed sing-box process")?
-        .is_some()
-    {
-        return Ok(());
-    }
-    child
-        .kill()
-        .context("failed to kill managed sing-box process")?;
-    child
-        .wait()
-        .context("failed to reap managed sing-box process")?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_elevated_sing_box_child(child: &mut Child) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if child
-            .try_wait()
-            .context("failed to inspect elevated sing-box wrapper")?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let pid = child.id();
-    stop_sing_box_pid_sudo(pid)
-        .with_context(|| format!("failed to stop elevated sing-box wrapper pid {pid}"))?;
-    child
-        .wait()
-        .context("failed to reap elevated sing-box wrapper")?;
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn stop_elevated_sing_box_child(child: &mut Child) -> Result<()> {
-    stop_sing_box_child(child)
-}
-
-fn sing_box_process_log_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join("sing-box.log")
 }
 
 #[cfg(windows)]
@@ -5324,12 +3768,12 @@ fn default_tui_tun_helper_command() -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn tun_helper_needs_sudo() -> bool {
+pub(crate) fn tun_helper_needs_sudo() -> bool {
     unsafe { libc::geteuid() != 0 }
 }
 
 #[cfg(not(unix))]
-fn tun_helper_needs_sudo() -> bool {
+pub(crate) fn tun_helper_needs_sudo() -> bool {
     false
 }
 
@@ -5406,7 +3850,7 @@ struct App {
     china_ip_routing_enabled: bool,
     china_ip_routing_explicit: bool,
     verify_job: Option<VerifyJob>,
-    sing_box: SingBoxProcessRuntime,
+    sing_box: ManagedSingBox,
     private_access: PrivateAccessRuntime,
     private_access_progress: Option<PrivateAccessProgressModal>,
     private_access_auth: Option<PrivateAccessAuthModal>,
@@ -5449,28 +3893,6 @@ struct TunToggleJob {
 struct VerifyJob {
     receiver: mpsc::Receiver<VerificationReport>,
     worker: JoinHandle<()>,
-}
-
-struct SingBoxProcessRuntime {
-    executable: PathBuf,
-    managed_pid: Option<u32>,
-    managed_child: Option<Child>,
-    elevated: bool,
-    privileged_helper: bool,
-    keep_running: bool,
-}
-
-impl SingBoxProcessRuntime {
-    fn new(executable: PathBuf, keep_running: bool) -> Self {
-        Self {
-            executable,
-            managed_pid: None,
-            managed_child: None,
-            elevated: false,
-            privileged_helper: false,
-            keep_running,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -6170,7 +4592,7 @@ impl App {
             settings_edit: None,
             settings_error: None,
             subscription_refresh,
-            system_proxy_config_path,
+            system_proxy_config_path: system_proxy_config_path.clone(),
             system_proxy_server,
             system_proxy_server_override: false,
             system_proxy_enabled,
@@ -6183,7 +4605,11 @@ impl App {
             china_ip_routing_enabled,
             china_ip_routing_explicit: false,
             verify_job: None,
-            sing_box: SingBoxProcessRuntime::new(sing_box_executable, keep_sing_box_running),
+            sing_box: ManagedSingBox::new(
+                sing_box_executable,
+                system_proxy_config_path,
+                keep_sing_box_running,
+            ),
             private_access: PrivateAccessRuntime::new()?,
             private_access_progress: None,
             private_access_auth: None,
@@ -6195,12 +4621,8 @@ impl App {
             app.ensure_private_access_tun_baseline()?;
             app.authorize_tun_elevation_if_needed()?;
             app.start_managed_sing_box()?;
-            if let Err(error) = app.wait_for_controller_ready() {
-                let _ = app.shutdown_managed_sing_box();
-                return Err(error);
-            }
         } else {
-            app.wait_for_controller_ready()
+            wait_for_controller_ready(&app.client)
                 .context("headless auto-pick could not reach the existing sing-box controller")?;
         }
         if let Err(error) = app.refresh() {
@@ -6371,20 +4793,7 @@ impl App {
     /// launch sing-box once the cached sudo timestamp expires. Running `sudo -v` here re-authorizes
     /// interactively while the terminal is still in its normal (non-raw) mode.
     fn authorize_tun_elevation_if_needed(&self) -> Result<()> {
-        let has_any_tun = self.managed_sing_box_needs_elevation()?;
-        let has_legacy_elevated_process = legacy_elevated_sing_box_process_needs_authorization(
-            &self.sing_box.executable,
-            &self.system_proxy_config_path,
-        )?;
-        #[cfg(target_os = "macos")]
-        if macos_privileged_helper::helper_available() {
-            // A process reported by the daemon is not a legacy sudo child. The daemon owns its
-            // complete lifecycle, so no sudo timestamp is needed merely to reconnect the TUI.
-            if macos_privileged_helper::status()?.is_some() || !has_legacy_elevated_process {
-                return Ok(());
-            }
-        }
-        if (!has_any_tun && !has_legacy_elevated_process) || !tun_helper_needs_sudo() {
+        if self.sing_box.startup_authorization_requirement()? == AuthorizationRequirement::None {
             return Ok(());
         }
         let status = Command::new("sudo")
@@ -6397,11 +4806,6 @@ impl App {
             );
         }
         Ok(())
-    }
-
-    fn managed_sing_box_needs_elevation(&self) -> Result<bool> {
-        Ok(self.system_proxy_config_path.exists()
-            && inspect_tun_config(&self.system_proxy_config_path)?.has_any_tun())
     }
 
     fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
@@ -6947,12 +5351,7 @@ impl App {
     }
 
     fn sing_box_summary_line(&self) -> String {
-        match (self.sing_box.managed_pid, self.sing_box.keep_running) {
-            (Some(pid), true) => format!("sing-box: managed pid={pid} exit=keep-background"),
-            (Some(pid), false) => format!("sing-box: managed pid={pid} exit=stop"),
-            (None, true) => "sing-box: not managed exit=keep-background".to_string(),
-            (None, false) => "sing-box: not managed exit=stop".to_string(),
-        }
+        format!("sing-box: {}", self.sing_box.diagnostics())
     }
 
     fn connections_summary_line(&self) -> String {
@@ -7805,9 +6204,9 @@ impl App {
                 self.china_ip_routing_explicit = true;
                 self.save_runtime_state()?;
                 if changed {
-                    self.restart_managed_sing_box()?;
+                    let receipt = self.restart_managed_sing_box()?;
                     let label = if enable { "enabled" } else { "disabled" };
-                    match self.wait_for_controller_ready() {
+                    match receipt.observe_controller(&self.client) {
                         Ok(()) => self.set_status_with_flash(format!(
                             "China IP routing {label}; sing-box restarted"
                         )),
@@ -8846,82 +7245,27 @@ impl App {
     }
 
     fn start_managed_sing_box(&mut self) -> Result<()> {
-        let result = self.restart_managed_sing_box()?;
-        if result.restarted_pids.is_empty() {
-            self.status = format!("Started managed sing-box pid {}", result.started_pid);
+        let report = self.sing_box.start(&self.client)?;
+        if report.replaced_existing() {
+            self.status = format!("Restarted managed sing-box {}", report.transition());
         } else {
-            self.status = format!(
-                "Restarted managed sing-box pid(s) {:?} -> {}",
-                result.restarted_pids, result.started_pid
-            );
+            self.status = format!("Started managed sing-box {}", report.started_process());
         }
         Ok(())
     }
 
-    fn restart_managed_sing_box(&mut self) -> Result<SingBoxRestartSummary> {
-        let elevate = self.managed_sing_box_needs_elevation()?;
-        #[cfg(target_os = "macos")]
-        let helper_can_restart_in_place = Self::macos_helper_can_restart_in_place(
-            self.sing_box.privileged_helper,
-            macos_privileged_helper::helper_available(),
-        );
-        #[cfg(not(target_os = "macos"))]
-        let helper_can_restart_in_place = false;
-        if !helper_can_restart_in_place {
-            self.stop_managed_sing_box_process()?;
-        }
-        let result = restart_sing_box_for_config(
-            &self.sing_box.executable,
-            &self.system_proxy_config_path,
-            elevate,
-        )?;
-        let summary = SingBoxRestartSummary {
-            restarted_pids: result.restarted_pids,
-            started_pid: result.started_pid,
-        };
-        self.sing_box.managed_pid = Some(result.started_pid);
-        self.sing_box.managed_child = result.child;
-        self.sing_box.elevated = result.elevated;
-        self.sing_box.privileged_helper = result.privileged_helper;
-        Ok(summary)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn macos_helper_can_restart_in_place(
-        helper_owns_process: bool,
-        helper_available: bool,
-    ) -> bool {
-        helper_owns_process && helper_available
-    }
-
-    fn wait_for_controller_ready(&self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut last_error = None;
-        while Instant::now() < deadline {
-            match self.client.fetch_config() {
-                Ok(_) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-        match last_error {
-            Some(error) => {
-                Err(error).context("sing-box started but controller API did not become ready")
-            }
-            None => bail!("sing-box started but controller API did not become ready"),
-        }
+    fn restart_managed_sing_box(&mut self) -> Result<RestartReceipt> {
+        self.sing_box.restart()
     }
 
     fn shutdown_managed_sing_box(&mut self) -> Result<()> {
-        if self.sing_box.keep_running {
+        if self.sing_box.is_leaving_running() {
             return Ok(());
         }
         if self.background_worker_management_enabled() {
             self.stop_live_background_auto_pick_task()?;
         }
-        self.stop_managed_sing_box_process().map(|_| ())
+        self.sing_box.shutdown()
     }
 
     fn keep_sing_box_running_in_background(&mut self) -> Result<bool> {
@@ -8953,7 +7297,7 @@ impl App {
             ));
             return Ok(true);
         }
-        self.sing_box.keep_running = true;
+        self.sing_box.leave_running();
         let mut parts = vec!["sing-box".to_string()];
         if let Some(pid) = auto_pick_pid {
             parts.push(format!("auto-pick pid {pid}"));
@@ -9315,83 +7659,6 @@ impl App {
             }
             thread::sleep(Duration::from_millis(100));
         }
-    }
-
-    fn stop_managed_sing_box_process(&mut self) -> Result<Option<u32>> {
-        let pid = self.sing_box.managed_pid;
-        #[cfg(target_os = "macos")]
-        if self.sing_box.privileged_helper {
-            macos_privileged_helper::stop()
-                .context("failed to stop sing-box through macOS privileged helper")?;
-            self.sing_box.managed_pid = None;
-            self.sing_box.managed_child = None;
-            self.sing_box.elevated = false;
-            self.sing_box.privileged_helper = false;
-            return Ok(pid);
-        }
-        let elevated = self.sing_box.elevated;
-        if let Some(mut child) = self.sing_box.managed_child.take() {
-            let child_pid = child.id();
-            let stop_result = (|| {
-                if elevated {
-                    // The PID is known to be root-owned, so go directly through sudo instead of
-                    // first leaking an expected EPERM from an unprivileged `kill` to the terminal.
-                    if let Some(pid) = pid {
-                        stop_owned_elevated_sing_box_pid(
-                            pid,
-                            child_pid,
-                            &self.sing_box.executable,
-                            &self.system_proxy_config_path,
-                        )
-                        .with_context(|| format!("failed to stop elevated sing-box pid {pid}"))?;
-                    }
-                    stop_elevated_sing_box_child(&mut child).with_context(|| {
-                        format!("failed to reap elevated sing-box wrapper pid {child_pid}")
-                    })?;
-                } else {
-                    stop_sing_box_child(&mut child).with_context(|| {
-                        format!("failed to stop managed sing-box pid {child_pid}")
-                    })?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = stop_result {
-                // Keep ownership on failure so a subsequent retry can finish stopping the same
-                // process instead of forgetting that it may still be elevated and alive.
-                self.sing_box.managed_child = Some(child);
-                return Err(error);
-            }
-            self.sing_box.managed_pid = None;
-            self.sing_box.elevated = false;
-            self.sing_box.privileged_helper = false;
-            return Ok(Some(child_pid));
-        }
-        if let Some(pid) = pid {
-            if ensure_managed_sing_box_pid_identity(
-                pid,
-                &self.sing_box.executable,
-                &self.system_proxy_config_path,
-            )? {
-                if elevated {
-                    stop_known_elevated_sing_box_pid(
-                        pid,
-                        &self.sing_box.executable,
-                        &self.system_proxy_config_path,
-                    )
-                    .with_context(|| format!("failed to stop elevated sing-box pid {pid}"))?;
-                } else {
-                    stop_sing_box_pid(pid)
-                        .with_context(|| format!("failed to stop managed sing-box pid {pid}"))?;
-                }
-            }
-            self.sing_box.managed_pid = None;
-            self.sing_box.elevated = false;
-            self.sing_box.privileged_helper = false;
-            return Ok(Some(pid));
-        }
-        self.sing_box.elevated = false;
-        self.sing_box.privileged_helper = false;
-        Ok(None)
     }
 
     fn open_private_access_progress(&mut self) {
@@ -10132,21 +8399,8 @@ impl App {
             "重启 sing-box 中...".to_string(),
         );
         match self.restart_managed_sing_box() {
-            Ok(result) if result.restarted_pids.is_empty() => {
-                let message = format!("sing-box 启动成功: pid {}", result.started_pid);
-                self.push_private_access_progress_for_profile(
-                    profile_index,
-                    PrivateAccessProgressTone::Success,
-                    message,
-                );
-                self.finish_private_access_progress_for_profile(profile_index);
-                Ok(format!("started sing-box pid {}", result.started_pid))
-            }
-            Ok(result) => {
-                let message = format!(
-                    "sing-box 重启成功: pid(s) {:?} -> {}",
-                    result.restarted_pids, result.started_pid
-                );
+            Ok(receipt) if !receipt.report().replaced_existing() => {
+                let message = format!("sing-box 启动成功: {}", receipt.report().started_process());
                 self.push_private_access_progress_for_profile(
                     profile_index,
                     PrivateAccessProgressTone::Success,
@@ -10154,8 +8408,21 @@ impl App {
                 );
                 self.finish_private_access_progress_for_profile(profile_index);
                 Ok(format!(
-                    "restarted sing-box pid(s) {:?} -> {}",
-                    result.restarted_pids, result.started_pid
+                    "started sing-box {}",
+                    receipt.report().started_process()
+                ))
+            }
+            Ok(receipt) => {
+                let message = format!("sing-box 重启成功: {}", receipt.report().transition());
+                self.push_private_access_progress_for_profile(
+                    profile_index,
+                    PrivateAccessProgressTone::Success,
+                    message,
+                );
+                self.finish_private_access_progress_for_profile(profile_index);
+                Ok(format!(
+                    "restarted sing-box {}",
+                    receipt.report().transition()
                 ))
             }
             Err(error) => Err(error),
@@ -10244,20 +8511,16 @@ impl App {
     }
 
     fn tun_toggle_needs_terminal_prompt(&self) -> bool {
-        if self.tun_toggle_job.is_some() || !tun_helper_needs_sudo() {
+        if self.tun_toggle_job.is_some() {
             return false;
         }
-        #[cfg(target_os = "macos")]
-        if macos_privileged_helper::helper_available() {
-            return self.sing_box.elevated && !self.sing_box.privileged_helper;
-        }
-        if self.tun_enabled {
-            return self.sing_box.elevated;
-        }
-        let config_allows_enable = self.system_proxy_config_path.exists()
+        let next_run_needs_elevation = !self.tun_enabled
+            && self.system_proxy_config_path.exists()
             && inspect_tun_config(&self.system_proxy_config_path)
                 .is_ok_and(|state| !state.other_tun && !state.reserved_tag_conflict);
-        config_allows_enable
+        self.sing_box
+            .restart_authorization_requirement(next_run_needs_elevation)
+            == AuthorizationRequirement::InteractiveSudo
     }
 
     fn toggle_tun_mode(&mut self) {
@@ -10406,12 +8669,10 @@ impl App {
                     )),
                 };
                 match self.restart_managed_sing_box() {
-                    Ok(summary) => {
-                        let restarted = format!(
-                            "sing-box restarted pid(s) {:?} -> {}",
-                            summary.restarted_pids, summary.started_pid
-                        );
-                        if let Err(error) = self.wait_for_controller_ready() {
+                    Ok(receipt) => {
+                        let restarted =
+                            format!("sing-box restarted {}", receipt.report().transition());
+                        if let Err(error) = receipt.observe_controller(&self.client) {
                             self.set_status_with_flash(format!(
                                 "TUN mode {state}; {restarted}; controller not ready: {}{}",
                                 truncate_for_width(&format!("{error:#}"), 60),
@@ -10541,14 +8802,10 @@ impl App {
     }
 }
 
-impl Drop for App {
-    fn drop(&mut self) {
-        let _ = self.shutdown_managed_sing_box();
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::process_alive_via_ps;
     use super::{
         App, AutoSelectSwitchPlan, BackgroundLatencyResult, BackgroundLatencySnapshot,
         CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
@@ -10556,17 +8813,16 @@ mod tests {
         LatencyChartState, LatencyChartTimeUnit, LeftPaneSection, PrivateAccessMode,
         PrivateAccessProfileRuntime, PrivateAccessProgressTone, PrivateAccessRuntime,
         PrivateAccessState, RULE_CLASH_MODE, SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
-        SettingsEditState, SettingsField, SingBoxProcessRuntime,
-        command_matches_headless_auto_pick, command_matches_sing_box_run_for_config,
-        config_arg_matches_path, connection_is_direct, format_bytes, format_connection_line,
-        format_duration_badge, is_private_access_settings_field, latency_chart_segments,
-        latency_chart_threshold_line, latency_chart_time_unit, latency_chart_windowed_samples,
-        latency_chart_y_bounds, latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
+        SettingsEditState, SettingsField, command_matches_headless_auto_pick, connection_is_direct,
+        format_bytes, format_connection_line, format_duration_badge,
+        is_private_access_settings_field, latency_chart_segments, latency_chart_threshold_line,
+        latency_chart_time_unit, latency_chart_windowed_samples, latency_chart_y_bounds,
+        latency_chart_zoom_in, latency_chart_zoom_out, next_clash_mode,
         normalize_http_connect_proxy, private_access_auth_display_value,
         private_access_auth_initial_value, settings_field_display_value, settings_field_value,
-        should_apply_private_access_state_after_integration, sing_box_config_args,
-        sonicwall_http_connect_settings, status_lines, subscription_report_badge,
-        system_proxy_bypass_entries, truncate_for_width, visible_settings_fields,
+        should_apply_private_access_state_after_integration, sonicwall_http_connect_settings,
+        status_lines, subscription_report_badge, system_proxy_bypass_entries, truncate_for_width,
+        visible_settings_fields,
     };
     use crate::config::{RouteAutoDetectInterfaceState, default_tun_inbound, inspect_tun_config};
     use crate::controller::{
@@ -10575,6 +8831,7 @@ mod tests {
         ProxyGroup,
     };
     use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
+    use crate::managed_sing_box::ManagedSingBox;
     use crate::private_access::{PrivateAccessAuthField, PrivateAccessBridge, PrivateAccessRoute};
     use crate::subscriptions::{ProviderRefreshSummary, SubscriptionRefreshOutput};
     use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState, TuiStateStore};
@@ -10587,9 +8844,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -10764,7 +9019,11 @@ mod tests {
             china_ip_routing_enabled: false,
             china_ip_routing_explicit: false,
             verify_job: None,
-            sing_box: SingBoxProcessRuntime::new(PathBuf::from("sing-box"), false),
+            sing_box: ManagedSingBox::new(
+                PathBuf::from("sing-box"),
+                PathBuf::from("config.json"),
+                false,
+            ),
             private_access: PrivateAccessRuntime::with_default_hillstone()
                 .expect("private access runtime"),
             private_access_progress: None,
@@ -11022,33 +9281,6 @@ mod tests {
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(state_directory);
-    }
-
-    #[test]
-    fn custom_tun_requires_elevation_without_becoming_managed() {
-        let config_path = test_state_path();
-        std::fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&json!({
-                "inbounds": [{
-                    "type": "tun",
-                    "tag": "custom-tun",
-                    "address": ["172.20.0.1/30"]
-                }]
-            }))
-            .expect("config serializes"),
-        )
-        .expect("config writes");
-        let mut app = test_app();
-        app.system_proxy_config_path = config_path.clone();
-
-        assert!(!app.tun_enabled);
-        assert!(
-            app.managed_sing_box_needs_elevation()
-                .expect("TUN inspection succeeds")
-        );
-
-        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]
@@ -11852,782 +10084,6 @@ mod tests {
     }
 
     #[test]
-    fn sing_box_process_matcher_accepts_run_command_for_config() {
-        let executable = PathBuf::from("sing-box");
-        let config = PathBuf::from("config.json");
-
-        assert!(command_matches_sing_box_run_for_config(
-            "sing-box run --config ./config.json",
-            &executable,
-            &config
-        ));
-        assert!(command_matches_sing_box_run_for_config(
-            "/usr/local/bin/sing-box run -c config.json",
-            &executable,
-            &config
-        ));
-    }
-
-    #[test]
-    fn sing_box_process_matcher_accepts_canonicalized_executable_path() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-canonical-executable-{}",
-            unique_test_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("temporary executable directory creates");
-        let executable = root.join("./fake-sing-box");
-        std::fs::write(&executable, b"").expect("temporary executable writes");
-        let canonical_executable = executable
-            .canonicalize()
-            .expect("temporary executable canonicalizes");
-        let config = PathBuf::from("config.json");
-
-        let command = format!(
-            "{} run --config config.json",
-            canonical_executable.display()
-        );
-        assert!(command_matches_sing_box_run_for_config(
-            &command,
-            &executable,
-            &config
-        ));
-
-        std::fs::remove_dir_all(root).expect("temporary executable directory removes");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sing_box_program_name_is_resolved_from_search_path() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-executable-path-{}",
-            unique_test_suffix()
-        ));
-        let executable = root.join("fake-sing-box");
-        std::fs::create_dir_all(&root).expect("temporary executable directory creates");
-        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("temporary executable writes");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("temporary executable metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("temporary executable becomes runnable");
-        let search_path = std::env::join_paths([&root]).expect("temporary PATH builds");
-
-        let resolved = super::resolve_sing_box_executable_from_path(
-            Path::new("fake-sing-box"),
-            Some(&search_path),
-        )
-        .expect("program name resolves from PATH");
-        assert_eq!(
-            resolved,
-            executable
-                .canonicalize()
-                .expect("temporary executable canonicalizes")
-        );
-
-        std::fs::remove_dir_all(root).expect("temporary executable directory removes");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_executable_path_matching_is_case_and_suffix_sensitive() {
-        assert!(!super::command_path_text_matches(
-            "/nonexistent/SING-BOX",
-            "/nonexistent/sing-box"
-        ));
-        assert!(!super::command_path_text_matches(
-            "/nonexistent/sing-box.exe",
-            "/nonexistent/sing-box"
-        ));
-    }
-
-    #[test]
-    fn windows_drive_relative_path_is_not_absolute() {
-        assert!(!super::path_text_is_absolute(r"C:config.json"));
-        assert!(super::path_text_is_absolute(r"C:\config.json"));
-        assert!(super::path_text_is_absolute(r"C:/config.json"));
-        assert!(super::path_text_is_absolute(r"\\server\share\config.json"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn elevated_pid_handoff_only_accepts_the_wrapper_process_tree() {
-        let matching = [41, 42, 43, 44];
-        let excluded = [41];
-        let descendants = [43];
-
-        assert_eq!(
-            super::select_owned_sing_box_pid(&matching, &excluded, 42, &descendants),
-            Some(42)
-        );
-        assert_eq!(
-            super::select_owned_sing_box_pid(&matching, &[41, 42], 42, &descendants),
-            Some(43)
-        );
-        assert_eq!(
-            super::select_owned_sing_box_pid(&[41, 44], &excluded, 42, &descendants),
-            None
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn ps_pid_uid_command_parser_accepts_padded_columns() {
-        assert_eq!(
-            super::parse_ps_pid_uid_command(
-                "  13744     0 ./.local/sing-box run --config config.json"
-            ),
-            Some((13744, 0, "./.local/sing-box run --config config.json"))
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn process_matcher_skips_process_probes_for_irrelevant_commands() {
-        let executable_calls = std::cell::Cell::new(0);
-        let cwd_calls = std::cell::Cell::new(0);
-
-        let matches = super::process_matches_sing_box_run_for_config_with_probes(
-            42,
-            "/usr/bin/unrelated-worker --serve",
-            Path::new("/bin/sleep"),
-            Path::new("/tmp/config.json"),
-            |_| {
-                executable_calls.set(executable_calls.get() + 1);
-                None
-            },
-            |_| {
-                cwd_calls.set(cwd_calls.get() + 1);
-                None
-            },
-        );
-
-        assert!(!matches);
-        assert_eq!(executable_calls.get(), 0);
-        assert_eq!(cwd_calls.get(), 0);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn process_matcher_skips_cwd_probe_when_executable_differs() {
-        let executable_calls = std::cell::Cell::new(0);
-        let cwd_calls = std::cell::Cell::new(0);
-
-        let matches = super::process_matches_sing_box_run_for_config_with_probes(
-            42,
-            "./legacy-sing-box run --config config.json",
-            Path::new("/bin/sleep"),
-            Path::new("/tmp/config.json"),
-            |_| {
-                executable_calls.set(executable_calls.get() + 1);
-                Some(PathBuf::from("/bin/sh"))
-            },
-            |_| {
-                cwd_calls.set(cwd_calls.get() + 1);
-                None
-            },
-        );
-
-        assert!(!matches);
-        assert_eq!(executable_calls.get(), 1);
-        assert_eq!(cwd_calls.get(), 0);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn process_matcher_skips_cwd_probe_for_a_different_absolute_config() {
-        let cwd_calls = std::cell::Cell::new(0);
-
-        let matches = super::process_matches_sing_box_run_for_config_with_probes(
-            42,
-            "./legacy-sing-box run --config /tmp/other-config.json",
-            Path::new("/bin/sleep"),
-            Path::new("/tmp/expected-config.json"),
-            |_| Some(PathBuf::from("/bin/sleep")),
-            |_| {
-                cwd_calls.set(cwd_calls.get() + 1);
-                None
-            },
-        );
-
-        assert!(!matches);
-        assert_eq!(cwd_calls.get(), 0);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn signal_test_process(pid: u32, force: bool) -> anyhow::Result<()> {
-        let mut command = std::process::Command::new("/bin/kill");
-        if force {
-            command.arg("-9");
-        }
-        let status = command.arg(pid.to_string()).status()?;
-        anyhow::ensure!(status.success(), "test signal command exited with {status}");
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn spawn_sigterm_resistant_test_process() -> std::process::Child {
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; printf 'READY\\n'; exec sleep 30"])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("SIGTERM-resistant test process starts");
-        let mut ready = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(
-                child
-                    .stdout
-                    .take()
-                    .expect("test process stdout is captured"),
-            ),
-            &mut ready,
-        )
-        .expect("test process reports readiness");
-        assert_eq!(ready.trim(), "READY");
-        child
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn stop_escalation_force_stops_the_same_process_instance() {
-        let mut child = spawn_sigterm_resistant_test_process();
-        let pid = child.id();
-        let signals = std::cell::RefCell::new(Vec::new());
-
-        let result = super::stop_sing_box_pid_with_escalation(
-            pid,
-            Duration::from_millis(50),
-            |_| Ok(true),
-            |pid, force| {
-                signals.borrow_mut().push(force);
-                signal_test_process(pid, force)
-            },
-        );
-        child.wait().expect("test process reaps");
-
-        assert!(result.is_ok(), "stop escalation failed: {result:?}");
-        assert_eq!(*signals.borrow(), vec![false, true]);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn stop_escalation_refuses_force_after_identity_changes() {
-        let mut child = spawn_sigterm_resistant_test_process();
-        let pid = child.id();
-        let verify_calls = std::cell::Cell::new(0);
-        let signals = std::cell::RefCell::new(Vec::new());
-
-        let result = super::stop_sing_box_pid_with_escalation(
-            pid,
-            Duration::from_millis(50),
-            |_| {
-                let call = verify_calls.get();
-                verify_calls.set(call + 1);
-                Ok(call == 0)
-            },
-            |pid, force| {
-                signals.borrow_mut().push(force);
-                signal_test_process(pid, force)
-            },
-        );
-        let _ = child.kill();
-        child.wait().expect("test process reaps");
-
-        let error = result.expect_err("changed identity prevents force stop");
-        assert!(format!("{error:#}").contains("process identity no longer matches"));
-        assert_eq!(verify_calls.get(), 2);
-        assert_eq!(*signals.borrow(), vec![false]);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn stop_escalation_does_not_signal_a_pid_that_disappears_during_verification() {
-        let child = std::cell::RefCell::new(Some(
-            std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .expect("test process starts"),
-        ));
-        let pid = child.borrow().as_ref().expect("test process exists").id();
-        let signal_calls = std::cell::Cell::new(0);
-
-        let result = super::stop_sing_box_pid_with_escalation(
-            pid,
-            Duration::from_millis(50),
-            |_| {
-                let mut child = child
-                    .borrow_mut()
-                    .take()
-                    .expect("identity verifier owns the test process");
-                child
-                    .kill()
-                    .expect("test process terminates during verification");
-                child
-                    .wait()
-                    .expect("test process reaps during verification");
-                Ok(false)
-            },
-            |_, _| {
-                signal_calls.set(signal_calls.get() + 1);
-                Ok(())
-            },
-        );
-
-        assert!(
-            result.is_ok(),
-            "a vanished process is already stopped: {result:?}"
-        );
-        assert_eq!(signal_calls.get(), 0);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn process_verification_rejects_a_changed_start_token_before_identity_probe() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("test process starts");
-        let pid = child.id();
-        let actual_start = super::process_start_token(pid).expect("test process has a start token");
-        let changed_start = super::ProcessStartToken {
-            primary: actual_start.primary ^ 1,
-            secondary: actual_start.secondary,
-        };
-        let identity_calls = std::cell::Cell::new(0);
-
-        let result =
-            super::verify_process_instance_before_force_stop(pid, Some(changed_start), &mut |_| {
-                identity_calls.set(identity_calls.get() + 1);
-                Ok(true)
-            });
-        child.kill().expect("test process terminates");
-        child.wait().expect("test process reaps");
-
-        let error = result.expect_err("changed start token must be rejected");
-        assert!(format!("{error:#}").contains("different process instance"));
-        assert_eq!(identity_calls.get(), 0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "targeted TUN-disable lifecycle reproducer; run alone with --test-threads=1"]
-    fn tun_disable_releases_a_sigterm_resistant_elevated_listener() {
-        struct PathRestore(Option<std::ffi::OsString>);
-
-        impl Drop for PathRestore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(path) => unsafe { std::env::set_var("PATH", path) },
-                    None => unsafe { std::env::remove_var("PATH") },
-                }
-            }
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-tun-disable-repro-{}",
-            unique_test_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("reproduction directory creates");
-        let fake_sudo = root.join("sudo");
-        std::fs::write(
-            &fake_sudo,
-            b"#!/bin/sh\nif [ \"$1\" = \"-n\" ]; then shift; fi\nif [ \"$1\" = \"kill\" ]; then shift; exec /bin/kill \"$@\"; fi\n\"$@\" &\nchild=$!\nwait \"$child\"\n",
-        )
-        .expect("fake sudo writes");
-        let mut permissions = std::fs::metadata(&fake_sudo)
-            .expect("fake sudo metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_sudo, permissions).expect("fake sudo is executable");
-
-        let original_path = std::env::var_os("PATH");
-        let mut search_paths = vec![root.clone()];
-        if let Some(path) = original_path.as_deref() {
-            search_paths.extend(std::env::split_paths(path));
-        }
-        let test_path = std::env::join_paths(search_paths).expect("test PATH joins");
-        let _path_restore = PathRestore(original_path);
-        unsafe { std::env::set_var("PATH", test_path) };
-
-        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("loopback reproduction port reserves");
-        let port = reservation
-            .local_addr()
-            .expect("reproduction port resolves")
-            .port();
-        drop(reservation);
-
-        let config = root.join("config.json");
-        std::fs::write(
-            &config,
-            serde_json::to_vec_pretty(&json!({
-                "log": { "level": "error" },
-                "inbounds": [{
-                    "type": "mixed",
-                    "tag": "repro-mixed-in",
-                    "listen": "127.0.0.1",
-                    "listen_port": port
-                }],
-                "outbounds": [{ "type": "direct", "tag": "direct" }]
-            }))
-            .expect("reproduction config serializes"),
-        )
-        .expect("reproduction config writes");
-        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/sing-box");
-        assert!(
-            executable.is_file(),
-            "targeted reproduction needs {}",
-            executable.display()
-        );
-        let wrapper = std::process::Command::new(&fake_sudo)
-            .arg("-n")
-            .arg(&executable)
-            .arg("run")
-            .arg("--config")
-            .arg(&config)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("fake elevated wrapper starts");
-        let wrapper_pid = wrapper.id();
-        let ready_deadline = Instant::now() + Duration::from_secs(15);
-        let listener_pid = loop {
-            let listener_pid = super::process_descendant_pids(wrapper_pid)
-                .expect("fake elevated wrapper descendants can be inspected")
-                .into_iter()
-                .next();
-            let port_is_owned = std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
-            if let Some(listener_pid) = listener_pid
-                && port_is_owned
-            {
-                break listener_pid;
-            }
-            assert!(
-                Instant::now() < ready_deadline,
-                "isolated sing-box did not start on loopback port {port}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let stop_status = std::process::Command::new("/bin/kill")
-            .args(["-STOP", &listener_pid.to_string()])
-            .status()
-            .expect("isolated sing-box can be suspended");
-        assert!(stop_status.success(), "isolated sing-box suspends");
-
-        let mut app = test_app();
-        app.system_proxy_config_path = config.clone();
-        app.sing_box.executable = executable;
-        app.sing_box.managed_pid = Some(listener_pid);
-        app.sing_box.managed_child = Some(wrapper);
-        app.sing_box.elevated = true;
-
-        let started = Instant::now();
-        let stop_result = app.stop_managed_sing_box_process();
-        let elapsed = started.elapsed();
-        let port_was_still_owned = std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
-
-        let wrapper = app.sing_box.managed_child.take();
-        app.sing_box.managed_pid = None;
-        app.sing_box.elevated = false;
-        if super::process_alive_via_ps(listener_pid) {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-CONT", &listener_pid.to_string()])
-                .status();
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-9", &listener_pid.to_string()])
-                .status();
-        }
-        if let Some(mut wrapper) = wrapper {
-            let _ = wrapper.wait();
-        }
-        std::fs::remove_dir_all(&root).expect("reproduction directory removes");
-
-        assert!(
-            stop_result.is_ok() && !port_was_still_owned,
-            "stable TUN-disable reproduction: stop_result={}; loopback port {port} still owned={port_was_still_owned}; elapsed={elapsed:?}",
-            stop_result
-                .as_ref()
-                .map(|_| "ok".to_string())
-                .unwrap_or_else(|error| format!("{error:#}"))
-        );
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn legacy_relative_process_identity_is_resolved_against_its_own_cwd() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-relative-process-identity-{}",
-            unique_test_suffix()
-        ));
-        let process_dir = root.join("process");
-        let other_dir = root.join("other");
-        let executable = PathBuf::from("/bin/sleep");
-        let process_config = process_dir.join("config.json");
-        let other_config = other_dir.join("config.json");
-        std::fs::create_dir_all(&process_dir).expect("process directory creates");
-        std::fs::create_dir_all(&other_dir).expect("other directory creates");
-        std::fs::write(&process_config, b"{}").expect("process config writes");
-        std::fs::write(&other_config, b"{}").expect("other config writes");
-        let mut command_builder = std::process::Command::new(&executable);
-        command_builder
-            .arg0("./fake-sing-box")
-            .arg("30")
-            .current_dir(&process_dir);
-        let mut child = command_builder
-            .spawn()
-            .expect("relative test process starts");
-        let command = "./fake-sing-box run --config config.json";
-
-        let own_config_matches = super::process_matches_sing_box_run_for_config(
-            child.id(),
-            command,
-            &executable,
-            &process_config,
-        );
-        let same_name_in_another_cwd_matches = super::process_matches_sing_box_run_for_config(
-            child.id(),
-            command,
-            &executable,
-            &other_config,
-        );
-        child.kill().expect("relative test process stops");
-        child.wait().expect("relative test process reaps");
-        std::fs::remove_dir_all(root).expect("relative test directory removes");
-
-        assert!(own_config_matches);
-        assert!(!same_name_in_another_cwd_matches);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn restart_retries_a_transient_address_in_use_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-restart-retry-{}",
-            unique_test_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("temporary restart directory creates");
-        let executable = PathBuf::from("fake-sing-box-retry");
-        let config = root.join("config.json");
-        let log_path = root.join("sing-box.log");
-        std::fs::write(&config, b"{}").expect("temporary config writes");
-
-        let mut attempt_count = 0_u32;
-        let mut child = super::spawn_sing_box_with_bind_retry(
-            &executable,
-            &config,
-            &log_path,
-            || {
-                attempt_count += 1;
-                if attempt_count == 1 {
-                    let mut command = std::process::Command::new("sh");
-                    command.args([
-                        "-c",
-                        "printf '%s\\n' 'FATAL start inbound/mixed[0]: listen tcp 0.0.0.0:6780: bind: address already in use' >&2; exit 1",
-                    ]);
-                    command
-                } else {
-                    let mut command = std::process::Command::new("sleep");
-                    command.arg("5");
-                    command
-                }
-            },
-        )
-        .expect("transient address-in-use startup retries");
-        assert!(
-            child
-                .try_wait()
-                .expect("retried child can be inspected")
-                .is_none(),
-            "the successful retry must still be running"
-        );
-        super::stop_sing_box_child(&mut child).expect("fake sing-box stops");
-        std::fs::remove_dir_all(&root).expect("temporary restart directory removes");
-
-        assert_eq!(attempt_count, 2);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn restart_does_not_reuse_an_old_bind_error_for_a_new_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-restart-log-offset-{}",
-            unique_test_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("temporary restart directory creates");
-        let executable = PathBuf::from("fake-sing-box-log-offset");
-        let config = root.join("config.json");
-        let log_path = root.join("sing-box.log");
-        std::fs::write(&config, b"{}").expect("temporary config writes");
-
-        let mut attempt_count = 0_u32;
-        let error = super::spawn_sing_box_with_bind_retry(&executable, &config, &log_path, || {
-            attempt_count += 1;
-            let message = if attempt_count == 1 {
-                "FATAL start inbound/mixed[0]: bind: address already in use"
-            } else {
-                "FATAL decode config: unknown field definitely-invalid"
-            };
-            let mut command = std::process::Command::new("sh");
-            command.args(["-c", &format!("printf '%s\\n' '{message}' >&2; exit 1")]);
-            command
-        })
-        .expect_err("a non-bind startup failure is returned immediately");
-        std::fs::remove_dir_all(&root).expect("temporary restart directory removes");
-
-        assert_eq!(attempt_count, 2);
-        assert!(format!("{error:#}").contains("definitely-invalid"));
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn elevated_pid_resolution_failure_cleans_up_uncommitted_child() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-pid-resolution-cleanup-{}",
-            unique_test_suffix()
-        ));
-        std::fs::create_dir_all(&root).expect("temporary cleanup directory creates");
-        let executable = root.join("fake-sing-box-never-started");
-        let config = root.join("config.json");
-        std::fs::write(&executable, b"").expect("fake executable writes");
-        std::fs::write(&config, b"{}").expect("temporary config writes");
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & wait"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("uncommitted startup wrapper starts");
-        let wrapper_pid = child.id();
-        let descendant_deadline = Instant::now() + Duration::from_secs(2);
-        let descendant_pid = loop {
-            if let Some(pid) = super::process_descendant_pids(wrapper_pid)
-                .expect("wrapper descendants can be inspected")
-                .into_iter()
-                .next()
-            {
-                break pid;
-            }
-            assert!(
-                Instant::now() < descendant_deadline,
-                "startup wrapper did not create its test descendant"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-
-        let error =
-            super::resolve_new_sing_box_pid_or_cleanup(&executable, &config, &[], &mut child)
-                .expect_err("missing elevated sing-box pid fails ownership handoff");
-        assert!(format!("{error:#}").contains("did not appear in the process list"));
-        let wrapper_alive = super::process_alive_via_ps(wrapper_pid);
-        let descendant_alive = super::process_alive_via_ps(descendant_pid);
-        let wrapper_reaped = child
-            .try_wait()
-            .expect("cleaned wrapper can be inspected")
-            .is_some();
-        if wrapper_alive {
-            let _ = super::stop_sing_box_pid_escalating(wrapper_pid);
-        }
-        if descendant_alive {
-            let _ = super::stop_sing_box_pid_escalating(descendant_pid);
-        }
-        std::fs::remove_dir_all(&root).expect("temporary cleanup directory removes");
-
-        assert!(
-            !wrapper_alive,
-            "failed ownership handoff left its wrapper alive"
-        );
-        assert!(
-            !descendant_alive,
-            "failed ownership handoff left descendant pid {descendant_pid} alive"
-        );
-        assert!(
-            wrapper_reaped,
-            "failed ownership handoff did not reap its wrapper"
-        );
-    }
-
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn sing_box_bind_retry_classifier_is_specific() {
-        assert!(super::sing_box_log_reports_bind_conflict(
-            "start inbound/mixed[0]: bind: address already in use"
-        ));
-        assert!(!super::sing_box_log_reports_bind_conflict(
-            "decode config: address already in use is not a valid field"
-        ));
-        assert!(!super::sing_box_log_reports_bind_conflict(
-            "start inbound/mixed[0]: bind: permission denied"
-        ));
-        assert!(super::sing_box_log_reports_bind_conflict(
-            "bind: Only one usage of each socket address is normally permitted"
-        ));
-    }
-
-    #[test]
-    fn sing_box_process_matcher_uses_only_custom_executable() {
-        let executable = PathBuf::from(r#"C:\Program Files\Vendor\proxy-core.exe"#);
-        let config = PathBuf::from("config.json");
-
-        assert!(command_matches_sing_box_run_for_config(
-            r#""C:\Program Files\Vendor\proxy-core.exe" run --config config.json"#,
-            &executable,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "proxy-core.exe run -c ./config.json",
-            &executable,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            r#"C:\Other Vendor\proxy-core.exe run --config config.json"#,
-            &executable,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "/opt/vendor/proxy-core run -c ./config.json",
-            &executable,
-            &config
-        ));
-        let executable_with_space = PathBuf::from("/tmp/review path/proxy-core");
-        assert!(command_matches_sing_box_run_for_config(
-            "/tmp/review path/proxy-core run -c ./config.json",
-            &executable_with_space,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "/tmp/other path/proxy-core run -c ./config.json",
-            &executable_with_space,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "sing-box run --config config.json",
-            &executable,
-            &config
-        ));
-    }
-
-    #[test]
-    fn sing_box_process_matcher_rejects_non_matching_commands() {
-        let executable = PathBuf::from("proxy-core");
-        let config = PathBuf::from("config.json");
-
-        assert!(!command_matches_sing_box_run_for_config(
-            "proxy-core version",
-            &executable,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "other-core run --config config.json",
-            &executable,
-            &config
-        ));
-        assert!(!command_matches_sing_box_run_for_config(
-            "proxy-core run --config ./other.json",
-            &executable,
-            &config
-        ));
-    }
-
-    #[test]
     fn headless_auto_pick_process_matcher_accepts_worker_command() {
         assert!(command_matches_headless_auto_pick(
             "/Users/ldd/proj/rust/sing-box-tui/target/debug/sing-box-tui run --headless-auto-pick --controller http://127.0.0.1:9992"
@@ -12781,132 +10237,6 @@ mod tests {
 
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_file(target);
-    }
-
-    #[test]
-    fn sing_box_config_args_support_common_forms() {
-        assert_eq!(
-            sing_box_config_args(&["sing-box", "run", "--config", "./config.json"]),
-            vec!["./config.json"]
-        );
-        assert_eq!(
-            sing_box_config_args(&["sing-box", "run", "-c=config.json"]),
-            vec!["config.json"]
-        );
-        assert!(config_arg_matches_path(
-            "./config.json",
-            &PathBuf::from("config.json")
-        ));
-    }
-
-    #[test]
-    fn config_path_matcher_rejects_different_existing_files_with_same_name() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-config-identity-{}",
-            unique_test_suffix()
-        ));
-        let first = root.join("first/config.json");
-        let second = root.join("second/config.json");
-        std::fs::create_dir_all(first.parent().expect("first parent exists"))
-            .expect("first directory creates");
-        std::fs::create_dir_all(second.parent().expect("second parent exists"))
-            .expect("second directory creates");
-        std::fs::write(&first, b"{}").expect("first config writes");
-        std::fs::write(&second, b"{}").expect("second config writes");
-
-        assert!(!config_arg_matches_path(
-            second.to_str().expect("second path is UTF-8"),
-            &first
-        ));
-
-        std::fs::remove_dir_all(root).expect("temporary configs remove");
-    }
-
-    #[test]
-    fn config_path_matcher_rejects_missing_same_name_path_when_target_exists() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-config-missing-identity-{}",
-            unique_test_suffix()
-        ));
-        let target = root.join("target/config.json");
-        let missing = root.join("missing/config.json");
-        std::fs::create_dir_all(target.parent().expect("target parent exists"))
-            .expect("target directory creates");
-        std::fs::write(&target, b"{}").expect("target config writes");
-
-        assert!(!config_arg_matches_path(
-            missing.to_str().expect("missing path is UTF-8"),
-            &target
-        ));
-
-        std::fs::remove_dir_all(root).expect("temporary configs remove");
-    }
-
-    #[test]
-    fn absolute_process_identity_rejects_relative_executable_and_config() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-absolute-process-identity-{}",
-            unique_test_suffix()
-        ));
-        let executable = root.join("sing-box");
-        let config = root.join("config.json");
-        std::fs::create_dir_all(&root).expect("temporary identity directory creates");
-        std::fs::write(&executable, b"").expect("temporary executable writes");
-        std::fs::write(&config, b"{}").expect("temporary config writes");
-        let executable = executable
-            .canonicalize()
-            .expect("temporary executable canonicalizes");
-        let config = config
-            .canonicalize()
-            .expect("temporary config canonicalizes");
-
-        assert!(!command_matches_sing_box_run_for_config(
-            "sing-box run --config config.json",
-            &executable,
-            &config
-        ));
-        assert!(!config_arg_matches_path("config.json", &config));
-
-        std::fs::remove_dir_all(root).expect("temporary identity directory removes");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn managed_pid_identity_rejects_an_unrelated_live_process() {
-        let root = std::env::temp_dir().join(format!(
-            "sing-box-tui-managed-pid-identity-{}",
-            unique_test_suffix()
-        ));
-        let executable = root.join("sing-box");
-        let config = root.join("config.json");
-        std::fs::create_dir_all(&root).expect("temporary identity directory creates");
-        std::fs::write(&executable, b"").expect("temporary executable writes");
-        std::fs::write(&config, b"{}").expect("temporary config writes");
-
-        let error =
-            super::ensure_managed_sing_box_pid_identity(std::process::id(), &executable, &config)
-                .expect_err("an unrelated live process must not pass sing-box identity validation");
-        assert!(format!("{error:#}").contains("refusing to stop managed sing-box pid"));
-
-        std::fs::remove_dir_all(root).expect("temporary identity directory removes");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn elevated_wrapper_is_reaped_after_its_natural_exit() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 0.05"])
-            .spawn()
-            .expect("short-lived wrapper starts");
-
-        super::stop_elevated_sing_box_child(&mut child)
-            .expect("short-lived wrapper exits without a signal");
-        assert!(
-            child
-                .try_wait()
-                .expect("reaped wrapper can be inspected")
-                .is_some()
-        );
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
@@ -13798,31 +11128,6 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn disabling_elevated_tun_requires_terminal_prompt() {
-        let mut app = test_app();
-        app.tun_enabled = true;
-        app.sing_box.elevated = true;
-
-        assert!(app.tun_toggle_needs_terminal_prompt());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn installed_macos_helper_owns_sing_box_even_when_tun_is_disabled() {
-        assert!(super::should_use_macos_privileged_helper(true));
-        assert!(!super::should_use_macos_privileged_helper(false));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_helper_restarts_in_place_only_with_explicit_process_ownership() {
-        assert!(App::macos_helper_can_restart_in_place(true, true));
-        assert!(!App::macos_helper_can_restart_in_place(false, true));
-        assert!(!App::macos_helper_can_restart_in_place(true, false));
-    }
-
     #[test]
     fn tun_mode_without_persisted_helper_uses_interactive_tui_helper() {
         let mut app = test_app();
@@ -14158,12 +11463,11 @@ mod tests {
     #[test]
     fn uppercase_b_keeps_managed_sing_box_running_and_exits_tui() {
         let mut app = test_app();
-        app.sing_box.keep_running = false;
 
         let keep_running = app.handle_key(KeyCode::Char('B')).expect("handle key");
 
         assert!(!keep_running);
-        assert!(app.sing_box.keep_running);
+        assert!(app.sing_box.is_leaving_running());
     }
 
     #[test]
@@ -14849,7 +12153,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn process_alive_via_ps_recognizes_current_process() {
-        assert!(super::process_alive_via_ps(std::process::id()));
+        assert!(process_alive_via_ps(std::process::id()));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -14861,7 +12165,7 @@ mod tests {
         let exited_pid = child.id();
         child.wait().expect("short-lived child exits");
 
-        assert!(!super::process_alive_via_ps(exited_pid));
+        assert!(!process_alive_via_ps(exited_pid));
     }
 
     #[test]
