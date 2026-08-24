@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use anyhow::{Context, Result, bail};
 
 mod atomic_file;
+mod auto_pick;
 mod clash;
 mod cli;
 mod config;
