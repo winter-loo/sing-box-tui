@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::SocketAddrV4;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
@@ -64,6 +64,7 @@ use crate::subscriptions::{
     DEFAULT_SUBSCRIPTION_SOURCE_PATH, SubscriptionRefreshOutput, SubscriptionRefreshRequest,
     refresh_subscriptions,
 };
+use crate::system_proxy::{SystemProxy, SystemProxyToggle, SystemProxyUpdate};
 use crate::tui_state::{
     BypassRuleSetStore, TuiRuntimeState, TuiStateStore, default_bypass_rule_set_path,
     default_tui_state_path, parse_bypass_entries,
@@ -93,14 +94,8 @@ const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const SYSTEM_PROXY_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
-// Keep RFC1918 ranges out of the OS-level bypass list. The Hillstone bridge
-// problem showed why this matters: if macOS bypasses 10.* before traffic reaches
-// sing-box, sing-box cannot apply its route override to the local ESP bridge.
-// Private/LAN destinations should enter sing-box first and then use direct rules.
-const DEFAULT_SYSTEM_PROXY_BYPASS: &[&str] = &["localhost", "127.*"];
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
@@ -265,7 +260,6 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.maybe_start_subscription_refresh();
         app.maybe_refresh_latency_chart()?;
         app.maybe_refresh_connections();
-        app.maybe_refresh_system_proxy_status();
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -387,7 +381,7 @@ fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::VerifyTargets => app.verify_targets.clone(),
         SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
-        SettingsField::SystemProxyServer => app.system_proxy_server.clone(),
+        SettingsField::SystemProxyServer => app.system_proxy.server().to_string(),
         SettingsField::ChinaIpRouting => app.china_ip_routing_enabled.to_string(),
         SettingsField::PrivateAccessProfile => app
             .private_access
@@ -593,314 +587,6 @@ fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
         .unwrap_or_else(|| RULE_CLASH_MODE.to_string())
 }
 
-fn default_system_proxy_server(config_path: &Path) -> String {
-    env::var("SING_BOX_TUI_SYSTEM_PROXY_SERVER")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            detect_mixed_inbound_proxy_server(config_path)
-                .unwrap_or_else(|| "127.0.0.1:6780".to_string())
-        })
-}
-
-fn detect_mixed_inbound_proxy_server(config_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(config_path).ok()?;
-    detect_mixed_inbound_proxy_server_from_json(&text)
-        .or_else(|| detect_mixed_inbound_proxy_server_from_text(&text))
-}
-
-fn detect_mixed_inbound_proxy_server_from_json(text: &str) -> Option<String> {
-    let config: Value = serde_json::from_str(text).ok()?;
-    let inbounds = config.get("inbounds")?.as_array()?;
-    let inbound = inbounds
-        .iter()
-        .find(|inbound| inbound.get("type").and_then(Value::as_str) == Some("mixed"))?;
-    let port = inbound.get("listen_port")?.as_u64()?;
-    let listen = inbound
-        .get("listen")
-        .and_then(Value::as_str)
-        .unwrap_or("127.0.0.1");
-    let host = match listen {
-        "::" | "0.0.0.0" | "" => "127.0.0.1",
-        value => value,
-    };
-    Some(format!("{host}:{port}"))
-}
-
-fn detect_mixed_inbound_proxy_server_from_text(text: &str) -> Option<String> {
-    let inbounds_key = text.find("\"inbounds\"")?;
-    let after_key = &text[inbounds_key..];
-    let array_start = after_key.find('[')? + inbounds_key;
-    let array_end = find_json_array_end(text, array_start)?;
-    let inbounds = &text[array_start..=array_end];
-    let mixed_index = inbounds.find("\"mixed\"")?;
-    let before_mixed = &inbounds[..mixed_index];
-    let object_start = before_mixed.rfind('{')?;
-    let after_object_start = &inbounds[object_start..];
-    let object_end = find_json_object_end(after_object_start, 0)?;
-    let inbound = &after_object_start[..=object_end];
-    let port = find_json_u16_field(inbound, "listen_port")?;
-    let listen = find_json_string_field(inbound, "listen").unwrap_or("127.0.0.1");
-    let host = match listen {
-        "::" | "0.0.0.0" | "" => "127.0.0.1",
-        value => value,
-    };
-    Some(format!("{host}:{port}"))
-}
-
-fn find_json_array_end(text: &str, start: usize) -> Option<usize> {
-    find_json_container_end(text, start, '[', ']')
-}
-
-fn find_json_object_end(text: &str, start: usize) -> Option<usize> {
-    find_json_container_end(text, start, '{', '}')
-}
-
-fn find_json_container_end(text: &str, start: usize, open: char, close: char) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-        } else if ch == open {
-            depth += 1;
-        } else if ch == close {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(start + offset);
-            }
-        }
-    }
-    None
-}
-
-fn find_json_u16_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
-    let key = format!("\"{field}\"");
-    let key_index = object.find(&key)?;
-    let after_key = &object[key_index + key.len()..];
-    let colon_index = after_key.find(':')?;
-    let value = after_key[colon_index + 1..].trim_start();
-    let end = value
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(value.len());
-    let port = &value[..end];
-    if port.is_empty() { None } else { Some(port) }
-}
-
-fn find_json_string_field<'a>(object: &'a str, field: &str) -> Option<&'a str> {
-    let key = format!("\"{field}\"");
-    let key_index = object.find(&key)?;
-    let after_key = &object[key_index + key.len()..];
-    let colon_index = after_key.find(':')?;
-    let value = after_key[colon_index + 1..].trim_start();
-    let value = value.strip_prefix('"')?;
-    let end = value.find('"')?;
-    Some(&value[..end])
-}
-
-fn system_proxy_bypass_entries(entries: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut bypass = Vec::new();
-    for entry in DEFAULT_SYSTEM_PROXY_BYPASS {
-        push_unique_system_proxy_bypass_value(&mut bypass, &mut seen, entry);
-    }
-    push_cgnat_system_proxy_bypass_values(&mut bypass, &mut seen);
-    for entry in entries {
-        push_system_proxy_bypass_entry(&mut bypass, &mut seen, entry);
-    }
-    bypass
-}
-
-fn push_cgnat_system_proxy_bypass_values(bypass: &mut Vec<String>, seen: &mut BTreeSet<String>) {
-    for octet in 64..=127 {
-        push_unique_system_proxy_bypass_value(bypass, seen, &format!("100.{octet}.*"));
-    }
-}
-
-fn push_system_proxy_bypass_entry(
-    bypass: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-    entry: &str,
-) {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return;
-    }
-    push_unique_system_proxy_bypass_value(bypass, seen, entry);
-    if !entry.contains('*')
-        && !entry.contains('/')
-        && !entry.starts_with('<')
-        && !entry.parse::<std::net::IpAddr>().is_ok()
-    {
-        push_unique_system_proxy_bypass_value(bypass, seen, &format!("*.{entry}"));
-    }
-}
-
-fn push_unique_system_proxy_bypass_value(
-    bypass: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-    value: &str,
-) {
-    let value = value.trim().to_ascii_lowercase();
-    if !value.is_empty() && seen.insert(value.clone()) {
-        bypass.push(value);
-    }
-}
-
-#[cfg(windows)]
-fn wininet_proxy_override_entries(entries: &[String]) -> Vec<String> {
-    let mut entries = system_proxy_bypass_entries(entries);
-    if !entries.iter().any(|entry| entry == "<local>") {
-        entries.push("<local>".to_string());
-    }
-    entries
-}
-
-#[cfg(windows)]
-fn run_system_proxy_update(
-    server: &str,
-    enable: bool,
-    bypass_entries: &[String],
-) -> Result<String> {
-    let script = windows_system_proxy_script_path()
-        .with_context(|| "failed to locate scripts/windows/set-system-proxy.ps1")?;
-    let action = if enable { "-Enable" } else { "-Disable" };
-    let mut args = vec![
-        "-NoProfile".to_string(),
-        "-ExecutionPolicy".to_string(),
-        "Bypass".to_string(),
-        "-File".to_string(),
-        script
-            .to_str()
-            .context("system proxy script path is not valid UTF-8")?
-            .to_string(),
-        action.to_string(),
-    ];
-    if enable {
-        args.extend(["-Server".to_string(), server.to_string()]);
-        let override_list = wininet_proxy_override_entries(bypass_entries).join(";");
-        args.extend(["-Override".to_string(), override_list]);
-    }
-    let output = Command::new("powershell.exe")
-        .args(args)
-        .output()
-        .context("failed to run PowerShell system proxy script")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() {
-        return Ok(if stdout.is_empty() {
-            format!("Enabled Windows system proxy: {server}")
-        } else {
-            stdout
-        });
-    }
-
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    bail!(
-        "PowerShell exited with {}: {}",
-        output.status.code().unwrap_or(-1),
-        message
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn run_system_proxy_update(
-    server: &str,
-    enable: bool,
-    bypass_entries: &[String],
-) -> Result<String> {
-    let services = macos_system_proxy_services()?;
-    if services.is_empty() {
-        bail!("no enabled macOS network services found");
-    }
-
-    if enable {
-        let (host, port) = parse_proxy_server(server)?;
-        let bypass = system_proxy_bypass_entries(bypass_entries);
-        for service in &services {
-            run_networksetup(&["-setwebproxy", service, &host, &port])?;
-            run_networksetup(&["-setsecurewebproxy", service, &host, &port])?;
-            run_networksetup(&["-setsocksfirewallproxy", service, &host, &port])?;
-            let mut args = vec!["-setproxybypassdomains", service.as_str()];
-            args.extend(bypass.iter().map(String::as_str));
-            run_networksetup(&args)?;
-        }
-        Ok(format!(
-            "Enabled macOS system proxy for {} at {server}",
-            services.join(", ")
-        ))
-    } else {
-        for service in &services {
-            run_networksetup(&["-setwebproxystate", service, "off"])?;
-            run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
-            run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
-        }
-        Ok(format!(
-            "Disabled macOS system proxy for {}",
-            services.join(", ")
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn run_system_proxy_update(
-    server: &str,
-    enable: bool,
-    bypass_entries: &[String],
-) -> Result<String> {
-    if !command_exists("gsettings") {
-        bail!("Linux system proxy toggle requires gsettings");
-    }
-
-    if enable {
-        let (host, port) = parse_proxy_server(server)?;
-        let host_value = gsettings_string_value(&host);
-        run_gsettings(&["set", "org.gnome.system.proxy", "mode", "manual"])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.http", "host", &host_value])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.http", "port", &port])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.https", "host", &host_value])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.https", "port", &port])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.socks", "host", &host_value])?;
-        run_gsettings(&["set", "org.gnome.system.proxy.socks", "port", &port])?;
-        let ignore_hosts =
-            gsettings_string_list_value(&system_proxy_bypass_entries(bypass_entries));
-        run_gsettings(&[
-            "set",
-            "org.gnome.system.proxy",
-            "ignore-hosts",
-            &ignore_hosts,
-        ])?;
-        Ok(format!(
-            "Enabled Linux system proxy via gsettings: {server}"
-        ))
-    } else {
-        run_gsettings(&["set", "org.gnome.system.proxy", "mode", "none"])?;
-        Ok("Disabled Linux system proxy via gsettings".to_string())
-    }
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn run_system_proxy_update(
-    _server: &str,
-    _enable: bool,
-    _bypass_entries: &[String],
-) -> Result<String> {
-    bail!("system proxy toggle is only available on Windows, macOS, and Linux")
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_exists(pid: u32) -> bool {
     let exists = Command::new("kill")
@@ -972,263 +658,6 @@ fn process_exists(_pid: u32) -> bool {
     false
 }
 
-#[cfg(windows)]
-fn system_proxy_matches(server: &str) -> bool {
-    let output = Command::new("reg.exe")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        ])
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    registry_value_line(&text, "ProxyEnable")
-        .is_some_and(|line| line.split_whitespace().last() == Some("0x1"))
-        && registry_value_line(&text, "ProxyServer").is_some_and(|line| {
-            line.split_once("REG_SZ")
-                .map(|(_, value)| value.trim() == server)
-                .unwrap_or(false)
-        })
-}
-
-#[cfg(target_os = "macos")]
-fn system_proxy_matches(server: &str) -> bool {
-    let Ok((host, port)) = parse_proxy_server(server) else {
-        return false;
-    };
-    let output = Command::new("scutil").arg("--proxy").output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    macos_proxy_value(&text, "HTTPEnable") == Some("1")
-        && macos_proxy_value(&text, "HTTPProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "HTTPPort") == Some(port.as_str())
-        && macos_proxy_value(&text, "HTTPSEnable") == Some("1")
-        && macos_proxy_value(&text, "HTTPSProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "HTTPSPort") == Some(port.as_str())
-        && macos_proxy_value(&text, "SOCKSEnable") == Some("1")
-        && macos_proxy_value(&text, "SOCKSProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "SOCKSPort") == Some(port.as_str())
-}
-
-#[cfg(target_os = "linux")]
-fn system_proxy_matches(server: &str) -> bool {
-    let Ok((host, port)) = parse_proxy_server(server) else {
-        return false;
-    };
-    gsettings_value("org.gnome.system.proxy", "mode").as_deref() == Some("manual")
-        && gsettings_value("org.gnome.system.proxy.http", "host").as_deref() == Some(host.as_str())
-        && gsettings_value("org.gnome.system.proxy.http", "port").as_deref() == Some(port.as_str())
-        && gsettings_value("org.gnome.system.proxy.https", "host").as_deref() == Some(host.as_str())
-        && gsettings_value("org.gnome.system.proxy.https", "port").as_deref() == Some(port.as_str())
-        && gsettings_value("org.gnome.system.proxy.socks", "host").as_deref() == Some(host.as_str())
-        && gsettings_value("org.gnome.system.proxy.socks", "port").as_deref() == Some(port.as_str())
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn system_proxy_matches(_server: &str) -> bool {
-    false
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn parse_proxy_server(server: &str) -> Result<(String, String)> {
-    let server = server.trim();
-    let (host, port) = server
-        .rsplit_once(':')
-        .with_context(|| format!("system proxy server must be host:port, got {server}"))?;
-    let host = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = port.trim().to_string();
-    if host.is_empty() {
-        bail!("system proxy server host is empty");
-    }
-    let parsed_port = port
-        .parse::<u16>()
-        .with_context(|| format!("system proxy server port must be a number, got {port}"))?;
-    if parsed_port == 0 {
-        bail!("system proxy server port must be greater than 0");
-    }
-    Ok((host, port))
-}
-
-#[cfg(target_os = "linux")]
-fn run_gsettings(args: &[&str]) -> Result<()> {
-    let output = Command::new("gsettings")
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run gsettings {}", args.join(" ")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    bail!(
-        "gsettings {} exited with {}: {}",
-        args.join(" "),
-        output.status.code().unwrap_or(-1),
-        message
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn gsettings_value(schema: &str, key: &str) -> Option<String> {
-    let output = Command::new("gsettings")
-        .args(["get", schema, key])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Some(parse_gsettings_scalar(&value).to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn parse_gsettings_scalar(value: &str) -> &str {
-    value.trim().trim_start_matches('\'').trim_end_matches('\'')
-}
-
-#[cfg(target_os = "linux")]
-fn gsettings_string_value(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
-#[cfg(target_os = "linux")]
-fn gsettings_string_list_value(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| gsettings_string_value(value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{values}]")
-}
-
-#[cfg(target_os = "linux")]
-fn command_exists(command: &str) -> bool {
-    env::var_os("PATH")
-        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).is_file()))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_system_proxy_services() -> Result<Vec<String>> {
-    if let Ok(value) = env::var("SING_BOX_TUI_SYSTEM_PROXY_SERVICE") {
-        let services = value
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        if !services.is_empty() {
-            return Ok(services);
-        }
-    }
-
-    let output = Command::new("networksetup")
-        .arg("-listallnetworkservices")
-        .output()
-        .context("failed to list macOS network services")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!(
-            "networksetup -listallnetworkservices exited with {}: {}",
-            output.status.code().unwrap_or(-1),
-            message
-        );
-    }
-
-    Ok(stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("An asterisk"))
-        .filter(|line| !line.starts_with('*'))
-        .map(ToString::to_string)
-        .collect())
-}
-
-#[cfg(target_os = "macos")]
-fn run_networksetup(args: &[&str]) -> Result<()> {
-    let output = Command::new("networksetup")
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run networksetup {}", args.join(" ")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    bail!(
-        "networksetup {} exited with {}: {}",
-        args.join(" "),
-        output.status.code().unwrap_or(-1),
-        message
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_proxy_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-    text.lines().find_map(|line| {
-        let (key, value) = line.trim().split_once(':')?;
-        (key.trim() == name).then_some(value.trim())
-    })
-}
-
-#[cfg(windows)]
-fn registry_value_line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-    text.lines().find(|line| {
-        line.split_whitespace()
-            .next()
-            .is_some_and(|value| value.eq_ignore_ascii_case(name))
-    })
-}
-
-#[cfg(windows)]
-fn windows_system_proxy_script_path() -> Option<PathBuf> {
-    if let Ok(path) = env::var("SING_BOX_TUI_SYSTEM_PROXY_SCRIPT") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let cwd_path = PathBuf::from("scripts")
-        .join("windows")
-        .join("set-system-proxy.ps1");
-    if cwd_path.exists() {
-        return Some(cwd_path);
-    }
-
-    let exe = env::current_exe().ok()?;
-    for ancestor in exe.ancestors() {
-        let candidate = ancestor
-            .join("scripts")
-            .join("windows")
-            .join("set-system-proxy.ps1");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 struct App {
     client: ApiClient,
     groups: Vec<ProxyGroup>,
@@ -1281,11 +710,7 @@ struct App {
     settings_error: Option<String>,
     subscription_refresh: Option<SubscriptionRefreshState>,
     system_proxy_config_path: PathBuf,
-    system_proxy_server: String,
-    system_proxy_server_override: bool,
-    system_proxy_enabled: bool,
-    system_proxy_job: Option<SystemProxyJob>,
-    last_system_proxy_status_refresh: Instant,
+    system_proxy: SystemProxy,
     internet_tun: InternetTunTransaction,
     china_ip_routing_enabled: bool,
     china_ip_routing_explicit: bool,
@@ -1312,13 +737,6 @@ struct SubscriptionRefreshJob {
 
 enum SubscriptionRefreshEvent {
     Finished(Result<SubscriptionRefreshOutput, String>),
-}
-
-struct SystemProxyJob {
-    server: String,
-    enable: bool,
-    receiver: mpsc::Receiver<Result<String, String>>,
-    worker: JoinHandle<()>,
 }
 
 struct VerifyJob {
@@ -1478,7 +896,7 @@ impl App {
             StatusFooter::Status(self.status_line())
         };
         let status = StatusSnapshot {
-            system_proxy_enabled: self.system_proxy_enabled,
+            system_proxy_enabled: self.system_proxy.enabled(),
             tun_enabled: self.internet_tun.is_enabled(),
             selection_context,
             connections: self.connections_summary_line(),
@@ -1553,10 +971,8 @@ impl App {
         let existing_state_file = state_store.exists();
         let mut runtime_state = state_store.load()?;
         let onboarding_complete = runtime_state.onboarding_complete || existing_state_file;
-        let system_proxy_server =
-            default_system_proxy_server(&subscription_refresh_options.config_path);
-        let system_proxy_enabled = system_proxy_matches(&system_proxy_server);
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
+        let system_proxy = SystemProxy::new(system_proxy_config_path.clone());
         let internet_tun = InternetTunTransaction::new(
             system_proxy_config_path.clone(),
             PersistedInternetTun::new(
@@ -1623,11 +1039,7 @@ impl App {
             settings_error: None,
             subscription_refresh,
             system_proxy_config_path: system_proxy_config_path.clone(),
-            system_proxy_server,
-            system_proxy_server_override: false,
-            system_proxy_enabled,
-            system_proxy_job: None,
-            last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            system_proxy,
             internet_tun,
             china_ip_routing_enabled,
             china_ip_routing_explicit: false,
@@ -1750,8 +1162,8 @@ impl App {
             .clone()
             .filter(|value| !value.trim().is_empty())
         {
-            self.system_proxy_server = value;
-            self.system_proxy_server_override = state.system_proxy_server_override;
+            self.system_proxy
+                .restore_server(value, state.system_proxy_server_override);
         }
         if let Some(value) = state.china_ip_routing_enabled {
             self.china_ip_routing_enabled = value;
@@ -1847,8 +1259,8 @@ impl App {
             verify_targets: normalize_optional_setting(Some(self.verify_targets.clone())),
             auto_select_threshold_ms: Some(self.auto_select_threshold_ms),
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
-            system_proxy_server: Some(self.system_proxy_server.clone()),
-            system_proxy_server_override: self.system_proxy_server_override,
+            system_proxy_server: Some(self.system_proxy.server().to_string()),
+            system_proxy_server_override: self.system_proxy.server_is_overridden(),
             tun_enabled: persisted_tun.enabled(),
             tun_auto_detect_interface_before_enable: persisted_tun.restore_auto_detect_interface(),
             china_ip_routing_enabled: self
@@ -2832,14 +2244,13 @@ impl App {
                 if value.is_empty() {
                     bail!("system proxy server cannot be empty");
                 }
-                self.system_proxy_server = value.to_string();
-                self.system_proxy_server_override = true;
+                self.system_proxy.override_server(value.to_string());
             }
             SettingsField::ChinaIpRouting => {
                 let enable = parse_bool_setting(value)?;
                 if enable {
                     let ruleset_dir = china_ip_routing_ruleset_dir(&self.system_proxy_config_path);
-                    let proxy_server = self.system_proxy_server.clone();
+                    let proxy_server = self.system_proxy.server().to_string();
                     self.client
                         .runtime
                         .block_on(download_china_ip_routing_rulesets(
@@ -3784,9 +3195,6 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        if !self.system_proxy_server_override {
-            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
-        }
         let targets = match parse_verification_targets(&self.verify_targets) {
             Ok(targets) if !targets.is_empty() => targets,
             Ok(_) => {
@@ -3798,7 +3206,7 @@ impl App {
                 return;
             }
         };
-        let proxy_server = self.system_proxy_server.clone();
+        let proxy_server = self.system_proxy.resolved_server();
         let worker_proxy_server = proxy_server.clone();
         let worker = thread::spawn(move || {
             let report = run_verification(&worker_proxy_server, &targets);
@@ -4033,86 +3441,32 @@ impl App {
     }
 
     fn set_system_proxy(&mut self) {
-        if self.system_proxy_job.is_some() {
-            self.set_status_only("System proxy update is already running");
-            return;
-        }
-        if !self.system_proxy_server_override {
-            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
-        }
-        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
-        let enable = !self.system_proxy_enabled;
-        let server = self.system_proxy_server.clone();
         let bypass_entries = self
             .private_access
             .system_proxy_bypass_entries(&self.bypass_entries);
-        let (tx, rx) = mpsc::channel();
-        let worker_server = server.clone();
-        let worker = thread::spawn(move || {
-            let result = run_system_proxy_update(&worker_server, enable, &bypass_entries)
-                .map_err(|error| error.to_string());
-            let _ = tx.send(result);
-        });
-        self.system_proxy_job = Some(SystemProxyJob {
-            server: server.clone(),
-            enable,
-            receiver: rx,
-            worker,
-        });
-        if enable {
-            self.set_status_only(format!("Enabling system proxy at {server}..."));
-        } else {
-            self.set_status_only("Disabling system proxy...");
+        match self.system_proxy.toggle(bypass_entries) {
+            SystemProxyToggle::AlreadyRunning => {
+                self.set_status_only("System proxy update is already running");
+            }
+            SystemProxyToggle::Started {
+                enable: true,
+                server,
+            } => self.set_status_only(format!("Enabling system proxy at {server}...")),
+            SystemProxyToggle::Started { enable: false, .. } => {
+                self.set_status_only("Disabling system proxy...");
+            }
         }
     }
 
     fn poll_system_proxy_updates(&mut self) {
-        let Some(job) = self.system_proxy_job.as_ref() else {
-            return;
-        };
-        let result = match job.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err("system proxy worker disconnected".to_string()),
-        };
-
-        let job = self
-            .system_proxy_job
-            .take()
-            .expect("system proxy job exists");
-        let _ = job.worker.join();
-        match result {
-            Ok(message) => {
-                self.system_proxy_server = job.server;
-                self.system_proxy_enabled = if job.enable {
-                    system_proxy_matches(&self.system_proxy_server)
-                } else {
-                    false
-                };
-                self.set_status_with_flash(message);
-            }
-            Err(error) => {
-                self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
-                self.set_status_with_flash(format!(
-                    "System proxy update failed: {}",
-                    truncate_for_width(&error, 90)
-                ));
-            }
+        match self.system_proxy.poll() {
+            Some(SystemProxyUpdate::Applied(message)) => self.set_status_with_flash(message),
+            Some(SystemProxyUpdate::Failed(error)) => self.set_status_with_flash(format!(
+                "System proxy update failed: {}",
+                truncate_for_width(&error, 90)
+            )),
+            None => {}
         }
-    }
-
-    fn maybe_refresh_system_proxy_status(&mut self) {
-        if self.system_proxy_job.is_some()
-            || self.last_system_proxy_status_refresh.elapsed()
-                < SYSTEM_PROXY_STATUS_REFRESH_INTERVAL
-        {
-            return;
-        }
-        self.last_system_proxy_status_refresh = Instant::now();
-        if !self.system_proxy_server_override {
-            self.system_proxy_server = default_system_proxy_server(&self.system_proxy_config_path);
-        }
-        self.system_proxy_enabled = system_proxy_matches(&self.system_proxy_server);
     }
 
     fn tun_toggle_needs_terminal_prompt(&self) -> bool {
@@ -4328,12 +3682,11 @@ mod tests {
         GLOBAL_CLASH_MODE, IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW,
         LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState, LeftPaneSection, PrivateAccessMode,
         PrivateAccessProfileRuntime, PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE,
-        SYSTEM_PROXY_STATUS_REFRESH_INTERVAL, SettingsEditState, SettingsField,
-        connection_is_direct, is_private_access_settings_field, next_clash_mode,
-        normalize_http_connect_proxy, private_access_auth_display_value,
-        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
-        sonicwall_http_connect_settings, system_proxy_bypass_entries, truncate_for_width,
-        visible_settings_fields,
+        SettingsEditState, SettingsField, SystemProxy, connection_is_direct,
+        is_private_access_settings_field, next_clash_mode, normalize_http_connect_proxy,
+        private_access_auth_display_value, private_access_auth_initial_value,
+        settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
+        truncate_for_width, visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkEvent, BenchmarkJob, BenchmarkJobKind, BenchmarkRequest,
@@ -4509,11 +3862,11 @@ mod tests {
             settings_error: None,
             subscription_refresh: None,
             system_proxy_config_path: PathBuf::from("config.json"),
-            system_proxy_server: "127.0.0.1:6780".to_string(),
-            system_proxy_server_override: false,
-            system_proxy_enabled: false,
-            system_proxy_job: None,
-            last_system_proxy_status_refresh: Instant::now() - SYSTEM_PROXY_STATUS_REFRESH_INTERVAL,
+            system_proxy: SystemProxy::for_test(
+                PathBuf::from("config.json"),
+                "127.0.0.1:6780",
+                false,
+            ),
             internet_tun: InternetTunTransaction::new(
                 PathBuf::from("config.json"),
                 PersistedInternetTun::default(),
@@ -4783,55 +4136,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_mixed_inbound_proxy_server_from_config() {
-        let path = std::env::temp_dir().join("sing-box-tui-proxy-config-test.json");
-        std::fs::write(
-            &path,
-            r#"{"inbounds":[{"type":"mixed","listen":"::","listen_port":6780}]}"#,
-        )
-        .expect("write config");
-
-        assert_eq!(
-            super::detect_mixed_inbound_proxy_server(&path).as_deref(),
-            Some("127.0.0.1:6780")
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn detects_mixed_inbound_proxy_server_from_partial_text_when_config_is_invalid() {
-        let text = r#"{
-            "inbounds": [
-                {"type":"mixed","listen":"::","listen_port":6780}
-            ],
-            "outbounds": [broken
-        }"#;
-
-        assert_eq!(
-            super::detect_mixed_inbound_proxy_server_from_text(text).as_deref(),
-            Some("127.0.0.1:6780")
-        );
-    }
-
-    #[test]
-    fn system_proxy_bypass_entries_include_tui_bypass_rules() {
-        let entries = system_proxy_bypass_entries(&[
-            "example.com".to_string(),
-            "*.github.com".to_string(),
-            "10.0.0.0/8".to_string(),
-            "1.1.1.1".to_string(),
-        ]);
-
-        assert!(entries.contains(&"localhost".to_string()));
-        assert!(entries.contains(&"example.com".to_string()));
-        assert!(entries.contains(&"*.example.com".to_string()));
-        assert!(entries.contains(&"*.github.com".to_string()));
-        assert!(entries.contains(&"10.0.0.0/8".to_string()));
-        assert!(entries.contains(&"1.1.1.1".to_string()));
-    }
-
-    #[test]
     fn private_access_domains_are_ephemeral_system_proxy_bypass_entries() {
         let mut app = test_app();
         app.bypass_entries = vec!["deeloo.cn".to_string()];
@@ -4875,27 +4179,6 @@ mod tests {
                 .system_proxy_bypass_entries(&app.bypass_entries),
             vec!["deeloo.cn".to_string()]
         );
-    }
-
-    #[test]
-    fn system_proxy_bypass_entries_do_not_bypass_private_ranges_by_default() {
-        let entries = system_proxy_bypass_entries(&[]);
-
-        assert!(entries.contains(&"localhost".to_string()));
-        assert!(entries.contains(&"127.*".to_string()));
-        assert!(!entries.contains(&"10.*".to_string()));
-        assert!(!entries.contains(&"172.16.*".to_string()));
-        assert!(!entries.contains(&"192.168.*".to_string()));
-    }
-
-    #[test]
-    fn system_proxy_bypass_entries_include_cgnat_overlay_range() {
-        let entries = system_proxy_bypass_entries(&[]);
-
-        assert!(entries.contains(&"100.64.*".to_string()));
-        assert!(entries.contains(&"100.121.*".to_string()));
-        assert!(entries.contains(&"100.127.*".to_string()));
-        assert!(!entries.contains(&"100.128.*".to_string()));
     }
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
