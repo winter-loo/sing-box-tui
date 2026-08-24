@@ -377,10 +377,7 @@ pub(crate) fn default_tun_inbound() -> Value {
     json!({
         "type": "tun",
         "tag": INTERNET_TUN_INBOUND_TAG,
-        "address": [
-            "172.19.0.1/30",
-            "2001:470:f9da:fdfa::1/64"
-        ],
+        "address": ["172.19.0.1/30"],
         "mtu": 9000,
         "auto_route": true,
         "strict_route": true,
@@ -2878,10 +2875,7 @@ mod tests {
             .find(|value| value["type"] == "tun")
             .expect("tun inbound");
         assert_eq!(tun["tag"], "tun-in");
-        assert_eq!(
-            tun["address"],
-            json!(["172.19.0.1/30", "2001:470:f9da:fdfa::1/64"])
-        );
+        assert_eq!(tun["address"], json!(["172.19.0.1/30"]));
         assert_eq!(tun["mtu"], 9000);
         assert_eq!(tun["auto_route"], true);
         assert_eq!(tun["strict_route"], true);
@@ -4177,6 +4171,7 @@ mod tests {
         let inbound = default_tun_inbound();
         assert_eq!(inbound["type"], "tun");
         assert_eq!(inbound["tag"], "tun-in");
+        assert_eq!(inbound["address"], json!(["172.19.0.1/30"]));
         assert_eq!(inbound["auto_route"], true);
         assert_eq!(inbound["strict_route"], true);
         assert_eq!(inbound["stack"], "mixed");

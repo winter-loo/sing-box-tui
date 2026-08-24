@@ -104,10 +104,7 @@ Example:
 {
   "type": "tun",
   "tag": "tun-in",
-  "address": [
-    "172.19.0.1/30",
-    "2001:470:f9da:fdfa::1/64"
-  ],
+  "address": ["172.19.0.1/30"],
   "mtu": 9000,
   "auto_route": true,
   "strict_route": true,
@@ -130,10 +127,7 @@ If the existing config has only one `mixed` inbound, the result should look like
     {
       "type": "tun",
       "tag": "tun-in",
-      "address": [
-        "172.19.0.1/30",
-        "2001:470:f9da:fdfa::1/64"
-      ],
+      "address": ["172.19.0.1/30"],
       "mtu": 9000,
       "auto_route": true,
       "strict_route": true,
