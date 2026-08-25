@@ -51,18 +51,33 @@ impl SubscriptionFormat {
     }
 }
 
-pub(crate) fn run_provider_sync(
-    provider: String,
-    account_file: &Path,
-    config_path: &Path,
-    output: Option<&PathBuf>,
-    subscription_output: Option<&PathBuf>,
-    replace_nodes: bool,
-    include_geosite_rules: bool,
-    include_tun_mode: bool,
-    write: bool,
-) -> Result<()> {
-    let credentials = ProviderCredentials::from_file(account_file)?;
+pub(crate) struct ProviderSyncOptions {
+    pub(crate) provider: String,
+    pub(crate) account_file: PathBuf,
+    pub(crate) config_path: PathBuf,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) subscription_output: Option<PathBuf>,
+    pub(crate) replace_nodes: bool,
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
+    pub(crate) write: bool,
+}
+
+pub(crate) fn run_provider_sync(options: ProviderSyncOptions) -> Result<()> {
+    let ProviderSyncOptions {
+        provider,
+        account_file,
+        config_path,
+        output,
+        subscription_output,
+        replace_nodes,
+        include_geosite_rules,
+        include_tun_mode,
+        write,
+    } = options;
+    let output = output.as_ref();
+    let subscription_output = subscription_output.as_ref();
+    let credentials = ProviderCredentials::from_file(&account_file)?;
     let provider_url = normalize_provider_url(&provider)?;
     let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
@@ -108,7 +123,7 @@ pub(crate) fn run_provider_sync(
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
-    let config_path_buf = config_path.to_path_buf();
+    let config_path_buf = config_path;
     let (config, imported_nodes) = build_full_config_from_singbox_subscription_with_options(
         &config_path_buf,
         &subscription_json,

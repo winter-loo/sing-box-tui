@@ -1089,19 +1089,21 @@ pub(crate) fn ensure_private_access_route_table(
     let rules = rules_value
         .as_array_mut()
         .context("existing config route.rules must be an array")?;
-    rules.retain(|rule| {
-        !rule_matches_private_access_route_targets(
-            rule,
-            &target_cidrs,
-            &target_domains,
-            &target_domain_suffixes,
-            &previous_cidrs,
-            &previous_domains,
-            &previous_domain_suffixes,
-            &direct_tag,
-            options.proxy,
-        )
-    });
+    let managed_targets = PrivateAccessManagedTargets {
+        current: PrivateAccessRouteTargets {
+            cidrs: &target_cidrs,
+            domains: &target_domains,
+            domain_suffixes: &target_domain_suffixes,
+        },
+        previous: PrivateAccessRouteTargets {
+            cidrs: &previous_cidrs,
+            domains: &previous_domains,
+            domain_suffixes: &previous_domain_suffixes,
+        },
+        direct_tag: &direct_tag,
+        proxy: options.proxy,
+    };
+    rules.retain(|rule| !rule_matches_private_access_route_targets(rule, &managed_targets));
 
     // Profile-owned route metadata cannot be written into sing-box route rules because sing-box
     // may reject unknown fields. Ownership is tracked by the TUI/Private Access session; the config rule
@@ -2336,24 +2338,32 @@ fn ensure_private_access_carrier_route(
     Ok(())
 }
 
+struct PrivateAccessRouteTargets<'a> {
+    cidrs: &'a [Ipv4Cidr],
+    domains: &'a [String],
+    domain_suffixes: &'a [String],
+}
+
+struct PrivateAccessManagedTargets<'a> {
+    current: PrivateAccessRouteTargets<'a>,
+    previous: PrivateAccessRouteTargets<'a>,
+    direct_tag: &'a str,
+    proxy: Option<SocketAddrV4>,
+}
+
 fn rule_matches_private_access_route_targets(
     rule: &Value,
-    target_cidrs: &[Ipv4Cidr],
-    target_domains: &[String],
-    target_domain_suffixes: &[String],
-    previous_cidrs: &[Ipv4Cidr],
-    previous_domains: &[String],
-    previous_domain_suffixes: &[String],
-    direct_tag: &str,
-    proxy: Option<SocketAddrV4>,
+    targets: &PrivateAccessManagedTargets<'_>,
 ) -> bool {
     let Some(object) = rule.as_object() else {
         return false;
     };
     let domains = rule_string_values(rule, "domain");
     let domain_suffixes = rule_string_values(rule, "domain_suffix");
-    let matches_domains = (domains == target_domains && domain_suffixes == target_domain_suffixes)
-        || (domains == previous_domains && domain_suffixes == previous_domain_suffixes);
+    let matches_domains = (domains == targets.current.domains
+        && domain_suffixes == targets.current.domain_suffixes)
+        || (domains == targets.previous.domains
+            && domain_suffixes == targets.previous.domain_suffixes);
 
     if rule.get("action").and_then(Value::as_str) == Some("resolve") {
         let only_managed_fields = object.keys().all(|key| {
@@ -2367,7 +2377,7 @@ fn rule_matches_private_access_route_targets(
             && matches_domains;
     }
     if rule.get("action").and_then(Value::as_str) != Some("route")
-        || rule.get("outbound").and_then(Value::as_str) != Some(direct_tag)
+        || rule.get("outbound").and_then(Value::as_str) != Some(targets.direct_tag)
     {
         return false;
     }
@@ -2389,29 +2399,33 @@ fn rule_matches_private_access_route_targets(
     }
     let is_bridge_override =
         rule.get("override_address").is_some() && rule.get("override_port").is_some();
-    if proxy.is_some() && !is_bridge_override {
+    if targets.proxy.is_some() && !is_bridge_override {
         return false;
     }
     let cidrs = rule_ip_cidrs(rule);
     let matches_profile_cidrs = !cidrs.is_empty()
         && cidrs.iter().any(|rule_cidr| {
-            target_cidrs
+            targets
+                .current
+                .cidrs
                 .iter()
-                .chain(previous_cidrs)
+                .chain(targets.previous.cidrs)
                 .any(|profile_cidr| rule_cidr.overlaps(*profile_cidr))
         });
-    let replaces_bridge_with_tun = proxy.is_none()
+    let replaces_bridge_with_tun = targets.proxy.is_none()
         && rule.get("override_address").is_some()
         && rule.get("override_port").is_some()
         && !cidrs.is_empty()
         && cidrs.iter().all(|rule_cidr| {
-            target_cidrs
+            targets
+                .current
+                .cidrs
                 .iter()
                 .any(|target_cidr| rule_cidr.overlaps(*target_cidr))
         });
     ((is_bridge_override && matches_profile_cidrs)
         || (!is_bridge_override
-            && (cidrs == target_cidrs || cidrs == previous_cidrs)
+            && (cidrs == targets.current.cidrs || cidrs == targets.previous.cidrs)
             && !cidrs.is_empty()))
         || replaces_bridge_with_tun
         || matches_domains && (!domains.is_empty() || !domain_suffixes.is_empty())
@@ -2701,10 +2715,10 @@ fn merge_outbound_members(outbound: &mut Value, new_members: &[String]) {
 
     let mut values = Vec::new();
     for value in existing.iter() {
-        if let Some(member) = value.as_str() {
-            if merged.insert(member.to_string()) {
-                values.push(Value::String(member.to_string()));
-            }
+        if let Some(member) = value.as_str()
+            && merged.insert(member.to_string())
+        {
+            values.push(Value::String(member.to_string()));
         }
     }
     for member in new_members {

@@ -274,8 +274,7 @@ fn apply_pushed_routes_to_config(
     options: &HillstoneProbeOptions,
     network: &NetworkSetup,
 ) -> Result<bool> {
-    if !options.apply_routes
-        && !(options.apply_routes_for_proxy && options.udp_http_proxy.is_some())
+    if !(options.apply_routes || options.apply_routes_for_proxy && options.udp_http_proxy.is_some())
     {
         return Ok(false);
     }
@@ -750,13 +749,15 @@ fn run_udp_http_proxy(
                     .context("failed to set accepted browser connection blocking")?;
                 if let Err(error) = handle_http_proxy_client(
                     &mut client,
-                    &socket,
-                    &mut esp,
-                    (server_ip, server_udp_port),
-                    client_ip,
-                    listen,
-                    &mut source_ports,
-                    timeout,
+                    HttpProxyClientContext {
+                        socket: &socket,
+                        esp: &mut esp,
+                        server_endpoint: (server_ip, server_udp_port),
+                        client_ip,
+                        listen,
+                        source_ports: &mut source_ports,
+                        timeout,
+                    },
                 ) {
                     failed_requests = failed_requests.saturating_add(1);
                     eprintln!("warning: failed to proxy browser request: {error:#}");
@@ -994,16 +995,29 @@ fn build_esp_keepalive(
     esp.encap_ipv4(&inner_packet)
 }
 
-fn handle_http_proxy_client(
-    client: &mut TcpStream,
-    socket: &UdpSocket,
-    esp: &mut EspSession,
+struct HttpProxyClientContext<'a> {
+    socket: &'a UdpSocket,
+    esp: &'a mut EspSession,
     server_endpoint: (Ipv4Addr, u16),
     client_ip: Ipv4Addr,
     listen: SocketAddrV4,
-    source_ports: &mut SourcePortAllocator,
+    source_ports: &'a mut SourcePortAllocator,
     timeout: Duration,
+}
+
+fn handle_http_proxy_client(
+    client: &mut TcpStream,
+    context: HttpProxyClientContext<'_>,
 ) -> Result<()> {
+    let HttpProxyClientContext {
+        socket,
+        esp,
+        server_endpoint,
+        client_ip,
+        listen,
+        source_ports,
+        timeout,
+    } = context;
     let browser_request = read_http_request(client, timeout)?;
     let target = resolve_http_proxy_target(&browser_request, listen)?;
     let proxy_request = build_upstream_http_request(&browser_request, listen, target)?;
@@ -1015,11 +1029,13 @@ fn handle_http_proxy_client(
         socket,
         esp,
         server_endpoint,
-        client_ip,
-        target,
-        source_ports.next(),
-        &proxy_request.bytes,
-        timeout,
+        EspHttpRequest {
+            client_ip,
+            target,
+            source_port: source_ports.next(),
+            bytes: &proxy_request.bytes,
+            timeout,
+        },
     )?;
     let status_line = http_status_line(&response).unwrap_or("<missing status line>");
     eprintln!("  browser_response: {status_line} bytes={}", response.len());
@@ -1044,24 +1060,37 @@ fn http_request_over_esp(
         socket,
         esp,
         server_endpoint,
-        client_ip,
-        target,
-        source_port,
-        request,
-        timeout,
+        EspHttpRequest {
+            client_ip,
+            target,
+            source_port,
+            bytes: request,
+            timeout,
+        },
     )
+}
+
+struct EspHttpRequest<'a> {
+    client_ip: Ipv4Addr,
+    target: SocketAddrV4,
+    source_port: u16,
+    bytes: &'a [u8],
+    timeout: Duration,
 }
 
 fn http_request_over_esp_from_source_port(
     socket: &UdpSocket,
     esp: &mut EspSession,
     server_endpoint: (Ipv4Addr, u16),
-    client_ip: Ipv4Addr,
-    target: SocketAddrV4,
-    source_port: u16,
-    request: &[u8],
-    timeout: Duration,
+    request: EspHttpRequest<'_>,
 ) -> Result<Vec<u8>> {
+    let EspHttpRequest {
+        client_ip,
+        target,
+        source_port,
+        bytes,
+        timeout,
+    } = request;
     let client_isn = random_u32();
     eprintln!("  inner_tcp: {client_ip}:{source_port} -> {target} seq=0x{client_isn:08x}");
     let mut state = tcp_handshake_over_esp(
@@ -1077,17 +1106,19 @@ fn http_request_over_esp_from_source_port(
         client_isn,
         timeout,
     )?;
-    send_tcp_payload_over_esp(socket, esp, server_endpoint, &mut state, request)?;
+    send_tcp_payload_over_esp(socket, esp, server_endpoint, &mut state, bytes)?;
     let response = recv_http_response_over_esp(socket, esp, server_endpoint, &mut state, timeout)?;
     send_tcp_over_esp(
         socket,
         esp,
         server_endpoint,
-        state.peer,
-        state.client_next_seq,
-        state.server_next_seq,
-        TCP_FLAG_FIN | TCP_FLAG_ACK,
-        &[],
+        TcpSendSpec {
+            peer: state.peer,
+            sequence: state.client_next_seq,
+            acknowledgement: state.server_next_seq,
+            flags: TCP_FLAG_FIN | TCP_FLAG_ACK,
+            payload: &[],
+        },
     )?;
     Ok(response)
 }
@@ -1129,11 +1160,13 @@ fn send_tcp_payload_over_esp(
             socket,
             esp,
             server_endpoint,
-            state.peer,
-            state.client_next_seq,
-            state.server_next_seq,
-            TCP_FLAG_PSH | TCP_FLAG_ACK,
-            chunk,
+            TcpSendSpec {
+                peer: state.peer,
+                sequence: state.client_next_seq,
+                acknowledgement: state.server_next_seq,
+                flags: TCP_FLAG_PSH | TCP_FLAG_ACK,
+                payload: chunk,
+            },
         )?;
         state.client_next_seq = state.client_next_seq.wrapping_add(chunk.len() as u32);
     }
@@ -1146,6 +1179,14 @@ struct TcpPeer {
     target_ip: Ipv4Addr,
     source_port: u16,
     destination_port: u16,
+}
+
+struct TcpSendSpec<'a> {
+    peer: TcpPeer,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    payload: &'a [u8],
 }
 
 struct TcpConnectionState {
@@ -1309,11 +1350,13 @@ fn recv_http_response_over_esp(
                 socket,
                 esp,
                 server_endpoint,
-                state.peer,
-                state.client_next_seq,
-                state.server_next_seq,
-                TCP_FLAG_ACK,
-                &[],
+                TcpSendSpec {
+                    peer: state.peer,
+                    sequence: state.client_next_seq,
+                    acknowledgement: state.server_next_seq,
+                    flags: TCP_FLAG_ACK,
+                    payload: &[],
+                },
             )?;
         }
 
@@ -1327,23 +1370,19 @@ fn send_tcp_over_esp(
     socket: &UdpSocket,
     esp: &mut EspSession,
     server_endpoint: (Ipv4Addr, u16),
-    peer: TcpPeer,
-    sequence: u32,
-    acknowledgement: u32,
-    flags: u8,
-    payload: &[u8],
+    spec: TcpSendSpec<'_>,
 ) -> Result<()> {
     let segment = build_tcp_segment(TcpSegmentSpec {
-        source_ip: peer.client_ip,
-        destination_ip: peer.target_ip,
-        source_port: peer.source_port,
-        destination_port: peer.destination_port,
-        sequence,
-        acknowledgement,
-        flags,
-        payload,
+        source_ip: spec.peer.client_ip,
+        destination_ip: spec.peer.target_ip,
+        source_port: spec.peer.source_port,
+        destination_port: spec.peer.destination_port,
+        sequence: spec.sequence,
+        acknowledgement: spec.acknowledgement,
+        flags: spec.flags,
+        payload: spec.payload,
     })?;
-    send_inner_tcp_packet(socket, esp, server_endpoint, peer, &segment)
+    send_inner_tcp_packet(socket, esp, server_endpoint, spec.peer, &segment)
 }
 
 fn send_inner_tcp_packet(
@@ -1505,7 +1544,7 @@ impl EspSession {
         }
 
         let ciphertext = &packet[8 + AES_BLOCK_SIZE..packet.len() - HMAC_MD5_96_LEN];
-        if ciphertext.is_empty() || ciphertext.len() % AES_BLOCK_SIZE != 0 {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(AES_BLOCK_SIZE) {
             bail!("ESP ciphertext length is invalid for AES-CBC");
         }
         let iv = &packet[8..8 + AES_BLOCK_SIZE];
@@ -1552,7 +1591,7 @@ fn read_key_slice(bytes: &[u8], offset: &mut usize, size: usize) -> Result<Vec<u
 }
 
 fn aes128_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    if plaintext.len() % AES_BLOCK_SIZE != 0 {
+    if !plaintext.len().is_multiple_of(AES_BLOCK_SIZE) {
         bail!("AES-CBC plaintext length must be block-aligned");
     }
     let cipher = Aes128CbcEnc::new_from_slices(key, iv)
@@ -1566,7 +1605,7 @@ fn aes128_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
 }
 
 fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    if ciphertext.len() % AES_BLOCK_SIZE != 0 {
+    if !ciphertext.len().is_multiple_of(AES_BLOCK_SIZE) {
         bail!("AES-CBC ciphertext length must be block-aligned");
     }
     let cipher = Aes128CbcDec::new_from_slices(key, iv)
@@ -2036,9 +2075,7 @@ fn resolve_http_proxy_target(browser_request: &[u8], listen: SocketAddrV4) -> Re
 
 fn http_uri_target(uri: &str, listen: SocketAddrV4) -> Option<SocketAddrV4> {
     let rest = uri.strip_prefix("http://")?;
-    let authority_end = rest
-        .find(|ch| matches!(ch, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     parse_http_authority_target(authority, listen, 80)
 }
@@ -2798,7 +2835,7 @@ impl std::fmt::Display for Ipv4RouteEntry {
 }
 
 fn decode_ipv4_route_entries(bytes: &[u8]) -> Option<Vec<Ipv4RouteEntry>> {
-    if bytes.len() % 12 == 0 {
+    if bytes.len().is_multiple_of(12) {
         return Some(
             bytes
                 .chunks_exact(12)
@@ -2815,7 +2852,7 @@ fn decode_ipv4_route_entries(bytes: &[u8]) -> Option<Vec<Ipv4RouteEntry>> {
                 .collect(),
         );
     }
-    if bytes.len() % 8 == 0 {
+    if bytes.len().is_multiple_of(8) {
         return Some(
             bytes
                 .chunks_exact(8)
