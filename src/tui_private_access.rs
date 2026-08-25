@@ -818,7 +818,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{
+    use std::fs;
+
+    use super::super::test_support::{
         private_access_progress_text, test_app, test_app_without_private_access, test_state_path,
     };
     use super::*;

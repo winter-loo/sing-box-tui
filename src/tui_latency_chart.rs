@@ -88,7 +88,7 @@ mod tests {
 
     use crossterm::event::KeyCode;
 
-    use super::super::tests::{test_app, test_db_path};
+    use super::super::test_support::{test_app, test_db_path};
     use super::{LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState};
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
     use crate::tui::AUTO_SELECT_THRESHOLD_MS;
