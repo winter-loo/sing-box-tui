@@ -345,10 +345,9 @@ fn collect_zone_interrogation_keys(value: &Value) -> Vec<String> {
                                     .and_then(|object| object_string(object, &["key", "Key"]))
                                     .map(|key| sanitize_probe_string(&key))
                                     .filter(|key| !key.is_empty())
+                                    && !keys.iter().any(|existing| existing == &key)
                                 {
-                                    if !keys.iter().any(|existing| existing == &key) {
-                                        keys.push(key);
-                                    }
+                                    keys.push(key);
                                 }
                             }
                         }
@@ -1158,12 +1157,11 @@ fn find_latest_logon_id(value: &Value) -> Option<String> {
         match value {
             Value::Object(object) => {
                 for (key, child) in object {
-                    if key.eq_ignore_ascii_case("logonid") {
-                        if let Some(candidate) = child.as_str() {
-                            if decode_logon_id(candidate).is_ok() {
-                                *latest = Some(candidate.to_string());
-                            }
-                        }
+                    if key.eq_ignore_ascii_case("logonid")
+                        && let Some(candidate) = child.as_str()
+                        && decode_logon_id(candidate).is_ok()
+                    {
+                        *latest = Some(candidate.to_string());
                     }
                     visit(child, latest);
                 }
@@ -1353,10 +1351,10 @@ fn parse_realms(value: &Value) -> Vec<SonicwallRealm> {
                     if key.eq_ignore_ascii_case("realms") {
                         if let Some(items) = child.as_array() {
                             for item in items {
-                                if let Some(object) = item.as_object() {
-                                    if let Some(realm) = parse_realm_object(object) {
-                                        realms.push(realm);
-                                    }
+                                if let Some(object) = item.as_object()
+                                    && let Some(realm) = parse_realm_object(object)
+                                {
+                                    realms.push(realm);
                                 }
                             }
                         }
@@ -1367,11 +1365,11 @@ fn parse_realms(value: &Value) -> Vec<SonicwallRealm> {
             }
             Value::Array(items) => {
                 for item in items {
-                    if let Some(object) = item.as_object() {
-                        if let Some(realm) = parse_realm_object(object) {
-                            realms.push(realm);
-                            continue;
-                        }
+                    if let Some(object) = item.as_object()
+                        && let Some(realm) = parse_realm_object(object)
+                    {
+                        realms.push(realm);
+                        continue;
                     }
                     visit(item, realms);
                 }

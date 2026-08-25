@@ -62,12 +62,12 @@ pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
 
     let mut final_node = summary.current.clone();
     let mut switched = false;
-    if options.switch {
-        if let Some(best) = summary.best_success() {
-            client.switch_proxy(&summary.selector, &best.name)?;
-            final_node = Some(best.name.clone());
-            switched = true;
-        }
+    if options.switch
+        && let Some(best) = summary.best_success()
+    {
+        client.switch_proxy(&summary.selector, &best.name)?;
+        final_node = Some(best.name.clone());
+        switched = true;
     }
 
     let verification = if options.verify {
@@ -464,7 +464,7 @@ pub(crate) fn matches_filter(value: &str, filter: &str) -> bool {
     let mut has_include = false;
     let mut include_matched = false;
     for pattern in filter
-        .split(|ch| ch == ',' || ch == '，')
+        .split([',', '，'])
         .map(str::trim)
         .filter(|pattern| !pattern.is_empty())
     {

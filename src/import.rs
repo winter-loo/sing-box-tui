@@ -66,17 +66,32 @@ pub(crate) fn run_import(
     Ok(())
 }
 
-pub(crate) fn run_subscribe_import(
-    subscription_url: String,
-    output: Option<&PathBuf>,
-    config_path: &PathBuf,
-    subscription_output: Option<&PathBuf>,
-    replace_nodes: bool,
-    include_geosite_rules: bool,
-    include_tun_mode: bool,
-    provider_name: Option<&str>,
-    existing_provider_name: Option<&str>,
-) -> Result<()> {
+pub(crate) struct SubscribeImportOptions {
+    pub(crate) subscription_url: String,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) subscription_output: Option<PathBuf>,
+    pub(crate) replace_nodes: bool,
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
+    pub(crate) provider_name: Option<String>,
+    pub(crate) existing_provider_name: Option<String>,
+}
+
+pub(crate) fn run_subscribe_import(options: SubscribeImportOptions) -> Result<()> {
+    let SubscribeImportOptions {
+        subscription_url,
+        output,
+        config_path,
+        subscription_output,
+        replace_nodes,
+        include_geosite_rules,
+        include_tun_mode,
+        provider_name,
+        existing_provider_name,
+    } = options;
+    let output = output.as_ref();
+    let subscription_output = subscription_output.as_ref();
     let parsed_url = Url::parse(&subscription_url).with_context(|| {
         format!(
             "invalid subscription URL: {}",
@@ -117,13 +132,13 @@ pub(crate) fn run_subscribe_import(
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
-    let (config, imported_nodes) = if let Some(provider_name) = provider_name {
+    let (config, imported_nodes) = if let Some(provider_name) = provider_name.as_deref() {
         build_full_config_from_singbox_subscription_with_provider_groups(
-            config_path,
+            &config_path,
             &subscription_json,
             replace_nodes,
             provider_name,
-            existing_provider_name,
+            existing_provider_name.as_deref(),
             DefaultConfigOptions {
                 include_geosite_rules,
                 include_tun_mode,
@@ -131,7 +146,7 @@ pub(crate) fn run_subscribe_import(
         )?
     } else {
         build_full_config_from_singbox_subscription_with_options(
-            config_path,
+            &config_path,
             &subscription_json,
             replace_nodes,
             DefaultConfigOptions {

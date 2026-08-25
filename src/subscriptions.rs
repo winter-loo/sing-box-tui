@@ -38,20 +38,34 @@ pub(crate) struct SubscriptionRefreshRequest {
     pub(crate) interval_days: u64,
 }
 
-pub(crate) fn run_subscription_refresh(
-    input: &Path,
-    cache_path: &Path,
-    config_path: &Path,
-    output: Option<&PathBuf>,
-    replace_nodes: bool,
-    include_geosite_rules: bool,
-    include_tun_mode: bool,
-    write: bool,
-    force: bool,
-    interval_days: u64,
-) -> Result<()> {
-    let config_path_buf = config_path.to_path_buf();
-    let merged_path = if let Some(path) = output.cloned() {
+pub(crate) struct SubscriptionRefreshOptions {
+    pub(crate) input: PathBuf,
+    pub(crate) cache_path: PathBuf,
+    pub(crate) config_path: PathBuf,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) replace_nodes: bool,
+    pub(crate) include_geosite_rules: bool,
+    pub(crate) include_tun_mode: bool,
+    pub(crate) write: bool,
+    pub(crate) force: bool,
+    pub(crate) interval_days: u64,
+}
+
+pub(crate) fn run_subscription_refresh(options: SubscriptionRefreshOptions) -> Result<()> {
+    let SubscriptionRefreshOptions {
+        input,
+        cache_path,
+        config_path,
+        output,
+        replace_nodes,
+        include_geosite_rules,
+        include_tun_mode,
+        write,
+        force,
+        interval_days,
+    } = options;
+    let config_path_buf = config_path;
+    let merged_path = if let Some(path) = output {
         path
     } else if write {
         config_path_buf.clone()
@@ -59,8 +73,8 @@ pub(crate) fn run_subscription_refresh(
         bail!("subscriptions requires either --output <FILE> or --write");
     };
     let report = refresh_subscriptions(&SubscriptionRefreshRequest {
-        input: input.to_path_buf(),
-        cache_path: cache_path.to_path_buf(),
+        input,
+        cache_path,
         config_path: config_path_buf,
         merged_path,
         replace_nodes,
@@ -871,7 +885,7 @@ fn redact_url(value: &str) -> String {
         return value.to_string();
     };
 
-    if !url.query_pairs().next().is_none() {
+    if url.query_pairs().next().is_some() {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {

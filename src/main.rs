@@ -37,10 +37,10 @@ use controller::{
 };
 use defaults::DEFAULT_VERIFICATION_TARGETS;
 use hillstone::{HillstoneProbeOptions, run_hillstone_probe};
-use import::{run_import, run_subscribe_import};
+use import::{SubscribeImportOptions, run_import, run_subscribe_import};
 use private_access::run_private_access_service_stdio;
-use provider::run_provider_sync;
-use subscriptions::run_subscription_refresh;
+use provider::{ProviderSyncOptions, run_provider_sync};
+use subscriptions::{SubscriptionRefreshOptions, run_subscription_refresh};
 use tui::{
     TuiSubscriptionRefreshOptions, run_background_status, run_background_stop,
     run_headless_auto_pick, run_tui,
@@ -124,17 +124,17 @@ fn main() -> Result<()> {
             include_tun_mode,
             provider_name,
             existing_provider_name,
-        } => run_subscribe_import(
-            url,
-            output.as_ref(),
-            &config_path,
-            subscription_output.as_ref(),
+        } => run_subscribe_import(SubscribeImportOptions {
+            subscription_url: url,
+            output,
+            config_path,
+            subscription_output,
             replace_nodes,
             include_geosite_rules,
             include_tun_mode,
-            provider_name.as_deref(),
-            existing_provider_name.as_deref(),
-        ),
+            provider_name,
+            existing_provider_name,
+        }),
         CliCommand::Subscriptions {
             input,
             cache,
@@ -146,18 +146,18 @@ fn main() -> Result<()> {
             write,
             force,
             interval_days,
-        } => run_subscription_refresh(
-            &input,
-            &cache,
-            &config_path,
-            output.as_ref(),
+        } => run_subscription_refresh(SubscriptionRefreshOptions {
+            input,
+            cache_path: cache,
+            config_path,
+            output,
             replace_nodes,
             include_geosite_rules,
             include_tun_mode,
             write,
             force,
             interval_days,
-        ),
+        }),
         CliCommand::Benchmark {
             controller,
             selector,
@@ -191,17 +191,17 @@ fn main() -> Result<()> {
             include_geosite_rules,
             include_tun_mode,
             write,
-        } => run_provider_sync(
+        } => run_provider_sync(ProviderSyncOptions {
             provider,
-            &account_file,
-            &config_path,
-            output.as_ref(),
-            subscription_output.as_ref(),
+            account_file,
+            config_path,
+            output,
+            subscription_output,
             replace_nodes,
             include_geosite_rules,
             include_tun_mode,
             write,
-        ),
+        }),
         CliCommand::HillstoneProbe {
             server,
             port,
