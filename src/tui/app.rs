@@ -48,55 +48,55 @@ use crate::tui_state::{
     BypassRuleSetStore, TuiStateStore, default_bypass_rule_set_path, default_tui_state_path,
 };
 
-#[path = "tui_auto_pick_worker.rs"]
+#[path = "../tui_auto_pick_worker.rs"]
 mod auto_pick_worker;
-#[path = "tui_benchmark_workflow.rs"]
+#[path = "../tui_benchmark_workflow.rs"]
 mod benchmark_actions;
-#[path = "tui_connections.rs"]
+#[path = "../tui_connections.rs"]
 mod connections;
-#[path = "tui_dashboard_snapshot.rs"]
+#[path = "../tui_dashboard_snapshot.rs"]
 mod dashboard_snapshot;
-#[path = "tui_input_workflow.rs"]
+#[path = "../tui_input_workflow.rs"]
 mod input_workflow;
-#[path = "tui_latency_chart.rs"]
+#[path = "../tui_latency_chart.rs"]
 mod latency_chart;
-#[path = "tui_managed_process.rs"]
+#[path = "../tui_managed_process.rs"]
 mod managed_process;
-#[path = "tui_network_mode.rs"]
+#[path = "../tui_network_mode.rs"]
 mod network_mode;
-#[path = "tui_onboarding.rs"]
+#[path = "../tui_onboarding.rs"]
 mod onboarding;
-#[path = "tui_presentation.rs"]
-mod presentation;
-#[path = "tui_private_access.rs"]
+#[path = "../tui_private_access.rs"]
 mod private_access_workflow;
-#[path = "tui_runtime_state.rs"]
+#[path = "../tui_runtime_state.rs"]
 mod runtime_state;
-#[path = "tui_selection_model.rs"]
+#[path = "../tui_selection_model.rs"]
 mod selection_model;
-#[path = "tui_selection_navigation.rs"]
+#[path = "../tui_selection_navigation.rs"]
 mod selection_navigation;
-#[path = "tui_settings.rs"]
+#[path = "../tui_settings.rs"]
 mod settings;
-#[path = "tui_subscription_workflow.rs"]
+#[path = "../tui_subscription_workflow.rs"]
 mod subscription_workflow;
 #[cfg(test)]
-#[path = "tui_test_support.rs"]
+#[path = "../tui_test_support.rs"]
 mod test_support;
-#[path = "tui_verification.rs"]
+#[path = "../tui_verification.rs"]
 mod verification;
+#[path = "view/mod.rs"]
+mod view;
 use crate::process_inspection::process_is_alive as process_exists;
+use settings::sonicwall_http_connect_settings;
+use subscription_workflow::SubscriptionRefreshState;
+use verification::{VerifyJob, default_verification_targets_setting};
 #[cfg(test)]
-use presentation::private_access_auth_display_value;
-use presentation::{
+use view::private_access_auth_display_value;
+use view::{
     Focus, LatencyChartState, LeftPaneSection, OnboardingState, PrivateAccessAuthModal,
     PrivateAccessProgressEntry, PrivateAccessProgressModal, PrivateAccessProgressTone,
     SettingsEditState, help_binding_count, private_access_auth_initial_value,
     private_access_progress_title, truncate_for_width,
 };
-use settings::sonicwall_http_connect_settings;
-use subscription_workflow::SubscriptionRefreshState;
-use verification::{VerifyJob, default_verification_targets_setting};
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
@@ -342,8 +342,8 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let snapshot = app.presentation_snapshot();
-    presentation::render(frame, &snapshot);
+    let snapshot = app.view_snapshot();
+    view::render(frame, &snapshot);
 }
 
 struct App {
@@ -715,8 +715,8 @@ impl App {
 }
 
 #[cfg(test)]
-#[path = "tui_interaction_tests.rs"]
+#[path = "../tui_interaction_tests.rs"]
 mod interaction_tests;
 #[cfg(test)]
-#[path = "tui_runtime_integration_tests.rs"]
+#[path = "../tui_runtime_integration_tests.rs"]
 mod runtime_integration_tests;

@@ -4,7 +4,7 @@ use crate::system_proxy::{SystemProxyToggle, SystemProxyUpdate};
 use crate::tui_state::TuiRuntimeState;
 
 use super::App;
-use super::presentation::truncate_for_width;
+use super::view::truncate_for_width;
 
 #[cfg(test)]
 #[path = "tui_network_mode_tests.rs"]

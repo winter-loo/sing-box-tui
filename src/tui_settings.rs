@@ -12,10 +12,10 @@ use crate::private_access_session::{
 use crate::ruleset::download_china_ip_routing_rulesets;
 
 use super::App;
-use super::presentation::{
+use super::verification::parse_verification_targets;
+use super::view::{
     SETTINGS_FIELDS, SettingsEditState, SettingsField, settings_field_label, truncate_for_width,
 };
-use super::verification::parse_verification_targets;
 
 #[cfg(test)]
 #[path = "tui_settings_tests.rs"]

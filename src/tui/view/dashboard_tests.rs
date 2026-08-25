@@ -1,0 +1,145 @@
+use super::*;
+use crate::private_access::PrivateAccessRoute;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+
+fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
+    DashboardSnapshot {
+        focus: Focus::Groups,
+        left_pane_section: LeftPaneSection::Internet,
+        internet_rows: vec![InternetRow {
+            name: "select".to_string(),
+            current: "node-a".to_string(),
+            is_current: true,
+        }],
+        internet_selected: 0,
+        intranet_rows: Vec::new(),
+        intranet_selected: 0,
+        candidate_title: "Candidates [SELECTOR ORDER]".to_string(),
+        candidate_rows: vec![CandidateRow {
+            name: "node-a".to_string(),
+            is_current: true,
+            marker: "42ms".to_string(),
+            tone: CandidateTone::Success,
+        }],
+        candidate_selected: Some(0),
+        intranet_detail: None,
+        status: StatusSnapshot {
+            system_proxy_enabled: false,
+            tun_enabled: true,
+            selection_context: "clash=rule  Pick=Manual  filter=''".to_string(),
+            connections: "connections active=1 proxy=1 direct=0".to_string(),
+            subscription: "subscriptions: disabled".to_string(),
+            sing_box: "sing-box: managed".to_string(),
+            footer: StatusFooter::Status("ready".to_string()),
+        },
+        flash: None,
+        latency_chart: None,
+        connections: None,
+        help_index: None,
+        settings: None,
+        onboarding: None,
+        private_access_progress: None,
+        private_access_auth: None,
+    }
+}
+
+fn rendered_lines(snapshot: &DashboardSnapshot<'_>) -> Vec<String> {
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, snapshot))
+        .expect("dashboard renders");
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .chunks(110)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
+#[test]
+fn render_consumes_a_dashboard_snapshot_without_app_state() {
+    let lines = rendered_lines(&dashboard_snapshot());
+    let text = lines.join("\n");
+
+    assert!(text.contains("Internet Proxy"));
+    assert!(text.contains("select"));
+    assert!(text.contains("node-a"));
+    assert!(text.contains("42ms"));
+    assert!(text.contains("System Proxy: disabled"));
+    assert!(text.contains("Tun Mode: enabled"));
+    assert!(!text.contains("Intranet Proxy"));
+    assert!(has_help_binding("\\", "Toggle TUN mode"));
+}
+
+#[test]
+fn status_footer_is_rendered_below_its_box() {
+    let lines = rendered_lines(&dashboard_snapshot());
+    let message_row = lines
+        .iter()
+        .position(|line| line.contains("ready"))
+        .expect("status footer row");
+
+    assert!(message_row > 0);
+    assert!(!lines[message_row].contains('─'));
+    assert!(lines[message_row - 1].contains('└'));
+    assert!(lines[message_row - 1].contains('┘'));
+}
+
+#[test]
+fn settings_overlay_uses_typed_rows() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.settings = Some(SettingsPanelSnapshot {
+        rows: vec![SettingRow {
+            label: "Latency URL",
+            value: "https://example.test/ping".to_string(),
+        }],
+        selected: 0,
+        editing: None,
+        error: None,
+    });
+
+    let text = rendered_lines(&snapshot).join("\n");
+    assert!(text.contains("Settings"));
+    assert!(text.contains("Latency URL"));
+    assert!(text.contains("https://example.test/ping"));
+}
+
+#[test]
+fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
+    let mut profile = PrivateAccessProfileRuntime::default_hillstone().expect("Hillstone profile");
+    profile.server = "vpn.example.com".to_string();
+    profile.state = PrivateAccessState::Connected;
+    profile.routes = vec![PrivateAccessRoute {
+        cidr: "10.20.0.0/16".to_string(),
+    }];
+    profile.dns = vec!["10.20.0.53".to_string()];
+    profile.domains = vec!["portal.internal.example".to_string()];
+    profile.domain_suffixes = vec!["corp.example".to_string()];
+    let expanded_sections = BTreeSet::new();
+    let mut snapshot = dashboard_snapshot();
+    snapshot.left_pane_section = LeftPaneSection::Intranet;
+    snapshot.intranet_rows = vec![IntranetRow {
+        id: profile.id.clone(),
+        state: profile.state.clone(),
+        background: false,
+    }];
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &expanded_sections,
+        scroll: 0,
+        active: true,
+    });
+
+    let text = rendered_lines(&snapshot).join("\n");
+    assert!(text.contains("Intranet Proxy"));
+    assert!(text.contains("Intranet: hillstone"));
+    assert!(text.contains("vpn.example.com:4433"));
+    assert!(text.contains("10.20.0.0/16"));
+    assert!(text.contains("10.20.0.53"));
+    assert!(text.contains("portal.internal.example"));
+    assert!(text.contains("*.corp.example"));
+    assert!(text.contains("Enter expand/fold"));
+}

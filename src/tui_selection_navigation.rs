@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::presentation::{Focus, LeftPaneSection};
+use super::view::{Focus, LeftPaneSection};
 use super::{App, DIRECT_CLASH_MODE, GLOBAL_CLASH_MODE, REFRESH_DEBOUNCE, RULE_CLASH_MODE};
 
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {

@@ -91,8 +91,8 @@ impl App {
 mod tests {
     use crossterm::event::KeyCode;
 
-    use super::super::presentation::OnboardingState;
     use super::super::test_support::test_app;
+    use super::super::view::OnboardingState;
     use super::subscription_url;
 
     #[test]

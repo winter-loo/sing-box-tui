@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use super::presentation::{
+use super::view::{
     LatencyChartState, latency_chart_window_label, latency_chart_zoom_in, latency_chart_zoom_out,
 };
 use super::{App, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL};
@@ -88,10 +88,10 @@ mod tests {
 
     use crossterm::event::KeyCode;
 
+    use super::super::AUTO_SELECT_THRESHOLD_MS;
     use super::super::test_support::{test_app, test_db_path};
     use super::{LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState};
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
-    use crate::tui::AUTO_SELECT_THRESHOLD_MS;
 
     #[test]
     fn pressing_i_opens_latency_chart_for_selected_node() {
