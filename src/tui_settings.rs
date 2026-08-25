@@ -477,8 +477,8 @@ mod tests {
     fn setting_parsers_validate_their_own_input_contracts() {
         assert_eq!(parse_positive::<u64>("12").unwrap(), 12);
         assert!(parse_positive::<u64>("0").is_err());
-        assert_eq!(parse_bool_setting("yes").unwrap(), true);
-        assert_eq!(parse_bool_setting("off").unwrap(), false);
+        assert!(parse_bool_setting("yes").unwrap());
+        assert!(!parse_bool_setting("off").unwrap());
         assert!(parse_bool_setting("maybe").is_err());
     }
 }

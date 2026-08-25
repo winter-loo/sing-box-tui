@@ -19,6 +19,7 @@ mod macos_privileged_helper;
 mod managed_sing_box;
 mod private_access;
 mod private_access_session;
+mod process_inspection;
 mod provider;
 mod ruleset;
 mod sonicwall;

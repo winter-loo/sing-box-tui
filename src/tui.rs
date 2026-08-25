@@ -70,8 +70,6 @@ mod onboarding;
 mod presentation;
 #[path = "tui_private_access.rs"]
 mod private_access_workflow;
-#[path = "tui_process.rs"]
-mod process_state;
 #[path = "tui_runtime_state.rs"]
 mod runtime_state;
 #[path = "tui_selection_model.rs"]
@@ -87,6 +85,7 @@ mod subscription_workflow;
 mod test_support;
 #[path = "tui_verification.rs"]
 mod verification;
+use crate::process_inspection::process_is_alive as process_exists;
 #[cfg(test)]
 use presentation::private_access_auth_display_value;
 use presentation::{
@@ -95,7 +94,6 @@ use presentation::{
     SettingsEditState, help_binding_count, private_access_auth_initial_value,
     private_access_progress_title, truncate_for_width,
 };
-use process_state::process_exists;
 use settings::sonicwall_http_connect_settings;
 use subscription_workflow::SubscriptionRefreshState;
 use verification::{VerifyJob, default_verification_targets_setting};
