@@ -1,38 +1,6 @@
 use super::*;
+use crate::process_command::{command_program_name_matches, command_tokens};
 use std::path::Path;
-
-fn command_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for character in command.chars() {
-        match character {
-            '"' => in_quotes = !in_quotes,
-            value if value.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            value => current.push(value),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn command_program_name_matches(program: &str, expected: &str) -> bool {
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let expected = expected.rsplit(['/', '\\']).next().unwrap_or(expected);
-    name.eq_ignore_ascii_case(expected)
-        || name
-            .strip_suffix(".exe")
-            .is_some_and(|base| base.eq_ignore_ascii_case(expected))
-        || expected
-            .strip_suffix(".exe")
-            .is_some_and(|base| name.eq_ignore_ascii_case(base))
-}
 
 fn command_matches_private_access_service(
     command: &str,
