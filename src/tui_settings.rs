@@ -1,10 +1,29 @@
-use anyhow::{Context, Result, bail};
+use std::net::SocketAddrV4;
+use std::time::Duration;
 
-use crate::controller::VerificationTarget;
-use crate::defaults::DEFAULT_VERIFICATION_TARGETS;
+use anyhow::{Context, Result, bail};
+use crossterm::event::KeyCode;
+
+use crate::config::{china_ip_routing_ruleset_dir, set_china_ip_routing};
+use crate::private_access_session::{
+    PrivateAccessMode, PrivateAccessProfileRuntime, load_manifest_for_profile,
+    parse_private_access_mode,
+};
+use crate::ruleset::download_china_ip_routing_rulesets;
 
 use super::App;
-use super::presentation::{SETTINGS_FIELDS, SettingsField};
+use super::presentation::{
+    SETTINGS_FIELDS, SettingsEditState, SettingsField, settings_field_label, truncate_for_width,
+};
+use super::verification::parse_verification_targets;
+
+#[cfg(test)]
+#[path = "tui_settings_tests.rs"]
+mod behavior_tests;
+
+fn private_access_profile_settings_locked(profile: &PrivateAccessProfileRuntime) -> bool {
+    profile.settings_locked()
+}
 
 pub(super) fn visible_settings_fields(app: &App) -> Vec<SettingsField> {
     SETTINGS_FIELDS
@@ -177,46 +196,239 @@ pub(super) fn normalize_optional_setting(value: Option<String>) -> Option<String
         .filter(|value| !value.is_empty())
 }
 
-pub(super) fn default_verification_targets_setting() -> String {
-    DEFAULT_VERIFICATION_TARGETS
-        .iter()
-        .map(|(name, url)| format!("{name}={url}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(super) fn parse_verification_targets(input: &str) -> Result<Vec<VerificationTarget>> {
-    input
-        .split([',', '\n', '\r'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(parse_verification_target)
-        .collect()
-}
-
-fn parse_verification_target(input: &str) -> Result<VerificationTarget> {
-    let (name, url) = input
-        .split_once('=')
-        .with_context(|| format!("verification target must be NAME=URL, got {input}"))?;
-    let name = name.trim();
-    let url = url.trim();
-    if name.is_empty() {
-        bail!("verification target name cannot be empty");
+impl App {
+    pub(super) fn open_settings_panel(&mut self) {
+        self.show_settings = true;
+        self.settings_edit = None;
+        let field_count = visible_settings_fields(self).len();
+        self.settings_index = self.settings_index.min(field_count.saturating_sub(1));
+        self.flash = None;
+        self.set_status_only("Showing settings");
     }
-    if url.is_empty() {
-        bail!("verification target URL cannot be empty");
+
+    pub(super) fn handle_settings_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.settings_edit.is_some() {
+            return self.handle_settings_edit_key(code);
+        }
+        let fields = visible_settings_fields(self);
+        self.settings_index = self.settings_index.min(fields.len().saturating_sub(1));
+        match code {
+            KeyCode::Esc | KeyCode::Char('o') => {
+                self.show_settings = false;
+                self.settings_error = None;
+                self.set_status_only("Settings closed");
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_error = None;
+                self.settings_index = (self.settings_index + 1).min(fields.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_error = None;
+                self.settings_index = self.settings_index.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let field = fields[self.settings_index];
+                self.settings_error = None;
+                self.settings_edit = Some(SettingsEditState {
+                    field,
+                    input: settings_field_value(self, field),
+                    error: None,
+                });
+            }
+            KeyCode::Char('q') => return Ok(false),
+            _ => {}
+        }
+        Ok(true)
     }
-    Ok(VerificationTarget {
-        name: name.to_string(),
-        url: url.to_string(),
-    })
+
+    fn handle_settings_edit_key(&mut self, code: KeyCode) -> Result<bool> {
+        let Some(edit) = self.settings_edit.as_mut() else {
+            return Ok(true);
+        };
+        match code {
+            KeyCode::Esc => {
+                self.settings_edit = None;
+                self.settings_error = None;
+            }
+            KeyCode::Enter => {
+                let edit = self.settings_edit.take().expect("settings edit exists");
+                if let Err(error) = self.apply_settings_value(edit.field, edit.input.clone()) {
+                    let message = error.to_string();
+                    self.settings_edit = Some(SettingsEditState {
+                        error: Some(message),
+                        ..edit
+                    });
+                }
+            }
+            KeyCode::Backspace => {
+                edit.input.pop();
+                edit.error = None;
+            }
+            KeyCode::Char(ch) => {
+                edit.input.push(ch);
+                edit.error = None;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    pub(super) fn apply_settings_value(
+        &mut self,
+        field: SettingsField,
+        input: String,
+    ) -> Result<()> {
+        if is_private_access_settings_field(field) && !self.private_access.is_configured() {
+            bail!("Private Access is not configured");
+        }
+        let value = input.trim();
+        match field {
+            SettingsField::BenchmarkUrl => {
+                if value.is_empty() {
+                    bail!("latency URL cannot be empty");
+                }
+                self.benchmark_url = value.to_string();
+            }
+            SettingsField::BenchmarkTimeoutMs => self.benchmark_timeout_ms = parse_positive(value)?,
+            SettingsField::RequestTimeoutSec => {
+                self.benchmark_request_timeout = value
+                    .parse::<f64>()
+                    .context("request timeout must be a number")?;
+                if self.benchmark_request_timeout <= 0.0 {
+                    bail!("request timeout must be greater than 0");
+                }
+            }
+            SettingsField::MaxConcurrency => {
+                self.benchmark_max_concurrency = parse_positive(value)?
+            }
+            SettingsField::VerifyTargets => {
+                if !value.is_empty() {
+                    parse_verification_targets(value)?;
+                }
+                self.verify_targets = value.to_string();
+            }
+            SettingsField::AutoPickThresholdMs => {
+                self.auto_select_threshold_ms = parse_positive(value)?
+            }
+            SettingsField::AutoPickIntervalSec => {
+                let seconds: u64 = parse_positive(value)?;
+                self.auto_select_interval = Duration::from_secs(seconds);
+            }
+            SettingsField::SystemProxyServer => {
+                if value.is_empty() {
+                    bail!("system proxy server cannot be empty");
+                }
+                self.system_proxy.override_server(value.to_string());
+            }
+            SettingsField::ChinaIpRouting => {
+                let enable = parse_bool_setting(value)?;
+                if enable {
+                    let ruleset_dir = china_ip_routing_ruleset_dir(&self.system_proxy_config_path);
+                    let proxy_server = self.system_proxy.server().to_string();
+                    self.client
+                        .runtime
+                        .block_on(download_china_ip_routing_rulesets(
+                            Some(&proxy_server),
+                            &ruleset_dir,
+                        ))?;
+                }
+                let changed = set_china_ip_routing(&self.system_proxy_config_path, enable)?;
+                self.china_ip_routing_enabled = enable;
+                self.china_ip_routing_explicit = true;
+                self.save_runtime_state()?;
+                if changed {
+                    let receipt = self.restart_managed_sing_box()?;
+                    let label = if enable { "enabled" } else { "disabled" };
+                    match receipt.observe_controller(&self.client) {
+                        Ok(()) => self.set_status_with_flash(format!(
+                            "China IP routing {label}; sing-box restarted"
+                        )),
+                        Err(error) => self.set_status_with_flash(format!(
+                            "China IP routing {label}; controller not ready: {}",
+                            truncate_for_width(&format!("{error:#}"), 60)
+                        )),
+                    }
+                } else {
+                    self.set_status_with_flash(format!(
+                        "China IP routing already {}",
+                        if enable { "enabled" } else { "disabled" }
+                    ));
+                }
+                return Ok(());
+            }
+            SettingsField::PrivateAccessProfile => {
+                self.private_access.set_focus_by_id(value)?;
+            }
+            SettingsField::PrivateAccessManifestPath => {
+                if private_access_profile_settings_locked(self.private_access.focused()) {
+                    bail!("disconnect Private Access before changing service manifest");
+                }
+                let profile_id = self.private_access.focused().id.clone();
+                let manifest_path = normalize_optional_setting(Some(value.to_string()));
+                let manifest = load_manifest_for_profile(&profile_id, manifest_path.as_deref())?;
+                let focused = self.private_access.focused_mut();
+                focused.manifest_path = manifest_path;
+                focused.manifest = manifest;
+            }
+            SettingsField::PrivateAccessMode => {
+                if private_access_profile_settings_locked(self.private_access.focused()) {
+                    bail!("disconnect Private Access before changing data plane mode");
+                }
+                if self.private_access.focused().manifest.id == "sonicwall" {
+                    if parse_private_access_mode(value)? != PrivateAccessMode::Tun {
+                        bail!("SonicWall private access supports TUN mode only");
+                    }
+                    self.private_access.focused_mut().mode = PrivateAccessMode::Tun;
+                } else {
+                    self.private_access.focused_mut().mode = parse_private_access_mode(value)?;
+                }
+            }
+            SettingsField::PrivateAccessServer => {
+                self.private_access.focused_mut().server = value.to_string();
+            }
+            SettingsField::PrivateAccessPort => {
+                self.private_access.focused_mut().port = parse_positive(value)?
+            }
+            SettingsField::PrivateAccessUsername => {
+                self.private_access.focused_mut().username = value.to_string();
+            }
+            SettingsField::PrivateAccessPassword => {
+                self.private_access.focused_mut().password = value.to_string();
+            }
+            SettingsField::PrivateAccessPasswordEnv => {
+                self.private_access.focused_mut().password_env = value.to_string();
+            }
+            SettingsField::PrivateAccessBridgeListen => {
+                value
+                    .parse::<SocketAddrV4>()
+                    .context("bridge listen must be an IPv4:PORT address")?;
+                self.private_access.focused_mut().bridge_listen = value.to_string();
+            }
+            SettingsField::PrivateAccessUseInternetProxy => {
+                if private_access_profile_settings_locked(self.private_access.focused()) {
+                    bail!("disconnect Private Access before changing SonicWall transport");
+                }
+                if self.private_access.focused().manifest.id != "sonicwall" {
+                    bail!("Internet proxy transport is only configurable for SonicWall");
+                }
+                self.private_access.focused_mut().use_internet_proxy = parse_bool_setting(value)?;
+            }
+            SettingsField::PrivateAccessTlsVerify => {
+                self.private_access.focused_mut().tls_verify = parse_bool_setting(value)?;
+            }
+        }
+        self.save_runtime_state()?;
+        self.ensure_auto_pick_background_worker_after_state_change()?;
+        self.set_status_only(format!("Saved {}", settings_field_label(field)));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         normalize_http_connect_proxy, parse_bool_setting, parse_positive,
-        parse_verification_targets, sonicwall_http_connect_settings,
+        sonicwall_http_connect_settings,
     };
 
     #[test]
@@ -268,14 +480,5 @@ mod tests {
         assert_eq!(parse_bool_setting("yes").unwrap(), true);
         assert_eq!(parse_bool_setting("off").unwrap(), false);
         assert!(parse_bool_setting("maybe").is_err());
-
-        let targets = parse_verification_targets(
-            "example=https://example.com, fallback=https://fallback.example",
-        )
-        .unwrap();
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].name, "example");
-        assert_eq!(targets[0].url, "https://example.com");
-        assert!(parse_verification_targets("missing-separator").is_err());
     }
 }

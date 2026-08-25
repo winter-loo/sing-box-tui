@@ -1,0 +1,216 @@
+use std::time::Duration;
+
+use anyhow::Result;
+
+use super::network_mode::apply_internet_tun_persistence;
+use super::presentation::{LeftPaneSection, truncate_for_width};
+use super::private_access_workflow::private_access_process_exists;
+use super::settings::normalize_optional_setting;
+use super::{App, REFRESH_DEBOUNCE, process_exists};
+use crate::config::{config_has_china_ip_routing, set_china_ip_routing};
+use crate::tui_state::TuiRuntimeState;
+
+#[cfg(test)]
+#[path = "tui_runtime_state_tests.rs"]
+mod tests;
+
+impl App {
+    pub(super) fn reconcile_persisted_tun_mode(
+        &mut self,
+        runtime_state: &mut TuiRuntimeState,
+    ) -> Result<()> {
+        let state_store = self.state_store.clone();
+        let mut persisted_runtime = self.runtime_state();
+        self.internet_tun.reconcile(|tun| {
+            apply_internet_tun_persistence(&mut persisted_runtime, tun);
+            if let Some(store) = &state_store {
+                store.save(&persisted_runtime)?;
+            }
+            Ok(())
+        })?;
+        apply_internet_tun_persistence(runtime_state, self.internet_tun.persisted());
+        Ok(())
+    }
+
+    /// Re-applies an explicit China IP routing choice to the config when it drifted, e.g. after a
+    /// subscription refresh regenerated the config without the geoip/geosite rule-sets.
+    pub(super) fn reconcile_persisted_china_ip_routing(&self) -> Result<()> {
+        if !self.china_ip_routing_explicit || !self.system_proxy_config_path.exists() {
+            return Ok(());
+        }
+        let in_config =
+            config_has_china_ip_routing(&self.system_proxy_config_path).unwrap_or(false);
+        if in_config != self.china_ip_routing_enabled {
+            set_china_ip_routing(
+                &self.system_proxy_config_path,
+                self.china_ip_routing_enabled,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Prompts for sudo credentials before the first elevated sing-box restart. `start_managed_sing_box`
+    /// uses `sudo -n`, which never prompts, so a config that already has a TUN inbound would fail to
+    /// launch sing-box once the cached sudo timestamp expires. Running `sudo -v` here re-authorizes
+    /// interactively while the terminal is still in its normal (non-raw) mode.
+    pub(super) fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
+        self.private_access
+            .apply_state(&state, private_access_process_exists)?;
+        if !self.private_access.is_configured() {
+            self.left_pane_section = LeftPaneSection::Internet;
+            self.intranet_detail_scroll = 0;
+        }
+        self.benchmark_filter = state.benchmark_filter;
+        self.auto_select_enabled = state.auto_pick_enabled;
+        self.auto_select_selector = state.auto_pick_selector;
+        self.bypass_entries = state.bypass_entries;
+        if let Some(value) = state.benchmark_url.filter(|value| !value.trim().is_empty()) {
+            self.benchmark_url = value;
+        }
+        if let Some(value) = state.benchmark_timeout_ms.filter(|value| *value > 0) {
+            self.benchmark_timeout_ms = value;
+        }
+        if let Some(value) = state.benchmark_request_timeout.filter(|value| *value > 0.0) {
+            self.benchmark_request_timeout = value;
+        }
+        if let Some(value) = state.benchmark_max_concurrency.filter(|value| *value > 0) {
+            self.benchmark_max_concurrency = value;
+        }
+        if let Some(value) = normalize_optional_setting(state.verify_targets) {
+            self.verify_targets = value;
+        }
+        if let Some(value) = state.auto_select_threshold_ms.filter(|value| *value > 0) {
+            self.auto_select_threshold_ms = value;
+        }
+        if let Some(value) = state.auto_select_interval_secs.filter(|value| *value > 0) {
+            self.auto_select_interval = Duration::from_secs(value);
+        }
+        if let Some(value) = state
+            .system_proxy_server
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.system_proxy
+                .restore_server(value, state.system_proxy_server_override);
+        }
+        if let Some(value) = state.china_ip_routing_enabled {
+            self.china_ip_routing_enabled = value;
+            self.china_ip_routing_explicit = true;
+        }
+        self.last_auto_select_benchmark = None;
+        if let Some(group) = self.selected_group()
+            && let Some(node) = state.current_selected_nodes.get(&group.name)
+        {
+            let node = node.clone();
+            self.sync_selection_to_member_name(&node);
+        }
+        self.sync_selection_to_displayed_members();
+        Ok(())
+    }
+
+    pub(super) fn runtime_state(&self) -> TuiRuntimeState {
+        let persisted_tun = self.internet_tun.persisted();
+        TuiRuntimeState {
+            benchmark_filter: self.benchmark_filter.clone(),
+            auto_pick_enabled: self.auto_select_enabled,
+            auto_pick_selector: self.auto_select_selector.clone(),
+            current_selected_nodes: self
+                .groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .current
+                        .as_ref()
+                        .map(|current| (group.name.clone(), current.clone()))
+                })
+                .collect(),
+            bypass_entries: self.bypass_entries.clone(),
+            onboarding_complete: self.onboarding_complete,
+            benchmark_url: Some(self.benchmark_url.clone()),
+            benchmark_timeout_ms: Some(self.benchmark_timeout_ms),
+            benchmark_request_timeout: Some(self.benchmark_request_timeout),
+            benchmark_max_concurrency: Some(self.benchmark_max_concurrency),
+            verify_targets: normalize_optional_setting(Some(self.verify_targets.clone())),
+            auto_select_threshold_ms: Some(self.auto_select_threshold_ms),
+            auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
+            system_proxy_server: Some(self.system_proxy.server().to_string()),
+            system_proxy_server_override: self.system_proxy.server_is_overridden(),
+            tun_enabled: persisted_tun.enabled(),
+            tun_auto_detect_interface_before_enable: persisted_tun.restore_auto_detect_interface(),
+            china_ip_routing_enabled: self
+                .china_ip_routing_explicit
+                .then_some(self.china_ip_routing_enabled),
+            private_access_profiles: self.private_access.runtime_states(process_exists),
+        }
+    }
+
+    pub(super) fn save_runtime_state(&self) -> Result<()> {
+        let Some(store) = &self.state_store else {
+            return Ok(());
+        };
+        store.save(&self.runtime_state())
+    }
+
+    pub(super) fn persisted_selection_restore_plan(
+        &self,
+        state: &TuiRuntimeState,
+    ) -> Vec<(String, String)> {
+        self.groups
+            .iter()
+            .filter(|group| group.kind.eq_ignore_ascii_case("selector"))
+            .filter_map(|group| {
+                let node = state.current_selected_nodes.get(&group.name)?;
+                if group.current.as_ref() == Some(node) {
+                    return None;
+                }
+                if !group.members.iter().any(|member| member == node) {
+                    return None;
+                }
+                Some((group.name.clone(), node.clone()))
+            })
+            .collect()
+    }
+
+    pub(super) fn restore_persisted_selections(&mut self, state: &TuiRuntimeState) -> Result<()> {
+        let plan = self.persisted_selection_restore_plan(state);
+        if plan.is_empty() {
+            return Ok(());
+        }
+
+        let mut restored = 0usize;
+        let mut failures = Vec::new();
+        for (group, node) in plan {
+            match self.client.switch_proxy(&group, &node) {
+                Ok(()) => restored += 1,
+                Err(error) => failures.push(format!("{group} -> {node}: {error}")),
+            }
+        }
+
+        if restored > 0 {
+            if REFRESH_DEBOUNCE > Duration::ZERO {
+                std::thread::sleep(REFRESH_DEBOUNCE);
+            }
+            self.refresh()?;
+        }
+
+        if failures.is_empty() {
+            if restored > 0 {
+                self.set_status_only(format!("Restored {restored} saved selector selection(s)"));
+            }
+        } else {
+            let detail = truncate_for_width(&failures.join("; "), 90);
+            self.set_status_only(format!(
+                "Restored {restored} saved selector selection(s); failed: {detail}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn save_bypass_rule_set(&self) -> Result<()> {
+        let Some(store) = &self.bypass_rule_set_store else {
+            return Ok(());
+        };
+        store.save(&self.bypass_entries)
+    }
+}
