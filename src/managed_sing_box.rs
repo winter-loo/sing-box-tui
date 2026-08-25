@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
@@ -707,10 +708,10 @@ fn stop_owned_elevated_sing_box_pid(
 fn stop_owned_elevated_sing_box_pid(
     pid: u32,
     _wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
+    _executable: &Path,
+    _config_path: &Path,
 ) -> Result<()> {
-    stop_known_elevated_sing_box_pid(pid, executable, config_path)
+    stop_sing_box_pid_escalating(pid)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
