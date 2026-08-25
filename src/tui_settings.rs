@@ -211,3 +211,71 @@ fn parse_verification_target(input: &str) -> Result<VerificationTarget> {
         url: url.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_http_connect_proxy, parse_bool_setting, parse_positive,
+        parse_verification_targets, sonicwall_http_connect_settings,
+    };
+
+    #[test]
+    fn sonicwall_http_connect_proxy_uses_tui_mixed_inbound() {
+        assert_eq!(
+            normalize_http_connect_proxy("127.0.0.1:6780").as_deref(),
+            Some("127.0.0.1:6780")
+        );
+        assert_eq!(
+            normalize_http_connect_proxy("http://127.0.0.1:6780/").as_deref(),
+            Some("127.0.0.1:6780")
+        );
+        assert_eq!(normalize_http_connect_proxy("  "), None);
+    }
+
+    #[test]
+    fn sonicwall_transport_setting_is_exclusive() {
+        let direct = sonicwall_http_connect_settings(
+            false,
+            "127.0.0.1:6780",
+            Some("manual -> node-a".to_string()),
+            "http://127.0.0.1:9992",
+            Some("manual".to_string()),
+        );
+        assert_eq!(direct, (None, None, None, None));
+
+        let proxied = sonicwall_http_connect_settings(
+            true,
+            "127.0.0.1:6780",
+            Some("manual -> node-a".to_string()),
+            "http://127.0.0.1:9992",
+            Some("manual".to_string()),
+        );
+        assert_eq!(
+            proxied,
+            (
+                Some("127.0.0.1:6780".to_string()),
+                Some("manual -> node-a".to_string()),
+                Some("http://127.0.0.1:9992".to_string()),
+                Some("manual".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn setting_parsers_validate_their_own_input_contracts() {
+        assert_eq!(parse_positive::<u64>("12").unwrap(), 12);
+        assert!(parse_positive::<u64>("0").is_err());
+        assert_eq!(parse_bool_setting("yes").unwrap(), true);
+        assert_eq!(parse_bool_setting("off").unwrap(), false);
+        assert!(parse_bool_setting("maybe").is_err());
+
+        let targets = parse_verification_targets(
+            "example=https://example.com, fallback=https://fallback.example",
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "example");
+        assert_eq!(targets[0].url, "https://example.com");
+        assert!(parse_verification_targets("missing-separator").is_err());
+    }
+}
