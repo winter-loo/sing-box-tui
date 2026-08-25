@@ -5,7 +5,7 @@ Terms that define how sing-box-tui owns proxy runtime and network-access behavio
 ## Language
 
 **Managed sing-box process**:
-A sing-box process under sing-box-tui's explicit lifecycle ownership for one configuration; unrelated or user-owned sing-box instances are outside this concept.
+A sing-box process started by the current `ManagedSingBox` instance and held in its explicit lifecycle ownership for one configuration. Existing, unrelated, user-owned, or previous-instance sing-box processes are never adopted, restarted, or stopped.
 _Avoid_: Managed child, adopted process, sing-box service
 
 **Controller readiness**:
