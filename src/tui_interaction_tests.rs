@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, MouseEventKind};
 #[test]
 fn tun_toggle_is_documented_in_help_and_status_bar() {
     let mut app = test_app();
-    let snapshot = app.presentation_snapshot();
+    let snapshot = app.view_snapshot();
     assert!(!snapshot.status.system_proxy_enabled);
     assert!(!snapshot.status.tun_enabled);
     assert!(!snapshot.status.selection_context.contains("Controller:"));
@@ -25,7 +25,7 @@ fn status_header_tracks_filter_clash_and_pick_mode() {
     app.auto_select_enabled = false;
     app.benchmark_filter = "-香港,-广告".to_string();
 
-    let snapshot = app.presentation_snapshot();
+    let snapshot = app.view_snapshot();
     let context = &snapshot.status.selection_context;
     assert!(context.contains("filter='-香港,-广告'"));
     assert!(context.contains("clash="));
@@ -34,7 +34,7 @@ fn status_header_tracks_filter_clash_and_pick_mode() {
     assert!(!context.contains("auto="));
     app.auto_select_enabled = true;
 
-    let snapshot = app.presentation_snapshot();
+    let snapshot = app.view_snapshot();
     let context = &snapshot.status.selection_context;
     assert!(context.contains("Pick=Auto"));
 }
@@ -45,7 +45,7 @@ fn status_header_keeps_empty_filter_label_in_intranet_details() {
     app.benchmark_filter.clear();
     app.left_pane_section = LeftPaneSection::Intranet;
 
-    let snapshot = app.presentation_snapshot();
+    let snapshot = app.view_snapshot();
     assert!(snapshot.status.selection_context.contains("filter=''"));
     assert!(
         snapshot

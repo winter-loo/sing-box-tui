@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
-use super::presentation::{format_duration_badge, subscription_report_badge, truncate_for_width};
+use super::view::{format_duration_badge, subscription_report_badge, truncate_for_width};
 use super::{App, SUBSCRIPTION_REFRESH_RETRY_INTERVAL, TuiSubscriptionRefreshOptions};
 use crate::subscriptions::{
     SubscriptionRefreshOutput, SubscriptionRefreshRequest, refresh_subscriptions,

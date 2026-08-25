@@ -1,8 +1,8 @@
 use crossterm::event::KeyCode;
 
 use super::super::App;
-use super::super::presentation::{Focus, IntranetDetailSection, LeftPaneSection};
 use super::super::test_support::test_app;
+use super::super::view::{Focus, IntranetDetailSection, LeftPaneSection};
 use super::super::{DIRECT_CLASH_MODE, GLOBAL_CLASH_MODE, RULE_CLASH_MODE};
 use super::next_clash_mode;
 use crate::private_access::PrivateAccessRoute;

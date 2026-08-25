@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::presentation::{format_bytes_opt, truncate_for_width};
+use super::view::{format_bytes_opt, truncate_for_width};
 use super::{App, CONNECTION_REFRESH_INTERVAL};
 use crate::controller::ConnectionInfo;
 

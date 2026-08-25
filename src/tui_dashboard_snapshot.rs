@@ -1,13 +1,13 @@
 use super::App;
-use super::presentation::{
+use super::settings::{settings_field_display_value, visible_settings_fields};
+use super::view::{
     CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
     IntranetDetailSnapshot, IntranetRow, SettingRow, SettingsPanelSnapshot, StatusFooter,
     StatusSnapshot, node_order_badge, pick_mode_badge, settings_field_label,
 };
-use super::settings::{settings_field_display_value, visible_settings_fields};
 
 impl App {
-    pub(super) fn presentation_snapshot(&mut self) -> DashboardSnapshot<'_> {
+    pub(super) fn view_snapshot(&mut self) -> DashboardSnapshot<'_> {
         let flash = self.flash_message();
         let implicit_root_mode = self.implicit_root_mode();
         let implicit_current = self

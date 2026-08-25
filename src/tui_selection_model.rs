@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::App;
-use super::presentation::{
+use super::view::{
     IntranetDetailSection, IntranetDetailView, LeftPaneSection, private_access_detail_view,
 };
 use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};

@@ -3,9 +3,9 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::network_mode::apply_internet_tun_persistence;
-use super::presentation::{LeftPaneSection, truncate_for_width};
 use super::private_access_workflow::private_access_process_exists;
 use super::settings::normalize_optional_setting;
+use super::view::{LeftPaneSection, truncate_for_width};
 use super::{App, REFRESH_DEBOUNCE, process_exists};
 use crate::config::{config_has_china_ip_routing, set_china_ip_routing};
 use crate::tui_state::TuiRuntimeState;
