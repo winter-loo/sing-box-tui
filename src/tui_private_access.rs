@@ -1,6 +1,8 @@
 use super::*;
 use crate::process_command::{command_program_name_matches, command_tokens};
 use std::path::Path;
+#[cfg(all(windows, not(test)))]
+use std::process::Stdio;
 
 fn command_matches_private_access_service(
     command: &str,
@@ -22,7 +24,7 @@ fn command_matches_private_access_service(
             .all(|expected| tokens.iter().skip(1).any(|actual| actual == expected))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(super) fn private_access_process_exists(
     pid: u32,
     manifest: &PrivateAccessServiceManifest,
@@ -32,7 +34,7 @@ pub(super) fn private_access_process_exists(
             .is_ok_and(|command| command_matches_private_access_service(&command, manifest))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub(super) fn private_access_process_exists(
     pid: u32,
     _manifest: &PrivateAccessServiceManifest,
@@ -49,6 +51,22 @@ fn background_process_command(pid: u32) -> Result<String> {
     if !output.status.success() {
         bail!(
             "failed to inspect background process {pid}: ps exited with {}",
+            output.status
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(windows)]
+fn background_process_command(pid: u32) -> Result<String> {
+    let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .with_context(|| format!("failed to inspect background process {pid}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect background process {pid}: PowerShell exited with {}",
             output.status
         );
     }

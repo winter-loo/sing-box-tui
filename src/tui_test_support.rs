@@ -63,6 +63,10 @@ pub(super) fn test_app() -> App {
     };
     let benchmark_workflow =
         BenchmarkWorkflow::for_test(api_client.base_url.clone(), api_client.client.clone());
+    let config_path = std::env::temp_dir().join(format!(
+        "sing-box-tui-config-test-{}.json",
+        unique_test_suffix()
+    ));
 
     App {
         client: api_client,
@@ -120,21 +124,17 @@ pub(super) fn test_app() -> App {
         settings_edit: None,
         settings_error: None,
         subscription_refresh: None,
-        system_proxy_config_path: PathBuf::from("config.json"),
-        system_proxy: SystemProxy::for_test(PathBuf::from("config.json"), "127.0.0.1:6780", false),
+        system_proxy_config_path: config_path.clone(),
+        system_proxy: SystemProxy::for_test(config_path.clone(), "127.0.0.1:6780", false),
         internet_tun: InternetTunTransaction::new(
-            PathBuf::from("config.json"),
+            config_path.clone(),
             PersistedInternetTun::default(),
         )
         .expect("Internet TUN transaction initializes"),
         china_ip_routing_enabled: false,
         china_ip_routing_explicit: false,
         verify_job: None,
-        sing_box: ManagedSingBox::new(
-            PathBuf::from("sing-box"),
-            PathBuf::from("config.json"),
-            false,
-        ),
+        sing_box: ManagedSingBox::new(PathBuf::from("sing-box"), config_path, false),
         private_access: PrivateAccessRuntime::with_default_hillstone()
             .expect("private access runtime"),
         private_access_progress: None,
