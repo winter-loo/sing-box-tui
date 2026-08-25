@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};
+use crate::process_inspection::process_is_alive as process_exists;
 
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
@@ -1028,57 +1029,6 @@ fn stop_registered_background_auto_pick_task() -> Result<Option<u32>> {
 fn random_background_token() -> String {
     let bytes: [u8; 32] = rand::random();
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_exists(pid: u32) -> bool {
-    let exists = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    exists && !process_is_zombie(pid)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_is_zombie(pid: u32) -> bool {
-    let Ok(output) = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .trim_start()
-            .starts_with('Z')
-}
-
-#[cfg(windows)]
-fn process_exists(pid: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    if pid == 0 {
-        return false;
-    }
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut exit_code = 0_u32;
-    let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code).is_ok() }
-        && exit_code == STILL_ACTIVE.0 as u32;
-    let _ = unsafe { CloseHandle(handle) };
-    alive
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn process_exists(_pid: u32) -> bool {
-    false
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

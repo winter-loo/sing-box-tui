@@ -16,6 +16,10 @@ use serde_json::Value;
 use crate::config::inspect_tun_config;
 #[cfg(target_os = "macos")]
 use crate::macos_privileged_helper;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::process_inspection::process_may_be_alive as process_alive_via_ps;
+#[cfg(windows)]
+use crate::process_inspection::process_may_be_alive as process_exists;
 struct SingBoxRestartResult {
     started_pid: u32,
     child: Option<Child>,
@@ -1728,41 +1732,6 @@ fn wait_for_processes_to_exit(pids: &[u32]) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("timed out waiting for sing-box process(es) to exit: {pids:?}")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn process_alive_via_ps(pid: u32) -> bool {
-    let Ok(output) = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-    else {
-        return true;
-    };
-    let stat = String::from_utf8_lossy(&output.stdout);
-    if !stat.trim().is_empty() {
-        return !stat.trim_start().starts_with('Z');
-    }
-    !output.status.success() && !output.stderr.is_empty()
-}
-
-#[cfg(windows)]
-fn process_exists(pid: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    if pid == 0 {
-        return false;
-    }
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut exit_code = 0_u32;
-    let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code).is_ok() }
-        && exit_code == STILL_ACTIVE.0 as u32;
-    let _ = unsafe { CloseHandle(handle) };
-    alive
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
