@@ -72,6 +72,8 @@ use crate::tui_state::{
     default_tui_state_path, parse_bypass_entries,
 };
 
+#[path = "tui_latency_chart.rs"]
+mod latency_chart;
 #[path = "tui_presentation.rs"]
 mod presentation;
 #[path = "tui_private_access.rs"]
@@ -86,8 +88,7 @@ use presentation::{
     LatencyChartState, LeftPaneSection, OnboardingState, PrivateAccessAuthModal,
     PrivateAccessProgressEntry, PrivateAccessProgressModal, PrivateAccessProgressTone, SettingRow,
     SettingsEditState, SettingsField, SettingsPanelSnapshot, StatusFooter, StatusSnapshot,
-    format_bytes_opt, format_duration_badge, help_binding_count, latency_chart_window_label,
-    latency_chart_zoom_in, latency_chart_zoom_out, node_order_badge, pick_mode_badge,
+    format_bytes_opt, format_duration_badge, help_binding_count, node_order_badge, pick_mode_badge,
     private_access_auth_initial_value, private_access_detail_view, private_access_progress_title,
     settings_field_label, subscription_report_badge, truncate_for_width,
 };
@@ -2127,79 +2128,6 @@ impl App {
         self.help_index = self.help_index.saturating_sub(1);
     }
 
-    fn open_latency_chart(&mut self) -> Result<()> {
-        if self.showing_intranet_details() {
-            self.set_status_only("Latency history is available for Internet Proxy nodes only");
-            return Ok(());
-        }
-        let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
-            self.set_status_only("No selector group available for latency history");
-            return Ok(());
-        };
-        let Some(node) = self.selected_member_name() else {
-            self.set_status_only("No node selected for latency history");
-            return Ok(());
-        };
-        let Some(samples) =
-            self.benchmark_workflow
-                .node_latency_history(&group_name, &node, 200)?
-        else {
-            self.set_status_only("SQLite latency history is unavailable");
-            return Ok(());
-        };
-        if samples.iter().all(|sample| sample.delay_ms.is_none()) {
-            self.set_status_only(format!("No latency history for {}", node));
-            return Ok(());
-        }
-        let count = samples.len();
-        self.latency_chart = Some(LatencyChartState {
-            selector: group_name,
-            node: node.clone(),
-            samples,
-            window: LATENCY_CHART_DEFAULT_WINDOW,
-            threshold_ms: self.auto_select_threshold_ms,
-            last_refresh: Instant::now(),
-        });
-        self.set_status_only(format!("Showing {} latency samples for {}", count, node));
-        Ok(())
-    }
-
-    fn zoom_latency_chart_in(&mut self) {
-        let Some(chart) = self.latency_chart.as_mut() else {
-            return;
-        };
-        chart.window = latency_chart_zoom_in(chart.window);
-        let label = latency_chart_window_label(chart.window);
-        self.set_status_only(format!("Latency chart window: {label}"));
-    }
-
-    fn zoom_latency_chart_out(&mut self) {
-        let Some(chart) = self.latency_chart.as_mut() else {
-            return;
-        };
-        chart.window = latency_chart_zoom_out(chart.window);
-        let label = latency_chart_window_label(chart.window);
-        self.set_status_only(format!("Latency chart window: {label}"));
-    }
-
-    fn maybe_refresh_latency_chart(&mut self) -> Result<()> {
-        let Some(chart) = self.latency_chart.as_mut() else {
-            return Ok(());
-        };
-        if chart.last_refresh.elapsed() < LATENCY_CHART_REFRESH_INTERVAL {
-            return Ok(());
-        }
-        let Some(samples) =
-            self.benchmark_workflow
-                .node_latency_history(&chart.selector, &chart.node, 200)?
-        else {
-            return Ok(());
-        };
-        chart.samples = samples;
-        chart.last_refresh = Instant::now();
-        Ok(())
-    }
-
     fn move_next(&mut self) {
         match self.focus {
             Focus::Groups => match self.left_pane_section {
@@ -3272,16 +3200,14 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::process_alive_via_ps;
     use super::{
-        AUTO_SELECT_THRESHOLD_MS, App, AutoPickDecision, BackgroundLatencyResult,
-        BackgroundLatencySnapshot, BenchmarkCompletion, BenchmarkUpdate, BenchmarkWorkflow,
-        CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE,
-        IntranetDetailSection, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL,
-        LatencyChartState, LeftPaneSection, PrivateAccessMode, PrivateAccessProfileRuntime,
-        PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE, SettingsEditState,
-        SettingsField, SystemProxy, connection_is_direct, is_private_access_settings_field,
-        next_clash_mode, private_access_auth_display_value, private_access_auth_initial_value,
-        settings_field_display_value, settings_field_value, truncate_for_width,
-        visible_settings_fields,
+        App, AutoPickDecision, BackgroundLatencyResult, BackgroundLatencySnapshot,
+        BenchmarkCompletion, BenchmarkUpdate, BenchmarkWorkflow, CONNECTION_REFRESH_INTERVAL,
+        DIRECT_CLASH_MODE, Focus, GLOBAL_CLASH_MODE, IntranetDetailSection, LeftPaneSection,
+        PrivateAccessMode, PrivateAccessProfileRuntime, PrivateAccessRuntime, PrivateAccessState,
+        RULE_CLASH_MODE, SettingsEditState, SettingsField, SystemProxy, connection_is_direct,
+        is_private_access_settings_field, next_clash_mode, private_access_auth_display_value,
+        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
+        truncate_for_width, visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionInfo,
@@ -3304,8 +3230,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::runtime::Builder as TokioRuntimeBuilder;
 
-    use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
-
     static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_test_suffix() -> String {
@@ -3317,7 +3241,7 @@ mod tests {
         format!("{nanos}-{counter}")
     }
 
-    fn test_db_path() -> std::path::PathBuf {
+    pub(super) fn test_db_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "sing-box-tui-tui-test-{}.sqlite3",
             unique_test_suffix()
@@ -4456,114 +4380,6 @@ mod tests {
 
         assert_eq!(app.status, "Latency tested select: best is node-a (42ms)");
         assert!(app.flash.is_none());
-    }
-
-    #[test]
-    fn pressing_i_opens_latency_chart_for_selected_node() {
-        let path = test_db_path();
-        let mut app = test_app();
-        app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
-        app.member_index = 1;
-        let store = BenchmarkStore::open(&path).expect("open benchmark store");
-        store
-            .record_benchmark(&BenchmarkRecord {
-                selector: "select",
-                node: "node-b",
-                filter: "美国",
-                delay_ms: Some(93),
-                completed: true,
-                job_kind: "single",
-            })
-            .expect("record benchmark");
-        app.benchmark_workflow.replace_store(Some(store));
-
-        app.handle_key(KeyCode::Char('i')).expect("open chart");
-
-        let chart = app.latency_chart.as_ref().expect("latency chart");
-        assert_eq!(chart.selector, "select");
-        assert_eq!(chart.node, "node-b");
-        assert_eq!(chart.samples.len(), 1);
-        assert_eq!(chart.samples[0].delay_ms, Some(93));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn z_and_shift_z_zoom_latency_chart() {
-        let mut app = test_app();
-        app.latency_chart = Some(LatencyChartState {
-            selector: "select".to_string(),
-            node: "node-a".to_string(),
-            samples: vec![NodeLatencySample {
-                recorded_at_ms: 1_000,
-                delay_ms: Some(90),
-            }],
-            window: LATENCY_CHART_DEFAULT_WINDOW,
-            threshold_ms: AUTO_SELECT_THRESHOLD_MS,
-            last_refresh: Instant::now(),
-        });
-
-        app.handle_key(KeyCode::Char('z')).expect("zoom in");
-        assert_eq!(
-            app.latency_chart.as_ref().expect("chart").window,
-            Duration::from_secs(30 * 60)
-        );
-
-        app.handle_key(KeyCode::Char('Z')).expect("zoom out");
-        assert_eq!(
-            app.latency_chart.as_ref().expect("chart").window,
-            LATENCY_CHART_DEFAULT_WINDOW
-        );
-    }
-
-    #[test]
-    fn latency_chart_refreshes_from_sqlite() {
-        let path = test_db_path();
-        let mut app = test_app();
-        let store = BenchmarkStore::open(&path).expect("open benchmark store");
-        store
-            .record_benchmark(&BenchmarkRecord {
-                selector: "select",
-                node: "node-a",
-                filter: "美国",
-                delay_ms: Some(77),
-                completed: true,
-                job_kind: "auto",
-            })
-            .expect("record benchmark");
-        app.benchmark_workflow.replace_store(Some(store));
-        app.latency_chart = Some(LatencyChartState {
-            selector: "select".to_string(),
-            node: "node-a".to_string(),
-            samples: Vec::new(),
-            window: LATENCY_CHART_DEFAULT_WINDOW,
-            threshold_ms: AUTO_SELECT_THRESHOLD_MS,
-            last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
-        });
-
-        app.maybe_refresh_latency_chart().expect("refresh chart");
-
-        let chart = app.latency_chart.as_ref().expect("chart");
-        assert_eq!(chart.samples.len(), 1);
-        assert_eq!(chart.samples[0].delay_ms, Some(77));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn pressing_i_without_history_updates_status() {
-        let path = test_db_path();
-        let mut app = test_app();
-        app.benchmark_workflow.replace_store(Some(
-            BenchmarkStore::open(&path).expect("open benchmark store"),
-        ));
-
-        app.handle_key(KeyCode::Char('i')).expect("open chart");
-
-        assert!(app.latency_chart.is_none());
-        assert_eq!(app.status, "No latency history for node-a");
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
