@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::config::inspect_tun_config;
 #[cfg(target_os = "macos")]
 use crate::macos_privileged_helper;
+use crate::process_command::{command_program_name_matches, command_tokens};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::process_inspection::process_may_be_alive as process_alive_via_ps;
 #[cfg(windows)]
@@ -973,39 +974,6 @@ fn parse_windows_process_json(
 }
 
 const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(8);
-fn command_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for character in command.chars() {
-        match character {
-            '"' => in_quotes = !in_quotes,
-            value if value.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            value => current.push(value),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn command_program_name_matches(program: &str, expected: &str) -> bool {
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let expected = expected.rsplit(['/', '\\']).next().unwrap_or(expected);
-    name.eq_ignore_ascii_case(expected)
-        || name
-            .strip_suffix(".exe")
-            .is_some_and(|base| base.eq_ignore_ascii_case(expected))
-        || expected
-            .strip_suffix(".exe")
-            .is_some_and(|base| name.eq_ignore_ascii_case(base))
-}
-
 fn path_text_has_directory(path: &str) -> bool {
     path.rsplit_once(['/', '\\'])
         .is_some_and(|(parent, _)| !parent.is_empty())
