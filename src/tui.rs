@@ -94,9 +94,9 @@ use presentation::{
 use private_access_workflow::private_access_process_exists;
 use settings::{
     default_verification_targets_setting, is_private_access_settings_field,
-    normalize_http_connect_proxy, normalize_optional_setting, parse_bool_setting, parse_positive,
-    parse_verification_targets, settings_field_display_value, settings_field_value,
-    sonicwall_http_connect_settings, visible_settings_fields,
+    normalize_optional_setting, parse_bool_setting, parse_positive, parse_verification_targets,
+    settings_field_display_value, settings_field_value, sonicwall_http_connect_settings,
+    visible_settings_fields,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -3279,9 +3279,9 @@ mod tests {
         LatencyChartState, LeftPaneSection, PrivateAccessMode, PrivateAccessProfileRuntime,
         PrivateAccessRuntime, PrivateAccessState, RULE_CLASH_MODE, SettingsEditState,
         SettingsField, SystemProxy, connection_is_direct, is_private_access_settings_field,
-        next_clash_mode, normalize_http_connect_proxy, private_access_auth_display_value,
-        private_access_auth_initial_value, settings_field_display_value, settings_field_value,
-        sonicwall_http_connect_settings, truncate_for_width, visible_settings_fields,
+        next_clash_mode, private_access_auth_display_value, private_access_auth_initial_value,
+        settings_field_display_value, settings_field_value, truncate_for_width,
+        visible_settings_fields,
     };
     use crate::controller::{
         ApiClient, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionInfo,
@@ -3301,47 +3301,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn sonicwall_http_connect_proxy_uses_tui_mixed_inbound() {
-        assert_eq!(
-            normalize_http_connect_proxy("127.0.0.1:6780").as_deref(),
-            Some("127.0.0.1:6780")
-        );
-        assert_eq!(
-            normalize_http_connect_proxy("http://127.0.0.1:6780/").as_deref(),
-            Some("127.0.0.1:6780")
-        );
-        assert_eq!(normalize_http_connect_proxy("  "), None);
-    }
-
-    #[test]
-    fn sonicwall_transport_setting_is_exclusive() {
-        let direct = sonicwall_http_connect_settings(
-            false,
-            "127.0.0.1:6780",
-            Some("manual -> node-a".to_string()),
-            "http://127.0.0.1:9992",
-            Some("manual".to_string()),
-        );
-        assert_eq!(direct, (None, None, None, None));
-
-        let proxied = sonicwall_http_connect_settings(
-            true,
-            "127.0.0.1:6780",
-            Some("manual -> node-a".to_string()),
-            "http://127.0.0.1:9992",
-            Some("manual".to_string()),
-        );
-        assert_eq!(
-            proxied,
-            (
-                Some("127.0.0.1:6780".to_string()),
-                Some("manual -> node-a".to_string()),
-                Some("http://127.0.0.1:9992".to_string()),
-                Some("manual".to_string()),
-            )
-        );
-    }
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::runtime::Builder as TokioRuntimeBuilder;
 
