@@ -627,8 +627,31 @@ impl NodeRuntime {
         url: String,
         timeout_ms: u64,
     ) -> Result<Self> {
-        let proxy_port = free_port()?;
-        let controller_port = free_port()?;
+        let mut last_bind_error = None;
+        for _ in 0..5 {
+            match Self::start_once(id.clone(), environment.clone(), url.clone(), timeout_ms) {
+                Ok(runtime) => return Ok(runtime),
+                Err(error) if error_chain_reports_bind_conflict(&error) => {
+                    last_bind_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_bind_error.expect("a bind retry records its error"))
+    }
+
+    fn start_once(
+        id: String,
+        environment: RuntimeEnvironment,
+        url: String,
+        timeout_ms: u64,
+    ) -> Result<Self> {
+        // Keep both ports reserved while the config and supervisor command are built.
+        // sing-box cannot adopt pre-bound sockets, so release them at the last possible
+        // moment and retry the complete startup if another process wins that small race.
+        let (proxy_reservation, controller_reservation) = reserve_runtime_ports()?;
+        let proxy_port = proxy_reservation.local_addr()?.port();
+        let controller_port = controller_reservation.local_addr()?.port();
         let temp_dir = create_private_temp_dir(&id)?;
         let mut resources = RuntimeResources::new(temp_dir);
         let selector_tag = format!("__sing_box_tui_node_runtime_{id}");
@@ -681,6 +704,8 @@ impl NodeRuntime {
         ] {
             command.env_remove(name);
         }
+        drop(proxy_reservation);
+        drop(controller_reservation);
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to start isolated sing-box supervisor for {}",
@@ -1030,10 +1055,22 @@ fn build_runtime_config(
     Ok(source)
 }
 
-fn free_port() -> Result<u16> {
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve loopback port")?;
-    Ok(listener.local_addr()?.port())
+fn reserve_runtime_ports() -> Result<(TcpListener, TcpListener)> {
+    let proxy =
+        TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve runtime proxy port")?;
+    let controller =
+        TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve runtime controller port")?;
+    Ok((proxy, controller))
+}
+
+fn error_chain_reports_bind_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_ascii_lowercase();
+        text.contains("address already in use")
+            || text.contains("only one usage of each socket address")
+            || text.contains("bind:")
+            || text.contains("bind failed")
+    })
 }
 
 fn create_private_temp_dir(id: &str) -> Result<PathBuf> {
@@ -1061,7 +1098,12 @@ fn random_id() -> String {
 }
 
 fn discover_active_environment() -> ManagerResult<(PathBuf, PathBuf)> {
-    let directory = active_environment_dir();
+    let directory = active_environment_dir().map_err(|error| {
+        ManagerError::new(
+            "invalid_environment",
+            format!("failed to prepare active environment directory: {error:#}"),
+        )
+    })?;
     let mut active = Vec::new();
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -1139,9 +1181,7 @@ pub(crate) fn register_active_environment(
     config_path: &Path,
     sing_box_executable: &Path,
 ) -> Result<()> {
-    let directory = active_environment_dir();
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("failed to create {}", directory.display()))?;
+    let directory = active_environment_dir()?;
     let metadata = ActiveEnvironment {
         owner_pid: std::process::id(),
         sing_box_pid,
@@ -1156,7 +1196,7 @@ pub(crate) fn register_active_environment(
 }
 
 pub(crate) fn unregister_owned_active_environments() -> Result<()> {
-    let directory = active_environment_dir();
+    let directory = active_environment_dir()?;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1175,8 +1215,50 @@ pub(crate) fn unregister_owned_active_environments() -> Result<()> {
     Ok(())
 }
 
-fn active_environment_dir() -> PathBuf {
-    std::env::temp_dir().join(ACTIVE_ENVIRONMENT_DIR)
+fn active_environment_dir() -> Result<PathBuf> {
+    #[cfg(unix)]
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "sing-box-tui-user-{}",
+                // SAFETY: geteuid has no preconditions and does not mutate memory.
+                unsafe { libc::geteuid() }
+            ))
+        });
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir();
+
+    let directory = base.join(ACTIVE_ENVIRONMENT_DIR);
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    #[cfg(unix)]
+    protect_unix_user_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn protect_unix_user_directory(directory: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("failed to inspect {}", directory.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("active environment path is not a real directory");
+    }
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        bail!("active environment directory is owned by another user");
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to protect {}", directory.display()))?;
+    let protected = fs::metadata(directory)?;
+    if protected.mode() & 0o077 != 0 {
+        bail!("active environment directory permissions are not private");
+    }
+    Ok(())
 }
 
 type ManagerResult<T> = std::result::Result<T, ManagerError>;
@@ -1239,7 +1321,18 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{NodeRuntimeManager, RpcRequest, enumerate_nodes};
+    use super::{NodeRuntimeManager, RpcRequest, enumerate_nodes, reserve_runtime_ports};
+
+    #[test]
+    fn runtime_ports_are_reserved_together_and_cannot_collide() {
+        let (proxy, controller) = reserve_runtime_ports().expect("ports can be reserved");
+        let proxy_address = proxy.local_addr().unwrap();
+        let controller_address = controller.local_addr().unwrap();
+
+        assert_ne!(proxy_address.port(), controller_address.port());
+        assert!(std::net::TcpListener::bind(proxy_address).is_err());
+        assert!(std::net::TcpListener::bind(controller_address).is_err());
+    }
 
     #[test]
     fn all_selectors_expand_to_unique_concrete_nodes_in_config_order() {
