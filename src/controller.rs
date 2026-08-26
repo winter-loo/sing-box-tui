@@ -275,6 +275,22 @@ impl ApiClient {
         self.runtime.block_on(self.switch_proxy_async(group, proxy))
     }
 
+    pub(crate) fn measure_proxy_delay(
+        &self,
+        proxy: &str,
+        url: &str,
+        timeout_ms: u64,
+    ) -> Option<u64> {
+        self.runtime.block_on(measure_delay(
+            self.client.clone(),
+            self.base_url.clone(),
+            proxy.to_string(),
+            url.to_string(),
+            timeout_ms,
+            Duration::from_millis(timeout_ms.saturating_add(1_000)).as_secs_f64(),
+        ))
+    }
+
     pub(crate) fn set_mode(&self, mode: &str) -> Result<()> {
         self.runtime.block_on(self.set_mode_async(mode))
     }

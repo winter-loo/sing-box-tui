@@ -17,6 +17,7 @@ mod internet_tun;
 #[cfg(target_os = "macos")]
 mod macos_privileged_helper;
 mod managed_sing_box;
+mod node_runtime_manager;
 mod private_access;
 mod private_access_session;
 mod process_command;
@@ -277,6 +278,17 @@ fn main() -> Result<()> {
             run_private_access_service_stdio(&service, stdio)
         }
         CliCommand::PrivateAccessTunHelper { stdio } => run_private_access_tun_helper_stdio(stdio),
+        CliCommand::NodeRuntimeManager { stdio } => {
+            if !stdio {
+                bail!("node-runtime-manager requires --stdio");
+            }
+            node_runtime_manager::run_stdio()
+        }
+        CliCommand::NodeRuntimeChildSupervisor {
+            sing_box,
+            config,
+            directory,
+        } => node_runtime_manager::run_child_supervisor(&sing_box, &config, &directory),
         #[cfg(target_os = "macos")]
         CliCommand::MacosPrivilegedHelper {
             socket,

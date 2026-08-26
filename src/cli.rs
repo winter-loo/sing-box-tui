@@ -127,6 +127,14 @@ pub(crate) enum CliCommand {
     PrivateAccessTunHelper {
         stdio: bool,
     },
+    NodeRuntimeManager {
+        stdio: bool,
+    },
+    NodeRuntimeChildSupervisor {
+        sing_box: PathBuf,
+        config: PathBuf,
+        directory: PathBuf,
+    },
     #[cfg(target_os = "macos")]
     MacosPrivilegedHelper {
         socket: PathBuf,
@@ -179,6 +187,10 @@ impl CliCommand {
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
             "private-access-service" => Self::parse_private_access_service(&args[1..]),
             "private-access-tun-helper" => Self::parse_private_access_tun_helper(&args[1..]),
+            "node-runtime-manager" => Self::parse_node_runtime_manager(&args[1..]),
+            "node-runtime-child-supervisor" => {
+                Self::parse_node_runtime_child_supervisor(&args[1..])
+            }
             #[cfg(target_os = "macos")]
             "macos-privileged-helper" => Self::parse_macos_privileged_helper(&args[1..]),
             "--help" | "-h" | "help" => {
@@ -1095,6 +1107,53 @@ impl CliCommand {
         Ok(Self::PrivateAccessTunHelper { stdio })
     }
 
+    fn parse_node_runtime_manager(args: &[String]) -> Result<Self> {
+        let mut stdio = false;
+        for value in args {
+            match value.as_str() {
+                "--stdio" => stdio = true,
+                "--help" | "-h" => {
+                    println!("Usage: sing-box-tui node-runtime-manager --stdio");
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    bail!("unknown flag for node-runtime-manager: {value}")
+                }
+                value => bail!("unexpected positional argument for node-runtime-manager: {value}"),
+            }
+        }
+        if !stdio {
+            bail!("node-runtime-manager requires --stdio");
+        }
+        Ok(Self::NodeRuntimeManager { stdio })
+    }
+
+    fn parse_node_runtime_child_supervisor(args: &[String]) -> Result<Self> {
+        let mut sing_box = None;
+        let mut config = None;
+        let mut directory = None;
+        let mut i = 0;
+        while i < args.len() {
+            let target = match args[i].as_str() {
+                "--sing-box" => &mut sing_box,
+                "--config" => &mut config,
+                "--directory" => &mut directory,
+                value => bail!("unknown argument for node-runtime-child-supervisor: {value}"),
+            };
+            i += 1;
+            *target = Some(PathBuf::from(
+                args.get(i)
+                    .context("node-runtime-child-supervisor option requires a path")?,
+            ));
+            i += 1;
+        }
+        Ok(Self::NodeRuntimeChildSupervisor {
+            sing_box: sing_box.context("node-runtime-child-supervisor requires --sing-box")?,
+            config: config.context("node-runtime-child-supervisor requires --config")?,
+            directory: directory.context("node-runtime-child-supervisor requires --directory")?,
+        })
+    }
+
     #[cfg(target_os = "macos")]
     fn parse_macos_privileged_helper(args: &[String]) -> Result<Self> {
         let mut socket = PathBuf::from(crate::macos_privileged_helper::DEFAULT_SOCKET_PATH);
@@ -1159,6 +1218,7 @@ fn print_usage() {
     println!("  selectors       Show Clash selector groups");
     println!("  status          Show Clash controller status");
     println!("  background      Show or stop the detached TUI background worker");
+    println!("  node-runtime-manager  Serve isolated node runtimes over stdio JSON Lines RPC");
     println!("  import          Import Clash YAML into a full sing-box config");
     println!("  subscribe       Fetch a sing-box subscription URL and merge nodes");
     println!("  subscriptions   Refresh provider subscription URLs once per day");
@@ -1534,6 +1594,37 @@ mod tests {
                     .contains(&format!("{flag} requires a path or program name"))
             );
         }
+    }
+
+    #[test]
+    fn node_runtime_manager_command_selects_stdio_protocol() {
+        let command =
+            CliCommand::parse(["node-runtime-manager".to_string(), "--stdio".to_string()])
+                .expect("node runtime manager command parses");
+
+        assert!(matches!(
+            command,
+            CliCommand::NodeRuntimeManager { stdio: true }
+        ));
+    }
+
+    #[test]
+    fn node_runtime_child_supervisor_requires_all_runtime_paths() {
+        let command = CliCommand::parse([
+            "node-runtime-child-supervisor".to_string(),
+            "--sing-box".to_string(),
+            "core/sing-box".to_string(),
+            "--config".to_string(),
+            "runtime/config.json".to_string(),
+            "--directory".to_string(),
+            "source".to_string(),
+        ])
+        .expect("child supervisor command parses");
+
+        assert!(matches!(
+            command,
+            CliCommand::NodeRuntimeChildSupervisor { .. }
+        ));
     }
 
     #[test]

@@ -188,7 +188,7 @@ pub(crate) fn ensure_bypass_rule_set_file_for_config(
     Ok(Some(bypass_path))
 }
 
-fn parse_sing_box_config_text(text: &str) -> Result<Value> {
+pub(crate) fn parse_sing_box_config_text(text: &str) -> Result<Value> {
     match serde_json::from_str(text) {
         Ok(value) => Ok(value),
         Err(strict_error) => {

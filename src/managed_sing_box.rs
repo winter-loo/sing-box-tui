@@ -39,7 +39,7 @@ const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(500);
 const SING_BOX_STOP_GRACE: Duration = Duration::from_secs(3);
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-fn resolve_sing_box_executable(executable: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_sing_box_executable(executable: &Path) -> Result<PathBuf> {
     resolve_sing_box_executable_from_path(executable, env::var_os("PATH").as_deref())
 }
 
@@ -1390,11 +1390,15 @@ impl ManagedSingBox {
     }
 
     pub(crate) fn start(&mut self, probe: &dyn ControllerProbe) -> Result<LifecycleReport> {
-        self.core.start(probe)
+        let report = self.core.start(probe)?;
+        self.register_active_environment(&report)?;
+        Ok(report)
     }
 
     pub(crate) fn restart(&mut self) -> Result<RestartReceipt> {
-        self.core.restart()
+        let receipt = self.core.restart()?;
+        self.register_active_environment(receipt.report())?;
+        Ok(receipt)
     }
 
     pub(crate) fn startup_authorization_requirement(&self) -> Result<AuthorizationRequirement> {
@@ -1410,7 +1414,12 @@ impl ManagedSingBox {
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<()> {
-        self.core.shutdown()
+        let should_unregister = !self.is_leaving_running();
+        self.core.shutdown()?;
+        if should_unregister {
+            crate::node_runtime_manager::unregister_owned_active_environments()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn leave_running(&mut self) {
@@ -1424,6 +1433,30 @@ impl ManagedSingBox {
     pub(crate) fn diagnostics(&self) -> ManagedSingBoxDiagnostics {
         self.core.diagnostics()
     }
+
+    fn register_active_environment(&self, report: &LifecycleReport) -> Result<()> {
+        crate::node_runtime_manager::unregister_owned_active_environments()?;
+        crate::node_runtime_manager::register_active_environment(
+            report.started_pid,
+            &self.core.config_path,
+            &self.core.executable,
+        )
+    }
+}
+
+pub(crate) fn managed_sing_box_process_matches(
+    pid: u32,
+    executable: &Path,
+    config_path: &Path,
+) -> bool {
+    let Ok(executable) = resolve_sing_box_executable(executable) else {
+        return false;
+    };
+    let Ok(config_path) = config_path.canonicalize() else {
+        return false;
+    };
+    find_sing_box_run_pids_for_config(&executable, &config_path)
+        .is_ok_and(|pids| pids.contains(&pid))
 }
 
 struct ManagedSingBoxCore<B: ProcessBackend> {
