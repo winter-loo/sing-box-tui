@@ -25,6 +25,10 @@ const TAILSCALE_ENDPOINT_TAG: &str = "ts-ep";
 const TAILSCALE_DNS_TAG: &str = "tailscale-dns";
 const TAILSCALE_STATE_DIRECTORY: &str = ".local/tailscale-embedded";
 const TAILSCALE_IPV6_CIDR: &str = "fd7a:115c:a1e0::/48";
+// AliDNS alternate address, used as the directly reachable remote DoT default.
+const DEFAULT_REMOTE_DNS_SERVER: &str = "223.6.6.6";
+const LEGACY_REMOTE_DNS_SERVER: &str = "8.8.8.8";
+const DEFAULT_REMOTE_DNS_PORT: u64 = 853;
 
 // Every config editor performs a read-modify-write cycle. Atomic replacement protects readers
 // from partial files, while this process-wide lock prevents concurrent editors from committing
@@ -1044,10 +1048,6 @@ fn reject_tailscale_dns_tag_collision(root: &Map<String, Value>) -> Result<()> {
 }
 
 fn ensure_tailscale_remote_dns_server(root: &mut Map<String, Value>) -> Result<()> {
-    let selector_tag = root
-        .get("outbounds")
-        .and_then(Value::as_array)
-        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
     let servers = root
         .get_mut("dns")
         .and_then(Value::as_object_mut)
@@ -1062,15 +1062,12 @@ fn ensure_tailscale_remote_dns_server(root: &mut Map<String, Value>) -> Result<(
     {
         return Ok(());
     }
-    let mut server = json!({
+    let server = json!({
         "type": "tls",
         "tag": DEFAULT_REMOTE_DNS_TAG,
-        "server": "8.8.8.8",
-        "server_port": 853,
+        "server": DEFAULT_REMOTE_DNS_SERVER,
+        "server_port": DEFAULT_REMOTE_DNS_PORT,
     });
-    if let Some(selector_tag) = selector_tag {
-        server["detour"] = Value::String(selector_tag);
-    }
     servers.push(server);
     Ok(())
 }
@@ -1132,33 +1129,49 @@ fn existing_direct_outbound_tag(outbounds: &[Value]) -> Option<String> {
         })
 }
 
-fn existing_selector_outbound_tag(outbounds: &[Value]) -> Option<String> {
-    outbounds
-        .iter()
-        .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
-        .find(|tag| SELECTOR_TAG_ALIASES.iter().any(|alias| alias == tag))
-        .map(ToString::to_string)
-        .or_else(|| {
-            outbounds
-                .iter()
-                .find(|outbound| {
-                    matches!(
-                        outbound.get("type").and_then(Value::as_str),
-                        Some("selector" | "urltest")
-                    )
-                })
-                .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
-                .map(ToString::to_string)
-        })
+fn find_remote_dns_and_migrate_if_managed(servers: &mut [Value]) -> bool {
+    let Some(remote) = servers
+        .iter_mut()
+        .find(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG))
+    else {
+        return false;
+    };
+    let server = remote.get("server").and_then(Value::as_str);
+    let is_managed_remote = remote.get("type").and_then(Value::as_str) == Some("tls")
+        && matches!(
+            server,
+            Some(DEFAULT_REMOTE_DNS_SERVER | LEGACY_REMOTE_DNS_SERVER)
+        )
+        && remote.get("server_port").and_then(Value::as_u64) == Some(DEFAULT_REMOTE_DNS_PORT);
+    if is_managed_remote {
+        let remote = remote
+            .as_object_mut()
+            .expect("tagged DNS server is an object");
+        remote.insert(
+            "server".to_string(),
+            Value::String(DEFAULT_REMOTE_DNS_SERVER.to_string()),
+        );
+        remote.remove("detour");
+    }
+    true
+}
+
+fn migrate_existing_managed_remote_dns(root: &mut serde_json::Map<String, Value>) {
+    let Some(servers) = root
+        .get_mut("dns")
+        .and_then(Value::as_object_mut)
+        .and_then(|dns| dns.get_mut("servers"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    find_remote_dns_and_migrate_if_managed(servers);
 }
 
 /// Ensures the `local` and `remote` DNS servers the China DNS rules reference actually exist,
-/// adding the canonical definitions when they are missing.
+/// adding the canonical definitions when they are missing. Remote DNS dials directly, so any
+/// inherited detour is removed.
 fn ensure_china_ip_routing_dns_servers(root: &mut serde_json::Map<String, Value>) -> Result<()> {
-    let selector_tag = root
-        .get("outbounds")
-        .and_then(Value::as_array)
-        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
     let dns = root
         .entry("dns")
         .or_insert_with(|| json!({}))
@@ -1180,23 +1193,13 @@ fn ensure_china_ip_routing_dns_servers(root: &mut serde_json::Map<String, Value>
             "server_port": 853,
         }));
     }
-    if !servers
-        .iter()
-        .any(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG))
-    {
-        let mut server = json!({
+    if !find_remote_dns_and_migrate_if_managed(servers) {
+        servers.push(json!({
             "type": "tls",
             "tag": DEFAULT_REMOTE_DNS_TAG,
-            "server": "8.8.8.8",
-            "server_port": 853,
-        });
-        if let Some(selector_tag) = selector_tag {
-            server
-                .as_object_mut()
-                .expect("DNS server is an object")
-                .insert("detour".to_string(), Value::String(selector_tag));
-        }
-        servers.push(server);
+            "server": DEFAULT_REMOTE_DNS_SERVER,
+            "server_port": DEFAULT_REMOTE_DNS_PORT,
+        }));
     }
     Ok(())
 }
@@ -1753,9 +1756,8 @@ pub(crate) fn build_default_config_with_options(
                 {
                     "type": "tls",
                     "tag": DEFAULT_REMOTE_DNS_TAG,
-                    "server": "8.8.8.8",
-                    "server_port": 853,
-                    "detour": DEFAULT_SELECTOR_TAG,
+                    "server": DEFAULT_REMOTE_DNS_SERVER,
+                    "server_port": DEFAULT_REMOTE_DNS_PORT,
                 },
                 {
                     "type": "tls",
@@ -1801,6 +1803,7 @@ pub(crate) fn merge_into_existing_config(
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
     migrate_legacy_inbound_fields(root)?;
+    migrate_existing_managed_remote_dns(root);
     let outbounds_value = root
         .entry("outbounds")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -3143,6 +3146,8 @@ mod tests {
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(!members.contains(&Value::String("国内直连".to_string())));
         assert_eq!(config["dns"]["servers"][0]["type"], "tls");
+        assert_eq!(config["dns"]["servers"][0]["server"], "223.6.6.6");
+        assert!(config["dns"]["servers"][0].get("detour").is_none());
         let mixed = inbounds
             .iter()
             .find(|value| value["type"] == "mixed")
@@ -4214,6 +4219,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_migrates_legacy_remote_dns() {
+        let mut config = json!({
+            "dns": {
+                "servers": [{
+                    "type": "tls",
+                    "tag": "remote",
+                    "server": "8.8.8.8",
+                    "server_port": 853,
+                    "detour": "manual"
+                }]
+            },
+            "outbounds": []
+        });
+
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("merge succeeds");
+
+        let remote = config["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .find(|server| server["tag"] == "remote")
+            .expect("remote DNS server");
+        assert_eq!(remote["server"], "223.6.6.6");
+        assert!(remote.get("detour").is_none());
+    }
+
+    #[test]
     fn merge_preserves_existing_config_and_adds_imported_nodes() {
         let mut config = json!({
             "inbounds": [{
@@ -5049,6 +5081,99 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(dns_tags.contains(&"local"));
         assert!(dns_tags.contains(&"remote"));
+        let remote = enabled["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .find(|server| server["tag"] == "remote")
+            .expect("remote DNS server");
+        assert_eq!(remote["server"], "223.6.6.6");
+        assert!(remote.get("detour").is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_migrates_legacy_remote_dns() {
+        let path = temp_config_path("china-ip-routing-direct-remote-dns");
+        let base = json!({
+            "dns": {
+                "servers": [{
+                    "type": "tls",
+                    "tag": "remote",
+                    "server": "8.8.8.8",
+                    "server_port": 853,
+                    "detour": "手动选择"
+                }]
+            },
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "route": {
+                "rules": [{ "clash_mode": "规则", "outbound": "手动选择" }],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let remote = enabled["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .find(|server| server["tag"] == "remote")
+            .expect("remote DNS server");
+        assert_eq!(remote["server"], "223.6.6.6");
+        assert!(remote.get("detour").is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_china_ip_routing_preserves_custom_remote_dns_detour() {
+        let path = temp_config_path("china-ip-routing-custom-remote-dns");
+        let base = json!({
+            "dns": {
+                "servers": [{
+                    "type": "tls",
+                    "tag": "remote",
+                    "server": "1.1.1.1",
+                    "server_port": 853,
+                    "detour": "手动选择"
+                }]
+            },
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "route": {
+                "rules": [{ "clash_mode": "规则", "outbound": "手动选择" }],
+                "rule_set": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_china_ip_routing(&path, true).expect("enables");
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        let remote = enabled["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .find(|server| server["tag"] == "remote")
+            .expect("remote DNS server");
+        assert_eq!(remote["detour"], "手动选择");
 
         let _ = fs::remove_file(path);
     }
