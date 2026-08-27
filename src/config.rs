@@ -819,10 +819,9 @@ fn tailscale_config_state(config: &Value) -> TailscaleConfigState {
         .get("endpoints")
         .and_then(Value::as_array)
         .and_then(|endpoints| {
-            endpoints.iter().find(|endpoint| {
-                endpoint.get("tag").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG)
-                    && endpoint.get("type").and_then(Value::as_str) == Some("tailscale")
-            })
+            endpoints
+                .iter()
+                .find(|endpoint| is_managed_tailscale_endpoint(endpoint))
         });
     let tailnet_domain = config
         .get("dns")
@@ -856,6 +855,9 @@ fn ensure_tailscale_config(
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
 
+    if options.is_some() {
+        reject_tailscale_dns_tag_collision(root)?;
+    }
     remove_managed_tailscale_config(root)?;
     let Some(options) = options else {
         return Ok(());
@@ -888,11 +890,15 @@ fn ensure_tailscale_config(
     }
     endpoints.push(endpoint);
 
-    let dns = root
-        .entry("dns")
+    root.entry("dns")
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("existing config dns must be an object")?;
+    ensure_tailscale_remote_dns_server(root)?;
+    let dns = root
+        .get_mut("dns")
+        .and_then(Value::as_object_mut)
+        .expect("DNS object was initialized");
     let servers = dns
         .entry("servers")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -912,12 +918,18 @@ fn ensure_tailscale_config(
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .context("existing config dns.rules must be an array")?;
-    rules.insert(
-        0,
-        json!({
-            "domain_suffix": [tailnet_domain],
-            "server": TAILSCALE_DNS_TAG,
-        }),
+    rules.splice(
+        0..0,
+        [
+            json!({
+                "domain_suffix": [tailnet_domain],
+                "server": TAILSCALE_DNS_TAG,
+            }),
+            json!({
+                "domain_suffix": ["tailscale.com", "tailscale.io"],
+                "server": DEFAULT_REMOTE_DNS_TAG,
+            }),
+        ],
     );
 
     let route = root
@@ -943,46 +955,166 @@ fn ensure_tailscale_config(
 }
 
 fn remove_managed_tailscale_config(root: &mut Map<String, Value>) -> Result<()> {
+    let has_managed_endpoint = root
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .is_some_and(|endpoints| endpoints.iter().any(is_managed_tailscale_endpoint));
+    let has_managed_dns_server = root
+        .get("dns")
+        .and_then(|dns| dns.get("servers"))
+        .and_then(Value::as_array)
+        .is_some_and(|servers| servers.iter().any(is_managed_tailscale_dns_server));
     if let Some(endpoints) = root.get_mut("endpoints") {
         let endpoints = endpoints
             .as_array_mut()
             .context("existing config endpoints must be an array")?;
-        endpoints.retain(|endpoint| {
-            endpoint.get("tag").and_then(Value::as_str) != Some(TAILSCALE_ENDPOINT_TAG)
-                || endpoint.get("type").and_then(Value::as_str) != Some("tailscale")
-        });
+        endpoints.retain(|endpoint| !is_managed_tailscale_endpoint(endpoint));
     }
     if let Some(dns) = root.get_mut("dns").and_then(Value::as_object_mut) {
         if let Some(servers) = dns.get_mut("servers") {
             servers
                 .as_array_mut()
                 .context("existing config dns.servers must be an array")?
-                .retain(|server| {
-                    server.get("tag").and_then(Value::as_str) != Some(TAILSCALE_DNS_TAG)
-                });
+                .retain(|server| !is_managed_tailscale_dns_server(server));
         }
-        if let Some(rules) = dns.get_mut("rules") {
+        if has_managed_dns_server && let Some(rules) = dns.get_mut("rules") {
             rules
                 .as_array_mut()
                 .context("existing config dns.rules must be an array")?
-                .retain(|rule| !is_managed_tailscale_dns_rule(rule));
+                .retain(|rule| {
+                    !is_managed_tailscale_dns_rule(rule)
+                        && !is_managed_tailscale_control_plane_dns_rule(rule)
+                });
         }
     }
-    if let Some(route) = root.get_mut("route").and_then(Value::as_object_mut)
+    if has_managed_endpoint
+        && let Some(route) = root.get_mut("route").and_then(Value::as_object_mut)
         && let Some(rules) = route.get_mut("rules")
     {
         rules
             .as_array_mut()
             .context("existing config route.rules must be an array")?
-            .retain(|rule| {
-                rule.get("outbound").and_then(Value::as_str) != Some(TAILSCALE_ENDPOINT_TAG)
-            });
+            .retain(|rule| !is_managed_tailscale_route_rule(rule));
     }
     Ok(())
 }
 
 fn is_managed_tailscale_dns_rule(rule: &Value) -> bool {
-    rule.get("server").and_then(Value::as_str) == Some(TAILSCALE_DNS_TAG)
+    let Some(rule) = rule.as_object() else {
+        return false;
+    };
+    rule.len() == 2
+        && rule.get("server").and_then(Value::as_str) == Some(TAILSCALE_DNS_TAG)
+        && rule
+            .get("domain_suffix")
+            .and_then(Value::as_array)
+            .is_some_and(|domains| domains.len() == 1 && domains[0].is_string())
+}
+
+fn is_managed_tailscale_dns_server(server: &Value) -> bool {
+    server.get("type").and_then(Value::as_str) == Some("tailscale")
+        && server.get("tag").and_then(Value::as_str) == Some(TAILSCALE_DNS_TAG)
+        && server.get("endpoint").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG)
+}
+
+fn is_managed_tailscale_endpoint(endpoint: &Value) -> bool {
+    endpoint.get("type").and_then(Value::as_str) == Some("tailscale")
+        && endpoint.get("tag").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG)
+        && endpoint.get("state_directory").and_then(Value::as_str)
+            == Some(TAILSCALE_STATE_DIRECTORY)
+        && endpoint.get("accept_routes").and_then(Value::as_bool) == Some(true)
+        && endpoint.get("system_interface").and_then(Value::as_bool) == Some(false)
+}
+
+fn reject_tailscale_dns_tag_collision(root: &Map<String, Value>) -> Result<()> {
+    let collision = root
+        .get("dns")
+        .and_then(|dns| dns.get("servers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|server| {
+            server.get("tag").and_then(Value::as_str) == Some(TAILSCALE_DNS_TAG)
+                && !is_managed_tailscale_dns_server(server)
+        });
+    if collision.is_some() {
+        bail!("DNS server tag '{TAILSCALE_DNS_TAG}' is already in use");
+    }
+    Ok(())
+}
+
+fn ensure_tailscale_remote_dns_server(root: &mut Map<String, Value>) -> Result<()> {
+    let selector_tag = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
+    let servers = root
+        .get_mut("dns")
+        .and_then(Value::as_object_mut)
+        .expect("DNS object was initialized")
+        .entry("servers")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.servers must be an array")?;
+    if servers
+        .iter()
+        .any(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG))
+    {
+        return Ok(());
+    }
+    let mut server = json!({
+        "type": "tls",
+        "tag": DEFAULT_REMOTE_DNS_TAG,
+        "server": "8.8.8.8",
+        "server_port": 853,
+    });
+    if let Some(selector_tag) = selector_tag {
+        server["detour"] = Value::String(selector_tag);
+    }
+    servers.push(server);
+    Ok(())
+}
+
+fn is_managed_tailscale_control_plane_dns_rule(rule: &Value) -> bool {
+    let Some(rule) = rule.as_object() else {
+        return false;
+    };
+    rule.len() == 2
+        && rule.get("server").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG)
+        && string_array_equals(
+            rule.get("domain_suffix"),
+            &["tailscale.com", "tailscale.io"],
+        )
+}
+
+fn is_managed_tailscale_route_rule(rule: &Value) -> bool {
+    let Some(rule) = rule.as_object() else {
+        return false;
+    };
+    if rule.len() != 3
+        || rule.get("action").and_then(Value::as_str) != Some("route")
+        || rule.get("outbound").and_then(Value::as_str) != Some(TAILSCALE_ENDPOINT_TAG)
+    {
+        return false;
+    }
+    rule.get("domain_suffix")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.len() == 1 && values[0].is_string())
+        || string_array_equals(
+            rule.get("ip_cidr"),
+            &[CGNAT_OVERLAY_CIDR, TAILSCALE_IPV6_CIDR],
+        )
+        || string_array_equals(rule.get("preferred_by"), &[TAILSCALE_ENDPOINT_TAG])
+}
+
+fn string_array_equals(value: Option<&Value>, expected: &[&str]) -> bool {
+    value.and_then(Value::as_array).is_some_and(|values| {
+        values.len() == expected.len()
+            && values
+                .iter()
+                .zip(expected)
+                .all(|(value, expected)| value.as_str() == Some(*expected))
+    })
 }
 
 fn existing_direct_outbound_tag(outbounds: &[Value]) -> Option<String> {
@@ -2973,7 +3105,8 @@ mod tests {
         config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
         ensure_private_access_route_table, inspect_tailscale_config, inspect_tun_config,
-        lock_config_mutation, merge_into_existing_config, run_private_access_route_table_config,
+        is_managed_tailscale_control_plane_dns_rule, lock_config_mutation,
+        merge_into_existing_config, run_private_access_route_table_config,
         run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
         set_tailscale_config,
     };
@@ -5033,6 +5166,11 @@ mod tests {
         assert!(value_references(&enabled, TAILSCALE_ENDPOINT_TAG));
         assert!(value_references(&enabled, TAILSCALE_DNS_TAG));
         assert!(value_references(&enabled, TAILSCALE_IPV6_CIDR));
+        assert!(enabled["dns"]["rules"].as_array().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(is_managed_tailscale_control_plane_dns_rule)
+        }));
 
         assert!(set_tailscale_config(&path, None).expect("disables"));
         let disabled: Value =
@@ -5042,6 +5180,91 @@ mod tests {
         assert_eq!(disabled["endpoints"][0]["tag"], "other");
         assert_eq!(disabled["route"]["rules"][0]["action"], "hijack-dns");
         assert_eq!(disabled["route"]["rules"][1]["outbound"], "direct");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_tailscale_config_rejects_an_unmanaged_dns_tag_collision() {
+        let path = temp_config_path("tailscale-dns-collision");
+        let base = json!({
+            "dns": {
+                "servers": [{"type": "local", "tag": TAILSCALE_DNS_TAG}],
+                "rules": [{"domain_suffix": ["corp.example"], "server": TAILSCALE_DNS_TAG}]
+            },
+            "route": {"rules": []}
+        });
+        let original = serde_json::to_string_pretty(&base).expect("serializes");
+        fs::write(&path, &original).expect("writes config");
+
+        let error = set_tailscale_config(
+            &path,
+            Some(TailscaleConfigOptions {
+                tailnet_domain: "example.ts.net".to_string(),
+                hostname: None,
+            }),
+        )
+        .expect_err("unmanaged DNS tag must be rejected");
+        assert!(error.to_string().contains("tailscale-dns"));
+        assert_eq!(fs::read_to_string(&path).expect("reads"), original);
+        assert!(!set_tailscale_config(&path, None).expect("disable is a no-op"));
+        assert_eq!(fs::read_to_string(&path).expect("reads"), original);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn updating_tailscale_config_preserves_custom_routes_through_the_endpoint() {
+        let path = temp_config_path("tailscale-custom-route");
+        let base = json!({
+            "dns": {"servers": [], "rules": []},
+            "route": {"rules": [{"action": "hijack-dns"}]}
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+        set_tailscale_config(
+            &path,
+            Some(TailscaleConfigOptions {
+                tailnet_domain: "old.ts.net".to_string(),
+                hostname: None,
+            }),
+        )
+        .expect("enables");
+        let mut enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        enabled["route"]["rules"]
+            .as_array_mut()
+            .expect("route rules")
+            .push(json!({
+                "domain_suffix": ["custom.internal", "other.internal"],
+                "action": "route",
+                "outbound": TAILSCALE_ENDPOINT_TAG
+            }));
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&enabled).expect("serializes"),
+        )
+        .expect("writes config");
+
+        set_tailscale_config(
+            &path,
+            Some(TailscaleConfigOptions {
+                tailnet_domain: "new.ts.net".to_string(),
+                hostname: Some("new-host".to_string()),
+            }),
+        )
+        .expect("updates");
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert!(updated["route"]["rules"].as_array().is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.get("domain_suffix") == Some(&json!(["custom.internal", "other.internal"]))
+                    && rule.get("outbound").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG)
+            })
+        }));
 
         let _ = fs::remove_file(path);
     }
