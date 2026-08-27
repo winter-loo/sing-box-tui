@@ -21,6 +21,10 @@ use crate::defaults::{
 const CGNAT_OVERLAY_CIDR: &str = "100.64.0.0/10";
 const PRIVATE_ACCESS_SYSTEM_DNS_TAG: &str = "private-access-system";
 const INTERNET_TUN_INBOUND_TAG: &str = "tun-in";
+const TAILSCALE_ENDPOINT_TAG: &str = "ts-ep";
+const TAILSCALE_DNS_TAG: &str = "tailscale-dns";
+const TAILSCALE_STATE_DIRECTORY: &str = ".local/tailscale-embedded";
+const TAILSCALE_IPV6_CIDR: &str = "fd7a:115c:a1e0::/48";
 
 // Every config editor performs a read-modify-write cycle. Atomic replacement protects readers
 // from partial files, while this process-wide lock prevents concurrent editors from committing
@@ -116,6 +120,19 @@ pub(crate) struct TunConfigState {
     pub(crate) other_tun: bool,
     pub(crate) reserved_tag_conflict: bool,
     pub(crate) auto_detect_interface: RouteAutoDetectInterfaceState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TailscaleConfigState {
+    pub(crate) enabled: bool,
+    pub(crate) tailnet_domain: Option<String>,
+    pub(crate) hostname: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TailscaleConfigOptions {
+    pub(crate) tailnet_domain: String,
+    pub(crate) hostname: Option<String>,
 }
 
 impl TunConfigState {
@@ -766,6 +783,206 @@ pub(crate) fn set_china_ip_routing(config_path: &Path, enable: bool) -> Result<b
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     Ok(changed)
+}
+
+pub(crate) fn inspect_tailscale_config(config_path: &Path) -> Result<TailscaleConfigState> {
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    Ok(tailscale_config_state(&config))
+}
+
+pub(crate) fn set_tailscale_config(
+    config_path: &Path,
+    options: Option<TailscaleConfigOptions>,
+) -> Result<bool> {
+    let _config_guard = lock_config_mutation();
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut config = parse_sing_box_config_text(&text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let original = config.clone();
+    ensure_tailscale_config(&mut config, options)?;
+    let changed = config != original;
+    if changed {
+        let contents =
+            serde_json::to_string_pretty(&config).context("failed to serialize updated config")?;
+        write_atomic(config_path, format!("{contents}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    Ok(changed)
+}
+
+fn tailscale_config_state(config: &Value) -> TailscaleConfigState {
+    let endpoint = config
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .and_then(|endpoints| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.get("tag").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG)
+                    && endpoint.get("type").and_then(Value::as_str) == Some("tailscale")
+            })
+        });
+    let tailnet_domain = config
+        .get("dns")
+        .and_then(|dns| dns.get("rules"))
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| is_managed_tailscale_dns_rule(rule))
+        })
+        .and_then(|rule| rule.get("domain_suffix"))
+        .and_then(Value::as_array)
+        .and_then(|domains| domains.first())
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    TailscaleConfigState {
+        enabled: endpoint.is_some(),
+        tailnet_domain,
+        hostname: endpoint
+            .and_then(|endpoint| endpoint.get("hostname"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    }
+}
+
+fn ensure_tailscale_config(
+    config: &mut Value,
+    options: Option<TailscaleConfigOptions>,
+) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("existing sing-box config must be a JSON object")?;
+
+    remove_managed_tailscale_config(root)?;
+    let Some(options) = options else {
+        return Ok(());
+    };
+    let tailnet_domain = options.tailnet_domain.trim().trim_start_matches('.');
+    if tailnet_domain.is_empty() {
+        bail!("Tailscale tailnet domain cannot be empty");
+    }
+
+    let endpoints = root
+        .entry("endpoints")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config endpoints must be an array")?;
+    if endpoints
+        .iter()
+        .any(|endpoint| endpoint.get("tag").and_then(Value::as_str) == Some(TAILSCALE_ENDPOINT_TAG))
+    {
+        bail!("endpoint tag '{TAILSCALE_ENDPOINT_TAG}' is already in use");
+    }
+    let mut endpoint = json!({
+        "type": "tailscale",
+        "tag": TAILSCALE_ENDPOINT_TAG,
+        "state_directory": TAILSCALE_STATE_DIRECTORY,
+        "accept_routes": true,
+        "system_interface": false,
+    });
+    if let Some(hostname) = options.hostname.filter(|value| !value.trim().is_empty()) {
+        endpoint["hostname"] = Value::String(hostname.trim().to_string());
+    }
+    endpoints.push(endpoint);
+
+    let dns = root
+        .entry("dns")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config dns must be an object")?;
+    let servers = dns
+        .entry("servers")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.servers must be an array")?;
+    servers.insert(
+        0,
+        json!({
+            "type": "tailscale",
+            "tag": TAILSCALE_DNS_TAG,
+            "endpoint": TAILSCALE_ENDPOINT_TAG,
+            "accept_default_resolvers": false,
+        }),
+    );
+    let rules = dns
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config dns.rules must be an array")?;
+    rules.insert(
+        0,
+        json!({
+            "domain_suffix": [tailnet_domain],
+            "server": TAILSCALE_DNS_TAG,
+        }),
+    );
+
+    let route = root
+        .entry("route")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("existing config route must be an object")?;
+    let rules = route
+        .entry("rules")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("existing config route.rules must be an array")?;
+    let insertion = rules
+        .iter()
+        .position(|rule| rule.get("action").and_then(Value::as_str) != Some("hijack-dns"))
+        .unwrap_or(rules.len());
+    rules.splice(insertion..insertion, [
+        json!({"domain_suffix": [tailnet_domain], "action": "route", "outbound": TAILSCALE_ENDPOINT_TAG}),
+        json!({"ip_cidr": [CGNAT_OVERLAY_CIDR, TAILSCALE_IPV6_CIDR], "action": "route", "outbound": TAILSCALE_ENDPOINT_TAG}),
+        json!({"preferred_by": [TAILSCALE_ENDPOINT_TAG], "action": "route", "outbound": TAILSCALE_ENDPOINT_TAG}),
+    ]);
+    Ok(())
+}
+
+fn remove_managed_tailscale_config(root: &mut Map<String, Value>) -> Result<()> {
+    if let Some(endpoints) = root.get_mut("endpoints") {
+        let endpoints = endpoints
+            .as_array_mut()
+            .context("existing config endpoints must be an array")?;
+        endpoints.retain(|endpoint| {
+            endpoint.get("tag").and_then(Value::as_str) != Some(TAILSCALE_ENDPOINT_TAG)
+                || endpoint.get("type").and_then(Value::as_str) != Some("tailscale")
+        });
+    }
+    if let Some(dns) = root.get_mut("dns").and_then(Value::as_object_mut) {
+        if let Some(servers) = dns.get_mut("servers") {
+            servers
+                .as_array_mut()
+                .context("existing config dns.servers must be an array")?
+                .retain(|server| {
+                    server.get("tag").and_then(Value::as_str) != Some(TAILSCALE_DNS_TAG)
+                });
+        }
+        if let Some(rules) = dns.get_mut("rules") {
+            rules
+                .as_array_mut()
+                .context("existing config dns.rules must be an array")?
+                .retain(|rule| !is_managed_tailscale_dns_rule(rule));
+        }
+    }
+    if let Some(route) = root.get_mut("route").and_then(Value::as_object_mut)
+        && let Some(rules) = route.get_mut("rules")
+    {
+        rules
+            .as_array_mut()
+            .context("existing config route.rules must be an array")?
+            .retain(|rule| {
+                rule.get("outbound").and_then(Value::as_str) != Some(TAILSCALE_ENDPOINT_TAG)
+            });
+    }
+    Ok(())
+}
+
+fn is_managed_tailscale_dns_rule(rule: &Value) -> bool {
+    rule.get("server").and_then(Value::as_str) == Some(TAILSCALE_DNS_TAG)
 }
 
 fn existing_direct_outbound_tag(outbounds: &[Value]) -> Option<String> {
@@ -2750,13 +2967,15 @@ mod tests {
     use super::{
         DefaultConfigOptions, HillstoneRouteTableOptions, PRIVATE_ACCESS_SYSTEM_DNS_TAG,
         PrivateAccessRouteTableOptions, ProviderNodeSet, RouteAutoDetectInterfaceState,
-        build_default_config, build_default_config_with_options,
+        TAILSCALE_DNS_TAG, TAILSCALE_ENDPOINT_TAG, TAILSCALE_IPV6_CIDR, TailscaleConfigOptions,
+        TailscaleConfigState, build_default_config, build_default_config_with_options,
         build_full_config_with_provider_node_sets, config_has_china_ip_routing,
         config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
-        ensure_private_access_route_table, inspect_tun_config, lock_config_mutation,
-        merge_into_existing_config, run_private_access_route_table_config,
+        ensure_private_access_route_table, inspect_tailscale_config, inspect_tun_config,
+        lock_config_mutation, merge_into_existing_config, run_private_access_route_table_config,
         run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
+        set_tailscale_config,
     };
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
     use serde_json::{Value, json};
@@ -4776,6 +4995,53 @@ mod tests {
             geoip_index > global_index,
             "China rules must come after the global-mode override"
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_tailscale_config_manages_endpoint_dns_and_routes_idempotently() {
+        let path = temp_config_path("tailscale");
+        let base = json!({
+            "dns": {"servers": [], "rules": [{"server": "remote"}]},
+            "endpoints": [{"type": "wireguard", "tag": "other"}],
+            "route": {"rules": [{"action": "hijack-dns"}, {"outbound": "direct"}]}
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&base).expect("serializes"),
+        )
+        .expect("writes config");
+        let options = TailscaleConfigOptions {
+            tailnet_domain: ".example.ts.net".to_string(),
+            hostname: Some("laptop-sing-box".to_string()),
+        };
+
+        assert!(set_tailscale_config(&path, Some(options.clone())).expect("enables"));
+        assert!(!set_tailscale_config(&path, Some(options)).expect("second enable is stable"));
+        let state = inspect_tailscale_config(&path).expect("inspects");
+        assert_eq!(
+            state,
+            TailscaleConfigState {
+                enabled: true,
+                tailnet_domain: Some("example.ts.net".to_string()),
+                hostname: Some("laptop-sing-box".to_string()),
+            }
+        );
+        let enabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert!(value_references(&enabled, TAILSCALE_ENDPOINT_TAG));
+        assert!(value_references(&enabled, TAILSCALE_DNS_TAG));
+        assert!(value_references(&enabled, TAILSCALE_IPV6_CIDR));
+
+        assert!(set_tailscale_config(&path, None).expect("disables"));
+        let disabled: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("reads")).expect("parses");
+        assert!(!value_references(&disabled, TAILSCALE_ENDPOINT_TAG));
+        assert!(!value_references(&disabled, TAILSCALE_DNS_TAG));
+        assert_eq!(disabled["endpoints"][0]["tag"], "other");
+        assert_eq!(disabled["route"]["rules"][0]["action"], "hijack-dns");
+        assert_eq!(disabled["route"]["rules"][1]["outbound"], "direct");
 
         let _ = fs::remove_file(path);
     }

@@ -83,6 +83,12 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) china_ip_routing_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tailscale_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tailscale_tailnet_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tailscale_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tun_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tun_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
@@ -308,6 +314,27 @@ mod tests {
         let json = serde_json::to_string(&state).expect("serializes");
         let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
         assert_eq!(restored.china_ip_routing_enabled, Some(true));
+    }
+
+    #[test]
+    fn tailscale_settings_round_trip() {
+        let state = TuiRuntimeState {
+            tailscale_enabled: Some(true),
+            tailscale_tailnet_domain: Some("example.ts.net".to_string()),
+            tailscale_hostname: Some("laptop-sing-box".to_string()),
+            ..TuiRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+        assert_eq!(restored.tailscale_enabled, Some(true));
+        assert_eq!(
+            restored.tailscale_tailnet_domain.as_deref(),
+            Some("example.ts.net")
+        );
+        assert_eq!(
+            restored.tailscale_hostname.as_deref(),
+            Some("laptop-sing-box")
+        );
     }
 
     #[test]

@@ -7,7 +7,10 @@ use super::private_access_workflow::private_access_process_exists;
 use super::settings::normalize_optional_setting;
 use super::view::{LeftPaneSection, truncate_for_width};
 use super::{App, REFRESH_DEBOUNCE, process_exists};
-use crate::config::{config_has_china_ip_routing, set_china_ip_routing};
+use crate::config::{
+    TailscaleConfigOptions, config_has_china_ip_routing, inspect_tailscale_config,
+    set_china_ip_routing, set_tailscale_config,
+};
 use crate::tui_state::TuiRuntimeState;
 
 #[cfg(test)]
@@ -45,6 +48,27 @@ impl App {
                 &self.system_proxy_config_path,
                 self.china_ip_routing_enabled,
             )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reconcile_persisted_tailscale(&self) -> Result<()> {
+        if !self.tailscale_explicit || !self.system_proxy_config_path.exists() {
+            return Ok(());
+        }
+        let current = inspect_tailscale_config(&self.system_proxy_config_path).unwrap_or_default();
+        let desired_domain = self.tailscale_tailnet_domain.trim();
+        let desired_hostname = normalize_optional_setting(Some(self.tailscale_hostname.clone()));
+        if current.enabled != self.tailscale_enabled
+            || (self.tailscale_enabled
+                && (current.tailnet_domain.as_deref() != Some(desired_domain)
+                    || current.hostname != desired_hostname))
+        {
+            let options = self.tailscale_enabled.then(|| TailscaleConfigOptions {
+                tailnet_domain: desired_domain.to_string(),
+                hostname: desired_hostname,
+            });
+            set_tailscale_config(&self.system_proxy_config_path, options)?;
         }
         Ok(())
     }
@@ -97,6 +121,16 @@ impl App {
             self.china_ip_routing_enabled = value;
             self.china_ip_routing_explicit = true;
         }
+        if let Some(value) = state.tailscale_enabled {
+            self.tailscale_enabled = value;
+            self.tailscale_explicit = true;
+        }
+        if let Some(value) = normalize_optional_setting(state.tailscale_tailnet_domain) {
+            self.tailscale_tailnet_domain = value;
+        }
+        if let Some(value) = state.tailscale_hostname {
+            self.tailscale_hostname = value;
+        }
         self.last_auto_select_benchmark = None;
         if let Some(group) = self.selected_group()
             && let Some(node) = state.current_selected_nodes.get(&group.name)
@@ -140,6 +174,11 @@ impl App {
             china_ip_routing_enabled: self
                 .china_ip_routing_explicit
                 .then_some(self.china_ip_routing_enabled),
+            tailscale_enabled: self.tailscale_explicit.then_some(self.tailscale_enabled),
+            tailscale_tailnet_domain: normalize_optional_setting(Some(
+                self.tailscale_tailnet_domain.clone(),
+            )),
+            tailscale_hostname: normalize_optional_setting(Some(self.tailscale_hostname.clone())),
             private_access_profiles: self.private_access.runtime_states(process_exists),
         }
     }
