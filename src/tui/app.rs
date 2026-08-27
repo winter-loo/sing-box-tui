@@ -23,7 +23,7 @@ use crate::auto_pick::{
 };
 use crate::benchmark_workflow::BenchmarkWorkflow;
 use crate::config::{
-    PrivateAccessRouteTableOptions, config_has_china_ip_routing,
+    PrivateAccessRouteTableOptions, config_has_china_ip_routing, inspect_tailscale_config,
     run_private_access_route_table_config, run_private_access_tun_baseline_config,
 };
 use crate::controller::{ApiClient, ConnectionsSnapshot, ProxyGroup};
@@ -398,6 +398,10 @@ struct App {
     internet_tun: InternetTunTransaction,
     china_ip_routing_enabled: bool,
     china_ip_routing_explicit: bool,
+    tailscale_enabled: bool,
+    tailscale_explicit: bool,
+    tailscale_tailnet_domain: String,
+    tailscale_hostname: String,
     verify_job: Option<VerifyJob>,
     sing_box: ManagedSingBox,
     private_access: PrivateAccessRuntime,
@@ -429,6 +433,8 @@ impl App {
         )?;
         let china_ip_routing_enabled =
             config_has_china_ip_routing(&system_proxy_config_path).unwrap_or(false);
+        let tailscale_config =
+            inspect_tailscale_config(&system_proxy_config_path).unwrap_or_default();
         let subscription_refresh =
             SubscriptionRefreshState::from_options(subscription_refresh_options)?;
         let benchmark_workflow =
@@ -488,6 +494,10 @@ impl App {
             internet_tun,
             china_ip_routing_enabled,
             china_ip_routing_explicit: false,
+            tailscale_enabled: tailscale_config.enabled,
+            tailscale_explicit: tailscale_config.enabled,
+            tailscale_tailnet_domain: tailscale_config.tailnet_domain.unwrap_or_default(),
+            tailscale_hostname: tailscale_config.hostname.unwrap_or_default(),
             verify_job: None,
             sing_box: ManagedSingBox::new(
                 sing_box_executable,
@@ -502,6 +512,7 @@ impl App {
         if manage_sing_box {
             app.reconcile_persisted_tun_mode(&mut runtime_state)?;
             app.reconcile_persisted_china_ip_routing()?;
+            app.reconcile_persisted_tailscale()?;
             app.ensure_private_access_tun_baseline()?;
             app.authorize_tun_elevation_if_needed()?;
             app.start_managed_sing_box()?;

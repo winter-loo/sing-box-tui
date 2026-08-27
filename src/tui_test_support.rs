@@ -133,6 +133,10 @@ pub(super) fn test_app() -> App {
         .expect("Internet TUN transaction initializes"),
         china_ip_routing_enabled: false,
         china_ip_routing_explicit: false,
+        tailscale_enabled: false,
+        tailscale_explicit: false,
+        tailscale_tailnet_domain: String::new(),
+        tailscale_hostname: String::new(),
         verify_job: None,
         sing_box: ManagedSingBox::new(PathBuf::from("sing-box"), config_path, false),
         private_access: PrivateAccessRuntime::with_default_hillstone()

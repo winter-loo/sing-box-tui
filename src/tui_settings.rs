@@ -4,7 +4,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use crossterm::event::KeyCode;
 
-use crate::config::{china_ip_routing_ruleset_dir, set_china_ip_routing};
+use crate::config::{
+    TailscaleConfigOptions, china_ip_routing_ruleset_dir, set_china_ip_routing,
+    set_tailscale_config,
+};
 use crate::private_access_session::{
     PrivateAccessMode, PrivateAccessProfileRuntime, load_manifest_for_profile,
     parse_private_access_mode,
@@ -70,6 +73,9 @@ pub(super) fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
         SettingsField::SystemProxyServer => app.system_proxy.server().to_string(),
         SettingsField::ChinaIpRouting => app.china_ip_routing_enabled.to_string(),
+        SettingsField::TailscaleEnabled => app.tailscale_enabled.to_string(),
+        SettingsField::TailscaleTailnetDomain => app.tailscale_tailnet_domain.clone(),
+        SettingsField::TailscaleHostname => app.tailscale_hostname.clone(),
         SettingsField::PrivateAccessProfile => app
             .private_access
             .focused_opt()
@@ -356,6 +362,33 @@ impl App {
                 }
                 return Ok(());
             }
+            SettingsField::TailscaleEnabled => {
+                let enable = parse_bool_setting(value)?;
+                if enable && self.tailscale_tailnet_domain.trim().is_empty() {
+                    bail!("set Tailscale tailnet domain before enabling the endpoint");
+                }
+                self.tailscale_enabled = enable;
+                self.tailscale_explicit = true;
+                return self.apply_tailscale_settings();
+            }
+            SettingsField::TailscaleTailnetDomain => {
+                let domain = value.trim_start_matches('.');
+                if domain.is_empty() {
+                    bail!("Tailscale tailnet domain cannot be empty");
+                }
+                self.tailscale_tailnet_domain = domain.to_string();
+                self.tailscale_explicit = true;
+                if self.tailscale_enabled {
+                    return self.apply_tailscale_settings();
+                }
+            }
+            SettingsField::TailscaleHostname => {
+                self.tailscale_hostname = value.to_string();
+                self.tailscale_explicit = true;
+                if self.tailscale_enabled {
+                    return self.apply_tailscale_settings();
+                }
+            }
             SettingsField::PrivateAccessProfile => {
                 self.private_access.set_focus_by_id(value)?;
             }
@@ -420,6 +453,42 @@ impl App {
         self.save_runtime_state()?;
         self.ensure_auto_pick_background_worker_after_state_change()?;
         self.set_status_only(format!("Saved {}", settings_field_label(field)));
+        Ok(())
+    }
+
+    fn apply_tailscale_settings(&mut self) -> Result<()> {
+        let options = self.tailscale_enabled.then(|| TailscaleConfigOptions {
+            tailnet_domain: self.tailscale_tailnet_domain.clone(),
+            hostname: normalize_optional_setting(Some(self.tailscale_hostname.clone())),
+        });
+        let changed = set_tailscale_config(&self.system_proxy_config_path, options)?;
+        self.save_runtime_state()?;
+        if changed {
+            let receipt = self.restart_managed_sing_box()?;
+            let label = if self.tailscale_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            match receipt.observe_controller(&self.client) {
+                Ok(()) => self.set_status_with_flash(format!(
+                    "Tailscale endpoint {label}; sing-box restarted"
+                )),
+                Err(error) => self.set_status_with_flash(format!(
+                    "Tailscale endpoint {label}; controller not ready: {}",
+                    truncate_for_width(&format!("{error:#}"), 60)
+                )),
+            }
+        } else {
+            self.set_status_with_flash(format!(
+                "Tailscale endpoint already {}",
+                if self.tailscale_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ));
+        }
         Ok(())
     }
 }
