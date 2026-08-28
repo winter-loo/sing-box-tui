@@ -1,0 +1,66 @@
+{
+  "probe": "agy_gemini",
+  "prefilter_url": "http://www.gstatic.com/generate_204",
+  "results": [
+    {
+      "tag": "L1|日本03|直连|流媒体|2x",
+      "selectors": [
+        "手动选择",
+        "宝贝云",
+        "广告路由"
+      ],
+      "ordinal": 23,
+      "usable": true,
+      "agy_exit_code": 0,
+      "elapsed_ms": 23547
+    },
+    {
+      "tag": "L1|日本04|直连|流媒体|2x",
+      "selectors": [
+        "手动选择",
+        "宝贝云",
+        "广告路由"
+      ],
+      "ordinal": 24,
+      "usable": true,
+      "agy_exit_code": 0,
+      "elapsed_ms": 16625
+    },
+    {
+      "tag": "日本Trojan3",
+      "selectors": [
+        "手动选择",
+        "白嫖机场",
+        "广告路由"
+      ],
+      "ordinal": 82,
+      "usable": true,
+      "agy_exit_code": 0,
+      "elapsed_ms": 25187
+    },
+    {
+      "tag": "香港trojan2",
+      "selectors": [
+        "手动选择",
+        "白嫖机场",
+        "广告路由"
+      ],
+      "ordinal": 90,
+      "usable": true,
+      "agy_exit_code": 0,
+      "elapsed_ms": 27031
+    },
+    {
+      "tag": "香港Gemini",
+      "selectors": [
+        "手动选择",
+        "白嫖机场",
+        "广告路由"
+      ],
+      "ordinal": 98,
+      "usable": true,
+      "agy_exit_code": 0,
+      "elapsed_ms": 29015
+    }
+  ]
+}
