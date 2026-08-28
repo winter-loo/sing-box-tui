@@ -149,12 +149,15 @@ pub(crate) fn run_tui(
         keep_sing_box_running,
         true,
     )?;
-    app.ensure_auto_pick_background_worker_if_enabled()?;
-    let terminal = setup_terminal()?;
-    let result = run_app(terminal, &mut app);
-    let restore_result = restore_terminal();
+    let result = (|| {
+        app.ensure_auto_pick_background_worker_if_enabled()?;
+        let terminal = setup_terminal()?;
+        let result = run_app(terminal, &mut app);
+        let restore_result = restore_terminal();
+        result.and(restore_result)
+    })();
     let shutdown_result = app.shutdown_runtime_environment();
-    result.and(restore_result).and(shutdown_result)
+    result.and(shutdown_result)
 }
 
 pub(crate) fn run_headless_auto_pick(
@@ -508,26 +511,36 @@ impl App {
             private_access_progress: None,
             private_access_auth: None,
         };
-        app.apply_runtime_state(runtime_state.clone())?;
-        if manage_sing_box {
-            app.reconcile_persisted_tun_mode(&mut runtime_state)?;
-            app.reconcile_persisted_china_ip_routing()?;
-            app.reconcile_persisted_tailscale()?;
-            app.ensure_private_access_tun_baseline()?;
-            app.authorize_tun_elevation_if_needed()?;
-            app.start_managed_sing_box()?;
-            app.reconcile_persisted_system_proxy()?;
-        } else {
-            wait_for_controller_ready(&app.client)
-                .context("headless auto-pick could not reach the existing sing-box controller")?;
+        let initialization = (|| {
+            app.apply_runtime_state(runtime_state.clone())?;
+            if manage_sing_box {
+                app.reconcile_persisted_tun_mode(&mut runtime_state)?;
+                app.reconcile_persisted_china_ip_routing()?;
+                app.reconcile_persisted_tailscale()?;
+                app.ensure_private_access_tun_baseline()?;
+                app.authorize_tun_elevation_if_needed()?;
+                app.start_managed_sing_box()?;
+                app.reconcile_persisted_system_proxy()?;
+            } else {
+                wait_for_controller_ready(&app.client).context(
+                    "headless auto-pick could not reach the existing sing-box controller",
+                )?;
+            }
+            app.refresh()?;
+            app.restore_persisted_selections(&runtime_state)?;
+            app.apply_runtime_state(runtime_state.clone())?;
+            app.save_bypass_rule_set()?;
+            Ok(())
+        })();
+        if let Err(error) = initialization {
+            let cleanup = app.shutdown_runtime_environment();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    error.context(format!("startup cleanup also failed: {cleanup_error:#}"))
+                }
+            });
         }
-        if let Err(error) = app.refresh() {
-            let _ = app.shutdown_managed_sing_box();
-            return Err(error);
-        }
-        app.restore_persisted_selections(&runtime_state)?;
-        app.apply_runtime_state(runtime_state)?;
-        app.save_bypass_rule_set()?;
         Ok(app)
     }
 
