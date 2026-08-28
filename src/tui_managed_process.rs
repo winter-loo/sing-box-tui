@@ -17,14 +17,26 @@ impl App {
         if let Err(error) = self.save_runtime_state() {
             errors.push(format!("failed to preserve runtime intent: {error:#}"));
         }
-        if let Err(error) = self.system_proxy.suspend_for_exit() {
-            errors.push(format!("failed to disable system proxy: {error:#}"));
-        }
+        let proxy_suspended = match self.system_proxy.suspend_for_exit() {
+            Ok(_) => true,
+            Err(error) => {
+                errors.push(format!("failed to disable system proxy: {error:#}"));
+                false
+            }
+        };
         if let Err(error) = self.internet_tun.suspend_for_exit() {
             errors.push(format!("failed to suspend Internet TUN: {error:#}"));
         }
-        if let Err(error) = self.shutdown_managed_sing_box() {
-            errors.push(format!("failed to stop managed sing-box: {error:#}"));
+        if proxy_suspended {
+            if let Err(error) = self.shutdown_managed_sing_box() {
+                errors.push(format!("failed to stop managed sing-box: {error:#}"));
+            }
+        } else {
+            self.sing_box.leave_running();
+            errors.push(
+                "kept managed sing-box running because the system proxy is still enabled"
+                    .to_string(),
+            );
         }
 
         if errors.is_empty() {
@@ -113,6 +125,7 @@ mod tests {
     use super::super::test_support::{test_app, test_state_path};
     use crate::config::{RouteAutoDetectInterfaceState, default_tun_inbound, inspect_tun_config};
     use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
+    use crate::system_proxy::SystemProxy;
 
     #[test]
     fn uppercase_b_keeps_managed_sing_box_running_and_exits_tui() {
@@ -168,5 +181,18 @@ mod tests {
 
         assert!(inspect_tun_config(&path).unwrap().managed_internet_tun);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proxy_cleanup_failure_keeps_managed_sing_box_alive() {
+        let mut app = test_app();
+        app.system_proxy = SystemProxy::failing_for_test(test_state_path(), "127.0.0.1:6780", true);
+
+        let error = app
+            .shutdown_runtime_environment()
+            .expect_err("proxy cleanup failure is reported");
+
+        assert!(error.to_string().contains("failed to disable system proxy"));
+        assert!(app.sing_box.is_leaving_running());
     }
 }

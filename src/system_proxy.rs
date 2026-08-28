@@ -124,7 +124,7 @@ impl SystemProxy {
         }
         self.sync_detected_server();
         self.enabled = self.platform.matches(&self.server);
-        if !self.enabled {
+        if !self.enabled && self.enabled_intent != Some(true) {
             return Ok(false);
         }
         self.apply_verified(false, &[])?;
@@ -259,6 +259,23 @@ impl SystemProxy {
     pub(crate) fn for_test(config_path: impl Into<PathBuf>, server: &str, enabled: bool) -> Self {
         let platform = Arc::new(FixedSystemProxyPlatform {
             enabled: std::sync::atomic::AtomicBool::new(enabled),
+            fail_updates: false,
+        });
+        let mut proxy = Self::with_platform(config_path.into(), platform);
+        proxy.server = server.to_string();
+        proxy.enabled = enabled;
+        proxy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failing_for_test(
+        config_path: impl Into<PathBuf>,
+        server: &str,
+        enabled: bool,
+    ) -> Self {
+        let platform = Arc::new(FixedSystemProxyPlatform {
+            enabled: std::sync::atomic::AtomicBool::new(enabled),
+            fail_updates: true,
         });
         let mut proxy = Self::with_platform(config_path.into(), platform);
         proxy.server = server.to_string();
@@ -610,7 +627,7 @@ fn system_proxy_matches(server: &str) -> bool {
         return false;
     };
     let managed_service_matches = macos_system_proxy_services().is_ok_and(|services| {
-        services.iter().any(|service| {
+        all_macos_services_match(&services, |service| {
             [
                 "-getwebproxy",
                 "-getsecurewebproxy",
@@ -621,6 +638,14 @@ fn system_proxy_matches(server: &str) -> bool {
         })
     });
     managed_service_matches || macos_legacy_dynamic_proxy_matches(&host, &port)
+}
+
+#[cfg(target_os = "macos")]
+fn all_macos_services_match(
+    services: &[String],
+    mut service_matches: impl FnMut(&str) -> bool,
+) -> bool {
+    !services.is_empty() && services.iter().all(|service| service_matches(service))
 }
 
 #[cfg(target_os = "linux")]
@@ -1019,11 +1044,15 @@ fn windows_system_proxy_script_path() -> Option<PathBuf> {
 #[cfg(test)]
 struct FixedSystemProxyPlatform {
     enabled: std::sync::atomic::AtomicBool,
+    fail_updates: bool,
 }
 
 #[cfg(test)]
 impl SystemProxyPlatform for FixedSystemProxyPlatform {
     fn apply(&self, server: &str, enable: bool, _bypass_entries: &[String]) -> Result<String> {
+        if self.fail_updates {
+            bail!("injected system proxy update failure");
+        }
         self.enabled
             .store(enable, std::sync::atomic::Ordering::Relaxed);
         Ok(format!(
@@ -1147,6 +1176,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exit_suspend_cleans_partially_applied_enabled_intent() {
+        let platform = Arc::new(RecordingPlatform::default());
+        let mut proxy = SystemProxy::with_platform(PathBuf::from("missing.json"), platform.clone());
+        proxy.restore_enabled_intent(Some(true));
+
+        proxy
+            .suspend_for_exit()
+            .expect("partial proxy state is cleaned");
+
+        assert_eq!(
+            platform.updates.lock().expect("updates lock").as_slice(),
+            &[("127.0.0.1:6780".to_string(), false, Vec::new())]
+        );
+        assert_eq!(proxy.persisted_enabled(), Some(true));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_default_service_filter_excludes_vpn_connections() {
@@ -1165,6 +1211,16 @@ mod tests {
             exclude_macos_connection_services(services, &connections),
             vec!["Wi-Fi".to_string(), "USB 10/100 LAN".to_string()]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_status_requires_every_managed_service_to_match() {
+        let services = vec!["Wi-Fi".to_string(), "Ethernet".to_string()];
+
+        assert!(!all_macos_services_match(&services, |service| service == "Wi-Fi"));
+        assert!(all_macos_services_match(&services, |_| true));
+        assert!(!all_macos_services_match(&[], |_| true));
     }
 
     #[cfg(target_os = "macos")]
