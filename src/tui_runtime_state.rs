@@ -117,6 +117,8 @@ impl App {
             self.system_proxy
                 .restore_server(value, state.system_proxy_server_override);
         }
+        self.system_proxy
+            .restore_enabled_intent(state.system_proxy_enabled);
         if let Some(value) = state.china_ip_routing_enabled {
             self.china_ip_routing_enabled = value;
             self.china_ip_routing_explicit = true;
@@ -169,6 +171,7 @@ impl App {
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy.server().to_string()),
             system_proxy_server_override: self.system_proxy.server_is_overridden(),
+            system_proxy_enabled: self.system_proxy.persisted_enabled(),
             tun_enabled: persisted_tun.enabled(),
             tun_auto_detect_interface_before_enable: persisted_tun.restore_auto_detect_interface(),
             china_ip_routing_enabled: self
