@@ -26,6 +26,7 @@ enum Request {
     Restart { config: PathBuf },
     Stop,
     Status,
+    ClearSystemProxy { server: String },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,6 +81,16 @@ pub(crate) fn status() -> Result<Option<u32>> {
         Path::new(DEFAULT_SOCKET_PATH),
         &Request::Status,
     )?)
+}
+
+pub(crate) fn clear_system_proxy(server: &str) -> Result<()> {
+    response_result(send_request(
+        Path::new(DEFAULT_SOCKET_PATH),
+        &Request::ClearSystemProxy {
+            server: server.to_string(),
+        },
+    )?)?;
+    Ok(())
 }
 
 fn response_result(response: Response) -> Result<Option<u32>> {
@@ -186,6 +197,10 @@ fn handle_client(
             managed.stop()?;
             Ok(Response::success(None))
         }
+        Request::ClearSystemProxy { server } => {
+            clear_matching_dynamic_proxy_state(&server)?;
+            Ok(Response::success(managed.pid()))
+        }
         Request::Restart { config } => {
             let config = validate_user_file(&config, allowed_uid, "config")?;
             validate_config_paths(&config)?;
@@ -218,6 +233,112 @@ fn handle_client(
             Ok(Response::success(Some(pid)))
         }
     }
+}
+
+fn clear_matching_dynamic_proxy_state(server: &str) -> Result<()> {
+    let (host, port) = parse_loopback_proxy_server(server)?;
+    for service_id in network_connection_service_ids()? {
+        let key = format!("State:/Network/Service/{service_id}/Proxies");
+        let current = run_scutil(&format!("show {key}\n"))?;
+        if !dynamic_proxy_matches(&current, &host, &port) {
+            continue;
+        }
+        run_scutil(&format!("remove {key}\n"))?;
+        let remaining = run_scutil(&format!("show {key}\n"))?;
+        if dynamic_proxy_matches(&remaining, &host, &port) {
+            bail!("network extension republished matching dynamic proxy state")
+        }
+    }
+    Ok(())
+}
+
+fn parse_loopback_proxy_server(server: &str) -> Result<(String, String)> {
+    let (host, port) = server
+        .trim()
+        .rsplit_once(':')
+        .context("system proxy server must be host:port")?;
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if !matches!(host, "127.0.0.1" | "::1" | "localhost") {
+        bail!("privileged dynamic proxy cleanup is restricted to loopback servers")
+    }
+    let parsed_port = port
+        .trim()
+        .parse::<u16>()
+        .context("system proxy port must be a number")?;
+    if parsed_port == 0 {
+        bail!("system proxy port must be greater than zero")
+    }
+    Ok((host.to_string(), port.trim().to_string()))
+}
+
+fn network_connection_service_ids() -> Result<Vec<String>> {
+    let output = Command::new("/usr/sbin/scutil")
+        .args(["--nc", "list"])
+        .output()
+        .context("failed to list macOS network connections")?;
+    if !output.status.success() {
+        bail!("scutil --nc list failed with {}", output.status)
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|value| valid_service_id(value))
+        })
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn valid_service_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn run_scutil(script: &str) -> Result<String> {
+    let mut child = Command::new("/usr/sbin/scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start scutil")?;
+    child
+        .stdin
+        .take()
+        .context("failed to open scutil stdin")?
+        .write_all(script.as_bytes())?;
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() || stdout.contains("Permission denied") || !stderr.is_empty() {
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        bail!("scutil failed: {message}")
+    }
+    Ok(stdout)
+}
+
+fn dynamic_proxy_matches(text: &str, host: &str, port: &str) -> bool {
+    proxy_value(text, "HTTPEnable") == Some("1")
+        && proxy_value(text, "HTTPProxy") == Some(host)
+        && proxy_value(text, "HTTPPort") == Some(port)
+        && proxy_value(text, "HTTPSEnable") == Some("1")
+        && proxy_value(text, "HTTPSProxy") == Some(host)
+        && proxy_value(text, "HTTPSPort") == Some(port)
+        && proxy_value(text, "SOCKSEnable") == Some("1")
+        && proxy_value(text, "SOCKSProxy") == Some(host)
+        && proxy_value(text, "SOCKSPort") == Some(port)
+}
+
+fn proxy_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        (key.trim() == name).then_some(value.trim())
+    })
 }
 
 fn validate_root_executable(path: &Path) -> Result<PathBuf> {
@@ -476,6 +597,17 @@ mod tests {
     fn protocol_never_accepts_an_arbitrary_command() {
         let request = r#"{"action":"run","command":["sh","-c","id"]}"#;
         assert!(serde_json::from_str::<Request>(request).is_err());
+    }
+
+    #[test]
+    fn proxy_cleanup_protocol_accepts_only_a_server_not_a_dynamic_store_key() {
+        let request = r#"{"action":"clear_system_proxy","server":"127.0.0.1:6780"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(request),
+            Ok(Request::ClearSystemProxy { server }) if server == "127.0.0.1:6780"
+        ));
+        assert!(parse_loopback_proxy_server("192.168.10.2:6780").is_err());
+        assert!(parse_loopback_proxy_server("127.0.0.1:6780").is_ok());
     }
 
     #[test]

@@ -7,9 +7,17 @@ This note documents how the macOS system proxy was changed from the AirTCP clien
 The sing-box service was already running with a mixed inbound on port `6780` and a Clash API controller on port `9992`.
 
 The TUI can now toggle these proxy settings with `p`. By default it applies the
-proxy to every enabled macOS network service. Set
+proxy to enabled macOS network services except VPN and dial-up connection
+services. This keeps supplemental proxy state owned by clients such as
+Tailscale separate from the ordinary Wi-Fi/Ethernet system proxy. Set
 `SING_BOX_TUI_SYSTEM_PROXY_SERVICE` to a comma-separated list such as
 `Wi-Fi,USB 10/100 LAN` if you want to target specific services.
+
+When disabling, the TUI also detects legacy matching proxy state that an older
+version wrote into a connected VPN service. The installed macOS privileged
+helper removes only a dynamic HTTP/HTTPS/SOCKS proxy whose complete loopback
+server matches the TUI mixed inbound; it does not stop the VPN or alter its
+routes, DNS, or saved configuration.
 
 The live config showed the mixed inbound:
 
