@@ -81,6 +81,8 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default)]
     pub(crate) system_proxy_server_override: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_proxy_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) china_ip_routing_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tailscale_enabled: Option<bool>,
@@ -342,6 +344,18 @@ mod tests {
         let state = TuiRuntimeState::default();
         let value = serde_json::to_value(&state).expect("serializes");
         assert!(value.get("tun_enabled").is_none());
+    }
+
+    #[test]
+    fn system_proxy_intent_round_trips_independently_from_exit_cleanup() {
+        let state = TuiRuntimeState {
+            system_proxy_enabled: Some(true),
+            ..TuiRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: TuiRuntimeState = serde_json::from_str(&json).expect("parses");
+
+        assert_eq!(restored.system_proxy_enabled, Some(true));
     }
 
     #[test]

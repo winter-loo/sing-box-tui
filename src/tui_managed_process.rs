@@ -4,6 +4,36 @@ use super::App;
 use crate::managed_sing_box::RestartReceipt;
 
 impl App {
+    pub(super) fn network_transition_is_running(&self) -> bool {
+        self.system_proxy.is_updating() || self.internet_tun.is_transitioning()
+    }
+
+    pub(super) fn shutdown_runtime_environment(&mut self) -> Result<()> {
+        if self.sing_box.is_leaving_running() {
+            return Ok(());
+        }
+
+        let mut errors = Vec::new();
+        if let Err(error) = self.save_runtime_state() {
+            errors.push(format!("failed to preserve runtime intent: {error:#}"));
+        }
+        if let Err(error) = self.system_proxy.suspend_for_exit() {
+            errors.push(format!("failed to disable system proxy: {error:#}"));
+        }
+        if let Err(error) = self.internet_tun.suspend_for_exit() {
+            errors.push(format!("failed to suspend Internet TUN: {error:#}"));
+        }
+        if let Err(error) = self.shutdown_managed_sing_box() {
+            errors.push(format!("failed to stop managed sing-box: {error:#}"));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
+    }
+
     pub(super) fn start_managed_sing_box(&mut self) -> Result<()> {
         let report = self.sing_box.start(&self.client)?;
         if report.replaced_existing() {
@@ -78,8 +108,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
+    use serde_json::json;
 
-    use super::super::test_support::test_app;
+    use super::super::test_support::{test_app, test_state_path};
+    use crate::config::{RouteAutoDetectInterfaceState, default_tun_inbound, inspect_tun_config};
+    use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
 
     #[test]
     fn uppercase_b_keeps_managed_sing_box_running_and_exits_tui() {
@@ -87,5 +120,53 @@ mod tests {
         let keep_running = app.handle_key(KeyCode::Char('B')).unwrap();
         assert!(!keep_running);
         assert!(app.sing_box.is_leaving_running());
+    }
+
+    #[test]
+    fn ordinary_exit_suspends_tun_without_erasing_restore_intent() {
+        let path = test_state_path();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [default_tun_inbound()],
+                "route": { "auto_detect_interface": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let persisted =
+            PersistedInternetTun::new(Some(true), Some(RouteAutoDetectInterfaceState::Disabled));
+        let mut app = test_app();
+        app.internet_tun = InternetTunTransaction::new(path.clone(), persisted).unwrap();
+
+        app.shutdown_runtime_environment().unwrap();
+
+        assert!(!inspect_tun_config(&path).unwrap().managed_internet_tun);
+        assert_eq!(app.internet_tun.persisted(), persisted);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn background_exit_keeps_tun_configuration_active() {
+        let path = test_state_path();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "inbounds": [default_tun_inbound()],
+                "route": { "auto_detect_interface": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut app = test_app();
+        app.internet_tun =
+            InternetTunTransaction::new(path.clone(), PersistedInternetTun::new(Some(true), None))
+                .unwrap();
+        app.sing_box.leave_running();
+
+        app.shutdown_runtime_environment().unwrap();
+
+        assert!(inspect_tun_config(&path).unwrap().managed_internet_tun);
+        let _ = std::fs::remove_file(path);
     }
 }

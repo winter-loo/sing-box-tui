@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 use crate::internet_tun::{InternetTunTarget, InternetTunToggleOutcome, PersistedInternetTun};
 use crate::managed_sing_box::AuthorizationRequirement;
 use crate::system_proxy::{SystemProxyToggle, SystemProxyUpdate};
@@ -19,6 +21,14 @@ pub(super) fn apply_internet_tun_persistence(
 }
 
 impl App {
+    pub(super) fn reconcile_persisted_system_proxy(&mut self) -> Result<()> {
+        let bypass_entries = self
+            .private_access
+            .system_proxy_bypass_entries(&self.bypass_entries);
+        self.system_proxy.reconcile_persisted(bypass_entries)?;
+        Ok(())
+    }
+
     pub(super) fn set_system_proxy(&mut self) {
         let bypass_entries = self
             .private_access
@@ -39,7 +49,13 @@ impl App {
 
     pub(super) fn poll_system_proxy_updates(&mut self) {
         match self.system_proxy.poll() {
-            Some(SystemProxyUpdate::Applied(message)) => self.set_status_with_flash(message),
+            Some(SystemProxyUpdate::Applied(message)) => match self.save_runtime_state() {
+                Ok(()) => self.set_status_with_flash(message),
+                Err(error) => self.set_status_with_flash(format!(
+                    "{message}; failed to persist system proxy intent: {}",
+                    truncate_for_width(&format!("{error:#}"), 60)
+                )),
+            },
             Some(SystemProxyUpdate::Failed(error)) => self.set_status_with_flash(format!(
                 "System proxy update failed: {}",
                 truncate_for_width(&error, 90)

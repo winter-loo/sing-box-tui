@@ -153,7 +153,7 @@ pub(crate) fn run_tui(
     let terminal = setup_terminal()?;
     let result = run_app(terminal, &mut app);
     let restore_result = restore_terminal();
-    let shutdown_result = app.shutdown_managed_sing_box();
+    let shutdown_result = app.shutdown_runtime_environment();
     result.and(restore_result).and(shutdown_result)
 }
 
@@ -516,6 +516,7 @@ impl App {
             app.ensure_private_access_tun_baseline()?;
             app.authorize_tun_elevation_if_needed()?;
             app.start_managed_sing_box()?;
+            app.reconcile_persisted_system_proxy()?;
         } else {
             wait_for_controller_ready(&app.client)
                 .context("headless auto-pick could not reach the existing sing-box controller")?;
@@ -582,6 +583,12 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+        if matches!(code, KeyCode::Char('q') | KeyCode::Char('B'))
+            && self.network_transition_is_running()
+        {
+            self.set_status_only("Wait for the network mode update before exiting");
+            return Ok(true);
+        }
         if self.private_access_auth.is_some() {
             return self.handle_private_access_auth_key(code);
         }
@@ -651,6 +658,9 @@ impl App {
         }
 
         match code {
+            KeyCode::Char('q') | KeyCode::Esc if self.network_transition_is_running() => {
+                self.set_status_only("Wait for the network mode update before exiting");
+            }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab => {
                 self.focus = match self.focus {

@@ -25,6 +25,7 @@ pub(crate) struct SystemProxy {
     server: String,
     server_override: bool,
     enabled: bool,
+    enabled_intent: Option<bool>,
     update: Option<SystemProxyJob>,
     last_status_refresh: Instant,
     platform: Arc<dyn SystemProxyPlatform>,
@@ -77,6 +78,7 @@ impl SystemProxy {
             server,
             server_override: false,
             enabled,
+            enabled_intent: None,
             update: None,
             last_status_refresh: Instant::now() - STATUS_REFRESH_INTERVAL,
             platform,
@@ -89,6 +91,44 @@ impl SystemProxy {
 
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn is_updating(&self) -> bool {
+        self.update.is_some()
+    }
+
+    pub(crate) fn restore_enabled_intent(&mut self, enabled: Option<bool>) {
+        self.enabled_intent = enabled;
+    }
+
+    pub(crate) fn persisted_enabled(&self) -> Option<bool> {
+        Some(self.enabled_intent.unwrap_or(self.enabled))
+    }
+
+    pub(crate) fn reconcile_persisted(&mut self, bypass_entries: Vec<String>) -> Result<bool> {
+        let Some(desired) = self.enabled_intent else {
+            return Ok(false);
+        };
+        self.sync_detected_server();
+        self.enabled = self.platform.matches(&self.server);
+        if self.enabled == desired {
+            return Ok(false);
+        }
+        self.apply_verified(desired, &effective_bypass_entries(&bypass_entries))?;
+        Ok(true)
+    }
+
+    pub(crate) fn suspend_for_exit(&mut self) -> Result<bool> {
+        if self.update.is_some() {
+            bail!("cannot suspend system proxy while an update is running");
+        }
+        self.sync_detected_server();
+        self.enabled = self.platform.matches(&self.server);
+        if !self.enabled {
+            return Ok(false);
+        }
+        self.apply_verified(false, &[])?;
+        Ok(true)
     }
 
     pub(crate) fn server_is_overridden(&self) -> bool {
@@ -153,8 +193,16 @@ impl SystemProxy {
         self.server = job.server;
         match result {
             Ok(message) => {
-                self.enabled = job.enable && self.platform.matches(&self.server);
-                Some(SystemProxyUpdate::Applied(message))
+                self.enabled = self.platform.matches(&self.server);
+                if self.enabled == job.enable {
+                    self.enabled_intent = Some(job.enable);
+                    Some(SystemProxyUpdate::Applied(message))
+                } else {
+                    Some(SystemProxyUpdate::Failed(format!(
+                        "system proxy command completed but observed state is {}",
+                        if self.enabled { "enabled" } else { "disabled" }
+                    )))
+                }
             }
             Err(error) => {
                 self.enabled = self.platform.matches(&self.server);
@@ -195,9 +243,23 @@ impl SystemProxy {
         }
     }
 
+    fn apply_verified(&mut self, enable: bool, bypass_entries: &[String]) -> Result<String> {
+        let message = self.platform.apply(&self.server, enable, bypass_entries)?;
+        self.enabled = self.platform.matches(&self.server);
+        if self.enabled != enable {
+            bail!(
+                "system proxy command completed but observed state is {}",
+                if self.enabled { "enabled" } else { "disabled" }
+            );
+        }
+        Ok(message)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(config_path: impl Into<PathBuf>, server: &str, enabled: bool) -> Self {
-        let platform = Arc::new(FixedSystemProxyPlatform { enabled });
+        let platform = Arc::new(FixedSystemProxyPlatform {
+            enabled: std::sync::atomic::AtomicBool::new(enabled),
+        });
         let mut proxy = Self::with_platform(config_path.into(), platform);
         proxy.server = server.to_string();
         proxy.enabled = enabled;
@@ -956,12 +1018,14 @@ fn windows_system_proxy_script_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 struct FixedSystemProxyPlatform {
-    enabled: bool,
+    enabled: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 impl SystemProxyPlatform for FixedSystemProxyPlatform {
     fn apply(&self, server: &str, enable: bool, _bypass_entries: &[String]) -> Result<String> {
+        self.enabled
+            .store(enable, std::sync::atomic::Ordering::Relaxed);
         Ok(format!(
             "{} {server}",
             if enable { "enabled" } else { "disabled" }
@@ -969,7 +1033,7 @@ impl SystemProxyPlatform for FixedSystemProxyPlatform {
     }
 
     fn matches(&self, _server: &str) -> bool {
-        self.enabled
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1052,6 +1116,35 @@ mod tests {
         assert!(proxy.poll().is_none());
 
         assert!(proxy.enabled());
+    }
+
+    #[test]
+    fn exit_suspend_preserves_enabled_intent_for_next_reconcile() {
+        let platform = Arc::new(RecordingPlatform {
+            enabled: AtomicBool::new(true),
+            ..RecordingPlatform::default()
+        });
+        let mut proxy = SystemProxy::with_platform(PathBuf::from("missing.json"), platform.clone());
+        proxy.restore_enabled_intent(Some(true));
+
+        proxy.suspend_for_exit().expect("proxy suspends");
+
+        assert!(!proxy.enabled());
+        assert_eq!(proxy.persisted_enabled(), Some(true));
+        proxy
+            .reconcile_persisted(Vec::new())
+            .expect("proxy intent restores");
+        assert!(proxy.enabled());
+        assert_eq!(
+            platform
+                .updates
+                .lock()
+                .expect("updates lock")
+                .iter()
+                .map(|(_, enabled, _)| *enabled)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
     }
 
     #[cfg(target_os = "macos")]

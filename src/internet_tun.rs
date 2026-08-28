@@ -125,6 +125,25 @@ impl InternetTunTransaction {
             })
     }
 
+    /// Removes the managed TUN from the next sing-box configuration while preserving the user's
+    /// persisted intent. The caller must stop the currently running core after this succeeds so
+    /// its live routes and interface are released.
+    pub(crate) fn suspend_for_exit(&mut self) -> Result<bool> {
+        if self.is_transitioning() {
+            bail!("cannot suspend Internet TUN while a transition is running");
+        }
+        if !self.config_path.exists() {
+            return Ok(false);
+        }
+        let state = inspect_tun_config(&self.config_path)?;
+        if !state.managed_internet_tun {
+            return Ok(false);
+        }
+        let update =
+            set_internet_tun_mode(&self.config_path, false, self.restore_auto_detect_interface)?;
+        Ok(update.changed)
+    }
+
     /// Repairs managed Internet TUN configuration drift and completes an interrupted transition.
     /// Persistence is invoked before every config mutation that needs recovery metadata.
     pub(crate) fn reconcile<F>(&mut self, mut persist: F) -> Result<()>
@@ -554,6 +573,28 @@ mod tests {
             InternetTunTransaction::new(path.clone(), persisted).expect("transaction initializes");
 
         assert!(transaction.is_enabled());
+        assert_eq!(transaction.persisted(), persisted);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exit_suspend_removes_tun_config_without_erasing_persisted_intent() {
+        let path = test_path();
+        write_config(
+            &path,
+            json!({
+                "inbounds": [default_tun_inbound()],
+                "route": { "auto_detect_interface": true }
+            }),
+        );
+        let persisted =
+            PersistedInternetTun::new(Some(true), Some(RouteAutoDetectInterfaceState::Disabled));
+        let mut transaction =
+            InternetTunTransaction::new(path.clone(), persisted).expect("transaction initializes");
+
+        transaction.suspend_for_exit().expect("TUN suspends");
+
+        assert!(!inspect_tun_config(&path).unwrap().managed_internet_tun);
         assert_eq!(transaction.persisted(), persisted);
         let _ = fs::remove_file(path);
     }
