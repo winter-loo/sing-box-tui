@@ -1,8 +1,12 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -433,8 +437,8 @@ fn run_system_proxy_update(
         bail!("no enabled macOS network services found");
     }
 
+    let (host, port) = parse_proxy_server(server)?;
     if enable {
-        let (host, port) = parse_proxy_server(server)?;
         for service in &services {
             run_networksetup(&["-setwebproxy", service, &host, &port])?;
             run_networksetup(&["-setsecurewebproxy", service, &host, &port])?;
@@ -453,8 +457,17 @@ fn run_system_proxy_update(
             run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
             run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
         }
+        let cleaned_connections = clear_macos_legacy_dynamic_proxies(&host, &port)?;
+        let cleanup = if cleaned_connections.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; cleared legacy dynamic proxy for {}",
+                cleaned_connections.join(", ")
+            )
+        };
         Ok(format!(
-            "Disabled macOS system proxy for {}",
+            "Disabled macOS system proxy for {}{cleanup}",
             services.join(", ")
         ))
     }
@@ -534,23 +547,18 @@ fn system_proxy_matches(server: &str) -> bool {
     let Ok((host, port)) = parse_proxy_server(server) else {
         return false;
     };
-    let output = Command::new("scutil").arg("--proxy").output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    macos_proxy_value(&text, "HTTPEnable") == Some("1")
-        && macos_proxy_value(&text, "HTTPProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "HTTPPort") == Some(port.as_str())
-        && macos_proxy_value(&text, "HTTPSEnable") == Some("1")
-        && macos_proxy_value(&text, "HTTPSProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "HTTPSPort") == Some(port.as_str())
-        && macos_proxy_value(&text, "SOCKSEnable") == Some("1")
-        && macos_proxy_value(&text, "SOCKSProxy") == Some(host.as_str())
-        && macos_proxy_value(&text, "SOCKSPort") == Some(port.as_str())
+    let managed_service_matches = macos_system_proxy_services().is_ok_and(|services| {
+        services.iter().any(|service| {
+            [
+                "-getwebproxy",
+                "-getsecurewebproxy",
+                "-getsocksfirewallproxy",
+            ]
+            .iter()
+            .all(|action| macos_service_proxy_matches(action, service, &host, &port))
+        })
+    });
+    managed_service_matches || macos_legacy_dynamic_proxy_matches(&host, &port)
 }
 
 #[cfg(target_os = "linux")]
@@ -685,14 +693,198 @@ fn macos_system_proxy_services() -> Result<Vec<String>> {
         );
     }
 
-    Ok(stdout
+    let services = stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| !line.starts_with("An asterisk"))
         .filter(|line| !line.starts_with('*'))
         .map(ToString::to_string)
+        .collect();
+    let connections = macos_network_connections()?;
+    Ok(exclude_macos_connection_services(services, &connections))
+}
+
+#[cfg(target_os = "macos")]
+fn exclude_macos_connection_services(
+    services: Vec<String>,
+    connections: &[MacosNetworkConnection],
+) -> Vec<String> {
+    let connection_names = connections
+        .iter()
+        .map(|connection| connection.name.as_str())
+        .collect::<BTreeSet<_>>();
+    services
+        .into_iter()
+        .filter(|service| !connection_names.contains(service.as_str()))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+struct MacosNetworkConnection {
+    id: String,
+    name: String,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_network_connections() -> Result<Vec<MacosNetworkConnection>> {
+    let output = Command::new("scutil")
+        .args(["--nc", "list"])
+        .output()
+        .context("failed to list macOS network connection services")?;
+    if !output.status.success() {
+        bail!("scutil --nc list exited with {}", output.status);
+    }
+    Ok(macos_network_connections_from_scutil(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_network_connections_from_scutil(text: &str) -> Vec<MacosNetworkConnection> {
+    text.lines()
+        .filter_map(|line| {
+            let id = line
+                .split_whitespace()
+                .find(|value| valid_macos_service_id(value))?;
+            let (before_last_quote, _) = line.rsplit_once('"')?;
+            let (_, name) = before_last_quote.rsplit_once('"')?;
+            Some(MacosNetworkConnection {
+                id: id.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn valid_macos_service_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_legacy_dynamic_proxy_matches(host: &str, port: &str) -> bool {
+    macos_network_connections().is_ok_and(|connections| {
+        connections.iter().any(|connection| {
+            read_macos_dynamic_proxy(&connection.id)
+                .is_ok_and(|text| macos_dynamic_proxy_matches(&text, host, port))
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_legacy_dynamic_proxies(host: &str, port: &str) -> Result<Vec<String>> {
+    let mut matching = Vec::new();
+    for connection in macos_network_connections()? {
+        let current = read_macos_dynamic_proxy(&connection.id)?;
+        if macos_dynamic_proxy_matches(&current, host, port) {
+            matching.push(connection);
+        }
+    }
+    if matching.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let server = format!("{host}:{port}");
+    if crate::macos_privileged_helper::helper_available() {
+        crate::macos_privileged_helper::clear_system_proxy(&server)?;
+    } else {
+        for connection in &matching {
+            let key = macos_dynamic_proxy_key(&connection.id);
+            run_scutil_script(&format!("remove {key}\n"))?;
+        }
+    }
+
+    for connection in &matching {
+        let remaining = read_macos_dynamic_proxy(&connection.id)?;
+        if macos_dynamic_proxy_matches(&remaining, host, port) {
+            bail!(
+                "macOS network connection {} retained its legacy dynamic proxy",
+                connection.name
+            );
+        }
+    }
+    Ok(matching
+        .into_iter()
+        .map(|connection| connection.name)
         .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_dynamic_proxy(service_id: &str) -> Result<String> {
+    let key = macos_dynamic_proxy_key(service_id);
+    run_scutil_script(&format!("show {key}\n"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dynamic_proxy_key(service_id: &str) -> String {
+    format!("State:/Network/Service/{service_id}/Proxies")
+}
+
+#[cfg(target_os = "macos")]
+fn run_scutil_script(script: &str) -> Result<String> {
+    let mut child = Command::new("scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start scutil")?;
+    child
+        .stdin
+        .take()
+        .context("failed to open scutil stdin")?
+        .write_all(script.as_bytes())
+        .context("failed to write scutil command")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for scutil")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() || stdout.contains("Permission denied") || !stderr.is_empty() {
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        bail!("scutil update failed: {message}");
+    }
+    Ok(stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dynamic_proxy_matches(text: &str, host: &str, port: &str) -> bool {
+    macos_proxy_value(text, "HTTPEnable") == Some("1")
+        && macos_proxy_value(text, "HTTPProxy") == Some(host)
+        && macos_proxy_value(text, "HTTPPort") == Some(port)
+        && macos_proxy_value(text, "HTTPSEnable") == Some("1")
+        && macos_proxy_value(text, "HTTPSProxy") == Some(host)
+        && macos_proxy_value(text, "HTTPSPort") == Some(port)
+        && macos_proxy_value(text, "SOCKSEnable") == Some("1")
+        && macos_proxy_value(text, "SOCKSProxy") == Some(host)
+        && macos_proxy_value(text, "SOCKSPort") == Some(port)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_service_proxy_matches(action: &str, service: &str, host: &str, port: &str) -> bool {
+    let Ok(output) = Command::new("networksetup")
+        .args([action, service])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && macos_network_proxy_matches(&String::from_utf8_lossy(&output.stdout), host, port)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_network_proxy_matches(text: &str, host: &str, port: &str) -> bool {
+    macos_proxy_value(text, "Enabled") == Some("Yes")
+        && macos_proxy_value(text, "Server") == Some(host)
+        && macos_proxy_value(text, "Port") == Some(port)
 }
 
 #[cfg(target_os = "macos")]
@@ -860,6 +1052,86 @@ mod tests {
         assert!(proxy.poll().is_none());
 
         assert!(proxy.enabled());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_service_filter_excludes_vpn_connections() {
+        let services = vec![
+            "Wi-Fi".to_string(),
+            "USB 10/100 LAN".to_string(),
+            "Tailscale".to_string(),
+        ];
+        let connections = r#"
+* (Disconnected)   38D78F8E-9EF9-46BD-926E-BEDF0AEC448E PPP --> Modem "Modem" [PPP:Modem]
+* (Connected)      E52F0AD5-6C83-41D8-A3FB-0FDE7EE5383C VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]
+"#;
+
+        let connections = macos_network_connections_from_scutil(connections);
+        assert_eq!(
+            exclude_macos_connection_services(services, &connections),
+            vec!["Wi-Fi".to_string(), "USB 10/100 LAN".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_networksetup_state_is_the_status_source() {
+        let enabled = r#"
+Enabled: Yes
+Server: 127.0.0.1
+Port: 6780
+Authenticated Proxy Enabled: 0
+"#;
+        let disabled = r#"
+Enabled: No
+Server: 127.0.0.1
+Port: 6780
+Authenticated Proxy Enabled: 0
+"#;
+
+        assert!(macos_network_proxy_matches(enabled, "127.0.0.1", "6780"));
+        assert!(!macos_network_proxy_matches(disabled, "127.0.0.1", "6780"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_connection_parser_keeps_only_valid_dynamic_store_ids() {
+        let connections = r#"
+Available network connection services in the current set (*=enabled):
+* (Connected) E52F0AD5-6C83-41D8-A3FB-0FDE7EE5383C VPN "Tailscale" [VPN:io.tailscale]
+* (Disconnected) not/a/key VPN "Unsafe" [VPN:example]
+"#;
+
+        assert_eq!(
+            macos_network_connections_from_scutil(connections),
+            vec![MacosNetworkConnection {
+                id: "E52F0AD5-6C83-41D8-A3FB-0FDE7EE5383C".to_string(),
+                name: "Tailscale".to_string(),
+            }]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_dynamic_proxy_requires_a_complete_server_match() {
+        let stale = r#"
+HTTPEnable : 1
+HTTPProxy : 127.0.0.1
+HTTPPort : 6780
+HTTPSEnable : 1
+HTTPSProxy : 127.0.0.1
+HTTPSPort : 6780
+SOCKSEnable : 1
+SOCKSProxy : 127.0.0.1
+SOCKSPort : 6780
+SupplementalMatchDomains : <array> {
+  0 :
+}
+"#;
+
+        assert!(macos_dynamic_proxy_matches(stale, "127.0.0.1", "6780"));
+        assert!(!macos_dynamic_proxy_matches(stale, "127.0.0.1", "5780"));
     }
 
     #[test]
