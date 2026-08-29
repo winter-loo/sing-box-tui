@@ -207,8 +207,10 @@ impl BenchmarkWorkflow {
                         let group = self.jobs[index].group.clone();
                         let best_label = assessment.compact_evidence();
                         self.record_reachability_assessment(&group, &assessment);
-                        self.reachability_assessments
-                            .insert((group.clone(), assessment.name.clone()), assessment);
+                        if assessment.assessment.is_some() {
+                            self.reachability_assessments
+                                .insert((group.clone(), assessment.name.clone()), assessment);
+                        }
                         updates.push(BenchmarkUpdate::Progress { group, best_label });
                     }
                     Ok(BenchmarkEvent::Finished) => {

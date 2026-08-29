@@ -90,7 +90,8 @@ impl BenchmarkStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     recorded_at_ms INTEGER NOT NULL,
                     selector TEXT NOT NULL,
-                    node TEXT NOT NULL
+                    node TEXT NOT NULL,
+                    complete INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS probe_attempts (
                     assessment_id INTEGER NOT NULL REFERENCES reachability_assessments(id) ON DELETE CASCADE,
@@ -115,11 +116,15 @@ impl BenchmarkStore {
         selector: &str,
         assessment: &NodeReachabilityAssessment,
     ) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO reachability_assessments (recorded_at_ms, selector, node) VALUES (?1, ?2, ?3)",
-            params![current_timestamp_ms()?, selector, assessment.name],
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .context("failed to begin reachability assessment transaction")?;
+        transaction.execute(
+            "INSERT INTO reachability_assessments (recorded_at_ms, selector, node, complete) VALUES (?1, ?2, ?3, ?4)",
+            params![current_timestamp_ms()?, selector, assessment.name, i64::from(assessment.assessment.is_some())],
         ).context("failed to insert reachability assessment")?;
-        let assessment_id = self.connection.last_insert_rowid();
+        let assessment_id = transaction.last_insert_rowid();
         for (index, outcome) in assessment.attempts.iter().enumerate() {
             let (delay_ms, detail, status): (Option<i64>, Option<&str>, Option<i64>) = match outcome
             {
@@ -130,11 +135,14 @@ impl BenchmarkStore {
                 ProbeOutcome::InvalidMeasurement | ProbeOutcome::Cancelled => (None, None, None),
             };
             let kind = outcome.storage_kind();
-            self.connection.execute(
+            transaction.execute(
                 "INSERT INTO probe_attempts (assessment_id, attempt_index, outcome_kind, delay_ms, detail, controller_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![assessment_id, index as i64, kind, delay_ms, detail, status],
             ).context("failed to insert probe attempt")?;
         }
+        transaction
+            .commit()
+            .context("failed to commit reachability assessment")?;
         Ok(())
     }
 
@@ -150,7 +158,7 @@ impl BenchmarkStore {
             JOIN probe_attempts t ON t.assessment_id = a.id
             WHERE a.id IN (
                 SELECT id FROM reachability_assessments newer
-                WHERE newer.selector = a.selector AND newer.node = a.node
+                WHERE newer.selector = a.selector AND newer.node = a.node AND newer.complete = 1
                 ORDER BY recorded_at_ms DESC, id DESC LIMIT 1
             )
             ORDER BY a.selector, a.node, t.attempt_index
@@ -482,6 +490,73 @@ mod tests {
             store.latest_reachability_assessments().expect("load facts"),
             vec![("select".into(), assessment)]
         );
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn incomplete_run_does_not_replace_latest_complete_assessment() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).unwrap();
+        let complete = NodeReachabilityAssessment::from_attempts(
+            "node-a".into(),
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 40 },
+                ProbeOutcome::Reachable { delay_ms: 45 },
+                ProbeOutcome::Timeout,
+            ],
+        );
+        let incomplete = NodeReachabilityAssessment::from_attempts(
+            "node-a".into(),
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 50 },
+                ProbeOutcome::ControllerFailure { status: 503 },
+                ProbeOutcome::Timeout,
+            ],
+        );
+        store
+            .record_reachability_assessment("select", &complete)
+            .unwrap();
+        store
+            .record_reachability_assessment("select", &incomplete)
+            .unwrap();
+
+        assert_eq!(
+            store.latest_reachability_assessments().unwrap(),
+            vec![("select".into(), complete)]
+        );
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn assessment_and_attempts_commit_atomically() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).unwrap();
+        store.connection.execute_batch(
+            "CREATE TRIGGER fail_second_attempt BEFORE INSERT ON probe_attempts WHEN NEW.attempt_index = 1 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        ).unwrap();
+        let assessment = NodeReachabilityAssessment::from_attempts(
+            "node-a".into(),
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 40 },
+                ProbeOutcome::Reachable { delay_ms: 45 },
+                ProbeOutcome::Reachable { delay_ms: 50 },
+            ],
+        );
+
+        assert!(
+            store
+                .record_reachability_assessment("select", &assessment)
+                .is_err()
+        );
+        let parents: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM reachability_assessments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(parents, 0);
         drop(store);
         remove_test_db(&path);
     }
