@@ -230,32 +230,22 @@ impl App {
         };
         let group = self.selected_member_panel_group().unwrap_or(group);
         let Some(summary) = self.selected_benchmark() else {
-            return group
-                .members
-                .iter()
-                .filter(|member| self.member_matches_filter(member))
-                .cloned()
-                .collect();
+            return group.members.clone();
         };
         if !self.benchmark_workflow.latency_order() {
-            return group
-                .members
-                .iter()
-                .filter(|member| self.member_matches_filter(member))
-                .cloned()
-                .collect();
+            return group.members.clone();
         }
 
         let mut successes = Vec::new();
         let mut pending_or_untested = Vec::new();
         for (index, member) in group.members.iter().enumerate() {
-            if !self.member_matches_filter(member) {
-                continue;
-            }
             match summary.find_result(member) {
-                Some(result) if result.completed && result.delay.is_none() => {}
                 Some(result) if result.completed => {
-                    successes.push((result.delay.unwrap_or(u64::MAX), index, member.clone()))
+                    if let Some(delay) = result.delay {
+                        successes.push((delay, index, member.clone()));
+                    } else {
+                        pending_or_untested.push((index, member.clone()));
+                    }
                 }
                 _ => pending_or_untested.push((index, member.clone())),
             }

@@ -13,7 +13,10 @@ impl App {
             self.set_status_only("Latency history is available for Internet Proxy nodes only");
             return Ok(());
         }
-        let Some(group_name) = self.selected_group().map(|group| group.name.clone()) else {
+        let Some(group_name) = self
+            .selected_member_panel_group()
+            .map(|group| group.name.clone())
+        else {
             self.set_status_only("No selector group available for latency history");
             return Ok(());
         };
@@ -28,7 +31,13 @@ impl App {
             self.set_status_only("SQLite latency history is unavailable");
             return Ok(());
         };
-        if samples.iter().all(|sample| sample.delay_ms.is_none()) {
+        let reachability_assessment = self
+            .benchmark_workflow
+            .reachability_assessment(&group_name, &node)
+            .cloned();
+        if samples.iter().all(|sample| sample.delay_ms.is_none())
+            && reachability_assessment.is_none()
+        {
             self.set_status_only(format!("No latency history for {}", node));
             return Ok(());
         }
@@ -40,6 +49,7 @@ impl App {
             window: LATENCY_CHART_DEFAULT_WINDOW,
             threshold_ms: self.auto_select_threshold_ms,
             last_refresh: Instant::now(),
+            reachability_assessment,
         });
         self.set_status_only(format!("Showing {} latency samples for {}", count, node));
         Ok(())
@@ -91,6 +101,7 @@ mod tests {
     use super::super::AUTO_SELECT_THRESHOLD_MS;
     use super::super::test_support::{test_app, test_db_path};
     use super::{LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState};
+    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
 
     #[test]
@@ -135,6 +146,7 @@ mod tests {
             window: LATENCY_CHART_DEFAULT_WINDOW,
             threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now(),
+            reachability_assessment: None,
         });
         app.handle_key(KeyCode::Char('z')).expect("zoom in");
         assert_eq!(
@@ -171,6 +183,7 @@ mod tests {
             window: LATENCY_CHART_DEFAULT_WINDOW,
             threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
+            reachability_assessment: None,
         });
         app.maybe_refresh_latency_chart().expect("refresh chart");
         assert_eq!(
@@ -189,6 +202,44 @@ mod tests {
         app.handle_key(KeyCode::Char('i')).expect("open chart");
         assert!(app.latency_chart.is_none());
         assert_eq!(app.status, "No latency history for node-a");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pressing_i_exposes_persisted_probe_attempts_without_latency_history() {
+        let path = test_db_path();
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+        let store = BenchmarkStore::open(&path).unwrap();
+        store
+            .record_reachability_assessment(
+                "select",
+                &NodeReachabilityAssessment {
+                    name: "node-a".into(),
+                    attempts: vec![
+                        ProbeOutcome::Reachable { delay_ms: 42 },
+                        ProbeOutcome::Timeout,
+                        ProbeOutcome::Reachable { delay_ms: 51 },
+                    ],
+                    assessment: Some(ReachabilityAssessment::Reachable),
+                },
+            )
+            .unwrap();
+        app.benchmark_workflow.replace_store(Some(store));
+
+        app.handle_key(KeyCode::Char('i'))
+            .expect("open quality detail");
+
+        let detail = app.latency_chart.as_ref().expect("node-quality detail");
+        assert_eq!(
+            detail
+                .reachability_assessment
+                .as_ref()
+                .unwrap()
+                .attempts
+                .len(),
+            3
+        );
         let _ = std::fs::remove_file(path);
     }
 }

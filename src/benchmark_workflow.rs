@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -8,7 +10,8 @@ use reqwest::Client as AsyncClient;
 
 use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
 use crate::controller::{
-    BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, spawn_benchmark_worker,
+    BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
+    NodeReachabilityAssessment, spawn_benchmark_worker, spawn_reachability_assessment_worker,
 };
 use crate::defaults::SINGLE_NODE_RETEST_DEBOUNCE;
 use crate::storage::{
@@ -19,6 +22,7 @@ pub(crate) struct BenchmarkWorkflow {
     base_url: String,
     client: AsyncClient,
     summaries: BTreeMap<String, BenchmarkSummary>,
+    reachability_assessments: BTreeMap<(String, String), NodeReachabilityAssessment>,
     jobs: Vec<BenchmarkJob>,
     last_single_node: Option<(String, String, Instant)>,
     store: Option<BenchmarkStore>,
@@ -31,6 +35,7 @@ pub(crate) enum BenchmarkStart {
     AlreadyRunning,
     Debounced,
     NoCandidates,
+    CancellationRequested,
 }
 
 pub(crate) enum BenchmarkUpdate {
@@ -42,7 +47,7 @@ pub(crate) enum BenchmarkUpdate {
 pub(crate) enum BenchmarkCompletion {
     Group {
         group: String,
-        best: Option<BenchmarkResult>,
+        assessed: usize,
     },
     AutoSelect {
         group: String,
@@ -51,7 +56,7 @@ pub(crate) enum BenchmarkCompletion {
     SingleNode {
         group: String,
         node: String,
-        result: Option<BenchmarkResult>,
+        assessment: Option<NodeReachabilityAssessment>,
     },
 }
 
@@ -79,6 +84,7 @@ struct BenchmarkJob {
     kind: BenchmarkKind,
     receiver: mpsc::Receiver<BenchmarkEvent>,
     worker: JoinHandle<()>,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl BenchmarkWorkflow {
@@ -91,10 +97,18 @@ impl BenchmarkWorkflow {
     }
 
     fn new(base_url: String, client: AsyncClient, store: Option<BenchmarkStore>) -> Self {
+        let reachability_assessments = store
+            .as_ref()
+            .and_then(|store| store.latest_reachability_assessments().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(selector, assessment)| ((selector, assessment.name.clone()), assessment))
+            .collect();
         Self {
             base_url,
             client,
             summaries: BTreeMap::new(),
+            reachability_assessments,
             jobs: Vec::new(),
             last_single_node: None,
             store,
@@ -104,6 +118,15 @@ impl BenchmarkWorkflow {
 
     pub(crate) fn summary(&self, group: &str) -> Option<&BenchmarkSummary> {
         self.summaries.get(group)
+    }
+
+    pub(crate) fn reachability_assessment(
+        &self,
+        group: &str,
+        node: &str,
+    ) -> Option<&NodeReachabilityAssessment> {
+        self.reachability_assessments
+            .get(&(group.to_string(), node.to_string()))
     }
 
     pub(crate) fn latency_order(&self) -> bool {
@@ -129,6 +152,17 @@ impl BenchmarkWorkflow {
         node: String,
     ) -> BenchmarkStart {
         let group = request.selector.clone();
+        if let Some(job) = self
+            .jobs
+            .iter()
+            .find(|job| job.group == group && job.nodes.iter().any(|candidate| candidate == &node))
+        {
+            if let Some(cancellation) = &job.cancellation {
+                cancellation.store(true, Ordering::Relaxed);
+                return BenchmarkStart::CancellationRequested;
+            }
+            return BenchmarkStart::AlreadyRunning;
+        }
         if self
             .last_single_node
             .as_ref()
@@ -140,14 +174,6 @@ impl BenchmarkWorkflow {
         {
             return BenchmarkStart::Debounced;
         }
-        if self
-            .jobs
-            .iter()
-            .any(|job| job.group == group && job.nodes.iter().any(|candidate| candidate == &node))
-        {
-            return BenchmarkStart::AlreadyRunning;
-        }
-
         self.prepare_single_node(&request, &node);
         self.spawn(request, BenchmarkKind::SingleNode { node: node.clone() });
         self.last_single_node = Some((group, node, Instant::now()));
@@ -175,6 +201,14 @@ impl BenchmarkWorkflow {
                             })
                             .unwrap_or_else(|| "pending".to_string());
                         self.record_result(&group, &filter, &kind, &result);
+                        updates.push(BenchmarkUpdate::Progress { group, best_label });
+                    }
+                    Ok(BenchmarkEvent::ReachabilityProgress(assessment)) => {
+                        let group = self.jobs[index].group.clone();
+                        let best_label = assessment.compact_evidence();
+                        self.record_reachability_assessment(&group, &assessment);
+                        self.reachability_assessments
+                            .insert((group.clone(), assessment.name.clone()), assessment);
                         updates.push(BenchmarkUpdate::Progress { group, best_label });
                     }
                     Ok(BenchmarkEvent::Finished) => {
@@ -278,7 +312,13 @@ impl BenchmarkWorkflow {
         request: BenchmarkRequest,
         kind: BenchmarkKind,
     ) -> BenchmarkStart {
-        if self.jobs.iter().any(|job| job.group == request.selector) {
+        if let Some(job) = self.jobs.iter().find(|job| job.group == request.selector) {
+            if !matches!(kind, BenchmarkKind::AutoSelect)
+                && let Some(cancellation) = &job.cancellation
+            {
+                cancellation.store(true, Ordering::Relaxed);
+                return BenchmarkStart::CancellationRequested;
+            }
             return BenchmarkStart::AlreadyRunning;
         }
         if request.nodes.as_ref().is_none_or(Vec::is_empty) {
@@ -320,8 +360,24 @@ impl BenchmarkWorkflow {
         let nodes = request.nodes.clone().unwrap_or_default();
         let filter = request.pattern.clone();
         let (tx, receiver) = mpsc::channel();
-        let worker =
-            spawn_benchmark_worker(self.base_url.clone(), self.client.clone(), request, tx);
+        let (worker, cancellation) = if matches!(kind, BenchmarkKind::AutoSelect) {
+            (
+                spawn_benchmark_worker(self.base_url.clone(), self.client.clone(), request, tx),
+                None,
+            )
+        } else {
+            let cancellation = Arc::new(AtomicBool::new(false));
+            (
+                spawn_reachability_assessment_worker(
+                    self.base_url.clone(),
+                    self.client.clone(),
+                    request,
+                    tx,
+                    cancellation.clone(),
+                ),
+                Some(cancellation),
+            )
+        };
         self.jobs.push(BenchmarkJob {
             group,
             nodes,
@@ -329,23 +385,33 @@ impl BenchmarkWorkflow {
             kind,
             receiver,
             worker,
+            cancellation,
         });
     }
 
     fn completion(&self, group: String, kind: BenchmarkKind) -> Option<BenchmarkCompletion> {
-        let summary = self.summaries.get(&group)?;
         Some(match kind {
             BenchmarkKind::Group => BenchmarkCompletion::Group {
+                assessed: self
+                    .jobs
+                    .iter()
+                    .find(|job| job.group == group)
+                    .map(|job| {
+                        job.nodes
+                            .iter()
+                            .filter(|node| self.reachability_assessment(&group, node).is_some())
+                            .count()
+                    })
+                    .unwrap_or_default(),
                 group,
-                best: summary.best_success().cloned(),
             },
             BenchmarkKind::AutoSelect => BenchmarkCompletion::AutoSelect {
+                summary: self.summaries.get(&group)?.clone(),
                 group,
-                summary: summary.clone(),
             },
             BenchmarkKind::SingleNode { node } => BenchmarkCompletion::SingleNode {
+                assessment: self.reachability_assessment(&group, &node).cloned(),
                 group,
-                result: summary.find_result(&node).cloned(),
                 node,
             },
         })
@@ -374,6 +440,19 @@ impl BenchmarkWorkflow {
             .unwrap_or_else(|error| eprintln!("warning: {error:#}"));
     }
 
+    fn record_reachability_assessment(&self, group: &str, assessment: &NodeReachabilityAssessment) {
+        let Some(store) = &self.store else { return };
+        store
+            .record_reachability_assessment(group, assessment)
+            .with_context(|| {
+                format!(
+                    "failed to record reachability assessment for {}",
+                    assessment.name
+                )
+            })
+            .unwrap_or_else(|error| eprintln!("warning: {error:#}"));
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(base_url: String, client: AsyncClient) -> Self {
         Self::new(base_url, client, None)
@@ -381,7 +460,24 @@ impl BenchmarkWorkflow {
 
     #[cfg(test)]
     pub(crate) fn replace_store(&mut self, store: Option<BenchmarkStore>) {
+        self.reachability_assessments = store
+            .as_ref()
+            .and_then(|store| store.latest_reachability_assessments().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(selector, assessment)| ((selector, assessment.name.clone()), assessment))
+            .collect();
         self.store = store;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reachability_assessment(
+        &mut self,
+        group: &str,
+        assessment: NodeReachabilityAssessment,
+    ) {
+        self.reachability_assessments
+            .insert((group.to_string(), assessment.name.clone()), assessment);
     }
 
     #[cfg(test)]
@@ -449,6 +545,7 @@ mod tests {
             kind,
             receiver,
             worker: thread::spawn(|| {}),
+            cancellation: None,
         });
         keep_open.then_some(sender)
     }
@@ -488,8 +585,8 @@ mod tests {
         ));
         assert!(matches!(
             &updates[1],
-            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, best: Some(best) })
-                if group == "select" && best.name == "node-a"
+            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, assessed: 0 })
+                if group == "select"
         ));
         assert!(workflow.active_nodes("select").is_none());
     }
@@ -580,5 +677,25 @@ mod tests {
 
         assert_eq!(outcome, BenchmarkStart::Debounced);
         assert!(workflow.active_nodes("select").is_none());
+    }
+
+    #[test]
+    fn repeating_a_running_manual_assessment_requests_cancellation() {
+        let mut workflow = workflow(None);
+        let request = request("select", &["node-a"]);
+        assert_eq!(
+            workflow.start_group(request.clone()),
+            BenchmarkStart::Started
+        );
+        assert_eq!(
+            workflow.start_group(request),
+            BenchmarkStart::CancellationRequested
+        );
+        assert!(
+            workflow.jobs[0]
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::Relaxed))
+        );
     }
 }

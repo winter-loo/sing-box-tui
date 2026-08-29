@@ -49,17 +49,37 @@ impl App {
                 displayed_members
                     .iter()
                     .map(|member| {
+                        let assessment = self
+                            .benchmark_workflow
+                            .reachability_assessment(&group.name, member);
                         let result =
                             selected_benchmark.and_then(|summary| summary.find_result(member));
-                        let (marker, tone) = match result {
-                            Some(result) if !result.completed => {
-                                (result.display_delay(), CandidateTone::Pending)
+                        let (marker, tone) = if let Some(assessment) = assessment {
+                            let tone = match assessment.assessment {
+                                Some(
+                                    crate::controller::ReachabilityAssessment::StableReachable,
+                                )
+                                | Some(crate::controller::ReachabilityAssessment::Reachable) => {
+                                    CandidateTone::Success
+                                }
+                                Some(crate::controller::ReachabilityAssessment::Degraded)
+                                | Some(crate::controller::ReachabilityAssessment::Unreachable) => {
+                                    CandidateTone::Error
+                                }
+                                None => CandidateTone::Missing,
+                            };
+                            (assessment.compact_evidence(), tone)
+                        } else {
+                            match result {
+                                Some(result) if !result.completed => {
+                                    (result.display_delay(), CandidateTone::Pending)
+                                }
+                                Some(result) if result.delay.is_some() => {
+                                    (result.display_delay(), CandidateTone::Success)
+                                }
+                                Some(result) => (result.display_delay(), CandidateTone::Error),
+                                None => ("-".to_string(), CandidateTone::Missing),
                             }
-                            Some(result) if result.delay.is_some() => {
-                                (result.display_delay(), CandidateTone::Success)
-                            }
-                            Some(result) => (result.display_delay(), CandidateTone::Error),
-                            None => ("-".to_string(), CandidateTone::Missing),
                         };
                         CandidateRow {
                             name: member.clone(),
@@ -178,5 +198,35 @@ impl App {
             private_access_progress: self.private_access_progress.as_ref(),
             private_access_auth: self.private_access_auth.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::test_app;
+    use super::super::view::CandidateTone;
+    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
+
+    #[test]
+    fn application_snapshot_exposes_compact_reachability_evidence() {
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment {
+                name: "node-a".into(),
+                attempts: vec![
+                    ProbeOutcome::Reachable { delay_ms: 40 },
+                    ProbeOutcome::Reachable { delay_ms: 50 },
+                    ProbeOutcome::Timeout,
+                ],
+                assessment: Some(ReachabilityAssessment::Reachable),
+            },
+        );
+
+        let snapshot = app.view_snapshot();
+        assert_eq!(snapshot.candidate_rows[0].marker, "2/3 reachable");
+        assert_eq!(snapshot.candidate_rows[0].tone, CandidateTone::Success);
+        assert_eq!(snapshot.candidate_rows.len(), app.groups[0].members.len());
     }
 }

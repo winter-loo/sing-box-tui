@@ -2,7 +2,7 @@ use super::super::test_support::{internet_routes_app, test_app};
 use crate::controller::{BenchmarkResult, BenchmarkSummary, ProxyGroup};
 
 #[test]
-fn displayed_members_follow_active_filter() {
+fn default_panel_keeps_every_selector_member_when_probe_filter_changes() {
     let mut app = test_app();
     app.groups[0].members = vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()];
 
@@ -11,7 +11,7 @@ fn displayed_members_follow_active_filter() {
 
     assert_eq!(
         app.displayed_members(),
-        vec!["hk-1".to_string(), "hk-2".to_string()]
+        vec!["hk-1".to_string(), "us-1".to_string(), "hk-2".to_string()]
     );
 }
 
@@ -57,7 +57,10 @@ fn implicit_root_mode_supports_single_internet_route_selector() {
         .expect("apply filter");
 
     assert_eq!(app.selected_root_choice_name().as_deref(), Some("airtcp"));
-    assert_eq!(app.displayed_members(), vec!["美国-b".to_string()]);
+    assert_eq!(
+        app.displayed_members(),
+        vec!["香港-a".to_string(), "美国-b".to_string()]
+    );
     assert_eq!(
         app.selected_group().map(|group| group.name.as_str()),
         Some("airtcp")
