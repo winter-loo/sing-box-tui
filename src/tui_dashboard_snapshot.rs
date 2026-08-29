@@ -42,53 +42,67 @@ impl App {
             })
             .collect();
 
-        let displayed_members = self.displayed_members();
         let selected_group = self.selected_member_panel_group();
+        let streaming_projection = selected_group
+            .map(|group| {
+                self.benchmark_workflow
+                    .streaming_projection(&group.name, &group.members)
+            })
+            .unwrap_or_default();
+        // Streaming names and row evidence must come from the same leased projection. Re-reading
+        // fenced state per row would turn a normal cross-process generation change into a panic.
+        let displayed_members = if self.node_view_panel == NodeViewPanel::Streaming {
+            streaming_projection
+                .iter()
+                .map(|projection| projection.name.clone())
+                .collect()
+        } else {
+            self.displayed_members()
+        };
         let selected_benchmark = self.selected_benchmark();
         let candidate_rows = selected_group
             .map(|group| {
-                displayed_members
-                    .iter()
-                    .map(|member| {
-                        if self.node_view_panel == NodeViewPanel::Streaming {
-                            let assessment = self
-                                .benchmark_workflow
-                                .reachability_assessment(&group.name, member)
-                                .expect("Streaming members have a quick assessment");
-                            let (reachability, _) =
-                                split_reachability_evidence(&assessment.compact_evidence());
-                            let sustained = self
-                                .benchmark_workflow
-                                .sustained_quality(&group.name, member)
-                                .and_then(|result| result.completed())
-                                .expect("Streaming members have sustained completion");
-                            let successes =
-                                self.benchmark_workflow.sustained_stats(&group.name, member);
-                            let quick = self.benchmark_workflow.quick_history(&group.name, member);
-                            let p95 = quick
+                if self.node_view_panel == NodeViewPanel::Streaming {
+                    return streaming_projection
+                        .iter()
+                        .map(|projection| {
+                            let (reachability, _) = split_reachability_evidence(
+                                &projection.assessment.compact_evidence(),
+                            );
+                            let p95 = projection
+                                .quick_history
                                 .p95_ms
                                 .map(|value| format!("p95 {value}ms"))
                                 .unwrap_or_else(|| "p95 -".to_string());
-                            let cold = quick
+                            let cold = projection
+                                .quick_history
                                 .cold_start_ms
                                 .map(|value| format!("cold {value}ms"))
                                 .unwrap_or_else(|| "cold -".to_string());
                             let throughput = format!(
                                 "{:.1} MiB/s",
-                                sustained.throughput_bytes_per_second as f64 / (1024.0 * 1024.0)
+                                projection.completion.throughput_bytes_per_second as f64
+                                    / (1024.0 * 1024.0)
                             );
-                            return CandidateRow {
-                                name: member.clone(),
-                                is_current: group.current.as_deref() == Some(member.as_str()),
+                            CandidateRow {
+                                name: projection.name.clone(),
+                                is_current: group.current.as_deref()
+                                    == Some(projection.name.as_str()),
                                 reachability,
                                 marker: format!(
                                     "{throughput} · {}/{} sustained · {p95} · {cold}",
-                                    successes.successes, successes.attempts,
+                                    projection.sustained_stats.successes,
+                                    projection.sustained_stats.attempts,
                                 ),
                                 compact_marker: throughput.replace(" MiB/s", "M/s"),
                                 tone: CandidateTone::Success,
-                            };
-                        }
+                            }
+                        })
+                        .collect();
+                }
+                displayed_members
+                    .iter()
+                    .map(|member| {
                         let assessment = self
                             .benchmark_workflow
                             .reachability_assessment(&group.name, member);
@@ -153,7 +167,8 @@ impl App {
                     node_order_badge(self.benchmark_workflow.latency_order())
                 )
             });
-        let (all_count, streaming_count) = self.node_view_counts();
+        let all_count = selected_group.map_or(0, |group| group.members.len());
+        let streaming_count = streaming_projection.len();
         let node_view_tabs = vec![
             NodeViewTab {
                 label: "Current selector",
@@ -165,6 +180,17 @@ impl App {
             },
         ];
 
+        let candidate_selected = if self.node_view_panel == NodeViewPanel::Streaming {
+            selected_group
+                .and_then(|group| group.members.get(self.member_index))
+                .and_then(|current| {
+                    displayed_members
+                        .iter()
+                        .position(|member| member == current)
+                })
+        } else {
+            self.displayed_member_index()
+        };
         let showing_intranet_details = self.showing_intranet_details();
         let intranet_detail = if showing_intranet_details {
             self.private_access
@@ -247,7 +273,7 @@ impl App {
             node_view_tabs,
             active_node_view_tab: self.node_view_panel.index(),
             candidate_rows,
-            candidate_selected: self.displayed_member_index(),
+            candidate_selected,
             intranet_detail,
             status,
             flash,

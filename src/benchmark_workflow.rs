@@ -30,14 +30,23 @@ use crate::storage::{
     SustainedSuccessStats, lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
-    NodeSustainedQuality, SustainedProbeEvent, SustainedProbeRequest, spawn_sustained_probe_worker,
-    sustained_target_identity, validate_sustained_target,
+    NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
+    spawn_sustained_probe_worker, sustained_target_identity, validate_sustained_target,
 };
 
 type NodeMetricKey = (String, String);
 type QuickHistoryCache = BTreeMap<NodeMetricKey, NodeQuickHistory>;
 type SustainedStatsCache = BTreeMap<NodeMetricKey, SustainedSuccessStats>;
 type MetricCaches = (QuickHistoryCache, SustainedStatsCache);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StreamingNodeProjection {
+    pub(crate) name: String,
+    pub(crate) assessment: NodeReachabilityAssessment,
+    pub(crate) completion: SustainedCompletion,
+    pub(crate) sustained_stats: SustainedSuccessStats,
+    pub(crate) quick_history: NodeQuickHistory,
+}
 
 pub(crate) const QUALITY_RUNTIME_RECEIPT_ENV: &str = "SING_BOX_TUI_QUALITY_RUNTIME_RECEIPT";
 
@@ -775,40 +784,73 @@ impl BenchmarkWorkflow {
     }
 
     pub(crate) fn streaming_members(&self, group: &str, members: &[String]) -> Vec<String> {
+        self.streaming_projection(group, members)
+            .into_iter()
+            .map(|projection| projection.name)
+            .collect()
+    }
+
+    pub(crate) fn streaming_projection(
+        &self,
+        group: &str,
+        members: &[String],
+    ) -> Vec<StreamingNodeProjection> {
+        // Copy every field for the rendered rows while one cross-process lease blocks node
+        // reconciliation. The owned projection remains coherent even if its generation changes
+        // immediately after this method returns and the TUI has not rendered it yet.
+        let Ok(_quality_lease) = self.acquire_quality_read_lease() else {
+            return Vec::new();
+        };
         let mut ranked = members
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                if !self.quick_eligible(group, node) {
+                let key = (group.to_string(), node.to_string());
+                let assessment = self.reachability_assessments.get(&key)?;
+                if !assessment_is_quick_eligible(assessment) {
                     return None;
                 }
-                let completion = self.sustained_quality(group, node)?.completed()?;
-                let sustained = self.sustained_stats(group, node);
+                let sustained_quality = self.sustained_quality.get(&key)?;
+                let completion = sustained_quality.completed()?;
+                let sustained = self.sustained_stats_current(group, node, sustained_quality);
                 let quick = self.quick_history(group, node);
                 Some((
-                    node.clone(),
+                    StreamingNodeProjection {
+                        name: node.clone(),
+                        assessment: assessment.clone(),
+                        completion: completion.clone(),
+                        sustained_stats: sustained,
+                        quick_history: quick,
+                    },
                     index,
-                    completion.throughput_bytes_per_second,
-                    sustained,
-                    quick,
                 ))
             })
             .collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
             right
-                .2
-                .cmp(&left.2)
+                .0
+                .completion
+                .throughput_bytes_per_second
+                .cmp(&left.0.completion.throughput_bytes_per_second)
                 .then_with(|| {
                     compare_ratio_desc(
-                        left.3.successes,
-                        left.3.attempts,
-                        right.3.successes,
-                        right.3.attempts,
+                        left.0.sustained_stats.successes,
+                        left.0.sustained_stats.attempts,
+                        right.0.sustained_stats.successes,
+                        right.0.sustained_stats.attempts,
                     )
                 })
-                .then_with(|| compare_optional_ascending(left.4.p95_ms, right.4.p95_ms))
                 .then_with(|| {
-                    compare_optional_ascending(left.4.cold_start_ms, right.4.cold_start_ms)
+                    compare_optional_ascending(
+                        left.0.quick_history.p95_ms,
+                        right.0.quick_history.p95_ms,
+                    )
+                })
+                .then_with(|| {
+                    compare_optional_ascending(
+                        left.0.quick_history.cold_start_ms,
+                        right.0.quick_history.cold_start_ms,
+                    )
                 })
                 .then_with(|| left.1.cmp(&right.1))
         });
@@ -881,20 +923,20 @@ impl BenchmarkWorkflow {
         out
     }
 
-    pub(crate) fn sustained_stats(&self, group: &str, node: &str) -> SustainedSuccessStats {
-        if !self.quality_session_current() {
-            return SustainedSuccessStats::default();
-        }
+    fn sustained_stats_current(
+        &self,
+        group: &str,
+        node: &str,
+        sustained_quality: &NodeSustainedQuality,
+    ) -> SustainedSuccessStats {
         self.sustained_stats_cache
             .get(&(group.to_string(), node.to_string()))
             .copied()
+            // The caller already read this value under its quality lease. Falling back through
+            // `sustained_quality()` would try to acquire the same reconciliation lock again.
             .unwrap_or_else(|| SustainedSuccessStats {
-                successes: usize::from(
-                    self.sustained_quality(group, node)
-                        .and_then(NodeSustainedQuality::completed)
-                        .is_some(),
-                ),
-                attempts: usize::from(self.sustained_quality(group, node).is_some()),
+                successes: usize::from(sustained_quality.completed().is_some()),
+                attempts: 1,
             })
     }
 
@@ -3152,6 +3194,77 @@ mod tests {
             workflow.streaming_members("select", &members),
             vec!["throughput", "success", "cold", "p95"]
         );
+    }
+
+    #[test]
+    fn streaming_projection_remains_coherent_after_generation_change() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).unwrap();
+        store
+            .reconcile_node_history(&serde_json::json!({
+                "outbounds": [{"type":"direct", "tag":"node-a"}]
+            }))
+            .unwrap();
+        let assessment = reachable("node-a", [20, 30, 40]);
+        store
+            .record_reachability_assessment("select", &assessment)
+            .unwrap();
+        store
+            .record_sustained_quality(
+                "select",
+                &default_target_identity(),
+                &sustained("node-a", 2_000),
+            )
+            .unwrap();
+        let mut workflow = workflow(Some(store));
+        workflow.sustained_stats_cache.clear();
+
+        let sustained_quality = workflow
+            .sustained_quality
+            .get(&("select".into(), "node-a".into()))
+            .unwrap();
+        assert_eq!(
+            workflow.sustained_stats_current("select", "node-a", sustained_quality),
+            SustainedSuccessStats {
+                successes: 1,
+                attempts: 1,
+            }
+        );
+
+        let projection = workflow.streaming_projection("select", &["node-a".into()]);
+        assert_eq!(projection.len(), 1);
+
+        let reconciler = BenchmarkStore::open(&path).unwrap();
+        reconciler
+            .reconcile_node_history(&serde_json::json!({
+                "outbounds": [{"type":"direct", "tag":"node-b"}]
+            }))
+            .unwrap();
+
+        // The old frame owns one internally consistent copy, while a fresh frame observes the
+        // generation fence and fails closed instead of mixing old membership with missing facts.
+        assert_eq!(projection[0].name, "node-a");
+        assert_eq!(projection[0].assessment, assessment);
+        assert_eq!(
+            projection[0].completion.throughput_bytes_per_second,
+            512 * 1024 * 1_000 / 500
+        );
+        assert_eq!(
+            projection[0].sustained_stats,
+            SustainedSuccessStats {
+                successes: 1,
+                attempts: 1,
+            }
+        );
+        assert!(
+            workflow
+                .streaming_projection("select", &["node-a".into()])
+                .is_empty()
+        );
+
+        drop(reconciler);
+        drop(workflow);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

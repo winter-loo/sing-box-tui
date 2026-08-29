@@ -262,6 +262,7 @@ impl App {
         out
     }
 
+    #[cfg(test)]
     pub(super) fn node_view_counts(&self) -> (usize, usize) {
         let Some(group) = self.selected_member_panel_group() else {
             return (0, 0);
@@ -269,7 +270,7 @@ impl App {
         (
             group.members.len(),
             self.benchmark_workflow
-                .streaming_members(&group.name, &group.members)
+                .streaming_projection(&group.name, &group.members)
                 .len(),
         )
     }
