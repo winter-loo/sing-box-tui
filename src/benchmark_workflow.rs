@@ -139,9 +139,59 @@ impl BenchmarkWorkflow {
         let store =
             BenchmarkStore::open_while_reconciliation_locked(database_path, &quality_guard)?;
         store.bind_node_history_while_reconciliation_locked(&quality_guard, &config)?;
+        let runtime_reload_required = store.runtime_reload_required()?;
         // `Self::new` loads the persisted projection and takes the quality lock itself.
         drop(quality_guard);
-        Ok(Self::new(base_url, client, Some(store)))
+        Ok(Self::new(
+            base_url,
+            client,
+            (!runtime_reload_required).then_some(store),
+        ))
+    }
+
+    /// Runs a managed sing-box reload against one locked config snapshot, then re-enables facts.
+    ///
+    /// The callback must not return success until the controller for the newly started process is
+    /// ready. Holding the canonical config lock across both startup and observation is what makes
+    /// clearing the durable runtime fence a proof about the config that sing-box actually loaded.
+    pub(crate) fn confirm_managed_runtime_reload<T, Reload>(
+        &mut self,
+        config_path: &Path,
+        database_path: &Path,
+        reload: Reload,
+    ) -> Result<T>
+    where
+        Reload: FnOnce() -> Result<T>,
+    {
+        ensure_active_config_paths_are_distinct(config_path, database_path, &[])?;
+        let _config_guard = lock_config_mutation_for(config_path)?;
+        let config_text = fs::read_to_string(config_path).with_context(|| {
+            format!(
+                "failed to read active sing-box config {} before managed reload",
+                config_path.display()
+            )
+        })?;
+        let config = parse_sing_box_config_text(&config_text).with_context(|| {
+            format!(
+                "failed to parse active sing-box config {} before managed reload",
+                config_path.display()
+            )
+        })?;
+        let quality_guard = lock_node_quality_reconciliation(database_path)?;
+        let store =
+            BenchmarkStore::open_while_reconciliation_locked(database_path, &quality_guard)?;
+        store.bind_node_history_while_reconciliation_locked(&quality_guard, &config)?;
+
+        // Do not clear this cross-process fence merely because a TUI restarted. The callback's
+        // successful readiness observation, while the exact config remains locked, is the point
+        // at which old same-tag controller results become attributable to the bound identities.
+        let result = reload()?;
+        store
+            .clear_runtime_reload_required()
+            .context("managed sing-box loaded the config but quality persistence stayed fenced")?;
+        drop(quality_guard);
+        self.install_store(Some(store));
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -628,7 +678,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::node_quality_path::QUALITY_WRITE_BLOCK_SUFFIX;
+    use crate::node_quality_path::{
+        QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX,
+    };
 
     fn workflow(store: Option<BenchmarkStore>) -> BenchmarkWorkflow {
         BenchmarkWorkflow::new(
@@ -691,6 +743,12 @@ mod tests {
         PathBuf::from(path)
     }
 
+    fn runtime_reload_fence_path(database_path: &Path) -> PathBuf {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX);
+        PathBuf::from(path)
+    }
+
     fn remove_workflow_fixture(config_path: &Path, database_path: &Path) {
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_file(database_path);
@@ -699,6 +757,7 @@ mod tests {
             "-shm",
             "-journal",
             QUALITY_WRITE_BLOCK_SUFFIX,
+            QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
             ".node-quality-reconciliation.lock",
         ] {
             let mut path = database_path.as_os_str().to_os_string();
@@ -860,6 +919,64 @@ mod tests {
             Some(true)
         );
         assert!(!quality_marker_path(&database_path).exists());
+        drop(workflow);
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
+    #[test]
+    fn runtime_reload_fence_survives_restart_until_managed_config_is_observed() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("runtime-fence-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}]}"#,
+        )
+        .expect("write active config");
+        let store = BenchmarkStore::open(&database_path).expect("create quality store");
+        store
+            .reconcile_node_history(&serde_json::json!({
+                "outbounds": [{"type":"direct", "tag":"direct"}]
+            }))
+            .expect("bind active identities");
+        store
+            .ensure_runtime_reload_required()
+            .expect("persist runtime reload fence");
+        drop(store);
+
+        // Opening a new TUI can bind the on-disk config, but it cannot prove that an external
+        // controller has stopped serving the old same-tag outbound.
+        let mut workflow = BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            AsyncClient::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &database_path,
+        )
+        .expect("restart binds config without clearing runtime fence");
+        assert!(!workflow.quality_persistence_enabled());
+        assert!(runtime_reload_fence_path(&database_path).exists());
+
+        let error = workflow
+            .confirm_managed_runtime_reload(&config_path, &database_path, || -> Result<()> {
+                anyhow::bail!("injected managed runtime readiness failure")
+            })
+            .expect_err("failed runtime observation must retain the fence");
+        assert!(format!("{error:#}").contains("readiness failure"));
+        assert!(!workflow.quality_persistence_enabled());
+        assert!(runtime_reload_fence_path(&database_path).exists());
+
+        workflow
+            .confirm_managed_runtime_reload(&config_path, &database_path, || Ok(()))
+            .expect("observed managed runtime clears the fence");
+        assert!(workflow.quality_persistence_enabled());
+        assert!(!runtime_reload_fence_path(&database_path).exists());
+        assert_eq!(
+            workflow.persist_benchmark_for_test("direct").unwrap(),
+            Some(true)
+        );
+
         drop(workflow);
         remove_workflow_fixture(&config_path, &database_path);
     }

@@ -13,7 +13,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, derive_reachability_assessment};
-use crate::node_quality_path::{QUALITY_WRITE_BLOCK_SUFFIX, node_quality_reserved_paths};
+use crate::node_quality_path::{
+    QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX, node_quality_reserved_paths,
+};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
@@ -243,9 +245,24 @@ impl BenchmarkStore {
     /// lock. Returns true when this call created the marker and false when an earlier failed
     /// reconciliation already left it in place.
     pub(crate) fn ensure_quality_writes_blocked(&self) -> Result<bool> {
-        self.ensure_quality_writes_blocked_with(sync_parent_directory)
+        self.ensure_durable_marker_with(
+            QUALITY_WRITE_BLOCK_SUFFIX,
+            "node-quality write block",
+            sync_parent_directory,
+        )
     }
 
+    /// Persists the fact that the active config has moved to a new identity generation while the
+    /// live sing-box process may still be serving the previous same-tag outbounds.
+    pub(crate) fn ensure_runtime_reload_required(&self) -> Result<bool> {
+        self.ensure_durable_marker_with(
+            QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
+            "node-quality runtime reload fence",
+            sync_parent_directory,
+        )
+    }
+
+    #[cfg(test)]
     fn ensure_quality_writes_blocked_with<SyncParent>(
         &self,
         sync_parent: SyncParent,
@@ -253,74 +270,109 @@ impl BenchmarkStore {
     where
         SyncParent: FnOnce(&Path) -> Result<()>,
     {
-        let Some(path) = self.quality_write_block_path() else {
+        self.ensure_durable_marker_with(
+            QUALITY_WRITE_BLOCK_SUFFIX,
+            "node-quality write block",
+            sync_parent,
+        )
+    }
+
+    fn ensure_durable_marker_with<SyncParent>(
+        &self,
+        suffix: &str,
+        label: &str,
+        sync_parent: SyncParent,
+    ) -> Result<bool>
+    where
+        SyncParent: FnOnce(&Path) -> Result<()>,
+    {
+        let Some(path) = self.marker_path(suffix) else {
             return Ok(false);
         };
         let (file, created) = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => (file, true),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                (open_existing_quality_write_block(&path)?, false)
+                (open_existing_quality_marker(&path, label)?, false)
             }
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "failed to create node-quality write block {}",
-                    path.display()
-                )
-            })?,
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create {label} {}", path.display()))?,
         };
-        file.sync_all().with_context(|| {
-            format!(
-                "failed to flush node-quality write block {}",
-                path.display()
-            )
-        })?;
-        sync_parent(&path).with_context(|| {
-            format!(
-                "failed to persist node-quality write block {}",
-                path.display()
-            )
-        })?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {label} {}", path.display()))?;
+        sync_parent(&path)
+            .with_context(|| format!("failed to persist {label} {}", path.display()))?;
         Ok(created)
     }
 
     pub(crate) fn clear_quality_write_block(&self) -> Result<()> {
-        let Some(path) = self.quality_write_block_path() else {
+        self.clear_marker(
+            QUALITY_WRITE_BLOCK_SUFFIX,
+            "node-quality write block",
+            false,
+        )
+    }
+
+    pub(crate) fn clear_runtime_reload_required(&self) -> Result<()> {
+        self.clear_marker(
+            QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
+            "node-quality runtime reload fence",
+            true,
+        )
+    }
+
+    fn clear_marker(&self, suffix: &str, label: &str, durable: bool) -> Result<()> {
+        let Some(path) = self.marker_path(suffix) else {
             return Ok(());
         };
         match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if durable {
+                    sync_parent_directory(&path)
+                        .with_context(|| format!("failed to persist cleared {label}"))?;
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "failed to clear node-quality write block {}",
-                    path.display()
-                )
-            }),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to clear {label} {}", path.display()))
+            }
         }
     }
 
-    fn quality_write_block_path(&self) -> Option<PathBuf> {
+    fn marker_path(&self, suffix: &str) -> Option<PathBuf> {
         if self.database_path == Path::new(":memory:") {
             return None;
         }
         let mut path = self.database_path.as_os_str().to_os_string();
-        path.push(QUALITY_WRITE_BLOCK_SUFFIX);
+        path.push(suffix);
         Some(PathBuf::from(path))
     }
 
     fn quality_writes_blocked(&self) -> Result<bool> {
-        let Some(path) = self.quality_write_block_path() else {
+        Ok(self.quality_reads_blocked()? || self.runtime_reload_required()?)
+    }
+
+    fn quality_reads_blocked(&self) -> Result<bool> {
+        self.marker_exists(QUALITY_WRITE_BLOCK_SUFFIX, "node-quality write block")
+    }
+
+    pub(crate) fn runtime_reload_required(&self) -> Result<bool> {
+        self.marker_exists(
+            QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
+            "node-quality runtime reload fence",
+        )
+    }
+
+    fn marker_exists(&self, suffix: &str, label: &str) -> Result<bool> {
+        let Some(path) = self.marker_path(suffix) else {
             return Ok(false);
         };
         match fs::symlink_metadata(&path) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "failed to inspect node-quality write block {}",
-                    path.display()
-                )
-            }),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
+            }
         }
     }
 
@@ -347,6 +399,10 @@ impl BenchmarkStore {
                 WHERE singleton = 1
                     AND generation = ?5
                     AND identities_initialized = 1
+                    -- A fresh store can share the current generation while receiving facts from
+                    -- an external controller with a different config. Generation fencing alone
+                    -- cannot attribute such a same-process fact to this identity snapshot.
+                    AND EXISTS (SELECT 1 FROM node_identities WHERE tag = ?3)
             )
             "#,
                 params![
@@ -387,7 +443,7 @@ impl BenchmarkStore {
         &self,
     ) -> Result<Vec<(String, NodeReachabilityAssessment)>> {
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
-        if self.quality_writes_blocked()? {
+        if self.quality_reads_blocked()? {
             return Ok(Vec::new());
         }
         let mut statement = self
@@ -529,6 +585,9 @@ impl BenchmarkStore {
                     WHERE singleton = 1
                         AND generation = ?8
                         AND identities_initialized = 1
+                        -- Keep the membership check in the same SQLite statement as the insert so
+                        -- reconciliation cannot race an out-of-snapshot tag into persisted facts.
+                        AND EXISTS (SELECT 1 FROM node_identities WHERE tag = ?3)
                 )
                 "#,
                 params![
@@ -609,7 +668,7 @@ impl BenchmarkStore {
         limit: usize,
     ) -> Result<Vec<NodeLatencySample>> {
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
-        if self.quality_writes_blocked()? {
+        if self.quality_reads_blocked()? {
             return Ok(Vec::new());
         }
         let mut statement = self
@@ -922,18 +981,11 @@ fn normalize_database_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn open_existing_quality_write_block(path: &Path) -> Result<File> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed to inspect existing node-quality write block {}",
-            path.display()
-        )
-    })?;
+fn open_existing_quality_marker(path: &Path, label: &str) -> Result<File> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect existing {label} {}", path.display()))?;
     if !metadata.file_type().is_file() {
-        anyhow::bail!(
-            "existing node-quality write block is not a regular file: {}",
-            path.display()
-        );
+        anyhow::bail!("existing {label} is not a regular file: {}", path.display());
     }
 
     let mut options = OpenOptions::new();
@@ -943,26 +995,15 @@ fn open_existing_quality_write_block(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    let file = options.open(path).with_context(|| {
-        format!(
-            "failed to reopen existing node-quality write block {}",
-            path.display()
-        )
-    })?;
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to reopen existing {label} {}", path.display()))?;
     if !file
         .metadata()
-        .with_context(|| {
-            format!(
-                "failed to validate existing node-quality write block {}",
-                path.display()
-            )
-        })?
+        .with_context(|| format!("failed to validate existing {label} {}", path.display()))?
         .is_file()
     {
-        anyhow::bail!(
-            "existing node-quality write block is not a regular file: {}",
-            path.display()
-        );
+        anyhow::bail!("existing {label} is not a regular file: {}", path.display());
     }
     Ok(file)
 }
@@ -1547,7 +1588,8 @@ fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkRecord, BenchmarkStore, NODE_QUALITY_SCHEMA_VERSION, QUALITY_WRITE_BLOCK_SUFFIX,
+        BenchmarkRecord, BenchmarkStore, NODE_QUALITY_SCHEMA_VERSION,
+        QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX,
         current_schema_is_recognized, node_configuration_fingerprint, sync_parent_directory,
     };
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
@@ -1579,6 +1621,10 @@ mod tests {
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-shm"));
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-journal"));
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, QUALITY_WRITE_BLOCK_SUFFIX));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(
+            path,
+            QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
+        ));
         let _ = std::fs::remove_file(sqlite_sidecar_path(
             path,
             QUALITY_RECONCILIATION_LOCK_SUFFIX,
@@ -1817,6 +1863,39 @@ mod tests {
                 .expect("query reachability facts")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn current_generation_rejects_facts_for_tags_outside_bound_identities() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open node-quality store");
+        bind_test_identities(&store, &["node-a"]);
+
+        assert!(
+            !store
+                .record_benchmark(&BenchmarkRecord {
+                    selector: "select",
+                    node: "external-only-node",
+                    filter: "",
+                    delay_ms: Some(42),
+                    completed: true,
+                    job_kind: "single",
+                })
+                .expect("reject out-of-snapshot benchmark fact")
+        );
+        assert!(
+            !store
+                .record_reachability_assessment(
+                    "select",
+                    &complete_assessment("external-only-node", 40),
+                )
+                .expect("reject out-of-snapshot reachability fact")
+        );
+        assert!(store.recent_benchmarks(10).unwrap().is_empty());
+        assert!(store.latest_reachability_assessments().unwrap().is_empty());
+
+        drop(store);
+        remove_test_db(&path);
     }
 
     #[test]

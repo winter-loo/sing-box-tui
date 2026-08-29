@@ -93,7 +93,7 @@ impl App {
         }
         if let Some(report) = &state.last_report {
             let reload_note = if report.node_history_changed {
-                "  node-quality persistence paused until sing-box reload + TUI restart"
+                "  node-quality persistence paused until a managed sing-box reload is confirmed"
             } else if report.config_updated {
                 "  reload sing-box to apply"
             } else {
@@ -189,7 +189,7 @@ impl App {
                 state.last_report = Some(report.clone());
                 let status = if report.node_history_changed {
                     format!(
-                        "Subscription refresh updated config: {}; node-quality persistence paused until sing-box is reloaded and the TUI is restarted",
+                        "Subscription refresh updated config: {}; node-quality persistence paused until a managed sing-box reload is confirmed",
                         subscription_report_badge(&report)
                     )
                 } else if report.config_updated {

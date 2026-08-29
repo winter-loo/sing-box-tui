@@ -16,9 +16,7 @@ use crate::ruleset::download_china_ip_routing_rulesets;
 
 use super::App;
 use super::verification::parse_verification_targets;
-use super::view::{
-    SETTINGS_FIELDS, SettingsEditState, SettingsField, settings_field_label, truncate_for_width,
-};
+use super::view::{SETTINGS_FIELDS, SettingsEditState, SettingsField, settings_field_label};
 
 #[cfg(test)]
 #[path = "tui_settings_tests.rs"]
@@ -343,17 +341,11 @@ impl App {
                 self.china_ip_routing_explicit = true;
                 self.save_runtime_state()?;
                 if changed {
-                    let receipt = self.restart_managed_sing_box()?;
+                    self.restart_managed_sing_box()?;
                     let label = if enable { "enabled" } else { "disabled" };
-                    match receipt.observe_controller(&self.client) {
-                        Ok(()) => self.set_status_with_flash(format!(
-                            "China IP routing {label}; sing-box restarted"
-                        )),
-                        Err(error) => self.set_status_with_flash(format!(
-                            "China IP routing {label}; controller not ready: {}",
-                            truncate_for_width(&format!("{error:#}"), 60)
-                        )),
-                    }
+                    self.set_status_with_flash(format!(
+                        "China IP routing {label}; sing-box restarted"
+                    ));
                 } else {
                     self.set_status_with_flash(format!(
                         "China IP routing already {}",
@@ -464,21 +456,13 @@ impl App {
         let changed = set_tailscale_config(&self.system_proxy_config_path, options)?;
         self.save_runtime_state()?;
         if changed {
-            let receipt = self.restart_managed_sing_box()?;
+            self.restart_managed_sing_box()?;
             let label = if self.tailscale_enabled {
                 "enabled"
             } else {
                 "disabled"
             };
-            match receipt.observe_controller(&self.client) {
-                Ok(()) => self.set_status_with_flash(format!(
-                    "Tailscale endpoint {label}; sing-box restarted"
-                )),
-                Err(error) => self.set_status_with_flash(format!(
-                    "Tailscale endpoint {label}; controller not ready: {}",
-                    truncate_for_width(&format!("{error:#}"), 60)
-                )),
-            }
+            self.set_status_with_flash(format!("Tailscale endpoint {label}; sing-box restarted"));
         } else {
             self.set_status_with_flash(format!(
                 "Tailscale endpoint already {}",

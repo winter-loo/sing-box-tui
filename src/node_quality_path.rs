@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) const CONFIG_MUTATION_LOCK_SUFFIX: &str = ".sing-box-tui-config-mutation.lock";
 pub(crate) const QUALITY_WRITE_BLOCK_SUFFIX: &str = ".node-quality-writes-blocked";
+pub(crate) const QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX: &str =
+    ".node-quality-runtime-reload-required";
 pub(crate) const QUALITY_RECONCILIATION_LOCK_SUFFIX: &str = ".node-quality-reconciliation.lock";
 
 pub(crate) fn canonical_config_target(path: &Path) -> Result<PathBuf> {
@@ -57,6 +59,7 @@ pub(crate) fn node_quality_reserved_paths(database_path: &Path) -> Result<Vec<Pa
         with_suffix(&database_path, "-shm"),
         with_suffix(&database_path, "-journal"),
         with_suffix(&database_path, QUALITY_WRITE_BLOCK_SUFFIX),
+        with_suffix(&database_path, QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX),
         with_suffix(&database_path, QUALITY_RECONCILIATION_LOCK_SUFFIX),
     ]
     .into_iter()
@@ -90,6 +93,7 @@ pub(crate) fn ensure_active_config_paths_are_distinct(
         "node-quality shared-memory file",
         "node-quality rollback journal",
         "node-quality write block",
+        "node-quality runtime reload fence",
         "node-quality reconciliation lock",
     ]
     .into_iter()

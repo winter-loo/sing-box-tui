@@ -14,6 +14,7 @@ use crate::controller::{ApiClient, ConnectionsSnapshot, ProxyGroup};
 use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
 use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
 use crate::managed_sing_box::ManagedSingBox;
+use crate::node_quality_path::default_benchmark_db_path_for_config;
 
 static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -125,6 +126,8 @@ pub(super) fn test_app() -> App {
         settings_error: None,
         subscription_refresh: None,
         system_proxy_config_path: config_path.clone(),
+        node_quality_db_path: default_benchmark_db_path_for_config(&config_path)
+            .expect("derive test node-quality path"),
         system_proxy: SystemProxy::for_test(config_path.clone(), "127.0.0.1:6780", false),
         internet_tun: InternetTunTransaction::new(
             config_path.clone(),

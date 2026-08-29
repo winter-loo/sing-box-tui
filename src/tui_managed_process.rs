@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use super::App;
-use crate::managed_sing_box::RestartReceipt;
 
 impl App {
     pub(super) fn network_transition_is_running(&self) -> bool {
@@ -47,7 +46,15 @@ impl App {
     }
 
     pub(super) fn start_managed_sing_box(&mut self) -> Result<()> {
-        let report = self.sing_box.start(&self.client)?;
+        let config_path = &self.system_proxy_config_path;
+        let database_path = &self.node_quality_db_path;
+        let client = &self.client;
+        let sing_box = &mut self.sing_box;
+        let report = self.benchmark_workflow.confirm_managed_runtime_reload(
+            config_path,
+            database_path,
+            || sing_box.start(client),
+        )?;
         if report.replaced_existing() {
             self.status = format!("Restarted managed sing-box {}", report.transition());
         } else {
@@ -56,8 +63,17 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn restart_managed_sing_box(&mut self) -> Result<RestartReceipt> {
-        self.sing_box.restart()
+    pub(super) fn restart_managed_sing_box(&mut self) -> Result<()> {
+        let config_path = &self.system_proxy_config_path;
+        let database_path = &self.node_quality_db_path;
+        let client = &self.client;
+        let sing_box = &mut self.sing_box;
+        self.benchmark_workflow
+            .confirm_managed_runtime_reload(config_path, database_path, || {
+                let receipt = sing_box.restart()?;
+                receipt.observe_controller(client)?;
+                Ok(())
+            })
     }
 
     pub(super) fn shutdown_managed_sing_box(&mut self) -> Result<()> {
