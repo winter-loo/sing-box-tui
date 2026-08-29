@@ -35,7 +35,7 @@ pub(crate) fn pick_mode_badge(auto_select_enabled: bool) -> &'static str {
 }
 
 pub(crate) fn subscription_report_badge(report: &SubscriptionRefreshOutput) -> String {
-    report
+    let providers = report
         .providers
         .iter()
         .map(|provider| {
@@ -50,7 +50,12 @@ pub(crate) fn subscription_report_badge(report: &SubscriptionRefreshOutput) -> S
             )
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if report.config_updated {
+        providers
+    } else {
+        format!("config unchanged; {providers}")
+    }
 }
 
 pub(crate) fn format_duration_badge(duration: Duration) -> String {
@@ -152,6 +157,10 @@ mod tests {
             interval_days: 1,
             merged_config_path: "/usr/local/etc/sing-box/config.json".to_string(),
             backup_config_path: None,
+            config_updated: true,
+            node_history_reconciled: true,
+            node_history_changed: true,
+            node_quality_generation: Some(2),
             providers: vec![
                 ProviderRefreshSummary {
                     provider: "宝贝云".to_string(),
@@ -176,6 +185,11 @@ mod tests {
         assert!(badge.contains("宝贝云:fetched:67 nodes"));
         assert!(badge.contains("airtcp:cached:0 nodes"));
         assert!(badge.contains("no mergeable nodes found"));
+        let unchanged_badge = subscription_report_badge(&SubscriptionRefreshOutput {
+            config_updated: false,
+            ..report.clone()
+        });
+        assert!(unchanged_badge.starts_with("config unchanged; "));
         assert_eq!(format_duration_badge(Duration::from_secs(42)), "42s");
         assert_eq!(format_duration_badge(Duration::from_secs(5 * 60)), "5m");
         assert_eq!(

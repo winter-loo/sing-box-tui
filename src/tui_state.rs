@@ -6,13 +6,14 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::atomic_file::write_atomic;
 use crate::config::RouteAutoDetectInterfaceState;
 use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
+use crate::node_quality_path::{canonical_config_target, canonical_file_target};
 
 const DEFAULT_TUI_STATE_PATH: &str = "sing-box-tui.json";
 
@@ -163,10 +164,32 @@ pub(crate) fn default_tui_state_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_TUI_STATE_PATH))
 }
 
-pub(crate) fn default_bypass_rule_set_path() -> PathBuf {
-    env::var("SING_BOX_TUI_BYPASS_RULE_SET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_BYPASS_RULE_SET_PATH))
+pub(crate) fn resolved_tui_bypass_rule_set_path(config_path: &Path) -> Result<PathBuf> {
+    resolve_tui_bypass_rule_set_path(
+        config_path,
+        env::var_os("SING_BOX_TUI_BYPASS_RULE_SET")
+            .as_deref()
+            .map(Path::new),
+    )
+}
+
+fn resolve_tui_bypass_rule_set_path(
+    config_path: &Path,
+    configured_path: Option<&Path>,
+) -> Result<PathBuf> {
+    let config_target = canonical_config_target(config_path)?;
+    let config_parent = config_target
+        .parent()
+        .context("active config target must have a parent directory")?;
+    let candidate = match configured_path {
+        Some(path) if path.as_os_str().is_empty() => {
+            bail!("SING_BOX_TUI_BYPASS_RULE_SET must not be empty")
+        }
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => config_parent.join(path),
+        None => config_parent.join(DEFAULT_BYPASS_RULE_SET_PATH),
+    };
+    canonical_file_target(&candidate, "TUI bypass rule-set")
 }
 
 pub(crate) fn parse_bypass_entries(input: &str) -> Vec<String> {
@@ -240,8 +263,70 @@ fn is_ip_entry(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivateAccessProfileState, TuiRuntimeState};
+    use super::{PrivateAccessProfileState, TuiRuntimeState, resolve_tui_bypass_rule_set_path};
     use crate::config::RouteAutoDetectInterfaceState;
+    use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn bypass_rule_set_paths_are_bound_to_the_canonical_config_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sing-box-tui-bypass-path-{nonce}"));
+        fs::create_dir_all(&root).expect("create config directory");
+        let root = root.canonicalize().expect("canonicalize config directory");
+        let config = root.join("config.json");
+
+        assert_eq!(
+            resolve_tui_bypass_rule_set_path(&config, None).expect("resolve default path"),
+            root.join(DEFAULT_BYPASS_RULE_SET_PATH)
+        );
+        assert_eq!(
+            resolve_tui_bypass_rule_set_path(&config, Some(Path::new("nested/custom.json")))
+                .expect("resolve relative override"),
+            root.join("nested/custom.json")
+        );
+        let absolute = root.join("absolute.json");
+        assert_eq!(
+            resolve_tui_bypass_rule_set_path(&config, Some(&absolute))
+                .expect("resolve absolute override"),
+            absolute
+        );
+        assert!(resolve_tui_bypass_rule_set_path(&config, Some(Path::new(""))).is_err());
+        assert!(!root.join("nested").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_bypass_path_follows_a_cross_directory_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sing-box-tui-bypass-alias-{nonce}"));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&real).expect("create real directory");
+        fs::create_dir_all(&alias).expect("create alias directory");
+        fs::write(real.join("config.json"), b"{}\n").expect("write real config");
+        symlink("../real/config.json", alias.join("config.json"))
+            .expect("create cross-directory config alias");
+        let real = real.canonicalize().expect("canonicalize real directory");
+
+        assert_eq!(
+            resolve_tui_bypass_rule_set_path(&alias.join("config.json"), None)
+                .expect("resolve default through config alias"),
+            real.join(DEFAULT_BYPASS_RULE_SET_PATH)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn state_without_private_access_profiles_uses_empty_profile_list() {

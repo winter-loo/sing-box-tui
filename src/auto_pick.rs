@@ -679,13 +679,13 @@ struct BackgroundTaskState {
     token: String,
 }
 
-fn background_task_state_path() -> PathBuf {
+pub(crate) fn background_task_state_path() -> PathBuf {
     env::var("SING_BOX_TUI_BACKGROUND")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(BACKGROUND_TASK_PATH))
 }
 
-fn background_task_log_path() -> PathBuf {
+pub(crate) fn background_task_log_path() -> PathBuf {
     background_task_state_path().with_extension("log")
 }
 

@@ -205,7 +205,7 @@ impl SonicwallGatewayProfileCache {
     }
 }
 
-fn sonicwall_gateway_profile_cache_path() -> PathBuf {
+pub(crate) fn sonicwall_gateway_profile_cache_path() -> PathBuf {
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_app_data)
             .join("sing-box-tui")
@@ -2191,14 +2191,22 @@ fn run_sonicwall_tun_data_plane(
 }
 
 fn append_sonicwall_diagnostic(stage: &str, message: &str) {
-    append_private_access_diagnostic(SONICWALL_DIAGNOSTIC_LOG, stage, message);
+    append_private_access_diagnostic(&sonicwall_diagnostic_log_path(), stage, message);
 }
 
 fn append_hillstone_diagnostic(stage: &str, message: &str) {
-    append_private_access_diagnostic(HILLSTONE_DIAGNOSTIC_LOG, stage, message);
+    append_private_access_diagnostic(&hillstone_diagnostic_log_path(), stage, message);
 }
 
-fn append_private_access_diagnostic(path: &str, stage: &str, message: &str) {
+pub(crate) fn sonicwall_diagnostic_log_path() -> PathBuf {
+    PathBuf::from(SONICWALL_DIAGNOSTIC_LOG)
+}
+
+pub(crate) fn hillstone_diagnostic_log_path() -> PathBuf {
+    PathBuf::from(HILLSTONE_DIAGNOSTIC_LOG)
+}
+
+fn append_private_access_diagnostic(path: &Path, stage: &str, message: &str) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

@@ -9,6 +9,7 @@ mod benchmark_workflow;
 mod clash;
 mod cli;
 mod config;
+mod config_mutation;
 mod controller;
 mod defaults;
 mod hillstone;
@@ -17,6 +18,7 @@ mod internet_tun;
 #[cfg(target_os = "macos")]
 mod macos_privileged_helper;
 mod managed_sing_box;
+mod node_quality_path;
 mod node_runtime_manager;
 mod private_access;
 mod private_access_session;

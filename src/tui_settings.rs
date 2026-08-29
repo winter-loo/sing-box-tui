@@ -329,7 +329,7 @@ impl App {
             SettingsField::ChinaIpRouting => {
                 let enable = parse_bool_setting(value)?;
                 if enable {
-                    let ruleset_dir = china_ip_routing_ruleset_dir(&self.system_proxy_config_path);
+                    let ruleset_dir = china_ip_routing_ruleset_dir(&self.system_proxy_config_path)?;
                     let proxy_server = self.system_proxy.server().to_string();
                     self.client
                         .runtime

@@ -104,6 +104,20 @@ mod tests {
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
 
+    fn bind_test_nodes(store: &BenchmarkStore, nodes: &[&str]) {
+        let mut outbounds = vec![serde_json::json!({
+            "type":"selector", "tag":"select", "outbounds":nodes
+        })];
+        outbounds.extend(
+            nodes
+                .iter()
+                .map(|node| serde_json::json!({"type":"direct", "tag":node})),
+        );
+        store
+            .reconcile_node_history(&serde_json::json!({"outbounds":outbounds}))
+            .expect("bind latency-chart test identities");
+    }
+
     #[test]
     fn pressing_i_opens_latency_chart_for_selected_node() {
         let path = test_db_path();
@@ -111,6 +125,7 @@ mod tests {
         app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
         app.member_index = 1;
         let store = BenchmarkStore::open(&path).expect("open benchmark store");
+        bind_test_nodes(&store, &["node-a", "node-b"]);
         store
             .record_benchmark(&BenchmarkRecord {
                 selector: "select",
@@ -165,6 +180,7 @@ mod tests {
         let path = test_db_path();
         let mut app = test_app();
         let store = BenchmarkStore::open(&path).expect("open benchmark store");
+        bind_test_nodes(&store, &["node-a"]);
         store
             .record_benchmark(&BenchmarkRecord {
                 selector: "select",
@@ -211,6 +227,7 @@ mod tests {
         let mut app = test_app();
         app.benchmark_filter.clear();
         let store = BenchmarkStore::open(&path).unwrap();
+        bind_test_nodes(&store, &["node-a"]);
         store
             .record_reachability_assessment(
                 "select",

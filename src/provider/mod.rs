@@ -10,8 +10,17 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
-use crate::config::{DefaultConfigOptions, ensure_bypass_rule_set_file_for_config};
-use crate::import::build_full_config_from_singbox_subscription_with_options;
+use crate::atomic_file::write_atomic;
+use crate::config::{
+    DefaultConfigOptions, ensure_bypass_rule_set_file_for_config,
+    resolved_bypass_rule_set_path_for_config,
+};
+use crate::config_mutation::{lock_config_mutation_for, paths_refer_to_same_target};
+use crate::import::{
+    SubscriptionConfigRequest, build_full_config_from_singbox_subscription_with_options,
+    commit_subscription_payload_to_active_config,
+};
+use crate::node_quality_path::default_benchmark_db_path_for_config;
 
 mod airtcp;
 
@@ -77,6 +86,39 @@ pub(crate) fn run_provider_sync(options: ProviderSyncOptions) -> Result<()> {
     } = options;
     let output = output.as_ref();
     let subscription_output = subscription_output.as_ref();
+    let requested_merged_path =
+        provider_merged_path(&config_path, output.map(PathBuf::as_path), write)?;
+    let writes_active_config = paths_refer_to_same_target(&config_path, &requested_merged_path)?;
+    let bypass_path = resolved_bypass_rule_set_path_for_config(&requested_merged_path)?;
+    let resolved_database_path = default_benchmark_db_path_for_config(&config_path)?;
+    let database_path = if writes_active_config {
+        let mut auxiliary = vec![("provider account file", account_file.as_path())];
+        if let Some(path) = subscription_output {
+            auxiliary.push(("subscription output", path.as_path()));
+        }
+        auxiliary.push(("bypass rule-set", bypass_path.as_path()));
+        crate::node_quality_path::ensure_active_config_paths_are_distinct(
+            &config_path,
+            &resolved_database_path,
+            &auxiliary,
+        )?;
+        Some(resolved_database_path)
+    } else {
+        let mut paths = vec![
+            ("provider account file", account_file.as_path()),
+            ("merged provider output", requested_merged_path.as_path()),
+        ];
+        if let Some(path) = subscription_output {
+            paths.push(("subscription output", path.as_path()));
+        }
+        paths.push(("bypass rule-set", bypass_path.as_path()));
+        crate::node_quality_path::ensure_active_config_paths_are_distinct(
+            &config_path,
+            &resolved_database_path,
+            &paths,
+        )?;
+        None
+    };
     let credentials = ProviderCredentials::from_file(&account_file)?;
     let provider_url = normalize_provider_url(&provider)?;
     let runtime = TokioRuntimeBuilder::new_current_thread()
@@ -119,38 +161,26 @@ pub(crate) fn run_provider_sync(options: ProviderSyncOptions) -> Result<()> {
 
     let (plugin_key, subscription_url, subscription_json) = result;
     if let Some(path) = subscription_output {
-        fs::write(path, format!("{subscription_json}\n"))
+        write_atomic(path, format!("{subscription_json}\n").as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
-    let config_path_buf = config_path;
-    let (config, imported_nodes) = build_full_config_from_singbox_subscription_with_options(
-        &config_path_buf,
-        &subscription_json,
-        replace_nodes,
-        DefaultConfigOptions {
-            include_geosite_rules,
-            include_tun_mode,
+    let (merged_path, imported_nodes) = write_provider_payload(
+        &config_path,
+        ProviderPayloadWrite {
+            output: output.map(PathBuf::as_path),
+            write,
+            database_path: database_path.as_deref(),
+            subscription: SubscriptionConfigRequest::without_provider(
+                &subscription_json,
+                replace_nodes,
+                DefaultConfigOptions {
+                    include_geosite_rules,
+                    include_tun_mode,
+                },
+            ),
         },
     )?;
-
-    let merged_path = if let Some(path) = output.cloned() {
-        path
-    } else if write {
-        config_path_buf
-    } else {
-        bail!("sync requires either --output <FILE> or --write");
-    };
-    fs::write(
-        &merged_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&config)
-                .context("failed to serialize merged provider config")?
-        ),
-    )
-    .with_context(|| format!("failed to write {}", merged_path.display()))?;
-    ensure_bypass_rule_set_file_for_config(&merged_path)?;
 
     println!(
         "{}",
@@ -164,6 +194,84 @@ pub(crate) fn run_provider_sync(options: ProviderSyncOptions) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn provider_merged_path(config_path: &Path, output: Option<&Path>, write: bool) -> Result<PathBuf> {
+    if let Some(path) = output {
+        Ok(path.to_path_buf())
+    } else if write {
+        Ok(config_path.to_path_buf())
+    } else {
+        bail!("sync requires either --output <FILE> or --write")
+    }
+}
+
+struct ProviderPayloadWrite<'a> {
+    output: Option<&'a Path>,
+    write: bool,
+    database_path: Option<&'a Path>,
+    subscription: SubscriptionConfigRequest<'a>,
+}
+
+fn write_provider_payload(
+    config_path: &PathBuf,
+    options: ProviderPayloadWrite<'_>,
+) -> Result<(PathBuf, usize)> {
+    let ProviderPayloadWrite {
+        output,
+        write,
+        database_path,
+        subscription,
+    } = options;
+    let merged_path = provider_merged_path(config_path, output, write)?;
+    let imported_nodes = if paths_refer_to_same_target(config_path, &merged_path)? {
+        commit_subscription_payload_to_active_config(
+            config_path,
+            &merged_path,
+            database_path.context("active provider sync requires node-quality storage")?,
+            subscription,
+        )?
+    } else {
+        let _config_guard = lock_config_mutation_for(config_path)?;
+        let (config, imported_nodes) = build_full_config_from_singbox_subscription_with_options(
+            config_path,
+            subscription.subscription_json,
+            subscription.replace_nodes,
+            subscription.config_options,
+        )?;
+        let contents = serde_json::to_string_pretty(&config)
+            .context("failed to serialize merged provider config")?;
+        ensure_bypass_rule_set_file_for_config(&merged_path)?;
+        write_atomic(&merged_path, format!("{contents}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", merged_path.display()))?;
+        imported_nodes
+    };
+    Ok((merged_path, imported_nodes))
+}
+
+#[cfg(test)]
+pub(crate) fn commit_provider_payload_to_active_config(
+    config_path: &PathBuf,
+    active_output: &Path,
+    database_path: &Path,
+    subscription_json: &str,
+    replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
+) -> Result<usize> {
+    commit_subscription_payload_to_active_config(
+        config_path,
+        active_output,
+        database_path,
+        SubscriptionConfigRequest::without_provider(
+            subscription_json,
+            replace_nodes,
+            DefaultConfigOptions {
+                include_geosite_rules,
+                include_tun_mode,
+            },
+        ),
+    )
 }
 
 #[derive(Serialize)]
@@ -336,9 +444,136 @@ fn extract_subscription_url_from_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderCredentials, SubscriptionFormat, extract_script_asset_urls,
-        extract_subscription_url_from_text, normalize_provider_url, resolve_provider_plugin,
+        ProviderCredentials, ProviderPayloadWrite, ProviderSyncOptions, SubscriptionFormat,
+        extract_script_asset_urls, extract_subscription_url_from_text, normalize_provider_url,
+        resolve_provider_plugin, run_provider_sync, write_provider_payload,
     };
+    use crate::config::{DefaultConfigOptions, build_default_config};
+    use crate::import::SubscriptionConfigRequest;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-{label}-{nonce}"))
+    }
+
+    #[test]
+    fn provider_raw_subscription_output_cannot_alias_the_active_config() {
+        let dir = temp_dir("provider-raw-active-alias");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+
+        let error = run_provider_sync(ProviderSyncOptions {
+            provider: "this provider must never be parsed".to_string(),
+            account_file: dir.join("missing-account"),
+            config_path: config_path.clone(),
+            output: Some(config_path.clone()),
+            subscription_output: Some(config_path),
+            replace_nodes: true,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            write: false,
+        })
+        .expect_err("raw provider payload output must be rejected before credentials are read");
+
+        assert!(format!("{error:#}").contains("must not alias"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_account_and_output_alias_fails_before_credentials_or_network_io() {
+        let dir = temp_dir("provider-account-output-alias");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let account_and_output = dir.join("account.json");
+        fs::write(&account_and_output, b"credential-canary\n").expect("write credential canary");
+
+        let error = run_provider_sync(ProviderSyncOptions {
+            provider: "this provider must never be parsed".to_string(),
+            account_file: account_and_output.clone(),
+            config_path,
+            output: Some(account_and_output.clone()),
+            subscription_output: None,
+            replace_nodes: true,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            write: false,
+        })
+        .expect_err("account/output alias must fail before credentials are read");
+
+        assert!(format!("{error:#}").contains("must not alias"));
+        assert_eq!(
+            fs::read(&account_and_output).expect("read credential canary"),
+            b"credential-canary\n"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn distinct_provider_output_takes_precedence_over_write_without_touching_quality() {
+        let dir = temp_dir("provider-output-write-precedence");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("active.json");
+        let output_path = dir.join("preview.json");
+        let database_path = dir.join("quality.sqlite3");
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&build_default_config(vec![json!({
+                "type": "trojan", "tag": "node-a", "server": "active.example",
+                "server_port": 443, "password": "active-secret"
+            })]))
+            .expect("serialize active config"),
+        )
+        .expect("write active config");
+        let payload = json!({
+            "outbounds": [{
+                "type": "trojan", "tag": "node-a", "server": "preview.example",
+                "server_port": 443, "password": "preview-secret"
+            }]
+        })
+        .to_string();
+
+        let (merged_path, imported_nodes) = write_provider_payload(
+            &config_path,
+            ProviderPayloadWrite {
+                output: Some(&output_path),
+                write: true,
+                database_path: None,
+                subscription: SubscriptionConfigRequest::without_provider(
+                    &payload,
+                    true,
+                    DefaultConfigOptions {
+                        include_geosite_rules: false,
+                        include_tun_mode: false,
+                    },
+                ),
+            },
+        )
+        .expect("provider preview succeeds");
+
+        assert_eq!(merged_path, output_path);
+        assert_eq!(imported_nodes, 1);
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read active config")
+                .contains("active.example")
+        );
+        assert!(
+            fs::read_to_string(&merged_path)
+                .expect("read preview config")
+                .contains("preview.example")
+        );
+        assert!(
+            !database_path.exists(),
+            "a distinct --output remains preview-only even when --write is also present"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn resolves_airtcp_plugin_from_host() {
