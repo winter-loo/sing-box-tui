@@ -302,6 +302,23 @@ where
             ));
         }
     };
+    if reconciliation.identities_changed
+        && let Err(error) = quality_store.ensure_runtime_reload_required()
+    {
+        let config_rollback = restore_config(config_path, previous_config.as_deref());
+        return Err(recover_changed_config_failure(
+            &quality_store,
+            quality_transaction,
+            marker_created,
+            error.context(
+                "failed to fence node-quality facts until the live sing-box config is reloaded",
+            ),
+            config_rollback,
+        ));
+    }
+    // This durable fence is created before the identity transaction commits and before the
+    // general write block is removed. A new TUI process therefore cannot bind the new on-disk
+    // fingerprints and accidentally attribute facts still served by an old same-tag runtime.
     if let Err(error) = quality_transaction.commit(reconciliation) {
         let config_rollback = restore_config(config_path, previous_config.as_deref());
         return Err(combine_failures(
@@ -523,6 +540,16 @@ mod tests {
         );
     }
 
+    fn simulate_managed_runtime_reload(database_path: &Path) {
+        // Production clears this fence only after starting sing-box under the config lock and
+        // observing its controller. This test helper represents that external lifecycle event so
+        // the next writer can seed facts for the newly committed identity generation.
+        BenchmarkStore::open(database_path)
+            .expect("open store after simulated managed reload")
+            .clear_runtime_reload_required()
+            .expect("clear runtime fence after simulated managed reload");
+    }
+
     fn assert_history_cleared(database_path: &Path) {
         assert!(
             BenchmarkStore::open(database_path)
@@ -605,6 +632,55 @@ mod tests {
     }
 
     #[test]
+    fn identity_changing_commit_fences_facts_until_managed_runtime_reload() {
+        let dir = temp_dir("runtime-reload-fence");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let database_path = dir.join("quality.sqlite3");
+        let initial_config = build_default_config(vec![node("initial.example")]);
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&initial_config).expect("serialize initial config"),
+        )
+        .expect("write initial config");
+        seed_history(&database_path, &initial_config);
+
+        super::commit_active_node_config(
+            &config_path,
+            &database_path,
+            || Ok(build_default_config(vec![node("changed.example")])),
+            || Ok(()),
+            || Ok(None),
+        )
+        .expect("commit identity-changing config");
+
+        let store = BenchmarkStore::open(&database_path).expect("reopen fenced quality store");
+        assert!(
+            store
+                .runtime_reload_required()
+                .expect("inspect runtime fence")
+        );
+        assert!(
+            !store
+                .record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment::from_attempts(
+                        "node-a".to_string(),
+                        vec![
+                            ProbeOutcome::Reachable { delay_ms: 50 },
+                            ProbeOutcome::Reachable { delay_ms: 51 },
+                            ProbeOutcome::Reachable { delay_ms: 52 },
+                        ],
+                    ),
+                )
+                .expect("runtime fence rejects old-controller fact")
+        );
+
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn uncertain_new_config_removal_is_reported_after_the_visible_file_is_deleted() {
         let dir = temp_dir("uncertain-new-config-removal");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -659,6 +735,7 @@ mod tests {
         let import_config: Value =
             serde_json::from_slice(&fs::read(&config_path).expect("read import config"))
                 .expect("parse import config");
+        simulate_managed_runtime_reload(&database_path);
         seed_history(&database_path, &import_config);
         let config_alias = dir.join("active-config-alias.json");
         symlink(
@@ -696,6 +773,7 @@ mod tests {
         let subscribe_config: Value =
             serde_json::from_slice(&fs::read(&config_path).expect("read subscribe config"))
                 .expect("parse subscribe config");
+        simulate_managed_runtime_reload(&database_path);
         seed_history(&database_path, &subscribe_config);
 
         commit_provider_payload_to_active_config(
