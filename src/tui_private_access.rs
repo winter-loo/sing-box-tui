@@ -172,6 +172,9 @@ fn tun_helper_needs_sudo() -> bool {
 
 struct TuiPrivateAccessNetworkIntegration<'a> {
     config_path: &'a Path,
+    database_path: &'a Path,
+    benchmark_workflow: &'a mut BenchmarkWorkflow,
+    client: &'a ApiClient,
     sing_box: &'a mut ManagedSingBox,
     system_proxy: &'a mut SystemProxy,
     base_bypass_entries: &'a [String],
@@ -221,19 +224,22 @@ impl PrivateAccessNetworkIntegration for TuiPrivateAccessNetworkIntegration<'_> 
     }
 
     fn restart_carrier(&mut self) -> Result<PrivateAccessCarrierRestart> {
-        let receipt = self.sing_box.restart()?;
-        if receipt.report().replaced_existing() {
+        let report = super::managed_process::restart_managed_sing_box_with_quality_confirmation(
+            self.benchmark_workflow,
+            self.sing_box,
+            self.client,
+            self.config_path,
+            self.database_path,
+        )?;
+        if report.replaced_existing() {
             Ok(PrivateAccessCarrierRestart {
-                progress_message: format!("sing-box 重启成功: {}", receipt.report().transition()),
-                summary: format!("restarted sing-box {}", receipt.report().transition()),
+                progress_message: format!("sing-box 重启成功: {}", report.transition()),
+                summary: format!("restarted sing-box {}", report.transition()),
             })
         } else {
             Ok(PrivateAccessCarrierRestart {
-                progress_message: format!(
-                    "sing-box 启动成功: {}",
-                    receipt.report().started_process()
-                ),
-                summary: format!("started sing-box {}", receipt.report().started_process()),
+                progress_message: format!("sing-box 启动成功: {}", report.started_process()),
+                summary: format!("started sing-box {}", report.started_process()),
             })
         }
     }
@@ -725,6 +731,9 @@ impl App {
         let notices = {
             let mut integration = TuiPrivateAccessNetworkIntegration {
                 config_path: &self.system_proxy_config_path,
+                database_path: &self.node_quality_db_path,
+                benchmark_workflow: &mut self.benchmark_workflow,
+                client: &self.client,
                 sing_box: &mut self.sing_box,
                 system_proxy: &mut self.system_proxy,
                 base_bypass_entries: &self.bypass_entries,

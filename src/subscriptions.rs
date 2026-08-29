@@ -2048,7 +2048,7 @@ mod tests {
         )
         .expect("write active config");
         let request = request_for(&dir, config_path.clone(), config_path.clone());
-        let workflow = BenchmarkWorkflow::open(
+        let mut workflow = BenchmarkWorkflow::open(
             "http://127.0.0.1:9992".to_string(),
             reqwest::Client::builder()
                 .no_proxy()
@@ -2058,6 +2058,9 @@ mod tests {
             &request.node_quality_db_path,
         )
         .expect("startup binds committed active config");
+        workflow
+            .confirm_managed_runtime_reload(&config_path, &request.node_quality_db_path, || Ok(()))
+            .expect("observed startup runtime enables quality persistence");
         assert_eq!(
             workflow
                 .persist_benchmark_for_test("node-a")
@@ -2137,6 +2140,14 @@ mod tests {
         )
         .expect("write old config");
         let request = request_for(&dir, config_path.clone(), config_path.clone());
+        let loaded_runtime_store = BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("open quality store for the already loaded runtime");
+        // This fixture represents a controller already serving `old_config`; the startup under
+        // test therefore rebinds an unchanged generation and may install its store immediately.
+        loaded_runtime_store
+            .reconcile_node_history(&old_config)
+            .expect("bind identities for the already loaded runtime");
+        drop(loaded_runtime_store);
 
         let startup_config = config_path.clone();
         let startup_database = request.node_quality_db_path.clone();

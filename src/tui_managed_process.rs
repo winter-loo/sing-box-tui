@@ -1,6 +1,28 @@
+use std::path::Path;
+
 use anyhow::Result;
 
+use crate::benchmark_workflow::BenchmarkWorkflow;
+use crate::controller::ApiClient;
+use crate::managed_sing_box::{LifecycleReport, ManagedSingBox};
+
 use super::App;
+
+pub(super) fn restart_managed_sing_box_with_quality_confirmation(
+    benchmark_workflow: &mut BenchmarkWorkflow,
+    sing_box: &mut ManagedSingBox,
+    client: &ApiClient,
+    config_path: &Path,
+    database_path: &Path,
+) -> Result<LifecycleReport> {
+    benchmark_workflow.confirm_managed_runtime_reload(config_path, database_path, || {
+        let receipt = sing_box.restart()?;
+        // Every feature-triggered restart must prove controller readiness while the config and
+        // quality generation remain locked; process creation alone cannot release the fence.
+        receipt.observe_controller(client)?;
+        Ok(receipt.into_report())
+    })
+}
 
 impl App {
     pub(super) fn network_transition_is_running(&self) -> bool {
@@ -64,16 +86,14 @@ impl App {
     }
 
     pub(super) fn restart_managed_sing_box(&mut self) -> Result<()> {
-        let config_path = &self.system_proxy_config_path;
-        let database_path = &self.node_quality_db_path;
-        let client = &self.client;
-        let sing_box = &mut self.sing_box;
-        self.benchmark_workflow
-            .confirm_managed_runtime_reload(config_path, database_path, || {
-                let receipt = sing_box.restart()?;
-                receipt.observe_controller(client)?;
-                Ok(())
-            })
+        restart_managed_sing_box_with_quality_confirmation(
+            &mut self.benchmark_workflow,
+            &mut self.sing_box,
+            &self.client,
+            &self.system_proxy_config_path,
+            &self.node_quality_db_path,
+        )?;
+        Ok(())
     }
 
     pub(super) fn shutdown_managed_sing_box(&mut self) -> Result<()> {

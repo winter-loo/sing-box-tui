@@ -7,9 +7,9 @@ use anyhow::{Context, Result, bail};
 use crate::config::{
     InternetTunModeUpdate, RouteAutoDetectInterfaceState, inspect_tun_config, set_internet_tun_mode,
 };
-use crate::managed_sing_box::{
-    AuthorizationRequirement, ControllerProbe, LifecycleReport, ManagedSingBox,
-};
+#[cfg(test)]
+use crate::managed_sing_box::ControllerProbe;
+use crate::managed_sing_box::{AuthorizationRequirement, LifecycleReport, ManagedSingBox};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PersistedInternetTun {
@@ -290,26 +290,39 @@ impl InternetTunTransaction {
         Ok(target)
     }
 
-    pub(crate) fn poll<F>(
+    pub(crate) fn poll<Restart, F>(
         &mut self,
-        sing_box: &mut ManagedSingBox,
-        probe: &dyn ControllerProbe,
+        restart: Restart,
         persist: F,
     ) -> Option<InternetTunToggleOutcome>
     where
+        Restart: FnMut() -> Result<InternetTunRestart>,
         F: FnMut(PersistedInternetTun) -> Result<()>,
     {
-        self.poll_with(sing_box, probe, persist)
+        self.poll_with_restart(restart, persist)
     }
 
+    #[cfg(test)]
     fn poll_with<L, F>(
         &mut self,
         lifecycle: &mut L,
         probe: &dyn ControllerProbe,
-        mut persist: F,
+        persist: F,
     ) -> Option<InternetTunToggleOutcome>
     where
         L: TunLifecycle,
+        F: FnMut(PersistedInternetTun) -> Result<()>,
+    {
+        self.poll_with_restart(|| lifecycle.restart_and_observe(probe), persist)
+    }
+
+    fn poll_with_restart<Restart, F>(
+        &mut self,
+        mut restart: Restart,
+        mut persist: F,
+    ) -> Option<InternetTunToggleOutcome>
+    where
+        Restart: FnMut() -> Result<InternetTunRestart>,
         F: FnMut(PersistedInternetTun) -> Result<()>,
     {
         let job = self.job.as_ref()?;
@@ -322,19 +335,18 @@ impl InternetTunTransaction {
         if let Some(worker) = job.worker.take() {
             let _ = worker.join();
         }
-        Some(self.finish_toggle(job, result, lifecycle, probe, &mut persist))
+        Some(self.finish_toggle(job, result, &mut restart, &mut persist))
     }
 
-    fn finish_toggle<L, F>(
+    fn finish_toggle<Restart, F>(
         &mut self,
         job: TunToggleJob,
         result: Result<InternetTunModeUpdate, String>,
-        lifecycle: &mut L,
-        probe: &dyn ControllerProbe,
+        restart: &mut Restart,
         persist: &mut F,
     ) -> InternetTunToggleOutcome
     where
-        L: TunLifecycle,
+        Restart: FnMut() -> Result<InternetTunRestart>,
         F: FnMut(PersistedInternetTun) -> Result<()>,
     {
         let update = match result {
@@ -395,9 +407,7 @@ impl InternetTunTransaction {
             Err(error) => Some(format!("{error:#}")),
         };
 
-        let restart = lifecycle
-            .restart_and_observe(probe)
-            .map_err(|error| format!("{error:#}"));
+        let restart = restart().map_err(|error| format!("{error:#}"));
         InternetTunToggleOutcome::Applied {
             target: job.target,
             config_changed: update.changed,
@@ -413,6 +423,7 @@ trait TunLifecycle {
         next_run_needs_elevation: bool,
     ) -> AuthorizationRequirement;
 
+    #[cfg(test)]
     fn restart_and_observe(&mut self, probe: &dyn ControllerProbe) -> Result<InternetTunRestart>;
 }
 
@@ -424,6 +435,7 @@ impl TunLifecycle for ManagedSingBox {
         self.restart_authorization_requirement(next_run_needs_elevation)
     }
 
+    #[cfg(test)]
     fn restart_and_observe(&mut self, probe: &dyn ControllerProbe) -> Result<InternetTunRestart> {
         let receipt = self.restart()?;
         let controller_error = receipt
