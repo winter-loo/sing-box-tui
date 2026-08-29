@@ -44,6 +44,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Move focus to the pane on the right.",
     },
     HelpBinding {
+        key: "left/right",
+        summary: "Switch node-view tab",
+        detail: "When the candidate pane is focused, move between Current selector and Streaming views without changing the live selector.",
+    },
+    HelpBinding {
         key: "g",
         summary: "Move to first item",
         detail: "Jump to the first item in the focused list.",
@@ -70,13 +75,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "T",
-        summary: "Test current group latency",
-        detail: "Start an asynchronous latency test for all visible candidates in the selected group.",
+        summary: "Quick-assess current scope",
+        detail: "Run three live-controller reachability attempts for each node in the active selector or node-view scope.",
     },
     HelpBinding {
         key: "t",
-        summary: "Test selected node latency",
-        detail: "Start an asynchronous latency test for only the highlighted node.",
+        summary: "Fully assess selected node",
+        detail: "Run quick eligibility and then one bounded sustained transfer through an isolated node runtime.",
     },
     HelpBinding {
         key: "/",
@@ -90,8 +95,8 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "i",
-        summary: "Open latency chart",
-        detail: "Show SQLite-backed latency history for the highlighted node.",
+        summary: "Open node quality detail",
+        detail: "Show quick attempts, sustained evidence, and SQLite-backed history for the highlighted node.",
     },
     HelpBinding {
         key: "z",

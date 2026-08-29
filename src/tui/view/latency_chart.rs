@@ -18,6 +18,7 @@ pub(crate) struct LatencyChartState {
     pub(crate) threshold_ms: u64,
     pub(crate) last_refresh: Instant,
     pub(crate) reachability_assessment: Option<NodeReachabilityAssessment>,
+    pub(crate) sustained_quality: Option<NodeSustainedQuality>,
 }
 
 fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
@@ -70,27 +71,61 @@ fn latency_chart_windowed_samples(
 pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
     let area = centered_rect(90, 20, frame.area());
     frame.render_widget(Clear, area);
-    let [quality_area, area] = if chart.reachability_assessment.is_some() {
-        Layout::vertical([Constraint::Length(7), Constraint::Min(8)]).areas(area)
-    } else {
-        Layout::vertical([Constraint::Length(0), Constraint::Min(8)]).areas(area)
-    };
-    if let Some(assessment) = &chart.reachability_assessment {
-        let mut lines = vec![Line::from(format!(
-            "Assessment: {}",
-            assessment.compact_evidence()
-        ))];
-        for (index, outcome) in assessment.attempts.iter().enumerate() {
+    let [quality_area, area] =
+        if chart.reachability_assessment.is_some() || chart.sustained_quality.is_some() {
+            Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).areas(area)
+        } else {
+            Layout::vertical([Constraint::Length(0), Constraint::Min(8)]).areas(area)
+        };
+    if chart.reachability_assessment.is_some() || chart.sustained_quality.is_some() {
+        let mut lines = Vec::new();
+        if let Some(assessment) = &chart.reachability_assessment {
             lines.push(Line::from(format!(
-                "Attempt {}: {}",
-                index + 1,
-                probe_outcome_label(outcome)
+                "Assessment: {}",
+                assessment.compact_evidence()
             )));
+            for (index, outcome) in assessment.attempts.iter().enumerate() {
+                lines.push(Line::from(format!(
+                    "Attempt {}: {}",
+                    index + 1,
+                    probe_outcome_label(outcome)
+                )));
+            }
+        }
+        if let Some(sustained) = &chart.sustained_quality {
+            match &sustained.outcome {
+                SustainedProbeOutcome::Completed(completion) => {
+                    lines.push(Line::from(format!(
+                        "Sustained: {:.1} MiB/s, {} bytes",
+                        completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0),
+                        completion.bytes_read
+                    )));
+                    lines.push(Line::from(format!(
+                        "First byte: {}ms  Completion: {}ms",
+                        completion.first_byte_ms, completion.completion_ms
+                    )));
+                }
+                SustainedProbeOutcome::TransferFailed { detail } => {
+                    lines.push(Line::from(format!(
+                        "Sustained: transfer failed ({})",
+                        truncate_for_width(detail, 72)
+                    )));
+                }
+                SustainedProbeOutcome::RuntimeFailed { detail } => {
+                    lines.push(Line::from(format!(
+                        "Sustained: runtime failed ({})",
+                        truncate_for_width(detail, 72)
+                    )));
+                }
+                SustainedProbeOutcome::Cancelled => {
+                    lines.push(Line::from("Sustained: cancelled"));
+                }
+            }
         }
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
-                    .title("Reachability evidence")
+                    .title("Node quality evidence")
                     .borders(Borders::ALL),
             ),
             quality_area,

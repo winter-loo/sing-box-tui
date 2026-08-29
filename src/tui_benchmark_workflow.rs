@@ -4,11 +4,37 @@ use anyhow::{Context, Result, bail};
 
 use super::App;
 use crate::auto_pick::AutoPickDecision;
-use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkStart, BenchmarkUpdate};
+use crate::benchmark_workflow::{
+    BenchmarkCompletion, BenchmarkStart, BenchmarkUpdate, SustainedKind,
+    assessment_is_quick_eligible,
+};
 use crate::controller::{BenchmarkRequest, BenchmarkSummary, ProxyGroup};
 use crate::defaults::REFRESH_DEBOUNCE;
+use crate::sustained_quality::SustainedProbeRequest;
 
 impl App {
+    fn start_sustained_nodes(
+        &mut self,
+        group: String,
+        nodes: Vec<String>,
+        kind: SustainedKind,
+    ) -> Result<BenchmarkStart> {
+        let Some((config_path, sing_box_executable)) = self.sustained_runtime_environment.clone()
+        else {
+            return Ok(BenchmarkStart::NoCandidates);
+        };
+        self.benchmark_workflow.start_sustained(
+            SustainedProbeRequest {
+                selector: group,
+                nodes,
+                target_url: self.sustained_target_url.clone(),
+                config_path,
+                sing_box_executable,
+            },
+            kind,
+        )
+    }
+
     pub(super) fn start_group_benchmark(&mut self) -> Result<()> {
         if self.showing_intranet_details() {
             self.set_status_only("Latency tests are available for Internet Proxy nodes only");
@@ -17,7 +43,15 @@ impl App {
         let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
-        let candidate_names = self.benchmark_candidates_for_group(&group);
+        let mut candidate_names = self.benchmark_candidates_for_group(&group);
+        if let Some(current) = group
+            .current
+            .as_ref()
+            .filter(|current| group.members.contains(*current))
+            && !candidate_names.contains(current)
+        {
+            candidate_names.insert(0, current.clone());
+        }
         let request = BenchmarkRequest {
             selector: group.name.clone(),
             pattern: self.benchmark_filter.clone(),
@@ -56,13 +90,9 @@ impl App {
         let Some(group) = self.selected_member_panel_group().cloned() else {
             bail!("no selector group available");
         };
-        let displayed_members = self.displayed_members();
-        let Some(member) = self
-            .displayed_member_index()
-            .and_then(|index| displayed_members.get(index))
-            .cloned()
-        else {
-            bail!("no proxy available in selected group");
+        let Some(member) = self.selected_member_name() else {
+            self.set_status_only("No node is available in the active node view");
+            return Ok(());
         };
         let request = BenchmarkRequest {
             selector: group.name.clone(),
@@ -225,6 +255,8 @@ impl App {
         group_name: &str,
         summary: &BenchmarkSummary,
     ) -> Result<()> {
+        let _quality_lease = self.benchmark_workflow.acquire_quality_read_lease()?;
+        let _quality_generation = _quality_lease.generation();
         let Some(group) = self
             .groups
             .iter()
@@ -297,15 +329,60 @@ impl App {
     pub(super) fn apply_benchmark_update(&mut self, update: BenchmarkUpdate) -> Result<()> {
         match update {
             BenchmarkUpdate::Progress { group, best_label } => {
+                self.sync_selection_to_displayed_members();
                 self.status = format!("Testing latency for {group}... best so far: {best_label}");
+            }
+            BenchmarkUpdate::SustainedProgress { group, result } => {
+                self.sync_selection_to_displayed_members();
+                self.status = format!(
+                    "Sustained quality for {group} / {}: {}",
+                    result.name,
+                    result.compact_evidence()
+                );
             }
             BenchmarkUpdate::Disconnected { group } => {
                 self.set_status_only(format!("Latency test worker for {group} disconnected"));
             }
-            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, assessed }) => {
-                self.set_status_only(format!(
-                    "Reachability assessed {assessed} node(s) in {group}"
-                ));
+            BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
+                group,
+                assessed,
+                assessments,
+                quality_current,
+            }) => {
+                if !quality_current {
+                    self.set_status_only(format!(
+                        "Reachability results for {group} were discarded after the managed runtime changed; rerun T"
+                    ));
+                    return Ok(());
+                }
+                let status = format!("Reachability assessed {assessed} node(s) in {group}");
+                let Some(group_snapshot) = self.group_by_name(&group).cloned() else {
+                    self.set_status_only(status);
+                    return Ok(());
+                };
+                let nodes = self.benchmark_workflow.automatic_sustained_candidates(
+                    &group,
+                    group_snapshot.current.as_deref(),
+                    &group_snapshot.members,
+                    &assessments,
+                );
+                // The completion lease cannot span the UI event queue. Revalidate in
+                // `start_sustained_nodes`, but treat a concurrent reload as a retriable status
+                // instead of terminating the TUI loop.
+                match self.start_sustained_nodes(
+                    group.clone(),
+                    nodes.clone(),
+                    SustainedKind::Automatic,
+                ) {
+                    Ok(BenchmarkStart::Started) => self.set_status_only(format!(
+                        "{status}; sustained probing {} node(s) in background",
+                        nodes.len()
+                    )),
+                    Ok(_) => self.set_status_only(status),
+                    Err(error) => self.set_status_only(format!(
+                        "{status}; sustained probing deferred after runtime change: {error}"
+                    )),
+                }
             }
             BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect { group, summary }) => {
                 self.finish_auto_select_benchmark(&group, &summary)?;
@@ -314,15 +391,65 @@ impl App {
                 group,
                 node,
                 assessment,
+                quality_current,
             }) => {
-                let status = match assessment {
+                if !quality_current {
+                    self.set_status_only(format!(
+                        "Reachability result for {group} / {node} was discarded after the managed runtime changed; rerun t"
+                    ));
+                    return Ok(());
+                }
+                let status = match &assessment {
                     Some(assessment) => format!(
                         "Reachability assessed {group} / {node}: {}",
                         assessment.compact_evidence()
                     ),
                     None => format!("Reachability assessment incomplete for {group} / {node}"),
                 };
-                self.set_status_only(status);
+                if assessment
+                    .as_ref()
+                    .is_some_and(assessment_is_quick_eligible)
+                {
+                    match self.start_sustained_nodes(
+                        group.clone(),
+                        vec![node.clone()],
+                        SustainedKind::SingleNode,
+                    ) {
+                        Ok(BenchmarkStart::Started) => {
+                            self.set_status_only(format!("{status}; sustained transfer started"))
+                        }
+                        Ok(BenchmarkStart::AlreadyRunning) => self
+                            .set_status_only(format!("{status}; waiting for sustained transfer")),
+                        Ok(_) => self.set_status_only(status),
+                        Err(error) => self.set_status_only(format!(
+                            "{status}; sustained transfer deferred after runtime change: {error}"
+                        )),
+                    }
+                } else {
+                    self.set_status_only(status);
+                }
+            }
+            BenchmarkUpdate::Finished(BenchmarkCompletion::Sustained {
+                group,
+                kind,
+                completed,
+                attempted,
+                infrastructure_failures,
+                cancelled,
+            }) => {
+                let label = match kind {
+                    SustainedKind::Automatic => "Automatic sustained probing",
+                    SustainedKind::SingleNode => "Complete node assessment",
+                };
+                if infrastructure_failures > 0 || cancelled > 0 {
+                    self.set_status_only(format!(
+                        "{label} incomplete for {group}: {completed}/{attempted} attributable completed; {infrastructure_failures} infrastructure, {cancelled} cancelled"
+                    ));
+                } else {
+                    self.set_status_only(format!(
+                        "{label} finished for {group}: {completed}/{attempted} completed"
+                    ));
+                }
             }
         }
         Ok(())

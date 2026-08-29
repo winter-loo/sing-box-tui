@@ -63,6 +63,7 @@ pub(super) fn is_private_access_settings_field(field: SettingsField) -> bool {
 pub(super) fn settings_field_value(app: &App, field: SettingsField) -> String {
     match field {
         SettingsField::BenchmarkUrl => app.benchmark_url.clone(),
+        SettingsField::SustainedTargetUrl => app.sustained_target_url.clone(),
         SettingsField::BenchmarkTimeoutMs => app.benchmark_timeout_ms.to_string(),
         SettingsField::RequestTimeoutSec => app.benchmark_request_timeout.to_string(),
         SettingsField::MaxConcurrency => app.benchmark_max_concurrency.to_string(),
@@ -292,6 +293,12 @@ impl App {
                     bail!("latency URL cannot be empty");
                 }
                 self.benchmark_url = value.to_string();
+            }
+            SettingsField::SustainedTargetUrl => {
+                crate::sustained_quality::validate_sustained_target(value)?;
+                self.benchmark_workflow.activate_sustained_target(value)?;
+                self.sustained_target_url = value.to_string();
+                self.sync_selection_to_displayed_members();
             }
             SettingsField::BenchmarkTimeoutMs => self.benchmark_timeout_ms = parse_positive(value)?,
             SettingsField::RequestTimeoutSec => {

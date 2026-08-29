@@ -21,7 +21,9 @@ use crate::auto_pick::{
     BACKGROUND_TASK_KIND, BackgroundAutoPickManager, background_task_log_path,
     background_task_state_path, registered_status_value, stop_registered_worker,
 };
-use crate::benchmark_workflow::BenchmarkWorkflow;
+use crate::benchmark_workflow::{
+    BenchmarkWorkflow, QUALITY_RUNTIME_RECEIPT_ENV, QualityRuntimeReceipt,
+};
 use crate::config::{
     PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
     inspect_tailscale_config, run_private_access_route_table_config,
@@ -54,6 +56,7 @@ use crate::private_access_session::{
 };
 use crate::ruleset::china_ip_routing_ruleset_paths;
 use crate::subscriptions::DEFAULT_SUBSCRIPTION_SOURCE_PATH;
+use crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL;
 use crate::system_proxy::SystemProxy;
 use crate::tui_state::{
     BypassRuleSetStore, TuiStateStore, default_tui_state_path, resolved_tui_bypass_rule_set_path,
@@ -103,10 +106,10 @@ use verification::{VerifyJob, default_verification_targets_setting};
 #[cfg(test)]
 use view::private_access_auth_display_value;
 use view::{
-    Focus, LatencyChartState, LeftPaneSection, OnboardingState, PrivateAccessAuthModal,
-    PrivateAccessProgressEntry, PrivateAccessProgressModal, PrivateAccessProgressTone,
-    SettingsEditState, help_binding_count, private_access_auth_initial_value,
-    private_access_progress_title, truncate_for_width,
+    Focus, LatencyChartState, LeftPaneSection, NodeViewPanel, OnboardingState,
+    PrivateAccessAuthModal, PrivateAccessProgressEntry, PrivateAccessProgressModal,
+    PrivateAccessProgressTone, SettingsEditState, help_binding_count,
+    private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -366,6 +369,7 @@ struct App {
     group_index: usize,
     internet_route_index: usize,
     member_index: usize,
+    node_view_panel: NodeViewPanel,
     focus: Focus,
     left_pane_section: LeftPaneSection,
     intranet_detail_scroll: u16,
@@ -374,6 +378,8 @@ struct App {
     flash: Option<(String, Instant)>,
     benchmark_filter: String,
     benchmark_url: String,
+    sustained_target_url: String,
+    sustained_runtime_environment: Option<(PathBuf, PathBuf)>,
     benchmark_timeout_ms: u64,
     benchmark_request_timeout: f64,
     benchmark_max_concurrency: usize,
@@ -511,6 +517,10 @@ impl App {
         let existing_state_file = state_store.exists();
         let mut runtime_state = state_store.load()?;
         let onboarding_complete = runtime_state.onboarding_complete || existing_state_file;
+        let sustained_runtime_environment = Some((
+            system_proxy_config_path.clone(),
+            sing_box_executable.clone(),
+        ));
         let system_proxy = SystemProxy::new(system_proxy_config_path.clone());
         let internet_tun = InternetTunTransaction::new(
             system_proxy_config_path.clone(),
@@ -532,6 +542,7 @@ impl App {
             client.client.clone(),
             &system_proxy_config_path,
             &node_quality_db_path,
+            DEFAULT_SUSTAINED_TARGET_URL,
         )?;
         let mut app = Self {
             client,
@@ -539,6 +550,7 @@ impl App {
             group_index: 0,
             internet_route_index: 0,
             member_index: 0,
+            node_view_panel: NodeViewPanel::CurrentSelector,
             focus: Focus::Groups,
             left_pane_section: LeftPaneSection::Internet,
             intranet_detail_scroll: 0,
@@ -547,6 +559,8 @@ impl App {
             flash: None,
             benchmark_filter: String::new(),
             benchmark_url: String::from(DEFAULT_DELAY_TEST_URL),
+            sustained_target_url: String::from(DEFAULT_SUSTAINED_TARGET_URL),
+            sustained_runtime_environment,
             benchmark_timeout_ms: 5000,
             benchmark_request_timeout: 12.0,
             benchmark_max_concurrency,
@@ -616,6 +630,14 @@ impl App {
             } else {
                 wait_for_controller_ready(&app.client).context(
                     "headless auto-pick could not reach the existing sing-box controller",
+                )?;
+                let encoded_receipt = env::var(QUALITY_RUNTIME_RECEIPT_ENV)
+                    .context("headless auto-pick requires a foreground runtime receipt")?;
+                let runtime_receipt = QualityRuntimeReceipt::decode_from_child(&encoded_receipt)?;
+                app.benchmark_workflow.adopt_runtime_receipt(
+                    &app.system_proxy_config_path,
+                    &app.node_quality_db_path,
+                    runtime_receipt,
                 )?;
             }
             app.refresh()?;
@@ -773,6 +795,8 @@ impl App {
                     Focus::Members => Focus::Groups,
                 };
             }
+            KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
+            KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
             KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
@@ -819,10 +843,9 @@ impl App {
     }
 
     fn selected_member_name(&self) -> Option<String> {
-        self.selected_group()?
-            .members
-            .get(self.member_index)
-            .cloned()
+        let displayed = self.displayed_members();
+        let index = self.displayed_member_index()?;
+        displayed.get(index).cloned()
     }
 
     fn open_help_panel(&mut self) {

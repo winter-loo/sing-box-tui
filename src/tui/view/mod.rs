@@ -9,7 +9,7 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
-    Wrap,
+    Tabs, Wrap,
 };
 use zeroize::Zeroize;
 
@@ -20,6 +20,7 @@ use crate::private_access::{PrivateAccessAuthField, PrivateAccessState};
 use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRuntime};
 use crate::storage::NodeLatencySample;
 use crate::subscriptions::SubscriptionRefreshOutput;
+use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
 
 mod connections;
 mod dashboard;

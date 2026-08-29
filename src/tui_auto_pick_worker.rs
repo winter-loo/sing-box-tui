@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{App, current_unix_timestamp};
 use crate::auto_pick::{
@@ -87,12 +87,18 @@ impl App {
         }
     }
 
-    pub(super) fn background_launch_spec(&self) -> BackgroundLaunchSpec {
-        BackgroundLaunchSpec::new(
+    pub(super) fn background_launch_spec(&self) -> Result<BackgroundLaunchSpec> {
+        let runtime_receipt = self
+            .benchmark_workflow
+            .runtime_receipt()
+            .cloned()
+            .context("background auto-pick requires a confirmed managed runtime receipt")?;
+        Ok(BackgroundLaunchSpec::new(
             self.client.base_url.clone(),
             self.system_proxy_config_path.clone(),
             self.benchmark_max_concurrency,
-        )
+            runtime_receipt,
+        ))
     }
 
     pub(super) fn poll_background_auto_pick_status(&mut self) -> Result<()> {
@@ -100,7 +106,7 @@ impl App {
             return Ok(());
         }
         let config = self.auto_pick_config();
-        let launch = self.background_launch_spec();
+        let launch = self.background_launch_spec()?;
         let Some(event) =
             self.background_auto_pick
                 .poll(self.auto_select_enabled, &config, &launch)?
@@ -174,7 +180,7 @@ impl App {
 
     pub(super) fn ensure_auto_pick_background_worker(&mut self) -> Result<BackgroundWorkerEnsure> {
         let config = self.auto_pick_config();
-        let launch = self.background_launch_spec();
+        let launch = self.background_launch_spec()?;
         self.background_auto_pick.ensure(&config, &launch)
     }
 
@@ -187,11 +193,16 @@ impl App {
         worker_status: String,
         generation: u64,
     ) -> BackgroundStatusSnapshot {
+        let runtime_receipt = self.benchmark_workflow.runtime_receipt();
         BackgroundStatusSnapshot {
             kind: BACKGROUND_TASK_KIND.to_string(),
             pid: std::process::id(),
             controller: self.client.base_url.clone(),
             config_path: self.system_proxy_config_path.clone(),
+            quality_generation: runtime_receipt
+                .map(|receipt| receipt.quality_generation())
+                .unwrap_or(u64::MAX),
+            managed_pid: runtime_receipt.and_then(|receipt| receipt.managed_pid()),
             max_concurrency: self.benchmark_max_concurrency,
             started_at_unix: self.background_started_at_unix,
             status_generation: generation,

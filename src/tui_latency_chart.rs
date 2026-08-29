@@ -35,8 +35,13 @@ impl App {
             .benchmark_workflow
             .reachability_assessment(&group_name, &node)
             .cloned();
+        let sustained_quality = self
+            .benchmark_workflow
+            .sustained_quality(&group_name, &node)
+            .cloned();
         if samples.iter().all(|sample| sample.delay_ms.is_none())
             && reachability_assessment.is_none()
+            && sustained_quality.is_none()
         {
             self.set_status_only(format!("No latency history for {}", node));
             return Ok(());
@@ -50,6 +55,7 @@ impl App {
             threshold_ms: self.auto_select_threshold_ms,
             last_refresh: Instant::now(),
             reachability_assessment,
+            sustained_quality,
         });
         self.set_status_only(format!("Showing {} latency samples for {}", count, node));
         Ok(())
@@ -87,6 +93,14 @@ impl App {
             return Ok(());
         };
         chart.samples = samples;
+        chart.reachability_assessment = self
+            .benchmark_workflow
+            .reachability_assessment(&chart.selector, &chart.node)
+            .cloned();
+        chart.sustained_quality = self
+            .benchmark_workflow
+            .sustained_quality(&chart.selector, &chart.node)
+            .cloned();
         chart.last_refresh = Instant::now();
         Ok(())
     }
@@ -162,6 +176,7 @@ mod tests {
             threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now(),
             reachability_assessment: None,
+            sustained_quality: None,
         });
         app.handle_key(KeyCode::Char('z')).expect("zoom in");
         assert_eq!(
@@ -200,6 +215,7 @@ mod tests {
             threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
             reachability_assessment: None,
+            sustained_quality: None,
         });
         app.maybe_refresh_latency_chart().expect("refresh chart");
         assert_eq!(

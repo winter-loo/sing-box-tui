@@ -66,6 +66,8 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sustained_target_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) benchmark_request_timeout: Option<f64>,

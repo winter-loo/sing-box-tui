@@ -6,6 +6,28 @@ pub(crate) enum Focus {
     Members,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NodeViewPanel {
+    #[default]
+    CurrentSelector,
+    Streaming,
+}
+
+impl NodeViewPanel {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::CurrentSelector => 0,
+            Self::Streaming => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeViewTab {
+    pub(crate) label: &'static str,
+    pub(crate) count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LeftPaneSection {
     Internet,
@@ -38,7 +60,9 @@ pub(crate) enum CandidateTone {
 pub(crate) struct CandidateRow {
     pub(crate) name: String,
     pub(crate) is_current: bool,
+    pub(crate) reachability: String,
     pub(crate) marker: String,
+    pub(crate) compact_marker: String,
     pub(crate) tone: CandidateTone,
 }
 
@@ -50,6 +74,8 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) intranet_rows: Vec<IntranetRow>,
     pub(crate) intranet_selected: usize,
     pub(crate) candidate_title: String,
+    pub(crate) node_view_tabs: Vec<NodeViewTab>,
+    pub(crate) active_node_view_tab: usize,
     pub(crate) candidate_rows: Vec<CandidateRow>,
     pub(crate) candidate_selected: Option<usize>,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
@@ -177,6 +203,31 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
     }
 
+    let [tabs_area, candidate_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(members_area);
+    let tab_titles = snapshot
+        .node_view_tabs
+        .iter()
+        .map(|tab| Line::from(format!("{} {}", tab.label, tab.count)))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Tabs::new(tab_titles)
+            .select(snapshot.active_node_view_tab)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(" │ ")
+            .block(
+                Block::default()
+                    .title("Node views  ←/→")
+                    .borders(Borders::ALL)
+                    .border_style(border_style(snapshot.focus == Focus::Members)),
+            ),
+        tabs_area,
+    );
+
     let members = snapshot
         .candidate_rows
         .iter()
@@ -202,16 +253,51 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
                 ),
                 CandidateTone::Missing => (Style::default().fg(Color::DarkGray), ""),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    truncate_for_width(&row.name, members_area.width.saturating_sub(16) as usize),
-                    style,
-                ),
-                Span::raw("  "),
-                Span::styled(row.marker.clone(), marker_style),
-                Span::raw(loading_suffix),
-                Span::raw(if row.is_current { "  *" } else { "" }),
-            ]))
+            let current_suffix = if row.is_current { "  *" } else { "" };
+            let available = candidate_area.width.saturating_sub(4) as usize;
+            let suffix_width = unicode_width::UnicodeWidthStr::width(row.reachability.as_str())
+                + unicode_width::UnicodeWidthStr::width(loading_suffix)
+                + unicode_width::UnicodeWidthStr::width(current_suffix)
+                + 2;
+            let name_width = unicode_width::UnicodeWidthStr::width(row.name.as_str());
+            let marker = if !row.marker.is_empty()
+                && name_width
+                    + suffix_width
+                    + 2
+                    + unicode_width::UnicodeWidthStr::width(row.marker.as_str())
+                    <= available
+            {
+                row.marker.as_str()
+            } else if !row.compact_marker.is_empty()
+                && name_width
+                    + suffix_width
+                    + 2
+                    + unicode_width::UnicodeWidthStr::width(row.compact_marker.as_str())
+                    <= available
+            {
+                row.compact_marker.as_str()
+            } else {
+                ""
+            };
+            let marker_width = if marker.is_empty() {
+                0
+            } else {
+                unicode_width::UnicodeWidthStr::width(marker) + 2
+            };
+            let visible_name = truncate_for_width(
+                &row.name,
+                available.saturating_sub(suffix_width + marker_width),
+            );
+            let mut spans = vec![Span::styled(visible_name, style)];
+            if !marker.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(marker.to_string(), marker_style));
+            }
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(row.reachability.clone(), marker_style));
+            spans.push(Span::raw(loading_suffix));
+            spans.push(Span::raw(current_suffix));
+            ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
 
@@ -225,7 +311,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         .highlight_style(selected_style(snapshot.focus == Focus::Members))
         .highlight_symbol("> ");
     let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
-    frame.render_stateful_widget(members_widget, members_area, &mut members_state);
+    frame.render_stateful_widget(members_widget, candidate_area, &mut members_state);
 
     if let Some(detail) = snapshot.intranet_detail.as_ref() {
         let profile = detail.profile;
