@@ -2,9 +2,17 @@
 
 ## Current user intent
 
-Build a generic node usability probing facility for user-authored usability probe programs. The user program owns all application-specific probing, pass/fail decisions, and result aggregation. The lower-level facility must not ask for, receive, persist, or aggregate `true`/`false` probe results.
+Build a generic node usability probing facility for user-authored usability probe programs. The user program owns all application-specific probing and pass/fail decisions. The lower-level runtime facility must not ask for, receive, persist, or aggregate `true`/`false` probe results.
+
+ADR-0001 later extends the surrounding TUI architecture: a probe program may publish its application-specific results to the TUI for a derived node-view panel. That does not put result interpretation or persistence into the node runtime manager described here.
 
 No production implementation has been authorized yet. The architecture below was confirmed through a completed grilling session. Do not begin implementation until the user explicitly asks.
+
+## Lightweight URL probing stays outside this manager
+
+The TUI does not create a node runtime when a criterion only supplies an HTTP or HTTPS URL and defines usability as receiving any valid HTTP response. It calls the existing sing-box instance's Clash `/proxies/{node}/delay` endpoint for the named outbound. That internal request does not change the live selector and is sufficient for three-attempt generic reachability and URL-only usability panels.
+
+Create a node runtime only when the caller needs a fixed candidate-bound HTTP/SOCKS proxy for response-body validation, bounded transfer measurement, or an arbitrary application request. The manager retains its own Delay Endpoint prefilter because it is also a standalone facility used by programs that may run without the TUI or its recent reachability facts.
 
 ## Final terminology and control relationship
 
@@ -151,7 +159,7 @@ The following earlier ideas are explicitly obsolete:
 - launching one external process per node;
 - the manager launching a long-running plugin;
 - sending `true`/`false` or classifications back to the manager;
-- manager-owned result persistence or `usable_nodes` aggregation;
+- manager-owned result persistence or `usable_nodes` aggregation (TUI-owned view persistence is allowed by ADR-0001);
 - requiring callers to select selector names;
 - a globally shared node queue across runtimes.
 
@@ -162,7 +170,7 @@ The following earlier ideas are explicitly obsolete:
 - Feasibility study: `D:\proj\sing-box-tui\docs\gemini-node-probe-feasibility.md`.
 - Throwaway prototype: `D:\proj\sing-box-tui\scripts\gemini-node-probe-prototype.py`; experimental only.
 - Existing latency reference: `src\controller.rs`, especially `BenchmarkRequest`, `spawn_benchmark_task`, and `measure_delay`.
-- Existing benchmark persistence in `src\benchmark_workflow.rs` and `src\storage.rs` is out of scope and must not become a dependency.
+- Existing benchmark persistence in `src\benchmark_workflow.rs` and `src\storage.rs` is not a dependency of the node runtime manager. TUI-owned quality and usability-view persistence is specified separately by ADR-0001.
 
 ## Next action
 
