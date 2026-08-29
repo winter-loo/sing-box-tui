@@ -6,6 +6,7 @@ fn background_latency_snapshot_updates_visible_benchmark_results() {
     let mut app = test_app();
 
     app.apply_background_latency_snapshot(Some(&BackgroundLatencySnapshot {
+        quality_generation: 0,
         selector: "select".to_string(),
         current: Some("node-a".to_string()),
         pattern: "美国".to_string(),
@@ -45,6 +46,7 @@ fn background_latency_snapshot_ignores_stale_filter_results() {
     app.benchmark_filter = "new".to_string();
 
     app.apply_background_latency_snapshot(Some(&BackgroundLatencySnapshot {
+        quality_generation: 0,
         selector: "select".to_string(),
         current: Some("node-a".to_string()),
         pattern: "old".to_string(),

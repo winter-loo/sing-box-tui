@@ -91,6 +91,15 @@ impl App {
         if let Some(value) = state.benchmark_url.filter(|value| !value.trim().is_empty()) {
             self.benchmark_url = value;
         }
+        if let Some(value) = state
+            .sustained_target_url
+            .filter(|value| !value.trim().is_empty())
+        {
+            crate::sustained_quality::validate_sustained_target(&value)?;
+            self.sustained_target_url = value;
+        }
+        self.benchmark_workflow
+            .activate_sustained_target(&self.sustained_target_url)?;
         if let Some(value) = state.benchmark_timeout_ms.filter(|value| *value > 0) {
             self.benchmark_timeout_ms = value;
         }
@@ -163,6 +172,7 @@ impl App {
             bypass_entries: self.bypass_entries.clone(),
             onboarding_complete: self.onboarding_complete,
             benchmark_url: Some(self.benchmark_url.clone()),
+            sustained_target_url: Some(self.sustained_target_url.clone()),
             benchmark_timeout_ms: Some(self.benchmark_timeout_ms),
             benchmark_request_timeout: Some(self.benchmark_request_timeout),
             benchmark_max_concurrency: Some(self.benchmark_max_concurrency),

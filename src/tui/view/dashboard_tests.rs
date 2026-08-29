@@ -17,10 +17,23 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         intranet_rows: Vec::new(),
         intranet_selected: 0,
         candidate_title: "Candidates [SELECTOR ORDER]".to_string(),
+        node_view_tabs: vec![
+            NodeViewTab {
+                label: "Current selector",
+                count: 1,
+            },
+            NodeViewTab {
+                label: "Streaming",
+                count: 1,
+            },
+        ],
+        active_node_view_tab: 0,
         candidate_rows: vec![CandidateRow {
             name: "node-a".to_string(),
             is_current: true,
-            marker: "3/3 stable reachable".to_string(),
+            reachability: "3/3".to_string(),
+            marker: "stable reachable".to_string(),
+            compact_marker: String::new(),
             tone: CandidateTone::Success,
         }],
         candidate_selected: Some(0),
@@ -46,7 +59,11 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
 }
 
 fn rendered_lines(snapshot: &DashboardSnapshot<'_>) -> Vec<String> {
-    let backend = TestBackend::new(110, 30);
+    rendered_lines_at(snapshot, 110, 30)
+}
+
+fn rendered_lines_at(snapshot: &DashboardSnapshot<'_>, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
         .draw(|frame| render(frame, snapshot))
@@ -55,9 +72,55 @@ fn rendered_lines(snapshot: &DashboardSnapshot<'_>) -> Vec<String> {
         .backend()
         .buffer()
         .content
-        .chunks(110)
+        .chunks(width as usize)
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect()
+}
+
+#[test]
+fn node_view_tabs_and_candidates_remain_usable_at_normal_and_narrow_widths() {
+    let snapshot = dashboard_snapshot();
+    let normal = rendered_lines_at(&snapshot, 110, 30).join("\n");
+    assert!(normal.contains("Current selector 1"));
+    assert!(normal.contains("Streaming 1"));
+    assert!(normal.contains("node-a"));
+    assert!(normal.contains("3/3"));
+
+    let narrow = rendered_lines_at(&snapshot, 64, 24).join("\n");
+    assert!(narrow.contains("Current selector"));
+    assert!(narrow.contains("Streaming"));
+    assert!(narrow.contains("node-a"));
+    assert!(narrow.contains("3/3"));
+    assert!(!narrow.contains("Node details"));
+}
+
+#[test]
+fn streaming_rows_adapt_without_losing_node_identity_or_reachability() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.active_node_view_tab = 1;
+    snapshot.candidate_rows[0].is_current = false;
+    snapshot.candidate_rows[0].marker = "1.0 MiB/s · 2/2 sustained · p95 80ms · cold 40ms".into();
+    snapshot.candidate_rows[0].compact_marker = "1.0M/s".into();
+
+    let wide = rendered_lines_at(&snapshot, 130, 30).join("\n");
+    assert!(wide.contains("1.0 MiB/s"));
+    assert!(wide.contains("2/2 sustained"));
+    assert!(wide.contains("p95 80ms"));
+    assert!(wide.contains("cold 40ms"));
+    assert!(wide.contains("3/3"));
+
+    snapshot.candidate_rows[0].name = "这是一个很长的中文流媒体节点名称".into();
+    for width in [64, 52] {
+        let narrow = rendered_lines_at(&snapshot, width, 24).join("\n");
+        assert!(
+            narrow.contains('这'),
+            "node identity missing at width {width}"
+        );
+        assert!(
+            narrow.contains("3/3"),
+            "reachability missing at width {width}"
+        );
+    }
 }
 
 #[test]
@@ -68,7 +131,8 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(text.contains("Internet Proxy"));
     assert!(text.contains("select"));
     assert!(text.contains("node-a"));
-    assert!(text.contains("3/3 stable reachable"));
+    assert!(text.contains("stable reachable"));
+    assert!(text.contains("3/3"));
     assert!(text.contains("System Proxy: disabled"));
     assert!(text.contains("Tun Mode: enabled"));
     assert!(!text.contains("Intranet Proxy"));
@@ -127,6 +191,17 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
             ],
             assessment: Some(crate::controller::ReachabilityAssessment::Reachable),
         }),
+        sustained_quality: Some(crate::sustained_quality::NodeSustainedQuality {
+            name: "node-a".into(),
+            outcome: crate::sustained_quality::SustainedProbeOutcome::Completed(
+                crate::sustained_quality::SustainedCompletion {
+                    first_byte_ms: 120,
+                    completion_ms: 620,
+                    bytes_read: 512 * 1024,
+                    throughput_bytes_per_second: 1024 * 1024,
+                },
+            ),
+        }),
     };
     snapshot.latency_chart = Some(&chart);
 
@@ -135,6 +210,7 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
     assert!(text.contains("Attempt 1: reachable (42ms)"));
     assert!(text.contains("Attempt 2: timeout"));
     assert!(text.contains("Attempt 3: reachable (51ms)"));
+    assert!(text.contains("Sustained: 1.0 MiB/s, 524288 bytes"));
 }
 
 #[test]

@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use super::App;
 use super::view::{
-    IntranetDetailSection, IntranetDetailView, LeftPaneSection, private_access_detail_view,
+    IntranetDetailSection, IntranetDetailView, LeftPaneSection, NodeViewPanel,
+    private_access_detail_view,
 };
 use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};
 use crate::defaults::DEFAULT_SELECTOR_TAG;
@@ -25,10 +26,7 @@ impl App {
         let mut chain = vec![current.name.clone()];
         let mut visited = BTreeSet::new();
         visited.insert(current.name.clone());
-        loop {
-            let Some(selected) = current.current.as_deref() else {
-                break;
-            };
+        while let Some(selected) = current.current.as_deref() {
             chain.push(selected.to_string());
             let Some(next) = self.group_by_name(selected) else {
                 break;
@@ -229,6 +227,11 @@ impl App {
             return Vec::new();
         };
         let group = self.selected_member_panel_group().unwrap_or(group);
+        if self.node_view_panel == NodeViewPanel::Streaming {
+            return self
+                .benchmark_workflow
+                .streaming_members(&group.name, &group.members);
+        }
         let Some(summary) = self.selected_benchmark() else {
             return group.members.clone();
         };
@@ -257,6 +260,34 @@ impl App {
             .collect::<Vec<_>>();
         out.extend(pending_or_untested.into_iter().map(|(_, member)| member));
         out
+    }
+
+    pub(super) fn node_view_counts(&self) -> (usize, usize) {
+        let Some(group) = self.selected_member_panel_group() else {
+            return (0, 0);
+        };
+        (
+            group.members.len(),
+            self.benchmark_workflow
+                .streaming_members(&group.name, &group.members)
+                .len(),
+        )
+    }
+
+    pub(super) fn move_node_view_next(&mut self) {
+        self.node_view_panel = match self.node_view_panel {
+            NodeViewPanel::CurrentSelector => NodeViewPanel::Streaming,
+            NodeViewPanel::Streaming => NodeViewPanel::CurrentSelector,
+        };
+        self.sync_selection_to_displayed_members();
+        self.set_status_only(match self.node_view_panel {
+            NodeViewPanel::CurrentSelector => "Node view: current selector".to_string(),
+            NodeViewPanel::Streaming => "Node view: Streaming".to_string(),
+        });
+    }
+
+    pub(super) fn move_node_view_previous(&mut self) {
+        self.move_node_view_next();
     }
 
     pub(super) fn displayed_member_index(&self) -> Option<usize> {

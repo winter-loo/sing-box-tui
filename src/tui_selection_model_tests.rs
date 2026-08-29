@@ -1,5 +1,10 @@
 use super::super::test_support::{internet_routes_app, test_app};
-use crate::controller::{BenchmarkResult, BenchmarkSummary, ProxyGroup};
+use crate::benchmark_workflow::BenchmarkUpdate;
+use crate::controller::{
+    BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
+};
+use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
+use crossterm::event::KeyCode;
 
 #[test]
 fn default_panel_keeps_every_selector_member_when_probe_filter_changes() {
@@ -142,4 +147,141 @@ fn implicit_root_benchmark_summary_is_scoped_to_selected_choice() {
             .and_then(|summary| summary.find_result("bby-1"))
             .is_some()
     );
+}
+
+#[test]
+fn streaming_panel_filters_ranks_and_preserves_selector_members() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = vec!["node-a".into(), "node-b".into(), "node-c".into()];
+    for (node, throughput) in [("node-a", 1_000), ("node-b", 2_000)] {
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                node.into(),
+                vec![
+                    ProbeOutcome::Reachable { delay_ms: 40 },
+                    ProbeOutcome::Reachable { delay_ms: 45 },
+                    ProbeOutcome::Reachable { delay_ms: 50 },
+                ],
+            ),
+        );
+        app.benchmark_workflow.set_sustained_quality(
+            "select",
+            NodeSustainedQuality {
+                name: node.into(),
+                outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                    first_byte_ms: 100,
+                    completion_ms: 600,
+                    bytes_read: 512 * 1024,
+                    throughput_bytes_per_second: throughput,
+                }),
+            },
+        );
+    }
+
+    assert_eq!(app.node_view_counts(), (3, 2));
+    assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
+    app.move_node_view_next();
+    assert_eq!(app.displayed_members(), ["node-b", "node-a"]);
+    app.move_node_view_previous();
+    assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
+}
+
+#[test]
+fn arrow_keys_switch_tabs_only_while_candidate_pane_is_focused() {
+    let mut app = test_app();
+    assert_eq!(
+        app.node_view_panel,
+        super::super::NodeViewPanel::CurrentSelector
+    );
+
+    app.handle_key(KeyCode::Right).unwrap();
+    assert_eq!(app.node_view_panel, super::super::NodeViewPanel::Streaming);
+    app.handle_key(KeyCode::Left).unwrap();
+    assert_eq!(
+        app.node_view_panel,
+        super::super::NodeViewPanel::CurrentSelector
+    );
+
+    app.handle_key(KeyCode::Char('h')).unwrap();
+    assert_eq!(app.focus, super::super::Focus::Groups);
+    app.handle_key(KeyCode::Right).unwrap();
+    assert_eq!(app.focus, super::super::Focus::Members);
+    assert_eq!(
+        app.node_view_panel,
+        super::super::NodeViewPanel::CurrentSelector
+    );
+}
+
+#[test]
+fn empty_streaming_panel_makes_member_actions_safe_no_ops() {
+    let mut app = test_app();
+    app.move_node_view_next();
+    assert!(app.displayed_members().is_empty());
+    assert!(app.selected_member_name().is_none());
+
+    for key in [
+        KeyCode::Char(' '),
+        KeyCode::Char('t'),
+        KeyCode::Char('i'),
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+    ] {
+        assert!(app.handle_key(key).is_ok(), "{key:?} must not exit the TUI");
+        assert!(app.selected_member_name().is_none());
+    }
+}
+
+#[test]
+fn projection_update_resynchronizes_a_streaming_selection_that_disappears() {
+    let mut app = test_app();
+    app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+    for node in ["node-a", "node-b"] {
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                node.into(),
+                vec![
+                    ProbeOutcome::Reachable { delay_ms: 40 },
+                    ProbeOutcome::Reachable { delay_ms: 45 },
+                    ProbeOutcome::Reachable { delay_ms: 50 },
+                ],
+            ),
+        );
+        app.benchmark_workflow.set_sustained_quality(
+            "select",
+            NodeSustainedQuality {
+                name: node.into(),
+                outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                    first_byte_ms: 100,
+                    completion_ms: 600,
+                    bytes_read: 512 * 1024,
+                    throughput_bytes_per_second: 1_000,
+                }),
+            },
+        );
+    }
+    app.move_node_view_next();
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+
+    let failed = NodeSustainedQuality {
+        name: "node-a".into(),
+        outcome: SustainedProbeOutcome::TransferFailed {
+            detail: "short body".into(),
+        },
+    };
+    app.benchmark_workflow
+        .set_sustained_quality("select", failed.clone());
+    app.apply_benchmark_update(BenchmarkUpdate::SustainedProgress {
+        group: "select".into(),
+        result: failed,
+    })
+    .unwrap();
+
+    assert_eq!(app.displayed_members(), ["node-b"]);
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-b"));
+    app.handle_key(KeyCode::Char('j')).unwrap();
+    app.handle_key(KeyCode::Char('k')).unwrap();
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-b"));
 }

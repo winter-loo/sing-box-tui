@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::view::{Focus, LeftPaneSection};
+use super::view::{Focus, LeftPaneSection, NodeViewPanel};
 use super::{App, DIRECT_CLASH_MODE, GLOBAL_CLASH_MODE, REFRESH_DEBOUNCE, RULE_CLASH_MODE};
 
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
@@ -64,9 +64,12 @@ impl App {
                 if members.is_empty() {
                     return;
                 }
-                let current_index = self.displayed_member_index().unwrap_or(0);
-                if current_index + 1 < members.len() {
-                    self.sync_selection_to_member_name(&members[current_index + 1]);
+                match self.displayed_member_index() {
+                    Some(current_index) if current_index + 1 < members.len() => {
+                        self.sync_selection_to_member_name(&members[current_index + 1]);
+                    }
+                    None => self.sync_selection_to_member_name(&members[0]),
+                    _ => {}
                 }
             }
         }
@@ -111,9 +114,12 @@ impl App {
                 if members.is_empty() {
                     return;
                 }
-                let current_index = self.displayed_member_index().unwrap_or(0);
-                if current_index > 0 {
-                    self.sync_selection_to_member_name(&members[current_index - 1]);
+                match self.displayed_member_index() {
+                    Some(current_index) if current_index > 0 => {
+                        self.sync_selection_to_member_name(&members[current_index - 1]);
+                    }
+                    None => self.sync_selection_to_member_name(&members[0]),
+                    _ => {}
                 }
             }
         }
@@ -200,9 +206,18 @@ impl App {
             self.activate_root_choice()?;
             return Ok(());
         }
-        let Some(member) = group.members.get(self.member_index).cloned() else {
-            bail!("no proxy available in selected group");
+        let Some(member) = self.selected_member_name() else {
+            self.set_status_only("No node is available in the active node view");
+            return Ok(());
         };
+        let _quality_lease = if self.node_view_panel == NodeViewPanel::Streaming {
+            Some(self.benchmark_workflow.acquire_quality_read_lease()?)
+        } else {
+            None
+        };
+        let _quality_generation = _quality_lease
+            .as_ref()
+            .map(crate::storage::NodeQualityReadLease::generation);
         let parent_switch = if self.implicit_root_mode() {
             self.selected_root_choice_name().and_then(|choice| {
                 self.implicit_root_group()

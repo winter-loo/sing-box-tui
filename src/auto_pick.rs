@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::benchmark_workflow::{QUALITY_RUNTIME_RECEIPT_ENV, QualityRuntimeReceipt};
 use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};
 use crate::process_command::{command_program_name_matches, command_tokens};
 use crate::process_inspection::process_is_alive as process_exists;
@@ -90,6 +91,9 @@ pub(crate) struct BackgroundStatusSnapshot {
     pub(crate) pid: u32,
     pub(crate) controller: String,
     pub(crate) config_path: PathBuf,
+    pub(crate) quality_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) managed_pid: Option<u32>,
     pub(crate) max_concurrency: usize,
     pub(crate) started_at_unix: u64,
     pub(crate) status_generation: u64,
@@ -104,6 +108,7 @@ pub(crate) struct BackgroundStatusSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct BackgroundLatencySnapshot {
+    pub(crate) quality_generation: u64,
     pub(crate) selector: String,
     pub(crate) current: Option<String>,
     pub(crate) pattern: String,
@@ -254,6 +259,7 @@ pub(crate) struct BackgroundLaunchSpec {
     controller: String,
     config_path: PathBuf,
     max_concurrency: usize,
+    runtime_receipt: QualityRuntimeReceipt,
 }
 
 impl BackgroundLaunchSpec {
@@ -261,12 +267,21 @@ impl BackgroundLaunchSpec {
         controller: impl Into<String>,
         config_path: PathBuf,
         max_concurrency: usize,
+        runtime_receipt: QualityRuntimeReceipt,
     ) -> Self {
         Self {
             controller: controller.into(),
             config_path,
             max_concurrency,
+            runtime_receipt,
         }
+    }
+
+    fn matches_snapshot(&self, snapshot: &BackgroundStatusSnapshot) -> bool {
+        snapshot.controller.trim_end_matches('/') == self.controller.trim_end_matches('/')
+            && snapshot.config_path == self.config_path
+            && snapshot.quality_generation == self.runtime_receipt.quality_generation()
+            && snapshot.managed_pid == self.runtime_receipt.managed_pid()
     }
 }
 
@@ -371,20 +386,29 @@ impl BackgroundAutoPickManager {
         config: &AutoPickConfig,
         launch: &BackgroundLaunchSpec,
     ) -> Result<BackgroundWorkerEnsure> {
-        if let Some(runtime) = self.runtime.as_ref() {
+        if let Some(target) = self.runtime.as_ref().map(|runtime| BackgroundStatusTarget {
+            pid: runtime.pid,
+            bind_addr: runtime.bind_addr.clone(),
+            token: runtime.token.clone(),
+        }) {
             match send_background_control_request(
-                &runtime.bind_addr,
-                &runtime.token,
+                &target.bind_addr,
+                &target.token,
                 BackgroundWorkerCommand::ApplyConfig {
                     config: config.clone(),
                 },
             ) {
-                Ok(_) => return Ok(BackgroundWorkerEnsure::AlreadyRunning(runtime.pid)),
-                Err(error) if process_exists(runtime.pid) => {
+                Ok(snapshot) if launch.matches_snapshot(&snapshot) => {
+                    return Ok(BackgroundWorkerEnsure::AlreadyRunning(target.pid));
+                }
+                Ok(_) => {
+                    return self.restart_stale_target(&target, config, launch);
+                }
+                Err(error) if process_exists(target.pid) => {
                     return Err(error).with_context(|| {
                         format!(
                             "background auto-pick worker {} is alive but its control channel is unavailable",
-                            runtime.pid
+                            target.pid
                         )
                     });
                 }
@@ -401,7 +425,7 @@ impl BackgroundAutoPickManager {
                     config: config.clone(),
                 },
             ) {
-                Ok(_) => {
+                Ok(snapshot) if launch.matches_snapshot(&snapshot) => {
                     self.runtime = Some(BackgroundWorkerRuntime {
                         pid: state.pid,
                         bind_addr: state.bind_addr,
@@ -409,6 +433,14 @@ impl BackgroundAutoPickManager {
                         child: None,
                     });
                     return Ok(BackgroundWorkerEnsure::AlreadyRunning(state.pid));
+                }
+                Ok(_) => {
+                    let target = BackgroundStatusTarget {
+                        pid: state.pid,
+                        bind_addr: state.bind_addr,
+                        token: state.token,
+                    };
+                    return self.restart_stale_target(&target, config, launch);
                 }
                 Err(error) if process_exists(state.pid) => {
                     return Err(error).with_context(|| {
@@ -448,6 +480,11 @@ impl BackgroundAutoPickManager {
                 if self.current_target()?.as_ref() == Some(&target) {
                     let event = match resolve_background_status_poll(outcome) {
                         BackgroundStatusPollResolution::Snapshot(snapshot) => {
+                            if !launch.matches_snapshot(&snapshot) {
+                                return Ok(Some(BackgroundPollEvent::Restarted(
+                                    self.restart_stale_target(&target, config, launch)?,
+                                )));
+                            }
                             if self.runtime.is_none() {
                                 self.runtime = Some(BackgroundWorkerRuntime {
                                     pid: target.pid,
@@ -526,6 +563,34 @@ impl BackgroundAutoPickManager {
         Ok(())
     }
 
+    fn restart_stale_target(
+        &mut self,
+        target: &BackgroundStatusTarget,
+        config: &AutoPickConfig,
+        launch: &BackgroundLaunchSpec,
+    ) -> Result<BackgroundWorkerEnsure> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            if runtime.pid != target.pid
+                || runtime.bind_addr != target.bind_addr
+                || runtime.token != target.token
+            {
+                bail!("refusing to replace a background worker other than the polled target");
+            }
+        } else {
+            self.runtime = Some(BackgroundWorkerRuntime {
+                pid: target.pid,
+                bind_addr: target.bind_addr.clone(),
+                token: target.token.clone(),
+                child: None,
+            });
+        }
+        // A changed managed PID invalidates the child process's runtime proof permanently. Stop
+        // the authenticated old target before spawning so retries cannot leave two selectors.
+        self.stop()?;
+        self.spawn(config, launch)
+            .map(BackgroundWorkerEnsure::Started)
+    }
+
     fn current_target(&self) -> Result<Option<BackgroundStatusTarget>> {
         if let Some(runtime) = self.runtime.as_ref() {
             return Ok(Some(BackgroundStatusTarget {
@@ -562,6 +627,7 @@ impl BackgroundAutoPickManager {
 
     fn spawn(&mut self, config: &AutoPickConfig, launch: &BackgroundLaunchSpec) -> Result<u32> {
         let executable = env::current_exe().context("failed to locate current executable")?;
+        let encoded_receipt = launch.runtime_receipt.encode_for_child()?;
         let log_path = background_task_log_path();
         if let Some(parent) = log_path.parent()
             && !parent.as_os_str().is_empty()
@@ -595,6 +661,7 @@ impl BackgroundAutoPickManager {
             .arg(&launch.config_path)
             .arg("--no-subscription-refresh")
             .env("SING_BOX_TUI_BACKGROUND_TOKEN", random_background_token())
+            .env(QUALITY_RUNTIME_RECEIPT_ENV, encoded_receipt)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -627,6 +694,9 @@ impl BackgroundAutoPickManager {
             token: state.token,
             child: Some(child),
         });
+        // Status generations are local to one worker process; carrying the old counter across a
+        // receipt-driven restart could suppress every early status from the replacement.
+        self.last_status_generation = 0;
         Ok(pid)
     }
 }
@@ -1177,6 +1247,8 @@ mod tests {
             pid: 42,
             controller: "http://127.0.0.1:9992".to_string(),
             config_path: PathBuf::from("config.json"),
+            quality_generation: 0,
+            managed_pid: None,
             max_concurrency: 4,
             started_at_unix: 1,
             status_generation: 7,
@@ -1285,6 +1357,31 @@ mod tests {
             BackgroundStatusPollResolution::Reconnect(error)
                 if error == "worker exited"
         ));
+    }
+
+    #[test]
+    fn changed_managed_pid_requires_background_worker_replacement() {
+        let receipt = QualityRuntimeReceipt::decode_from_child(
+            r#"{"canonical_config_path":"config.json","canonical_database_path":"quality.sqlite3","controller_base_url":"http://127.0.0.1:9992","quality_generation":7,"managed_pid":100}"#,
+        )
+        .expect("test receipt decodes");
+        let launch = BackgroundLaunchSpec::new(
+            "http://127.0.0.1:9992",
+            PathBuf::from("config.json"),
+            4,
+            receipt,
+        );
+        let mut snapshot = status_snapshot();
+        snapshot.config_path = PathBuf::from("config.json");
+        snapshot.quality_generation = 7;
+        snapshot.managed_pid = Some(100);
+        assert!(launch.matches_snapshot(&snapshot));
+
+        snapshot.managed_pid = Some(101);
+        assert!(
+            !launch.matches_snapshot(&snapshot),
+            "a new managed sing-box process must enter the stop-and-spawn path"
+        );
     }
 
     #[test]

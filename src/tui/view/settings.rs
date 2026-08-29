@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsField {
     BenchmarkUrl,
+    SustainedTargetUrl,
     BenchmarkTimeoutMs,
     RequestTimeoutSec,
     MaxConcurrency,
@@ -29,6 +30,7 @@ pub(crate) enum SettingsField {
 
 pub(crate) const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::BenchmarkUrl,
+    SettingsField::SustainedTargetUrl,
     SettingsField::BenchmarkTimeoutMs,
     SettingsField::RequestTimeoutSec,
     SettingsField::MaxConcurrency,
@@ -140,6 +142,7 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
 pub(crate) fn settings_field_label(field: SettingsField) -> &'static str {
     match field {
         SettingsField::BenchmarkUrl => "Latency URL",
+        SettingsField::SustainedTargetUrl => "Sustained HTTPS target",
         SettingsField::BenchmarkTimeoutMs => "Latency timeout ms",
         SettingsField::RequestTimeoutSec => "Request timeout sec",
         SettingsField::MaxConcurrency => "Max concurrency",

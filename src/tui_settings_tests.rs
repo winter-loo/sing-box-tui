@@ -7,7 +7,12 @@ use super::{
 };
 use crate::private_access::PrivateAccessState;
 use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRuntime};
+use crate::storage::BenchmarkStore;
+use crate::sustained_quality::{
+    NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome, sustained_target_identity,
+};
 use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState};
+use crate::{controller::NodeReachabilityAssessment, controller::ProbeOutcome};
 
 #[test]
 fn china_ip_routing_settings_field_reflects_enabled_state() {
@@ -140,4 +145,102 @@ fn sonicwall_internet_proxy_setting_is_profile_scoped() {
     .expect("proxy choice saves");
     assert!(app.private_access.focused().use_internet_proxy);
     assert!(app.runtime_state().private_access_profiles[1].use_internet_proxy);
+}
+
+#[test]
+fn sustained_target_setting_requires_account_free_https() {
+    let mut app = test_app();
+    assert!(
+        app.apply_settings_value(
+            SettingsField::SustainedTargetUrl,
+            "http://example.test/payload".to_string(),
+        )
+        .is_err()
+    );
+    assert!(
+        app.apply_settings_value(
+            SettingsField::SustainedTargetUrl,
+            "https://example.test/payload?token=secret".to_string(),
+        )
+        .is_err()
+    );
+
+    app.apply_settings_value(
+        SettingsField::SustainedTargetUrl,
+        "https://example.test/payload?bytes=524288".to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        app.runtime_state().sustained_target_url.as_deref(),
+        Some("https://example.test/payload?bytes=524288")
+    );
+}
+
+#[test]
+fn changing_sustained_target_resynchronizes_streaming_selection() {
+    let mut app = test_app();
+    let target_a = "https://a.example.test/payload?bytes=524288";
+    let target_b = "https://b.example.test/payload?bytes=524288";
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("sing-box-tui-target-selection-{nanos}.sqlite3"));
+    let store = BenchmarkStore::open(&path).unwrap();
+    store
+        .reconcile_node_history(&serde_json::json!({
+            "outbounds": [
+                {"type":"direct", "tag":"node-a"},
+                {"type":"direct", "tag":"node-b"}
+            ]
+        }))
+        .unwrap();
+    for (target, node, completion_ms) in [(target_a, "node-a", 600), (target_b, "node-b", 400)] {
+        store
+            .record_sustained_quality(
+                "select",
+                &sustained_target_identity(target).unwrap(),
+                &NodeSustainedQuality {
+                    name: node.into(),
+                    outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                        first_byte_ms: 100,
+                        completion_ms,
+                        bytes_read: 512 * 1024,
+                        throughput_bytes_per_second: 1,
+                    }),
+                },
+            )
+            .unwrap();
+    }
+    app.benchmark_workflow.replace_store(Some(store));
+    app.benchmark_workflow
+        .activate_sustained_target(target_a)
+        .unwrap();
+    app.sustained_target_url = target_a.into();
+    app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+    for node in ["node-a", "node-b"] {
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                node.into(),
+                vec![
+                    ProbeOutcome::Reachable { delay_ms: 20 },
+                    ProbeOutcome::Reachable { delay_ms: 30 },
+                    ProbeOutcome::Reachable { delay_ms: 40 },
+                ],
+            ),
+        );
+    }
+    app.move_node_view_next();
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+
+    app.apply_settings_value(SettingsField::SustainedTargetUrl, target_b.into())
+        .unwrap();
+
+    assert_eq!(app.displayed_members(), ["node-b"]);
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-b"));
+    drop(app);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }

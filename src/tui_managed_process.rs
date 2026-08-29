@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::benchmark_workflow::BenchmarkWorkflow;
+use crate::benchmark_workflow::{BenchmarkWorkflow, ManagedRuntimeObservation};
 use crate::controller::ApiClient;
 use crate::managed_sing_box::{LifecycleReport, ManagedSingBox};
 
@@ -15,13 +15,30 @@ pub(super) fn restart_managed_sing_box_with_quality_confirmation(
     config_path: &Path,
     database_path: &Path,
 ) -> Result<LifecycleReport> {
-    benchmark_workflow.confirm_managed_runtime_reload(config_path, database_path, || {
-        let receipt = sing_box.restart()?;
-        // Every feature-triggered restart must prove controller readiness while the config and
-        // quality generation remain locked; process creation alone cannot release the fence.
-        receipt.observe_controller(client)?;
-        Ok(receipt.into_report())
-    })
+    let report =
+        benchmark_workflow.confirm_managed_runtime_reload(config_path, database_path, || {
+            let receipt = sing_box.restart()?;
+            // Every feature-triggered restart must prove controller readiness while the config and
+            // quality generation remain locked; process creation alone cannot release the fence.
+            receipt.observe_controller(client)?;
+            let report = receipt.into_report();
+            let pid = report.started_pid();
+            Ok(ManagedRuntimeObservation::new(
+                report,
+                config_path,
+                &client.base_url,
+                Some(pid),
+            ))
+        })?;
+    let runtime_receipt = benchmark_workflow
+        .runtime_receipt()
+        .cloned()
+        .context("managed restart did not produce a runtime receipt")?;
+    if let Err(error) = sing_box.register_confirmed_active_environment(&runtime_receipt) {
+        benchmark_workflow.pause_quality_persistence();
+        return Err(error).context("failed to publish confirmed active runtime environment");
+    }
+    Ok(report)
 }
 
 impl App {
@@ -75,8 +92,29 @@ impl App {
         let report = self.benchmark_workflow.confirm_managed_runtime_reload(
             config_path,
             database_path,
-            || sing_box.start(client),
+            || {
+                let report = sing_box.start(client)?;
+                let pid = report.started_pid();
+                Ok(ManagedRuntimeObservation::new(
+                    report,
+                    config_path,
+                    &client.base_url,
+                    Some(pid),
+                ))
+            },
         )?;
+        let runtime_receipt = self
+            .benchmark_workflow
+            .runtime_receipt()
+            .cloned()
+            .context("managed startup did not produce a runtime receipt")?;
+        if let Err(error) = self
+            .sing_box
+            .register_confirmed_active_environment(&runtime_receipt)
+        {
+            self.benchmark_workflow.pause_quality_persistence();
+            return Err(error).context("failed to publish confirmed active runtime environment");
+        }
         if report.replaced_existing() {
             self.status = format!("Restarted managed sing-box {}", report.transition());
         } else {

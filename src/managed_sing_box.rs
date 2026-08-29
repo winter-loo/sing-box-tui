@@ -1341,6 +1341,10 @@ impl LifecycleReport {
         !self.restarted_pids.is_empty()
     }
 
+    pub(crate) fn started_pid(&self) -> u32 {
+        self.started_pid
+    }
+
     pub(crate) fn started_process(&self) -> StartedProcessDisplay<'_> {
         StartedProcessDisplay(self)
     }
@@ -1376,6 +1380,7 @@ pub(crate) struct RestartReceipt {
 }
 
 impl RestartReceipt {
+    #[cfg(test)]
     pub(crate) fn report(&self) -> &LifecycleReport {
         &self.report
     }
@@ -1406,15 +1411,11 @@ impl ManagedSingBox {
     }
 
     pub(crate) fn start(&mut self, probe: &dyn ControllerProbe) -> Result<LifecycleReport> {
-        let report = self.core.start(probe)?;
-        self.register_active_environment(&report)?;
-        Ok(report)
+        self.core.start(probe)
     }
 
     pub(crate) fn restart(&mut self) -> Result<RestartReceipt> {
-        let receipt = self.core.restart()?;
-        self.register_active_environment(receipt.report())?;
-        Ok(receipt)
+        self.core.restart()
     }
 
     pub(crate) fn startup_authorization_requirement(&self) -> Result<AuthorizationRequirement> {
@@ -1450,14 +1451,30 @@ impl ManagedSingBox {
         self.core.diagnostics()
     }
 
-    fn register_active_environment(&self, report: &LifecycleReport) -> Result<()> {
+    pub(crate) fn register_confirmed_active_environment(
+        &self,
+        receipt: &crate::benchmark_workflow::QualityRuntimeReceipt,
+    ) -> Result<()> {
+        if !confirmed_config_target_matches(
+            receipt.canonical_config_path(),
+            &self.core.config_path,
+        )? {
+            anyhow::bail!("runtime receipt config does not match managed sing-box config");
+        }
+        let sing_box_pid = receipt
+            .managed_pid()
+            .context("managed runtime receipt does not include a process id")?;
         crate::node_runtime_manager::unregister_owned_active_environments()?;
         crate::node_runtime_manager::register_active_environment(
-            report.started_pid,
+            sing_box_pid,
             &self.core.config_path,
             &self.core.executable,
         )
     }
+}
+
+fn confirmed_config_target_matches(receipt_target: &Path, configured_path: &Path) -> Result<bool> {
+    Ok(crate::node_quality_path::canonical_config_target(configured_path)? == receipt_target)
 }
 
 pub(crate) fn managed_sing_box_process_matches(
@@ -1875,11 +1892,48 @@ mod tests {
     use super::{
         AuthorizationRequirement, BackendRestart, ManagedSingBoxCore, Ownership, ProcessBackend,
         StartedProcess, command_matches_sing_box_run_for_config, command_path_text_matches,
-        config_arg_matches_path, ensure_managed_sing_box_pid_identity, path_text_is_absolute,
+        config_arg_matches_path, confirmed_config_target_matches,
+        ensure_managed_sing_box_pid_identity, path_text_is_absolute,
         resolve_sing_box_executable_from_path, sing_box_config_args,
         sing_box_log_reports_bind_conflict, spawn_sing_box_with_bind_retry,
         stop_elevated_sing_box_child, stop_sing_box_child, stop_sing_box_pid_escalating,
     };
+
+    #[test]
+    fn confirmed_runtime_config_accepts_a_relative_path_to_the_same_target() {
+        let current = std::env::current_dir().unwrap();
+        let root = current
+            .join("target")
+            .join(format!("receipt-relative-{}", unique_test_suffix()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, b"{}").unwrap();
+        let relative = config.strip_prefix(&current).unwrap();
+
+        assert!(
+            confirmed_config_target_matches(&config.canonicalize().unwrap(), relative).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_runtime_config_accepts_a_symlink_to_the_same_target() {
+        let root = std::env::temp_dir().join(format!(
+            "sing-box-tui-receipt-symlink-{}",
+            unique_test_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        let alias = root.join("active.json");
+        std::fs::write(&config, b"{}").unwrap();
+        std::os::unix::fs::symlink(&config, &alias).unwrap();
+
+        assert!(confirmed_config_target_matches(&config.canonicalize().unwrap(), &alias).unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{
         ProcessStartToken, process_alive_via_ps, process_descendant_pids, process_start_token,

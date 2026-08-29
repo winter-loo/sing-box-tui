@@ -16,12 +16,13 @@ use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, derive_reachab
 use crate::node_quality_path::{
     QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX, node_quality_reserved_paths,
 };
+use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const BENCHMARK_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BENCHMARK_PRUNE_BATCH_SIZE: usize = 50_000;
-const NODE_QUALITY_SCHEMA_VERSION: i64 = 3;
+const NODE_QUALITY_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NodeIdentity {
@@ -43,6 +44,30 @@ pub(crate) struct BenchmarkRecord<'a> {
 pub(crate) struct NodeLatencySample {
     pub(crate) recorded_at_ms: u64,
     pub(crate) delay_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SustainedSuccessStats {
+    pub(crate) successes: usize,
+    pub(crate) attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NodeQuickHistory {
+    pub(crate) successful_rounds: usize,
+    pub(crate) rounds: usize,
+    pub(crate) warm_median_ms: Option<u64>,
+    pub(crate) p95_ms: Option<u64>,
+    /// Lower median of reachable attempt-zero timings across the retained rounds.
+    pub(crate) cold_start_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct SustainedStorageValues<'a> {
+    first_byte_ms: Option<i64>,
+    completion_ms: Option<i64>,
+    bytes_read: Option<i64>,
+    detail: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -71,6 +96,27 @@ pub(crate) struct NodeHistoryReconciliationTransaction<'store> {
 pub(crate) struct NodeQualityReconciliationLock {
     _file: Option<File>,
     database_path: PathBuf,
+}
+
+pub(crate) struct NodeQualityReadLease {
+    _guard: Option<NodeQualityReconciliationLock>,
+    database_path: Option<PathBuf>,
+    generation: u64,
+}
+
+impl NodeQualityReadLease {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64) -> Self {
+        Self {
+            _guard: None,
+            database_path: None,
+            generation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +258,22 @@ impl BenchmarkStore {
                 INSERT OR IGNORE INTO node_quality_state (
                     singleton, generation, identities_initialized
                 ) VALUES (1, 0, 0);
+                CREATE TABLE IF NOT EXISTS sustained_probe_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node_tag TEXT NOT NULL,
+                    target_identity TEXT NOT NULL,
+                    outcome_kind TEXT NOT NULL,
+                    first_byte_ms INTEGER,
+                    completion_ms INTEGER,
+                    bytes_read INTEGER,
+                    detail TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_sustained_probe_selector_node_target_recent
+                    ON sustained_probe_results(
+                        selector, node_tag, target_identity, recorded_at_ms DESC, id DESC
+                    );
                 "#,
             )
             .context("failed to initialize benchmark_results SQLite schema")?;
@@ -376,6 +438,71 @@ impl BenchmarkStore {
         }
     }
 
+    pub(crate) fn quality_session_current(&self) -> Result<bool> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        self.quality_session_current_while_locked()
+    }
+
+    pub(crate) fn acquire_quality_read_lease(&self) -> Result<Option<NodeQualityReadLease>> {
+        let guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(None);
+        }
+        Ok(Some(NodeQualityReadLease {
+            database_path: Some(guard.database_path.clone()),
+            _guard: Some(guard),
+            generation: self.quality_generation(),
+        }))
+    }
+
+    /// Keeps only tags bound to this store's generation while the caller holds its read lease.
+    ///
+    /// The pre-spawn membership check is deliberately performed under the same cross-process
+    /// lease used to freeze the job generation. The final INSERT repeats the check because a
+    /// worker can outlive this lease and must still fail closed after later reconciliation.
+    pub(crate) fn retain_bound_node_tags(
+        &self,
+        lease: &NodeQualityReadLease,
+        tags: &mut Vec<String>,
+    ) -> Result<()> {
+        if lease.database_path.as_ref() != Some(&self.database_path)
+            || lease.generation != self.quality_generation()
+        {
+            anyhow::bail!("node-quality read lease does not match this store generation");
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag FROM node_identities")
+            .context("failed to prepare bound node membership query")?;
+        let bound = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("failed to query bound node membership")?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .context("failed to read bound node membership")?;
+        tags.retain(|tag| bound.contains(tag));
+        Ok(())
+    }
+
+    fn quality_session_current_while_locked(&self) -> Result<bool> {
+        if self.quality_writes_blocked()? {
+            return Ok(false);
+        }
+        self.connection
+            .query_row(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM node_quality_state
+                    WHERE singleton = 1
+                        AND generation = ?1
+                        AND identities_initialized = 1
+                )
+                "#,
+                [self.quality_generation.get()],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("failed to validate node-quality session generation")
+    }
+
     pub(crate) fn record_reachability_assessment(
         &self,
         selector: &str,
@@ -443,7 +570,7 @@ impl BenchmarkStore {
         &self,
     ) -> Result<Vec<(String, NodeReachabilityAssessment)>> {
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
-        if self.quality_reads_blocked()? {
+        if !self.quality_session_current_while_locked()? {
             return Ok(Vec::new());
         }
         let mut statement = self
@@ -512,7 +639,7 @@ impl BenchmarkStore {
     ///
     /// A fact is retained only when a previously persisted identity has the same tag and
     /// fingerprint. Raw stores reject writes until the first identity binding, and any facts from
-    /// a pre-v3 database are discarded by the accepted whole-database reset policy. New fact
+    /// a pre-v4 database are discarded by the accepted whole-database reset policy. New fact
     /// tables should reference `node_identities(tag) ON DELETE CASCADE`; tables without that
     /// foreign key must also be added to `delete_unretained_node_facts`.
     #[cfg(test)]
@@ -584,6 +711,306 @@ impl BenchmarkStore {
         Ok(reconciliation)
     }
 
+    pub(crate) fn record_sustained_quality(
+        &self,
+        selector: &str,
+        target_identity: &str,
+        result: &NodeSustainedQuality,
+    ) -> Result<bool> {
+        let values = match &result.outcome {
+            SustainedProbeOutcome::Completed(completion) => SustainedStorageValues {
+                first_byte_ms: Some(completion.first_byte_ms as i64),
+                completion_ms: Some(completion.completion_ms as i64),
+                bytes_read: Some(completion.bytes_read as i64),
+                detail: None,
+            },
+            SustainedProbeOutcome::TransferFailed { .. } => SustainedStorageValues {
+                detail: Some("sustained transfer failed"),
+                ..SustainedStorageValues::default()
+            },
+            SustainedProbeOutcome::RuntimeFailed { .. } => SustainedStorageValues {
+                detail: Some("isolated runtime unavailable"),
+                ..SustainedStorageValues::default()
+            },
+            SustainedProbeOutcome::Cancelled => SustainedStorageValues::default(),
+        };
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("failed to begin sustained-quality transaction")?;
+        if self.quality_writes_blocked()? {
+            return Ok(false);
+        }
+        let inserted = transaction
+            .execute(
+                r#"
+                INSERT INTO sustained_probe_results (
+                    recorded_at_ms, selector, node_tag, target_identity, outcome_kind,
+                    first_byte_ms, completion_ms, bytes_read, detail
+                )
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                WHERE EXISTS (
+                    SELECT 1 FROM node_quality_state
+                    WHERE singleton = 1
+                        AND generation = ?10
+                        AND identities_initialized = 1
+                )
+                  AND EXISTS (SELECT 1 FROM node_identities WHERE tag = ?3)
+                "#,
+                params![
+                    current_timestamp_ms()?,
+                    selector,
+                    result.name,
+                    target_identity,
+                    result.outcome.storage_kind(),
+                    values.first_byte_ms,
+                    values.completion_ms,
+                    values.bytes_read,
+                    values.detail,
+                    self.quality_generation.get(),
+                ],
+            )
+            .context("failed to insert sustained probe result")?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        transaction
+            .commit()
+            .context("failed to commit sustained probe result")?;
+        Ok(true)
+    }
+
+    pub(crate) fn latest_sustained_quality(
+        &self,
+        target_identity: &str,
+    ) -> Result<Vec<(String, NodeSustainedQuality)>> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT s.selector, s.node_tag, s.outcome_kind, s.first_byte_ms,
+                       s.completion_ms, s.bytes_read, s.detail
+                FROM sustained_probe_results s
+                WHERE s.target_identity = ?1
+                  AND s.id = (
+                    SELECT newer.id
+                    FROM sustained_probe_results newer
+                    WHERE newer.selector = s.selector
+                      AND newer.node_tag = s.node_tag
+                      AND newer.target_identity = s.target_identity
+                      AND newer.outcome_kind IN ('completed', 'transfer_failed')
+                    ORDER BY newer.recorded_at_ms DESC, newer.id DESC
+                    LIMIT 1
+                )
+                ORDER BY s.selector, s.node_tag
+                "#,
+            )
+            .context("failed to prepare latest sustained-quality query")?;
+        let rows = statement
+            .query_map(params![target_identity], |row| {
+                let kind: String = row.get(2)?;
+                let first_byte_ms: Option<i64> = row.get(3)?;
+                let completion_ms: Option<i64> = row.get(4)?;
+                let bytes_read: Option<i64> = row.get(5)?;
+                let detail: Option<String> = row.get(6)?;
+                let outcome = sustained_outcome_from_storage(
+                    &kind,
+                    first_byte_ms,
+                    completion_ms,
+                    bytes_read,
+                    detail,
+                )?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    NodeSustainedQuality {
+                        name: row.get(1)?,
+                        outcome,
+                    },
+                ))
+            })
+            .context("failed to query latest sustained quality")?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.context("failed to read sustained-quality row")?);
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn sustained_success_stats(
+        &self,
+        selector: &str,
+        node: &str,
+        target_identity: &str,
+        limit: usize,
+    ) -> Result<SustainedSuccessStats> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(SustainedSuccessStats::default());
+        }
+        self.sustained_success_stats_while_locked(selector, node, target_identity, limit)
+    }
+
+    pub(crate) fn sustained_success_stats_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        selector: &str,
+        node: &str,
+        target_identity: &str,
+        limit: usize,
+    ) -> Result<SustainedSuccessStats> {
+        if lease.database_path.as_ref() != Some(&self.database_path)
+            || lease.generation != self.quality_generation()
+        {
+            anyhow::bail!("node-quality read lease does not match this store generation");
+        }
+        self.sustained_success_stats_while_locked(selector, node, target_identity, limit)
+    }
+
+    fn sustained_success_stats_while_locked(
+        &self,
+        selector: &str,
+        node: &str,
+        target_identity: &str,
+        limit: usize,
+    ) -> Result<SustainedSuccessStats> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT outcome_kind
+                FROM sustained_probe_results
+                WHERE selector = ?1
+                  AND node_tag = ?2
+                  AND target_identity = ?3
+                  AND outcome_kind IN ('completed', 'transfer_failed')
+                ORDER BY recorded_at_ms DESC, id DESC
+                LIMIT ?4
+                "#,
+            )
+            .context("failed to prepare sustained-success query")?;
+        let rows = statement
+            .query_map(
+                params![selector, node, target_identity, limit as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .context("failed to query sustained success")?;
+        let mut stats = SustainedSuccessStats::default();
+        for row in rows {
+            let kind = row.context("failed to read sustained-success row")?;
+            stats.attempts += 1;
+            stats.successes += usize::from(kind == "completed");
+        }
+        Ok(stats)
+    }
+
+    pub(crate) fn node_quick_history(
+        &self,
+        selector: &str,
+        node: &str,
+        limit: usize,
+    ) -> Result<NodeQuickHistory> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(NodeQuickHistory::default());
+        }
+        self.node_quick_history_while_locked(selector, node, limit)
+    }
+
+    pub(crate) fn node_quick_history_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        selector: &str,
+        node: &str,
+        limit: usize,
+    ) -> Result<NodeQuickHistory> {
+        if lease.database_path.as_ref() != Some(&self.database_path)
+            || lease.generation != self.quality_generation()
+        {
+            anyhow::bail!("node-quality read lease does not match this store generation");
+        }
+        self.node_quick_history_while_locked(selector, node, limit)
+    }
+
+    fn node_quick_history_while_locked(
+        &self,
+        selector: &str,
+        node: &str,
+        limit: usize,
+    ) -> Result<NodeQuickHistory> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT a.id, t.attempt_index, t.outcome_kind, t.delay_ms
+                FROM reachability_assessments a
+                JOIN probe_attempts t ON t.assessment_id = a.id
+                WHERE a.selector = ?1
+                  AND a.node = ?2
+                  AND a.complete = 1
+                  AND a.id IN (
+                      SELECT newer.id
+                      FROM reachability_assessments newer
+                      WHERE newer.selector = ?1
+                        AND newer.node = ?2
+                        AND newer.complete = 1
+                      ORDER BY newer.recorded_at_ms DESC, newer.id DESC
+                      LIMIT ?3
+                  )
+                ORDER BY a.recorded_at_ms DESC, a.id DESC, t.attempt_index
+                "#,
+            )
+            .context("failed to prepare quick-history query")?;
+        let rows = statement
+            .query_map(params![selector, node, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .context("failed to query quick history")?;
+        let mut rounds = Vec::<(i64, usize)>::new();
+        let mut all_delays = Vec::new();
+        let mut warm_delays = Vec::new();
+        let mut cold_delays = Vec::new();
+        for row in rows {
+            let (assessment_id, attempt_index, kind, delay_ms) =
+                row.context("failed to read quick-history row")?;
+            if rounds.last().is_none_or(|(id, _)| *id != assessment_id) {
+                rounds.push((assessment_id, 0));
+            }
+            if kind == "reachable" {
+                rounds.last_mut().expect("round was inserted").1 += 1;
+                if let Some(delay_ms) = delay_ms.map(|value| value as u64) {
+                    all_delays.push(delay_ms);
+                    if attempt_index == 0 {
+                        cold_delays.push(delay_ms);
+                    } else {
+                        warm_delays.push(delay_ms);
+                    }
+                }
+            }
+        }
+        let successful_rounds = rounds
+            .iter()
+            .filter(|(_, reachable)| *reachable >= 2)
+            .count();
+        if warm_delays.is_empty() {
+            warm_delays.clone_from(&all_delays);
+        }
+        Ok(NodeQuickHistory {
+            successful_rounds,
+            rounds: rounds.len(),
+            warm_median_ms: median(&mut warm_delays),
+            p95_ms: percentile_95(&mut all_delays),
+            cold_start_ms: median(&mut cold_delays),
+        })
+    }
+
     pub(crate) fn record_benchmark(&self, record: &BenchmarkRecord<'_>) -> Result<bool> {
         let recorded_at_ms = current_timestamp_ms()?;
         let delay_ms = record.delay_ms.map(|value| value as i64);
@@ -640,7 +1067,6 @@ impl BenchmarkStore {
         Ok(true)
     }
 
-    #[cfg(test)]
     pub(crate) fn quality_generation(&self) -> u64 {
         self.quality_generation.get() as u64
     }
@@ -694,7 +1120,7 @@ impl BenchmarkStore {
         limit: usize,
     ) -> Result<Vec<NodeLatencySample>> {
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
-        if self.quality_reads_blocked()? {
+        if !self.quality_session_current_while_locked()? {
             return Ok(Vec::new());
         }
         let mut statement = self
@@ -943,6 +1369,12 @@ fn delete_unretained_node_facts(
             [],
         )
         .context("failed to delete unretained benchmark facts")?;
+    transaction
+        .execute(
+            "DELETE FROM sustained_probe_results WHERE node_tag NOT IN (SELECT tag FROM retained_node_tags)",
+            [],
+        )
+        .context("failed to delete unretained sustained-quality facts")?;
     Ok(())
 }
 
@@ -990,6 +1422,62 @@ fn canonical_json_value(value: &Value) -> Value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
         _ => value.clone(),
     }
+}
+
+fn sustained_outcome_from_storage(
+    kind: &str,
+    first_byte_ms: Option<i64>,
+    completion_ms: Option<i64>,
+    bytes_read: Option<i64>,
+    detail: Option<String>,
+) -> rusqlite::Result<SustainedProbeOutcome> {
+    let invalid = |message: &'static str| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message).into(),
+        )
+    };
+    match kind {
+        "completed" => {
+            let first_byte_ms = first_byte_ms
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+                .ok_or_else(|| invalid("completed sustained result is missing first-byte time"))?;
+            let completion_ms = completion_ms
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+                .ok_or_else(|| invalid("completed sustained result is missing completion time"))?;
+            let bytes_read = bytes_read
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+                .ok_or_else(|| invalid("completed sustained result is missing bytes"))?;
+            SustainedCompletion::from_facts(first_byte_ms, completion_ms, bytes_read)
+                .map(SustainedProbeOutcome::Completed)
+                .map_err(|_| invalid("completed sustained result contains invalid facts"))
+        }
+        "transfer_failed" => Ok(SustainedProbeOutcome::TransferFailed {
+            detail: detail.unwrap_or_default(),
+        }),
+        _ => Err(invalid("latest sustained result has an unexpected outcome")),
+    }
+}
+
+fn median(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[(values.len() - 1) / 2])
+}
+
+fn percentile_95(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let rank = (values.len() * 95).div_ceil(100).saturating_sub(1);
+    values.get(rank).copied()
 }
 
 fn current_timestamp_ms() -> Result<i64> {
@@ -1136,14 +1624,20 @@ fn reset_legacy_database(path: &Path) -> Result<()> {
 }
 
 fn legacy_reset_sidecar_paths(path: &Path) -> Vec<PathBuf> {
-    ["-wal", "-shm", "-journal", QUALITY_WRITE_BLOCK_SUFFIX]
-        .into_iter()
-        .map(|suffix| {
-            let mut sidecar = path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            PathBuf::from(sidecar)
-        })
-        .collect()
+    [
+        "-wal",
+        "-shm",
+        "-journal",
+        QUALITY_WRITE_BLOCK_SUFFIX,
+        QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX,
+    ]
+    .into_iter()
+    .map(|suffix| {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    })
+    .collect()
 }
 
 fn inspect_legacy_reset_sidecars(path: &Path) -> Result<Vec<PathBuf>> {
@@ -1192,6 +1686,7 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
             "node_quality_state",
             "probe_attempts",
             "reachability_assessments",
+            "sustained_probe_results",
         ]
         || !published_core_table_schemas_are_recognized(connection, true)?
         || !table_has_exact_columns(
@@ -1208,6 +1703,22 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
                 ("identities_initialized", "INTEGER", true, 0),
             ],
         )?
+        || !table_has_exact_columns(
+            connection,
+            "sustained_probe_results",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("recorded_at_ms", "INTEGER", true, 0),
+                ("selector", "TEXT", true, 0),
+                ("node_tag", "TEXT", true, 0),
+                ("target_identity", "TEXT", true, 0),
+                ("outcome_kind", "TEXT", true, 0),
+                ("first_byte_ms", "INTEGER", false, 0),
+                ("completion_ms", "INTEGER", false, 0),
+                ("bytes_read", "INTEGER", false, 0),
+                ("detail", "TEXT", false, 0),
+            ],
+        )?
         || !user_behavior_objects(connection)?.is_empty()
         || !object_sql_matches(
             connection,
@@ -1222,6 +1733,12 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
             &[
                 "CREATE TABLE node_quality_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), generation INTEGER NOT NULL, identities_initialized INTEGER NOT NULL)",
             ],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "sustained_probe_results",
+            &[SUSTAINED_PROBE_RESULTS_TABLE_SQL],
         )?
     {
         return Ok(false);
@@ -1291,6 +1808,7 @@ fn published_core_table_schemas_are_recognized(
             "idx_benchmark_results_recorded_at",
             "idx_benchmark_results_selector_node_recent",
             "idx_reachability_assessments_selector_node_recent",
+            "idx_sustained_probe_selector_node_target_recent",
         ]
         && index_has_exact_key(
             connection,
@@ -1313,6 +1831,17 @@ fn published_core_table_schemas_are_recognized(
             &[
                 ("selector", false),
                 ("node", false),
+                ("recorded_at_ms", true),
+                ("id", true),
+            ],
+        )?
+        && index_has_exact_key(
+            connection,
+            "idx_sustained_probe_selector_node_target_recent",
+            &[
+                ("selector", false),
+                ("node_tag", false),
+                ("target_identity", false),
                 ("recorded_at_ms", true),
                 ("id", true),
             ],
@@ -1370,6 +1899,21 @@ const PROBE_ATTEMPTS_TABLE_SQL: &str = r#"
     )
 "#;
 
+const SUSTAINED_PROBE_RESULTS_TABLE_SQL: &str = r#"
+    CREATE TABLE sustained_probe_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at_ms INTEGER NOT NULL,
+        selector TEXT NOT NULL,
+        node_tag TEXT NOT NULL,
+        target_identity TEXT NOT NULL,
+        outcome_kind TEXT NOT NULL,
+        first_byte_ms INTEGER,
+        completion_ms INTEGER,
+        bytes_read INTEGER,
+        detail TEXT
+    )
+"#;
+
 fn published_core_sql_is_recognized(
     connection: &Connection,
     require_complete: bool,
@@ -1412,6 +1956,13 @@ fn published_core_sql_is_recognized(
         "idx_reachability_assessments_selector_node_recent",
         &[
             "CREATE INDEX idx_reachability_assessments_selector_node_recent ON reachability_assessments(selector, node, recorded_at_ms DESC, id DESC)",
+        ],
+    )? && object_sql_matches(
+        connection,
+        "index",
+        "idx_sustained_probe_selector_node_target_recent",
+        &[
+            "CREATE INDEX idx_sustained_probe_selector_node_target_recent ON sustained_probe_results(selector, node_tag, target_identity, recorded_at_ms DESC, id DESC)",
         ],
     )?)
 }
@@ -1620,6 +2171,9 @@ mod tests {
     };
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::node_quality_path::QUALITY_RECONCILIATION_LOCK_SUFFIX;
+    use crate::sustained_quality::{
+        NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
+    };
     use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -2023,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_and_empty_sqlite_header_recover_to_atomic_v3_schema() {
+    fn empty_file_and_empty_sqlite_header_recover_to_atomic_v4_schema() {
         for (label, create) in [("zero-bytes", false), ("sqlite-header", true)] {
             let path = test_db_path().with_extension(format!("{label}.sqlite3"));
             if create {
@@ -2050,7 +2604,7 @@ mod tests {
     }
 
     #[test]
-    fn both_published_v2_shapes_are_rebuilt_as_v3_without_old_facts() {
+    fn both_published_v2_shapes_are_rebuilt_as_v4_without_old_facts() {
         for complete_column in [false, true] {
             let path = test_db_path().with_extension(if complete_column {
                 "v2b.sqlite3"
@@ -2072,7 +2626,7 @@ mod tests {
                     .recent_benchmarks(10)
                     .expect("read rebuilt benchmark history")
                     .is_empty(),
-                "published v2 facts are discarded before old processes can target the v3 inode"
+                "published v2 facts are discarded before old processes can target the v4 inode"
             );
             assert!(
                 store
@@ -2083,7 +2637,7 @@ mod tests {
                         [],
                         |row| row.get::<_, bool>(0),
                     )
-                    .expect("verify v3 identity table")
+                    .expect("verify v4 identity table")
             );
             drop(store);
             remove_test_db(&path);
@@ -2150,23 +2704,23 @@ mod tests {
 
     #[test]
     fn malformed_current_schema_is_preserved() {
-        let path = test_db_path().with_extension("v3-trigger.sqlite3");
-        drop(BenchmarkStore::open(&path).expect("create recognized v3 database"));
-        let connection = rusqlite::Connection::open(&path).expect("open v3 fixture");
+        let path = test_db_path().with_extension("v4-trigger.sqlite3");
+        drop(BenchmarkStore::open(&path).expect("create recognized v4 database"));
+        let connection = rusqlite::Connection::open(&path).expect("open v4 fixture");
         connection
             .execute_batch(
-                "CREATE TRIGGER unrelated_v3_trigger AFTER INSERT ON benchmark_results \
+                "CREATE TRIGGER unrelated_v4_trigger AFTER INSERT ON benchmark_results \
                  BEGIN SELECT 1; END;",
             )
-            .expect("add unknown v3 trigger");
+            .expect("add unknown v4 trigger");
         drop(connection);
-        let before = std::fs::read(&path).expect("read v3 candidate");
+        let before = std::fs::read(&path).expect("read v4 candidate");
         let error = BenchmarkStore::open(&path)
             .err()
-            .expect("behavior-changing v3 trigger must be rejected");
-        assert!(format!("{error:#}").contains("unrecognized version 3"));
+            .expect("behavior-changing v4 trigger must be rejected");
+        assert!(format!("{error:#}").contains("unrecognized version 4"));
         assert_eq!(
-            std::fs::read(&path).expect("read preserved v3 candidate"),
+            std::fs::read(&path).expect("read preserved v4 candidate"),
             before
         );
         remove_test_db(&path);
@@ -2174,7 +2728,7 @@ mod tests {
 
     #[test]
     fn every_legacy_sqlite_schema_is_rebuilt_even_with_unrelated_objects() {
-        for version in [-1, 0, 1, 2] {
+        for version in [-1, 0, 1, 2, 3] {
             let path = test_db_path().with_extension(format!("legacy-v{version}.sqlite3"));
             let connection = rusqlite::Connection::open(&path).expect("create legacy database");
             connection
@@ -2187,6 +2741,9 @@ mod tests {
                 ))
                 .expect("seed unrelated legacy objects");
             drop(connection);
+            let old_runtime_fence = sqlite_sidecar_path(&path, QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX);
+            std::fs::write(&old_runtime_fence, b"legacy runtime fence\n")
+                .expect("seed legacy runtime fence");
 
             let store = BenchmarkStore::open(&path).expect("rebuild every legacy SQLite schema");
             assert_eq!(
@@ -2209,6 +2766,10 @@ mod tests {
                         |row| row.get::<_, bool>(0),
                     )
                     .expect("check unrelated legacy object removal")
+            );
+            assert!(
+                !old_runtime_fence.exists(),
+                "a whole-database v4 reset must remove every legacy protocol sidecar"
             );
             drop(store);
             remove_test_db(&path);
@@ -2236,7 +2797,7 @@ mod tests {
         for (label, schema) in [
             (
                 "spoofed-current",
-                "CREATE TABLE unrelated (value TEXT); PRAGMA user_version = 3;",
+                "CREATE TABLE unrelated (value TEXT); PRAGMA user_version = 4;",
             ),
             (
                 "future",
@@ -2286,6 +2847,56 @@ mod tests {
         assert_eq!(first.generation, second.generation);
 
         drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn quality_read_lease_blocks_reconciliation_and_stale_generation_cannot_reacquire() {
+        let path = test_db_path();
+        let reader = BenchmarkStore::open(&path).expect("open quality reader");
+        let initial = reader
+            .reconcile_node_history(&node_config(vec![
+                serde_json::json!({"type":"direct", "tag":"node-a"}),
+            ]))
+            .expect("bind initial identity");
+        let reconciler = BenchmarkStore::open(&path).expect("open reconciler");
+        let lease = reader
+            .acquire_quality_read_lease()
+            .expect("acquire quality lease")
+            .expect("current generation has a lease");
+        assert_eq!(lease.generation(), initial.generation);
+
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = reconciler.reconcile_node_history(&node_config(vec![
+                serde_json::json!({"type":"direct", "tag":"node-b"}),
+            ]));
+            finished_tx.send(result).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reconciliation must wait while the final quality decision holds its lease"
+        );
+        drop(lease);
+        let refreshed = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reconciliation resumes after lease release")
+            .expect("reconcile replacement identity");
+        worker.join().unwrap();
+        assert!(refreshed.generation > initial.generation);
+        assert!(
+            reader
+                .acquire_quality_read_lease()
+                .expect("inspect stale reader")
+                .is_none(),
+            "a stale process cannot reacquire a decision lease from only its cached generation"
+        );
+        drop(reader);
         remove_test_db(&path);
     }
 
@@ -2798,6 +3409,161 @@ mod tests {
             store.latest_reachability_assessments().unwrap(),
             vec![("select".into(), complete)]
         );
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn sustained_facts_round_trip_and_infrastructure_failure_preserves_evidence() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).unwrap();
+        bind_test_identities(&store, &["node-a", "node-b"]);
+        let completed_with_untrusted_metric = NodeSustainedQuality {
+            name: "node-a".into(),
+            outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                first_byte_ms: 120,
+                completion_ms: 620,
+                bytes_read: 512 * 1024,
+                throughput_bytes_per_second: 7,
+            }),
+        };
+        store
+            .record_sustained_quality("select", "target-a", &completed_with_untrusted_metric)
+            .unwrap();
+        let mut columns = store
+            .connection
+            .prepare("PRAGMA table_info(sustained_probe_results)")
+            .unwrap();
+        let column_names = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!column_names.iter().any(|name| name.contains("throughput")));
+        drop(columns);
+        store
+            .record_sustained_quality(
+                "select",
+                "target-a",
+                &NodeSustainedQuality {
+                    name: "node-a".into(),
+                    outcome: SustainedProbeOutcome::RuntimeFailed {
+                        detail: "isolated controller unavailable".into(),
+                    },
+                },
+            )
+            .unwrap();
+        let canary = "account-token-canary";
+        store
+            .record_sustained_quality(
+                "select",
+                "target-a",
+                &NodeSustainedQuality {
+                    name: "node-b".into(),
+                    outcome: SustainedProbeOutcome::TransferFailed {
+                        detail: canary.into(),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .record_sustained_quality(
+                "select",
+                "target-b",
+                &NodeSustainedQuality {
+                    name: "node-a".into(),
+                    outcome: SustainedProbeOutcome::TransferFailed {
+                        detail: "different target".into(),
+                    },
+                },
+            )
+            .unwrap();
+
+        let loaded = store.latest_sustained_quality("target-a").unwrap();
+        assert!(!format!("{loaded:?}").contains(canary));
+        assert_eq!(
+            loaded,
+            vec![
+                (
+                    "select".into(),
+                    NodeSustainedQuality {
+                        name: "node-a".into(),
+                        outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                            first_byte_ms: 120,
+                            completion_ms: 620,
+                            bytes_read: 512 * 1024,
+                            throughput_bytes_per_second: 1024 * 1024,
+                        }),
+                    },
+                ),
+                (
+                    "select".into(),
+                    NodeSustainedQuality {
+                        name: "node-b".into(),
+                        outcome: SustainedProbeOutcome::TransferFailed {
+                            detail: "sustained transfer failed".into(),
+                        },
+                    },
+                )
+            ]
+        );
+        assert_eq!(
+            store
+                .sustained_success_stats("select", "node-a", "target-a", 10)
+                .unwrap(),
+            super::SustainedSuccessStats {
+                successes: 1,
+                attempts: 1,
+            }
+        );
+        assert!(matches!(
+            store
+                .latest_sustained_quality("target-b")
+                .unwrap()
+                .as_slice(),
+            [(
+                selector,
+                NodeSustainedQuality {
+                    name,
+                    outcome: SustainedProbeOutcome::TransferFailed { .. },
+                },
+            )] if selector == "select" && name == "node-a"
+        ));
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn quick_history_derives_success_warm_median_and_p95() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).unwrap();
+        bind_test_identities(&store, &["node-a"]);
+        for attempts in [
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 90 },
+                ProbeOutcome::Reachable { delay_ms: 50 },
+                ProbeOutcome::Reachable { delay_ms: 60 },
+            ],
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 100 },
+                ProbeOutcome::Timeout,
+                ProbeOutcome::Reachable { delay_ms: 70 },
+            ],
+        ] {
+            store
+                .record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment::from_attempts("node-a".into(), attempts),
+                )
+                .unwrap();
+        }
+
+        let history = store.node_quick_history("select", "node-a", 10).unwrap();
+        assert_eq!(history.successful_rounds, 2);
+        assert_eq!(history.rounds, 2);
+        assert_eq!(history.warm_median_ms, Some(60));
+        assert_eq!(history.p95_ms, Some(100));
+        assert_eq!(history.cold_start_ms, Some(90));
         drop(store);
         remove_test_db(&path);
     }

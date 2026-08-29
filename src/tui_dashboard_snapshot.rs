@@ -2,8 +2,9 @@ use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
-    IntranetDetailSnapshot, IntranetRow, SettingRow, SettingsPanelSnapshot, StatusFooter,
-    StatusSnapshot, node_order_badge, pick_mode_badge, settings_field_label,
+    IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab, SettingRow,
+    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, node_order_badge, pick_mode_badge,
+    settings_field_label,
 };
 
 impl App {
@@ -49,12 +50,51 @@ impl App {
                 displayed_members
                     .iter()
                     .map(|member| {
+                        if self.node_view_panel == NodeViewPanel::Streaming {
+                            let assessment = self
+                                .benchmark_workflow
+                                .reachability_assessment(&group.name, member)
+                                .expect("Streaming members have a quick assessment");
+                            let (reachability, _) =
+                                split_reachability_evidence(&assessment.compact_evidence());
+                            let sustained = self
+                                .benchmark_workflow
+                                .sustained_quality(&group.name, member)
+                                .and_then(|result| result.completed())
+                                .expect("Streaming members have sustained completion");
+                            let successes =
+                                self.benchmark_workflow.sustained_stats(&group.name, member);
+                            let quick = self.benchmark_workflow.quick_history(&group.name, member);
+                            let p95 = quick
+                                .p95_ms
+                                .map(|value| format!("p95 {value}ms"))
+                                .unwrap_or_else(|| "p95 -".to_string());
+                            let cold = quick
+                                .cold_start_ms
+                                .map(|value| format!("cold {value}ms"))
+                                .unwrap_or_else(|| "cold -".to_string());
+                            let throughput = format!(
+                                "{:.1} MiB/s",
+                                sustained.throughput_bytes_per_second as f64 / (1024.0 * 1024.0)
+                            );
+                            return CandidateRow {
+                                name: member.clone(),
+                                is_current: group.current.as_deref() == Some(member.as_str()),
+                                reachability,
+                                marker: format!(
+                                    "{throughput} · {}/{} sustained · {p95} · {cold}",
+                                    successes.successes, successes.attempts,
+                                ),
+                                compact_marker: throughput.replace(" MiB/s", "M/s"),
+                                tone: CandidateTone::Success,
+                            };
+                        }
                         let assessment = self
                             .benchmark_workflow
                             .reachability_assessment(&group.name, member);
                         let result =
                             selected_benchmark.and_then(|summary| summary.find_result(member));
-                        let (marker, tone) = if let Some(assessment) = assessment {
+                        let (reachability, marker, tone) = if let Some(assessment) = assessment {
                             let tone = match assessment.assessment {
                                 Some(
                                     crate::controller::ReachabilityAssessment::StableReachable,
@@ -68,23 +108,29 @@ impl App {
                                 }
                                 None => CandidateTone::Missing,
                             };
-                            (assessment.compact_evidence(), tone)
+                            let (reachability, marker) =
+                                split_reachability_evidence(&assessment.compact_evidence());
+                            (reachability, marker, tone)
                         } else {
                             match result {
                                 Some(result) if !result.completed => {
-                                    (result.display_delay(), CandidateTone::Pending)
+                                    ("-/3".into(), result.display_delay(), CandidateTone::Pending)
                                 }
                                 Some(result) if result.delay.is_some() => {
-                                    (result.display_delay(), CandidateTone::Success)
+                                    ("-/3".into(), result.display_delay(), CandidateTone::Success)
                                 }
-                                Some(result) => (result.display_delay(), CandidateTone::Error),
-                                None => ("-".to_string(), CandidateTone::Missing),
+                                Some(result) => {
+                                    ("-/3".into(), result.display_delay(), CandidateTone::Error)
+                                }
+                                None => ("-/3".into(), "-".to_string(), CandidateTone::Missing),
                             }
                         };
                         CandidateRow {
                             name: member.clone(),
                             is_current: group.current.as_deref() == Some(member.as_str()),
+                            reachability,
                             marker,
+                            compact_marker: String::new(),
                             tone,
                         }
                     })
@@ -93,11 +139,13 @@ impl App {
             .unwrap_or_default();
         let candidate_title = selected_group
             .map(|group| {
-                format!(
-                    "Candidates for {} [{}]",
-                    group.name,
-                    node_order_badge(self.benchmark_workflow.latency_order())
-                )
+                let order = match self.node_view_panel {
+                    NodeViewPanel::CurrentSelector => {
+                        node_order_badge(self.benchmark_workflow.latency_order())
+                    }
+                    NodeViewPanel::Streaming => "THROUGHPUT",
+                };
+                format!("Candidates for {} [{order}]", group.name)
             })
             .unwrap_or_else(|| {
                 format!(
@@ -105,6 +153,17 @@ impl App {
                     node_order_badge(self.benchmark_workflow.latency_order())
                 )
             });
+        let (all_count, streaming_count) = self.node_view_counts();
+        let node_view_tabs = vec![
+            NodeViewTab {
+                label: "Current selector",
+                count: all_count,
+            },
+            NodeViewTab {
+                label: "Streaming",
+                count: streaming_count,
+            },
+        ];
 
         let showing_intranet_details = self.showing_intranet_details();
         let intranet_detail = if showing_intranet_details {
@@ -185,6 +244,8 @@ impl App {
             intranet_rows,
             intranet_selected: self.private_access.focused_index,
             candidate_title,
+            node_view_tabs,
+            active_node_view_tab: self.node_view_panel.index(),
             candidate_rows,
             candidate_selected: self.displayed_member_index(),
             intranet_detail,
@@ -199,6 +260,13 @@ impl App {
             private_access_auth: self.private_access_auth.as_ref(),
         }
     }
+}
+
+fn split_reachability_evidence(value: &str) -> (String, String) {
+    value
+        .split_once(' ')
+        .map(|(ratio, detail)| (ratio.to_string(), detail.to_string()))
+        .unwrap_or_else(|| (value.to_string(), String::new()))
 }
 
 #[cfg(test)]
@@ -225,7 +293,8 @@ mod tests {
         );
 
         let snapshot = app.view_snapshot();
-        assert_eq!(snapshot.candidate_rows[0].marker, "2/3 reachable");
+        assert_eq!(snapshot.candidate_rows[0].reachability, "2/3");
+        assert_eq!(snapshot.candidate_rows[0].marker, "reachable");
         assert_eq!(snapshot.candidate_rows[0].tone, CandidateTone::Success);
         assert_eq!(snapshot.candidate_rows.len(), app.groups[0].members.len());
     }

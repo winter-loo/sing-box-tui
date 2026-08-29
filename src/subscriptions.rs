@@ -2008,13 +2008,21 @@ mod tests {
         assert!(commit.node_history_reconciled);
         assert!(commit.node_history_changed);
         assert!(commit.node_quality_generation.is_some());
+        let committed: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read committed config"))
+                .expect("parse committed config");
+        // #16 gates every quality read behind the same runtime fence as writes. The unchanged
+        // row is retained in SQLite, but it must not become visible until the new config has been
+        // observed by the managed runtime.
+        assert!(history_nodes(&request.node_quality_db_path).is_empty());
+        BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("reopen fenced quality store")
+            .reconcile_node_history(&committed)
+            .expect("simulate managed runtime loading the committed config");
         assert_eq!(
             history_nodes(&request.node_quality_db_path),
             vec!["unchanged"]
         );
-        let committed: Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).expect("read committed config"))
-                .expect("parse committed config");
         assert!(
             committed["outbounds"]
                 .as_array()
@@ -2056,10 +2064,18 @@ mod tests {
                 .expect("test client"),
             &config_path,
             &request.node_quality_db_path,
+            crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL,
         )
         .expect("startup binds committed active config");
         workflow
-            .confirm_managed_runtime_reload(&config_path, &request.node_quality_db_path, || Ok(()))
+            .confirm_managed_runtime_reload(&config_path, &request.node_quality_db_path, || {
+                Ok(crate::benchmark_workflow::ManagedRuntimeObservation::new(
+                    (),
+                    &config_path,
+                    "http://127.0.0.1:9992",
+                    Some(std::process::id()),
+                ))
+            })
             .expect("observed startup runtime enables quality persistence");
         assert_eq!(
             workflow
@@ -2165,6 +2181,7 @@ mod tests {
                     .expect("test client"),
                 &startup_config,
                 &startup_database,
+                crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL,
                 || {
                     startup_locked_tx
                         .send(())
