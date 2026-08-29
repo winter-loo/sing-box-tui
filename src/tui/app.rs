@@ -18,24 +18,33 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 
 use crate::auto_pick::{
-    BACKGROUND_TASK_KIND, BackgroundAutoPickManager, registered_status_value,
-    stop_registered_worker,
+    BACKGROUND_TASK_KIND, BackgroundAutoPickManager, background_task_log_path,
+    background_task_state_path, registered_status_value, stop_registered_worker,
 };
 use crate::benchmark_workflow::BenchmarkWorkflow;
 use crate::config::{
-    PrivateAccessRouteTableOptions, config_has_china_ip_routing, inspect_tailscale_config,
-    run_private_access_route_table_config, run_private_access_tun_baseline_config,
+    PrivateAccessRouteTableOptions, china_ip_routing_ruleset_dir, config_has_china_ip_routing,
+    inspect_tailscale_config, run_private_access_route_table_config,
+    run_private_access_tun_baseline_config,
 };
+use crate::config_mutation::paths_refer_to_same_target;
 use crate::controller::{ApiClient, ConnectionsSnapshot, ProxyGroup};
 use crate::defaults::{
     DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER, DEFAULT_DELAY_TEST_URL, REFRESH_DEBOUNCE,
 };
 use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
 use crate::managed_sing_box::{
-    AuthorizationRequirement, ControllerProbe, ManagedSingBox, wait_for_controller_ready,
+    AuthorizationRequirement, ControllerProbe, ManagedSingBox, sing_box_process_log_path,
+    wait_for_controller_ready,
+};
+use crate::node_quality_path::{
+    canonical_config_target, default_benchmark_db_path_for_config,
+    ensure_active_config_paths_are_distinct,
 };
 use crate::private_access::{
     PrivateAccessSecret, PrivateAccessServiceManifest, PrivateAccessState,
+    hillstone_diagnostic_log_path, sonicwall_diagnostic_log_path,
+    sonicwall_gateway_profile_cache_path,
 };
 use crate::private_access_session::{
     PrivateAccessBridgeRouteUpdate, PrivateAccessCarrierRestart, PrivateAccessConnectOptions,
@@ -43,9 +52,11 @@ use crate::private_access_session::{
     PrivateAccessNoticeTone, PrivateAccessProfileRuntime, PrivateAccessRuntime,
     PrivateAccessSessionNotice,
 };
+use crate::ruleset::china_ip_routing_ruleset_paths;
+use crate::subscriptions::DEFAULT_SUBSCRIPTION_SOURCE_PATH;
 use crate::system_proxy::SystemProxy;
 use crate::tui_state::{
-    BypassRuleSetStore, TuiStateStore, default_bypass_rule_set_path, default_tui_state_path,
+    BypassRuleSetStore, TuiStateStore, default_tui_state_path, resolved_tui_bypass_rule_set_path,
 };
 
 #[path = "../tui_auto_pick_worker.rs"]
@@ -412,6 +423,44 @@ struct App {
     private_access_auth: Option<PrivateAccessAuthModal>,
 }
 
+fn tui_persistent_path_registry(
+    config_path: &std::path::Path,
+    mut registry: Vec<(&'static str, PathBuf)>,
+) -> Result<Vec<(&'static str, PathBuf)>> {
+    let canonical_config = canonical_config_target(config_path)?;
+    registry.push((
+        "managed sing-box log",
+        sing_box_process_log_path(&canonical_config),
+    ));
+    let china_ruleset_dir = china_ip_routing_ruleset_dir(config_path)?;
+    let china_rulesets = china_ip_routing_ruleset_paths(&china_ruleset_dir);
+    registry.push(("China routing rule-set directory", china_ruleset_dir));
+    for path in china_rulesets {
+        registry.push(("China routing rule-set", path));
+    }
+    registry.extend([
+        ("SonicWall diagnostic log", sonicwall_diagnostic_log_path()),
+        ("Hillstone diagnostic log", hillstone_diagnostic_log_path()),
+        (
+            "SonicWall gateway profile cache",
+            sonicwall_gateway_profile_cache_path(),
+        ),
+    ]);
+    Ok(registry)
+}
+
+fn validate_tui_persistent_paths(
+    config_path: &std::path::Path,
+    database_path: &std::path::Path,
+    registry: &[(&'static str, PathBuf)],
+) -> Result<()> {
+    let auxiliary = registry
+        .iter()
+        .map(|(label, path)| (*label, path.as_path()))
+        .collect::<Vec<_>>();
+    ensure_active_config_paths_are_distinct(config_path, database_path, &auxiliary)
+}
+
 impl App {
     fn new(
         client: ApiClient,
@@ -421,11 +470,46 @@ impl App {
         keep_sing_box_running: bool,
         manage_sing_box: bool,
     ) -> Result<Self> {
-        let state_store = TuiStateStore::new(default_tui_state_path());
+        let system_proxy_config_path = subscription_refresh_options.config_path.clone();
+        let node_quality_db_path = default_benchmark_db_path_for_config(&system_proxy_config_path)?;
+        let state_path = default_tui_state_path();
+        let bypass_rule_set_path = resolved_tui_bypass_rule_set_path(&system_proxy_config_path)?;
+        let onboarding_subscription = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
+        let background_state = background_task_state_path();
+        let background_log = background_task_log_path();
+        // Every persistent writer reachable from App or one of its managed child processes must
+        // be registered here before any state load, database open, network fetch, or file write.
+        let mut persistent_paths = vec![
+            (
+                "subscription source",
+                subscription_refresh_options.input.clone(),
+            ),
+            (
+                "subscription cache",
+                subscription_refresh_options.cache_path.clone(),
+            ),
+            ("TUI state", state_path.clone()),
+            ("runtime bypass rule-set", bypass_rule_set_path.clone()),
+            ("background task state", background_state),
+            ("background task log", background_log),
+        ];
+        if !paths_refer_to_same_target(
+            &subscription_refresh_options.input,
+            &onboarding_subscription,
+        )? {
+            persistent_paths.push(("onboarding subscription source", onboarding_subscription));
+        }
+        let persistent_paths =
+            tui_persistent_path_registry(&system_proxy_config_path, persistent_paths)?;
+        validate_tui_persistent_paths(
+            &system_proxy_config_path,
+            &node_quality_db_path,
+            &persistent_paths,
+        )?;
+        let state_store = TuiStateStore::new(state_path);
         let existing_state_file = state_store.exists();
         let mut runtime_state = state_store.load()?;
         let onboarding_complete = runtime_state.onboarding_complete || existing_state_file;
-        let system_proxy_config_path = subscription_refresh_options.config_path.clone();
         let system_proxy = SystemProxy::new(system_proxy_config_path.clone());
         let internet_tun = InternetTunTransaction::new(
             system_proxy_config_path.clone(),
@@ -438,10 +522,16 @@ impl App {
             config_has_china_ip_routing(&system_proxy_config_path).unwrap_or(false);
         let tailscale_config =
             inspect_tailscale_config(&system_proxy_config_path).unwrap_or_default();
-        let subscription_refresh =
-            SubscriptionRefreshState::from_options(subscription_refresh_options)?;
-        let benchmark_workflow =
-            BenchmarkWorkflow::open(client.base_url.clone(), client.client.clone())?;
+        let subscription_refresh = SubscriptionRefreshState::from_options(
+            subscription_refresh_options,
+            node_quality_db_path.clone(),
+        )?;
+        let benchmark_workflow = BenchmarkWorkflow::open(
+            client.base_url.clone(),
+            client.client.clone(),
+            &system_proxy_config_path,
+            &node_quality_db_path,
+        )?;
         let mut app = Self {
             client,
             groups: Vec::new(),
@@ -472,7 +562,7 @@ impl App {
             background_started_at_unix: current_unix_timestamp(),
             background_auto_pick: Default::default(),
             state_store: Some(state_store),
-            bypass_rule_set_store: Some(BypassRuleSetStore::new(default_bypass_rule_set_path())),
+            bypass_rule_set_store: Some(BypassRuleSetStore::new(bypass_rule_set_path)),
             latency_chart: None,
             clash_mode: None,
             clash_modes: Vec::new(),
@@ -754,3 +844,154 @@ mod interaction_tests;
 #[cfg(test)]
 #[path = "../tui_runtime_integration_tests.rs"]
 mod runtime_integration_tests;
+
+#[cfg(test)]
+mod persistent_path_tests {
+    use super::{tui_persistent_path_registry, validate_tui_persistent_paths};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-app-paths-{nonce}"))
+    }
+
+    #[test]
+    fn tui_writers_are_rejected_before_they_can_alias_quality_storage() {
+        for role in [
+            "input",
+            "onboarding",
+            "state",
+            "bypass",
+            "background",
+            "background-self",
+            "managed-log",
+            "ruleset",
+            "private-access",
+        ] {
+            let dir = temp_dir().join(role);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            let config = dir.join("config.json");
+            let database = match role {
+                "managed-log" => dir.join("sing-box.log"),
+                "ruleset" => dir.join("sing-box-tui-rulesets/geoip-cn.srs"),
+                _ => dir.join("quality.sqlite3"),
+            };
+            let alias = match role {
+                "input" | "onboarding" => dir.join("quality.sqlite3-shm"),
+                "state" => database.clone(),
+                "bypass" => dir.join("quality.sqlite3.node-quality-writes-blocked"),
+                "background" => dir.join("quality.sqlite3-journal"),
+                "background-self" => dir.join("background.log"),
+                "managed-log" | "ruleset" => database.clone(),
+                "private-access" => dir.join("quality.sqlite3-wal"),
+                _ => unreachable!(),
+            };
+            fs::write(&config, b"{}\n").expect("write active config");
+            if let Some(parent) = alias.parent() {
+                fs::create_dir_all(parent).expect("create alias parent");
+            }
+            fs::write(&alias, b"canary\n").expect("write protected canary");
+            let input = if role == "input" {
+                alias.clone()
+            } else {
+                dir.join("subscriptions.txt")
+            };
+            let state = if role == "state" {
+                alias.clone()
+            } else {
+                dir.join("state.json")
+            };
+            let bypass = if role == "bypass" {
+                alias.clone()
+            } else {
+                dir.join("bypass.json")
+            };
+            let background_state = if matches!(role, "background" | "background-self") {
+                alias.clone()
+            } else {
+                dir.join("background.json")
+            };
+            let background_log = if role == "background-self" {
+                alias.clone()
+            } else {
+                dir.join("background.log")
+            };
+            let onboarding = if role == "onboarding" {
+                alias.clone()
+            } else {
+                dir.join("onboarding.suburl")
+            };
+
+            let mut registry = vec![
+                ("subscription source", input),
+                ("subscription cache", dir.join("cache.json")),
+                ("TUI state", state),
+                ("runtime bypass rule-set", bypass),
+                ("background task state", background_state),
+                ("background task log", background_log),
+            ];
+            if role == "private-access" {
+                registry.push(("SonicWall diagnostic log", alias.clone()));
+            }
+            if registry[0].1 != onboarding {
+                registry.push(("onboarding subscription source", onboarding));
+            }
+            let registry =
+                tui_persistent_path_registry(&config, registry).expect("derive TUI writer paths");
+            let error = validate_tui_persistent_paths(&config, &database, &registry)
+                .expect_err("TUI writer alias must fail before startup I/O");
+            assert!(format!("{error:#}").contains("must not alias"));
+            assert_eq!(fs::read(&alias).expect("read canary"), b"canary\n");
+            assert!(!database.exists() || database == alias);
+            let _ = fs::remove_dir_all(dir.parent().expect("role directory parent"));
+        }
+    }
+
+    #[test]
+    fn fresh_tui_writer_directories_are_validated_without_being_created() {
+        let dir = temp_dir().join("fresh-startup");
+        fs::create_dir_all(&dir).expect("create config directory");
+        let config = dir.join("config.json");
+        let database = dir.join("quality.sqlite3");
+        let future_cache = dir.join("future/cache/subscriptions.json");
+        let future_background = dir.join("future/background/state.json");
+        let registry = tui_persistent_path_registry(
+            &config,
+            vec![
+                ("subscription source", dir.join("future/source/.suburl")),
+                ("subscription cache", future_cache.clone()),
+                ("TUI state", dir.join("future/state/tui.json")),
+                (
+                    "runtime bypass rule-set",
+                    dir.join("future/bypass/rules.json"),
+                ),
+                ("background task state", future_background.clone()),
+                (
+                    "background task log",
+                    dir.join("future/background/state.log"),
+                ),
+                (
+                    "onboarding subscription source",
+                    dir.join("future/onboarding/.suburl"),
+                ),
+                (
+                    "SonicWall gateway profile cache",
+                    dir.join("future/private-access/profiles.json"),
+                ),
+            ],
+        )
+        .expect("derive fresh writer registry");
+
+        validate_tui_persistent_paths(&config, &database, &registry)
+            .expect("missing writer parents are valid future targets");
+        assert!(!dir.join("future").exists());
+        assert!(!dir.join("sing-box-tui-rulesets").exists());
+        assert!(!database.exists());
+        let _ = fs::remove_dir_all(dir.parent().expect("temporary root"));
+    }
+}

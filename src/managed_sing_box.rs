@@ -199,7 +199,11 @@ fn restart_sing_box_for_config(
     let log_path = sing_box_process_log_path(&config_path);
     let child = spawn_sing_box_with_bind_retry(&executable, &config_path, &log_path, || {
         let mut command = Command::new(&executable);
-        command.arg("run").arg("--config").arg(&config_path);
+        command
+            .arg("run")
+            .arg("--config")
+            .arg(&config_path)
+            .current_dir(sing_box_config_directory(&config_path));
         command
     })?;
     let started_pid = child.id();
@@ -341,13 +345,25 @@ fn sing_box_run_command(executable: &Path, config_path: &Path, use_sudo: bool) -
             .arg(executable)
             .arg("run")
             .arg("--config")
-            .arg(config_path);
+            .arg(config_path)
+            .current_dir(sing_box_config_directory(config_path));
         command
     } else {
         let mut command = Command::new(executable);
-        command.arg("run").arg("--config").arg(config_path);
+        command
+            .arg("run")
+            .arg("--config")
+            .arg(config_path)
+            .current_dir(sing_box_config_directory(config_path));
         command
     }
+}
+
+fn sing_box_config_directory(config_path: &Path) -> &Path {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1832,7 +1848,7 @@ fn stop_elevated_sing_box_child(child: &mut Child) -> Result<()> {
     stop_sing_box_child(child)
 }
 
-fn sing_box_process_log_path(config_path: &Path) -> PathBuf {
+pub(crate) fn sing_box_process_log_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1867,9 +1883,22 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{
         ProcessStartToken, process_alive_via_ps, process_descendant_pids, process_start_token,
-        resolve_new_sing_box_pid_or_cleanup, select_owned_sing_box_pid,
+        resolve_new_sing_box_pid_or_cleanup, select_owned_sing_box_pid, sing_box_run_command,
         stop_sing_box_pid_with_escalation, verify_process_instance_before_force_stop,
     };
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn managed_run_command_uses_the_canonical_config_directory() {
+        let config = Path::new("/tmp/sing-box-tui-managed/real/config.json");
+        for use_sudo in [false, true] {
+            let command = sing_box_run_command(Path::new("/usr/bin/sing-box"), config, use_sudo);
+            assert_eq!(
+                command.get_current_dir(),
+                Some(Path::new("/tmp/sing-box-tui-managed/real"))
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct BackendState {

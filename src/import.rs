@@ -1,5 +1,6 @@
+use std::cell::Cell;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
@@ -9,11 +10,17 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
+use crate::atomic_file::write_atomic;
 use crate::clash::{ClashConfig, convert_clash_proxy, is_metadata_entry};
 use crate::config::{
     DefaultConfigOptions, build_full_config_with_options,
     build_full_config_with_provider_groups_and_options, ensure_bypass_rule_set_file_for_config,
+    resolved_bypass_rule_set_path_for_config,
 };
+use crate::config_mutation::{
+    commit_active_node_config, lock_config_mutation_for, paths_refer_to_same_target,
+};
+use crate::node_quality_path::default_benchmark_db_path_for_config;
 
 pub(crate) fn run_import(
     source: &PathBuf,
@@ -24,6 +31,7 @@ pub(crate) fn run_import(
     include_geosite_rules: bool,
     include_tun_mode: bool,
 ) -> Result<()> {
+    preflight_import_paths(source, output, full_config, config_path)?;
     let text = fs::read_to_string(source)
         .with_context(|| format!("failed to read Clash proxy file {}", source.display()))?;
     let config: ClashConfig = serde_yaml::from_str(&text).context("failed to parse Clash YAML")?;
@@ -35,6 +43,24 @@ pub(crate) fn run_import(
         .map(convert_clash_proxy)
         .collect::<Result<Vec<_>>>()?;
 
+    if full_config && let Some(output) = output {
+        write_imported_nodes_full_config(
+            config_path,
+            output,
+            converted,
+            replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
+        )?;
+        println!("{}", output.display());
+        return Ok(());
+    }
+
+    let _config_guard = if full_config {
+        Some(lock_config_mutation_for(config_path)?)
+    } else {
+        None
+    };
     let output_value = if full_config {
         build_full_config_with_options(
             config_path,
@@ -53,17 +79,135 @@ pub(crate) fn run_import(
         .context("failed to serialize sing-box import output")?;
 
     if let Some(output) = output {
-        fs::write(output, format!("{json_text}\n"))
-            .with_context(|| format!("failed to write {}", output.display()))?;
         if full_config {
             ensure_bypass_rule_set_file_for_config(output)?;
         }
+        write_atomic(output, format!("{json_text}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", output.display()))?;
         println!("{}", output.display());
     } else {
         println!("{json_text}");
     }
 
     Ok(())
+}
+
+fn preflight_import_paths(
+    source: &Path,
+    output: Option<&PathBuf>,
+    full_config: bool,
+    config_path: &Path,
+) -> Result<()> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    let active_output = paths_refer_to_same_target(config_path, output)?;
+    if !full_config && active_output {
+        bail!("raw import output must not overwrite the active sing-box config");
+    }
+    let database_path = default_benchmark_db_path_for_config(config_path)?;
+    let bypass_path = if full_config {
+        Some(resolved_bypass_rule_set_path_for_config(output)?)
+    } else {
+        None
+    };
+    let mut auxiliary = vec![("Clash import source", source)];
+    if !active_output {
+        auxiliary.push(("import output", output.as_path()));
+    }
+    if let Some(path) = bypass_path.as_deref() {
+        auxiliary.push(("bypass rule-set", path));
+    }
+    crate::node_quality_path::ensure_active_config_paths_are_distinct(
+        config_path,
+        &database_path,
+        &auxiliary,
+    )
+}
+
+pub(crate) fn commit_imported_nodes_to_active_config(
+    config_path: &PathBuf,
+    active_output: &Path,
+    database_path: &Path,
+    imported_nodes: Vec<Value>,
+    replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
+) -> Result<()> {
+    if !paths_refer_to_same_target(config_path, active_output)? {
+        bail!("active config commit destination does not match --config target");
+    }
+    commit_active_node_config(
+        active_output,
+        database_path,
+        || {
+            build_full_config_with_options(
+                config_path,
+                imported_nodes,
+                replace_nodes,
+                DefaultConfigOptions {
+                    include_geosite_rules,
+                    include_tun_mode,
+                },
+            )
+        },
+        || ensure_bypass_rule_set_file_for_config(active_output).map(|_| ()),
+        || Ok(None),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write_imported_nodes_full_config(
+    config_path: &PathBuf,
+    output: &Path,
+    imported_nodes: Vec<Value>,
+    replace_nodes: bool,
+    include_geosite_rules: bool,
+    include_tun_mode: bool,
+) -> Result<()> {
+    let database_path = default_benchmark_db_path_for_config(config_path)?;
+    let bypass_path = resolved_bypass_rule_set_path_for_config(output)?;
+    if paths_refer_to_same_target(config_path, output)? {
+        crate::node_quality_path::ensure_active_config_paths_are_distinct(
+            config_path,
+            &database_path,
+            &[("bypass rule-set", bypass_path.as_path())],
+        )?;
+        return commit_imported_nodes_to_active_config(
+            config_path,
+            output,
+            &database_path,
+            imported_nodes,
+            replace_nodes,
+            include_geosite_rules,
+            include_tun_mode,
+        );
+    }
+
+    crate::node_quality_path::ensure_active_config_paths_are_distinct(
+        config_path,
+        &database_path,
+        &[
+            ("merged import output", output),
+            ("bypass rule-set", bypass_path.as_path()),
+        ],
+    )?;
+
+    let _config_guard = lock_config_mutation_for(config_path)?;
+    let config = build_full_config_with_options(
+        config_path,
+        imported_nodes,
+        replace_nodes,
+        DefaultConfigOptions {
+            include_geosite_rules,
+            include_tun_mode,
+        },
+    )?;
+    let contents = serde_json::to_string_pretty(&config)
+        .context("failed to serialize sing-box import output")?;
+    ensure_bypass_rule_set_file_for_config(output)?;
+    write_atomic(output, format!("{contents}\n").as_bytes())
+        .with_context(|| format!("failed to write {}", output.display()))
 }
 
 pub(crate) struct SubscribeImportOptions {
@@ -92,6 +236,52 @@ pub(crate) fn run_subscribe_import(options: SubscribeImportOptions) -> Result<()
     } = options;
     let output = output.as_ref();
     let subscription_output = subscription_output.as_ref();
+    let active_output = output
+        .map(|path| paths_refer_to_same_target(&config_path, path))
+        .transpose()?
+        .unwrap_or(false);
+    let bypass_path = output
+        .map(|path| resolved_bypass_rule_set_path_for_config(path))
+        .transpose()?;
+    let has_file_output = output.is_some() || subscription_output.is_some();
+    let resolved_database_path = has_file_output
+        .then(|| default_benchmark_db_path_for_config(&config_path))
+        .transpose()?;
+    let database_path = if active_output {
+        let mut auxiliary = subscription_output
+            .map(|path| vec![("subscription output", path.as_path())])
+            .unwrap_or_default();
+        if let Some(path) = bypass_path.as_deref() {
+            auxiliary.push(("bypass rule-set", path));
+        }
+        crate::node_quality_path::ensure_active_config_paths_are_distinct(
+            &config_path,
+            resolved_database_path
+                .as_deref()
+                .context("active subscription import requires node-quality path binding")?,
+            &auxiliary,
+        )?;
+        resolved_database_path
+    } else if let Some(resolved_database_path) = resolved_database_path {
+        let mut paths = Vec::new();
+        if let Some(path) = output {
+            paths.push(("merged subscription output", path.as_path()));
+        }
+        if let Some(path) = subscription_output {
+            paths.push(("subscription output", path.as_path()));
+        }
+        if let Some(path) = bypass_path.as_deref() {
+            paths.push(("bypass rule-set", path));
+        }
+        crate::node_quality_path::ensure_active_config_paths_are_distinct(
+            &config_path,
+            &resolved_database_path,
+            &paths,
+        )?;
+        None
+    } else {
+        None
+    };
     let parsed_url = Url::parse(&subscription_url).with_context(|| {
         format!(
             "invalid subscription URL: {}",
@@ -128,40 +318,51 @@ pub(crate) fn run_subscribe_import(options: SubscribeImportOptions) -> Result<()
     }
 
     if let Some(path) = subscription_output {
-        fs::write(path, format!("{subscription_json}\n"))
+        write_atomic(path, format!("{subscription_json}\n").as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
-    let (config, imported_nodes) = if let Some(provider_name) = provider_name.as_deref() {
-        build_full_config_from_singbox_subscription_with_provider_groups(
-            &config_path,
-            &subscription_json,
-            replace_nodes,
-            provider_name,
-            existing_provider_name.as_deref(),
-            DefaultConfigOptions {
-                include_geosite_rules,
-                include_tun_mode,
-            },
-        )?
-    } else {
-        build_full_config_from_singbox_subscription_with_options(
-            &config_path,
-            &subscription_json,
-            replace_nodes,
-            DefaultConfigOptions {
-                include_geosite_rules,
-                include_tun_mode,
-            },
-        )?
-    };
-    let config_text =
-        serde_json::to_string_pretty(&config).context("failed to serialize merged config")?;
-
     if let Some(output) = output {
-        fs::write(output, format!("{config_text}\n"))
-            .with_context(|| format!("failed to write {}", output.display()))?;
-        ensure_bypass_rule_set_file_for_config(output)?;
+        let imported_nodes = if active_output {
+            commit_subscription_payload_to_active_config(
+                &config_path,
+                output,
+                database_path
+                    .as_deref()
+                    .context("active subscription import requires node-quality storage")?,
+                SubscriptionConfigRequest {
+                    subscription_json: &subscription_json,
+                    replace_nodes,
+                    config_options: DefaultConfigOptions {
+                        include_geosite_rules,
+                        include_tun_mode,
+                    },
+                    provider_name: provider_name.as_deref(),
+                    existing_provider_name: existing_provider_name.as_deref(),
+                },
+            )?
+        } else {
+            let _config_guard = lock_config_mutation_for(&config_path)?;
+            let (config, imported_nodes) = build_subscribe_config(
+                &config_path,
+                SubscriptionConfigRequest {
+                    subscription_json: &subscription_json,
+                    replace_nodes,
+                    config_options: DefaultConfigOptions {
+                        include_geosite_rules,
+                        include_tun_mode,
+                    },
+                    provider_name: provider_name.as_deref(),
+                    existing_provider_name: existing_provider_name.as_deref(),
+                },
+            )?;
+            let config_text = serde_json::to_string_pretty(&config)
+                .context("failed to serialize merged config")?;
+            ensure_bypass_rule_set_file_for_config(output)?;
+            write_atomic(output, format!("{config_text}\n").as_bytes())
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            imported_nodes
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!(SubscriptionImportOutput {
@@ -173,10 +374,97 @@ pub(crate) fn run_subscribe_import(options: SubscribeImportOptions) -> Result<()
             }))?
         );
     } else {
+        let _config_guard = lock_config_mutation_for(&config_path)?;
+        let (config, _) = build_subscribe_config(
+            &config_path,
+            SubscriptionConfigRequest {
+                subscription_json: &subscription_json,
+                replace_nodes,
+                config_options: DefaultConfigOptions {
+                    include_geosite_rules,
+                    include_tun_mode,
+                },
+                provider_name: provider_name.as_deref(),
+                existing_provider_name: existing_provider_name.as_deref(),
+            },
+        )?;
+        let config_text =
+            serde_json::to_string_pretty(&config).context("failed to serialize merged config")?;
         println!("{config_text}");
     }
 
     Ok(())
+}
+
+pub(crate) struct SubscriptionConfigRequest<'a> {
+    pub(crate) subscription_json: &'a str,
+    pub(crate) replace_nodes: bool,
+    pub(crate) config_options: DefaultConfigOptions,
+    pub(crate) provider_name: Option<&'a str>,
+    pub(crate) existing_provider_name: Option<&'a str>,
+}
+
+impl<'a> SubscriptionConfigRequest<'a> {
+    pub(crate) fn without_provider(
+        subscription_json: &'a str,
+        replace_nodes: bool,
+        config_options: DefaultConfigOptions,
+    ) -> Self {
+        Self {
+            subscription_json,
+            replace_nodes,
+            config_options,
+            provider_name: None,
+            existing_provider_name: None,
+        }
+    }
+}
+
+pub(crate) fn commit_subscription_payload_to_active_config(
+    config_path: &PathBuf,
+    active_output: &Path,
+    database_path: &Path,
+    request: SubscriptionConfigRequest<'_>,
+) -> Result<usize> {
+    if !paths_refer_to_same_target(config_path, active_output)? {
+        bail!("active config commit destination does not match --config target");
+    }
+    let imported_nodes = Cell::new(0);
+    commit_active_node_config(
+        active_output,
+        database_path,
+        || {
+            let (config, count) = build_subscribe_config(config_path, request)?;
+            imported_nodes.set(count);
+            Ok(config)
+        },
+        || ensure_bypass_rule_set_file_for_config(active_output).map(|_| ()),
+        || Ok(None),
+    )?;
+    Ok(imported_nodes.get())
+}
+
+fn build_subscribe_config(
+    config_path: &PathBuf,
+    request: SubscriptionConfigRequest<'_>,
+) -> Result<(Value, usize)> {
+    if let Some(provider_name) = request.provider_name {
+        build_full_config_from_singbox_subscription_with_provider_groups(
+            config_path,
+            request.subscription_json,
+            request.replace_nodes,
+            provider_name,
+            request.existing_provider_name,
+            request.config_options,
+        )
+    } else {
+        build_full_config_from_singbox_subscription_with_options(
+            config_path,
+            request.subscription_json,
+            request.replace_nodes,
+            request.config_options,
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -328,7 +616,150 @@ fn redact_url(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_full_config_from_singbox_subscription;
+    use super::{
+        SubscribeImportOptions, build_full_config_from_singbox_subscription, run_import,
+        run_subscribe_import, write_imported_nodes_full_config,
+    };
+    use crate::config::build_default_config;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sing-box-tui-{label}-{nonce}"))
+    }
+
+    #[test]
+    fn raw_subscription_output_cannot_alias_the_active_config() {
+        let dir = temp_dir("subscribe-raw-active-alias");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+
+        let error = run_subscribe_import(SubscribeImportOptions {
+            subscription_url: "this URL must never be parsed".to_string(),
+            output: Some(config_path.clone()),
+            config_path: config_path.clone(),
+            subscription_output: Some(config_path),
+            replace_nodes: true,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            provider_name: None,
+            existing_provider_name: None,
+        })
+        .expect_err("raw subscription output must be rejected before fetching");
+
+        assert!(
+            format!("{error:#}").contains("must not alias"),
+            "unexpected error: {error:#}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clash_source_and_output_alias_fails_before_source_read() {
+        let dir = temp_dir("clash-source-output-alias");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let canary = dir.join("source.yaml");
+        let original = b"not valid Clash YAML and must remain unchanged\n";
+        fs::write(&canary, original).expect("write source canary");
+
+        let error = run_import(
+            &canary,
+            Some(&canary),
+            true,
+            &config_path,
+            true,
+            false,
+            false,
+        )
+        .expect_err("source/output alias must fail during preflight");
+
+        assert!(
+            format!("{error:#}").contains("must not alias"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&canary).expect("read canary"), original);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_only_subscription_import_does_not_resolve_node_quality_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("subscribe-stdout-lazy-quality");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("dangling-config.json");
+        symlink(dir.join("missing-target.json"), &config_path)
+            .expect("create dangling config symlink");
+
+        let error = run_subscribe_import(SubscribeImportOptions {
+            subscription_url: "this URL must never reach the network".to_string(),
+            output: None,
+            config_path,
+            subscription_output: None,
+            replace_nodes: true,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            provider_name: None,
+            existing_provider_name: None,
+        })
+        .expect_err("invalid URL must fail without resolving the config-bound database");
+
+        assert!(
+            format!("{error:#}").contains("invalid subscription URL"),
+            "unexpected error: {error:#}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn distinct_import_output_does_not_open_or_mutate_the_quality_database() {
+        let dir = temp_dir("import-output-only-quality");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("active.json");
+        let output_path = dir.join("preview.json");
+        let database_path = dir.join("active.json.sing-box-tui.sqlite3");
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&build_default_config(vec![json!({
+                "type": "trojan", "tag": "node-a", "server": "old.example",
+                "server_port": 443, "password": "old-secret"
+            })]))
+            .expect("serialize active config"),
+        )
+        .expect("write active config");
+
+        write_imported_nodes_full_config(
+            &config_path,
+            &output_path,
+            vec![json!({
+                "type": "trojan", "tag": "node-a", "server": "preview.example",
+                "server_port": 443, "password": "preview-secret"
+            })],
+            true,
+            false,
+            false,
+        )
+        .expect("write preview config");
+
+        assert!(output_path.exists());
+        assert!(
+            !database_path.exists(),
+            "a distinct preview output must not initialize node-quality storage"
+        );
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read active config")
+                .contains("old.example")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn singbox_subscription_extracts_only_mergeable_nodes() {

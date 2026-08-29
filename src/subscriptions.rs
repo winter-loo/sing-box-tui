@@ -14,9 +14,15 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use crate::atomic_file::write_atomic;
 use crate::config::{
     DefaultConfigOptions, ProviderNodeSet, build_full_config_with_provider_node_sets_and_options,
-    ensure_bypass_rule_set_file_for_config, lock_config_mutation,
+    ensure_bypass_rule_set_file_for_config, resolved_bypass_rule_set_path_for_config,
+};
+use crate::config_mutation::{
+    commit_active_node_config, lock_config_mutation_for, paths_refer_to_same_target,
 };
 use crate::import::extract_mergeable_outbounds_from_singbox_subscription;
+use crate::node_quality_path::{
+    default_benchmark_db_path_for_config, ensure_active_config_paths_are_distinct,
+};
 
 pub(crate) const DEFAULT_SUBSCRIPTION_SOURCE_PATH: &str = ".suburl";
 pub(crate) const DEFAULT_SUBSCRIPTION_CACHE_PATH: &str = ".suburl.cache.json";
@@ -31,6 +37,7 @@ pub(crate) struct SubscriptionRefreshRequest {
     pub(crate) cache_path: PathBuf,
     pub(crate) config_path: PathBuf,
     pub(crate) merged_path: PathBuf,
+    pub(crate) node_quality_db_path: PathBuf,
     pub(crate) replace_nodes: bool,
     pub(crate) include_geosite_rules: bool,
     pub(crate) include_tun_mode: bool,
@@ -72,11 +79,13 @@ pub(crate) fn run_subscription_refresh(options: SubscriptionRefreshOptions) -> R
     } else {
         bail!("subscriptions requires either --output <FILE> or --write");
     };
+    let node_quality_db_path = default_benchmark_db_path_for_config(&config_path_buf)?;
     let report = refresh_subscriptions(&SubscriptionRefreshRequest {
         input,
         cache_path,
         config_path: config_path_buf,
         merged_path,
+        node_quality_db_path,
         replace_nodes,
         include_geosite_rules,
         include_tun_mode,
@@ -91,6 +100,7 @@ pub(crate) fn run_subscription_refresh(options: SubscriptionRefreshOptions) -> R
 pub(crate) fn refresh_subscriptions(
     request: &SubscriptionRefreshRequest,
 ) -> Result<SubscriptionRefreshOutput> {
+    validate_subscription_refresh_paths(request)?;
     if request.interval_days == 0 {
         bail!("--interval-days must be greater than 0");
     }
@@ -119,6 +129,9 @@ pub(crate) fn refresh_subscriptions(
         now_unix,
     ))?;
 
+    let no_provider_fetch_failed = resolved
+        .iter()
+        .all(|item| !matches!(item.status, SubscriptionFetchStatus::StaleCache));
     let mut summaries = Vec::new();
     let mut cache_changed = false;
     let mut provider_node_sets = Vec::new();
@@ -171,32 +184,190 @@ pub(crate) fn refresh_subscriptions(
     if cache_changed {
         cache_store.save(&cache)?;
     }
-    let backup_path = merge_and_commit_subscription_config(request, provider_node_sets)?;
-    ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
+    let commit = commit_subscription_config_and_quality(
+        request,
+        provider_node_sets,
+        no_provider_fetch_failed,
+    )?;
 
     Ok(SubscriptionRefreshOutput {
         input_path: request.input.display().to_string(),
         cache_path: request.cache_path.display().to_string(),
         interval_days: request.interval_days,
         merged_config_path: request.merged_path.display().to_string(),
-        backup_config_path: backup_path.map(|path| path.display().to_string()),
+        backup_config_path: commit.backup_path.map(|path| path.display().to_string()),
+        config_updated: commit.config_updated,
+        node_history_reconciled: commit.node_history_reconciled,
+        node_history_changed: commit.node_history_changed,
+        node_quality_generation: commit.node_quality_generation,
         providers: summaries,
     })
+}
+
+pub(crate) fn validate_subscription_refresh_paths(
+    request: &SubscriptionRefreshRequest,
+) -> Result<()> {
+    let writes_active_config =
+        paths_refer_to_same_target(&request.config_path, &request.merged_path)?;
+    if writes_active_config {
+        // The writer intentionally preserves an active-config symlink by replacing the path
+        // named by `merged_path`, so its backup and prerequisite live beside that actual entry.
+        let backup_path = subscription_config_backup_path(&request.merged_path);
+        let bypass_path = resolved_bypass_rule_set_path_for_config(&request.merged_path)?;
+        ensure_active_config_paths_are_distinct(
+            &request.config_path,
+            &request.node_quality_db_path,
+            &[
+                ("subscription source", request.input.as_path()),
+                ("subscription cache", request.cache_path.as_path()),
+                ("subscription backup", backup_path.as_path()),
+                ("bypass rule-set", bypass_path.as_path()),
+            ],
+        )
+    } else {
+        let backup_path = subscription_config_backup_path(&request.merged_path);
+        let bypass_path = resolved_bypass_rule_set_path_for_config(&request.merged_path)?;
+        ensure_active_config_paths_are_distinct(
+            &request.config_path,
+            &request.node_quality_db_path,
+            &[
+                ("subscription source", request.input.as_path()),
+                ("subscription cache", request.cache_path.as_path()),
+                ("merged subscription output", request.merged_path.as_path()),
+                ("subscription output backup", backup_path.as_path()),
+                ("bypass rule-set", bypass_path.as_path()),
+            ],
+        )
+    }
+}
+
+struct SubscriptionConfigCommit {
+    backup_path: Option<PathBuf>,
+    config_updated: bool,
+    node_history_reconciled: bool,
+    node_history_changed: bool,
+    node_quality_generation: Option<u64>,
+}
+
+impl std::fmt::Debug for SubscriptionConfigCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubscriptionConfigCommit")
+            .field("backup_path", &self.backup_path)
+            .field("config_updated", &self.config_updated)
+            .field("node_history_reconciled", &self.node_history_reconciled)
+            .field("node_history_changed", &self.node_history_changed)
+            .field("node_quality_generation", &self.node_quality_generation)
+            .finish()
+    }
+}
+
+fn commit_subscription_config_and_quality(
+    request: &SubscriptionRefreshRequest,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+    no_provider_fetch_failed: bool,
+) -> Result<SubscriptionConfigCommit> {
+    let writes_active_config =
+        paths_refer_to_same_target(&request.config_path, &request.merged_path)?;
+    if !no_provider_fetch_failed && writes_active_config {
+        return Ok(unchanged_subscription_commit());
+    }
+    if !writes_active_config {
+        return merge_and_commit_subscription_config(request, provider_node_sets);
+    }
+
+    let active = commit_active_node_config(
+        &request.merged_path,
+        &request.node_quality_db_path,
+        || build_subscription_config(request, provider_node_sets),
+        || ensure_bypass_rule_set_file_for_config(&request.merged_path).map(|_| ()),
+        || backup_existing_config(&request.merged_path),
+    )?;
+    Ok(subscription_commit_from_active(active))
+}
+
+#[cfg(test)]
+fn commit_subscription_config_as_independent_process(
+    request: &SubscriptionRefreshRequest,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+    before_reconcile: impl FnOnce(),
+    after_commit_before_marker_cleanup: impl FnOnce(),
+) -> Result<SubscriptionConfigCommit> {
+    let active = crate::config_mutation::commit_active_node_config_as_independent_process(
+        &request.merged_path,
+        &request.node_quality_db_path,
+        || build_subscription_config(request, provider_node_sets),
+        || ensure_bypass_rule_set_file_for_config(&request.merged_path).map(|_| ()),
+        || backup_existing_config(&request.merged_path),
+        before_reconcile,
+        after_commit_before_marker_cleanup,
+    )?;
+    Ok(subscription_commit_from_active(active))
+}
+
+fn unchanged_subscription_commit() -> SubscriptionConfigCommit {
+    SubscriptionConfigCommit {
+        backup_path: None,
+        config_updated: false,
+        node_history_reconciled: false,
+        node_history_changed: false,
+        node_quality_generation: None,
+    }
+}
+
+fn subscription_commit_from_active(
+    active: crate::config_mutation::ActiveNodeConfigCommit,
+) -> SubscriptionConfigCommit {
+    SubscriptionConfigCommit {
+        backup_path: active.backup_path,
+        config_updated: true,
+        node_history_reconciled: true,
+        node_history_changed: active.reconciliation.identities_changed,
+        node_quality_generation: Some(active.reconciliation.generation),
+    }
 }
 
 fn merge_and_commit_subscription_config(
     request: &SubscriptionRefreshRequest,
     provider_node_sets: Vec<ProviderNodeRefresh>,
-) -> Result<Option<PathBuf>> {
-    let _config_guard = lock_config_mutation();
-    let refreshed_config = if request.config_path.exists() {
+) -> Result<SubscriptionConfigCommit> {
+    let _config_guard = lock_config_mutation_for(&request.config_path)?;
+    ensure_bypass_rule_set_file_for_config(&request.merged_path)?;
+    merge_and_commit_subscription_config_unlocked(request, provider_node_sets)
+}
+
+fn merge_and_commit_subscription_config_unlocked(
+    request: &SubscriptionRefreshRequest,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+) -> Result<SubscriptionConfigCommit> {
+    let refreshed_config = build_subscription_config(request, provider_node_sets)?;
+
+    let contents = serde_json::to_string_pretty(&refreshed_config)
+        .context("failed to serialize refreshed subscription config")?;
+    let backup_path = backup_existing_config(&request.merged_path)?;
+    write_atomic(&request.merged_path, format!("{contents}\n").as_bytes())
+        .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
+    Ok(SubscriptionConfigCommit {
+        backup_path,
+        config_updated: true,
+        node_history_reconciled: false,
+        node_history_changed: false,
+        node_quality_generation: None,
+    })
+}
+
+fn build_subscription_config(
+    request: &SubscriptionRefreshRequest,
+    provider_node_sets: Vec<ProviderNodeRefresh>,
+) -> Result<Value> {
+    if request.config_path.exists() {
         let mut config = read_existing_config(&request.config_path)?;
         refresh_provider_node_outbounds_only(
             &mut config,
             provider_node_sets,
             request.replace_nodes,
         )?;
-        config
+        Ok(config)
     } else {
         build_full_config_with_provider_node_sets_and_options(
             &request.config_path,
@@ -212,15 +383,8 @@ fn merge_and_commit_subscription_config(
                 include_geosite_rules: request.include_geosite_rules,
                 include_tun_mode: request.include_tun_mode,
             },
-        )?
-    };
-
-    let contents = serde_json::to_string_pretty(&refreshed_config)
-        .context("failed to serialize refreshed subscription config")?;
-    let backup_path = backup_existing_config(&request.merged_path)?;
-    write_atomic(&request.merged_path, format!("{contents}\n").as_bytes())
-        .with_context(|| format!("failed to write {}", request.merged_path.display()))?;
-    Ok(backup_path)
+        )
+    }
 }
 
 fn read_existing_config(path: &Path) -> Result<Value> {
@@ -646,6 +810,10 @@ pub(crate) struct SubscriptionRefreshOutput {
     pub(crate) interval_days: u64,
     pub(crate) merged_config_path: String,
     pub(crate) backup_config_path: Option<String>,
+    pub(crate) config_updated: bool,
+    pub(crate) node_history_reconciled: bool,
+    pub(crate) node_history_changed: bool,
+    pub(crate) node_quality_generation: Option<u64>,
     pub(crate) providers: Vec<ProviderRefreshSummary>,
 }
 
@@ -690,11 +858,12 @@ fn backup_existing_config(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn subscription_config_backup_path(path: &Path) -> PathBuf {
-    let file_name = path
+    let mut file_name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    path.with_file_name(format!("{file_name}.{SUBSCRIPTION_CONFIG_BACKUP_SUFFIX}"))
+        .unwrap_or_else(|| std::ffi::OsStr::new("config.json"))
+        .to_os_string();
+    file_name.push(format!(".{SUBSCRIPTION_CONFIG_BACKUP_SUFFIX}"));
+    path.with_file_name(file_name)
 }
 
 fn parse_subscription_sources(text: &str) -> Result<Vec<SubscriptionSource>> {
@@ -928,21 +1097,125 @@ fn is_secret_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSubscription, ProviderNodeRefresh, SubscriptionRefreshRequest,
-        backup_existing_config, cache_entry_is_fresh, merge_and_commit_subscription_config,
-        parse_subscription_sources, redact_url, refresh_node_outbounds_only,
-        refresh_provider_node_outbounds_only, strip_flag_emoji_from_node_tags,
-        subscription_config_backup_path, subscription_source_requires_direct_fetch,
-        subscription_source_strips_flag_emoji,
+        CachedSubscription, ProviderNodeRefresh, SubscriptionCache, SubscriptionCacheStore,
+        SubscriptionRefreshRequest, backup_existing_config, cache_entry_is_fresh,
+        commit_subscription_config_and_quality, commit_subscription_config_as_independent_process,
+        hash_url, merge_and_commit_subscription_config, parse_subscription_sources, redact_url,
+        refresh_node_outbounds_only, refresh_provider_node_outbounds_only, refresh_subscriptions,
+        strip_flag_emoji_from_node_tags, subscription_config_backup_path,
+        subscription_source_requires_direct_fetch, subscription_source_strips_flag_emoji, unix_now,
+        validate_subscription_refresh_paths,
     };
-    use crate::config::lock_config_mutation;
-    use crate::defaults::default_clash_api_external_controller;
+    use crate::atomic_file::DurableAtomicWriteError;
+    use crate::benchmark_workflow::BenchmarkWorkflow;
+    use crate::config::{set_internet_tun_mode, set_internet_tun_mode_after_read_for_test};
+    use crate::config_mutation::{
+        commit_active_node_config, commit_active_node_config_with_writer_for_test,
+        lock_config_mutation_for, paths_refer_to_same_target,
+    };
+    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome};
+    use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, default_clash_api_external_controller};
+    use crate::storage::{BenchmarkRecord, BenchmarkStore};
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn provider_config(nodes: Vec<Value>) -> Value {
+        let tags = nodes
+            .iter()
+            .map(|node| node["tag"].as_str().expect("node tag").to_string())
+            .collect::<Vec<_>>();
+        let mut outbounds = vec![
+            serde_json::json!({
+                "type": "selector",
+                "tag": "select",
+                "outbounds": ["provider-a", "direct"],
+                "default": "provider-a"
+            }),
+            serde_json::json!({
+                "type": "selector",
+                "tag": "provider-a",
+                "outbounds": tags,
+                "default": tags.first().cloned()
+            }),
+            serde_json::json!({"type": "direct", "tag": "direct"}),
+        ];
+        outbounds.extend(nodes);
+        serde_json::json!({"outbounds": outbounds})
+    }
+
+    fn request_for(
+        dir: &std::path::Path,
+        config_path: std::path::PathBuf,
+        merged_path: std::path::PathBuf,
+    ) -> SubscriptionRefreshRequest {
+        SubscriptionRefreshRequest {
+            input: dir.join("subscriptions.txt"),
+            cache_path: dir.join("cache.json"),
+            config_path,
+            merged_path,
+            node_quality_db_path: dir.join("quality.sqlite3"),
+            replace_nodes: false,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            force: true,
+            interval_days: 1,
+        }
+    }
+
+    fn seed_quality_history(db_path: &std::path::Path, config: &Value, nodes: &[&str]) {
+        let store = BenchmarkStore::open(db_path).expect("open quality store");
+        store
+            .reconcile_node_history(config)
+            .expect("seed node identities");
+        for (index, node) in nodes.iter().enumerate() {
+            assert!(
+                store
+                    .record_benchmark(&BenchmarkRecord {
+                        selector: "select",
+                        node,
+                        filter: "seed",
+                        delay_ms: Some(40 + index as u64),
+                        completed: true,
+                        job_kind: "test",
+                    })
+                    .expect("seed benchmark history")
+            );
+            store
+                .record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment::from_attempts(
+                        (*node).to_string(),
+                        vec![
+                            ProbeOutcome::Reachable {
+                                delay_ms: 40 + index as u64,
+                            },
+                            ProbeOutcome::Reachable {
+                                delay_ms: 41 + index as u64,
+                            },
+                            ProbeOutcome::Reachable {
+                                delay_ms: 42 + index as u64,
+                            },
+                        ],
+                    ),
+                )
+                .expect("seed node history");
+        }
+    }
+
+    fn history_nodes(db_path: &std::path::Path) -> Vec<String> {
+        BenchmarkStore::open(db_path)
+            .expect("reopen quality store")
+            .latest_reachability_assessments()
+            .expect("read quality history")
+            .into_iter()
+            .map(|(_, assessment)| assessment.name)
+            .collect()
+    }
 
     #[test]
     fn subscription_refresh_updates_only_server_node_outbounds() {
@@ -1495,6 +1768,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_config_names_keep_distinct_backup_sidecars() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let dir = temp_dir("subscription-non-utf8-backups");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let first = dir.join(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+        let second = dir.join(std::ffi::OsString::from_vec(vec![b'b', 0xfe]));
+        let first_backup = subscription_config_backup_path(&first);
+        let second_backup = subscription_config_backup_path(&second);
+
+        assert_ne!(first_backup, second_backup);
+        assert!(
+            first_backup
+                .file_name()
+                .expect("first backup name")
+                .as_bytes()
+                .starts_with(&[b'a', 0xff])
+        );
+        assert!(
+            second_backup
+                .file_name()
+                .expect("second backup name")
+                .as_bytes()
+                .starts_with(&[b'b', 0xfe])
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn backup_existing_config_replaces_prior_backup() {
         let dir = temp_dir("subscription-backup");
@@ -1553,6 +1856,1071 @@ mod tests {
     }
 
     #[test]
+    fn subscription_path_aliases_fail_before_source_cache_or_output_io() {
+        for role in ["input-cache", "cache", "merged", "backup", "bypass"] {
+            let dir = temp_dir(&format!("subscription-path-preflight-{role}"));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            let config = dir.join("config.json");
+            fs::write(&config, b"{}\n").expect("write active config");
+            let mut request = request_for(&dir, config.clone(), config.clone());
+            let canary = match role {
+                "input-cache" => {
+                    request.input = dir.join("source-and-cache.txt");
+                    request.cache_path = request.input.clone();
+                    request.input.clone()
+                }
+                "cache" => {
+                    request.cache_path = dir.join("quality.sqlite3-shm");
+                    request.cache_path.clone()
+                }
+                "merged" => {
+                    request.merged_path = dir.join("quality.sqlite3-wal");
+                    request.merged_path.clone()
+                }
+                "backup" => {
+                    request.merged_path = dir.join("preview.json");
+                    request.node_quality_db_path =
+                        subscription_config_backup_path(&request.merged_path);
+                    request.node_quality_db_path.clone()
+                }
+                "bypass" => {
+                    request.node_quality_db_path = dir.join(DEFAULT_BYPASS_RULE_SET_PATH);
+                    request.node_quality_db_path.clone()
+                }
+                _ => unreachable!(),
+            };
+            fs::write(&request.input, b"https://127.0.0.1:9/must-not-fetch\n")
+                .expect("write source canary");
+            if canary != request.input {
+                fs::write(&canary, b"protected canary\n").expect("write path canary");
+            }
+            let before = fs::read(&canary).expect("read canary before validation");
+
+            let error = refresh_subscriptions(&request)
+                .expect_err("path alias must fail before subscription I/O");
+            assert!(
+                format!("{error:#}").contains("must not alias"),
+                "{role}: {error:#}"
+            );
+            assert_eq!(fs::read(&canary).expect("read preserved canary"), before);
+            assert!(validate_subscription_refresh_paths(&request).is_err());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_cross_directory_alias_validates_the_actual_backup_and_resolved_bypass() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("subscription-cross-directory-preflight");
+        let real_dir = root.join("real");
+        let alias_dir = root.join("alias");
+        fs::create_dir_all(&real_dir).expect("create real config directory");
+        fs::create_dir_all(&alias_dir).expect("create alias config directory");
+        let config = real_dir.join("config.json");
+        let alias = alias_dir.join("config.json");
+        fs::write(&config, b"{}\n").expect("write active config");
+        symlink("../real/config.json", &alias).expect("create active config alias");
+
+        let backup = subscription_config_backup_path(&alias);
+        let bypass = crate::config::resolved_bypass_rule_set_path_for_config(&alias)
+            .expect("resolve actual bypass prerequisite");
+        fs::write(&backup, b"backup-canary\n").expect("write backup canary");
+        fs::write(&bypass, b"bypass-canary\n").expect("write bypass canary");
+        let request = SubscriptionRefreshRequest {
+            input: backup.clone(),
+            cache_path: bypass.clone(),
+            config_path: config,
+            merged_path: alias,
+            node_quality_db_path: real_dir.join("quality.sqlite3"),
+            replace_nodes: false,
+            include_geosite_rules: false,
+            include_tun_mode: false,
+            force: true,
+            interval_days: 7,
+        };
+
+        let error = refresh_subscriptions(&request)
+            .expect_err("actual writer aliases must fail before source or cache I/O");
+        assert!(format!("{error:#}").contains("must not alias"));
+        assert_eq!(
+            fs::read(&backup).expect("read backup canary"),
+            b"backup-canary\n"
+        );
+        assert_eq!(
+            fs::read(&bypass).expect("read bypass canary"),
+            b"bypass-canary\n"
+        );
+        assert!(!alias_dir.join(DEFAULT_BYPASS_RULE_SET_PATH).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_active_refresh_reconciles_history_after_the_config_commit() {
+        let dir = temp_dir("subscription-history-success");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![
+            serde_json::json!({
+                "type":"trojan", "tag":"unchanged", "server":"same.example",
+                "server_port":443, "password":"secret-a"
+            }),
+            serde_json::json!({
+                "type":"trojan", "tag":"removed", "server":"old.example",
+                "server_port":443, "password":"secret-b"
+            }),
+        ]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write old config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(
+            &request.node_quality_db_path,
+            &old_config,
+            &["unchanged", "removed"],
+        );
+
+        let commit = commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![
+                    serde_json::json!({
+                        "password":"secret-a", "server_port":443, "server":"same.example",
+                        "tag":"unchanged", "type":"trojan"
+                    }),
+                    serde_json::json!({
+                        "type":"vless", "tag":"added", "server":"new.example",
+                        "server_port":443, "uuid":"secret-c"
+                    }),
+                ],
+            }],
+            true,
+        )
+        .expect("active refresh commits and reconciles");
+
+        let diagnostic = format!("{commit:?}");
+        assert!(!diagnostic.contains("secret-a"));
+        assert!(!diagnostic.contains("secret-c"));
+        assert!(commit.node_history_reconciled);
+        assert!(commit.node_history_changed);
+        assert!(commit.node_quality_generation.is_some());
+        assert_eq!(
+            history_nodes(&request.node_quality_db_path),
+            vec!["unchanged"]
+        );
+        let committed: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read committed config"))
+                .expect("parse committed config");
+        assert!(
+            committed["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| outbound["tag"] == "added")
+        );
+        assert!(
+            !committed["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| outbound["tag"] == "removed")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_binding_preserves_new_facts_across_an_unchanged_active_refresh() {
+        let dir = temp_dir("subscription-startup-binding-unchanged");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"same.example",
+            "server_port":443, "password":"same-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config).expect("serialize active config"),
+        )
+        .expect("write active config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        let workflow = BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &request.node_quality_db_path,
+        )
+        .expect("startup binds committed active config");
+        assert_eq!(
+            workflow
+                .persist_benchmark_for_test("node-a")
+                .expect("write startup benchmark"),
+            Some(true)
+        );
+        let startup_store =
+            BenchmarkStore::open(&request.node_quality_db_path).expect("open startup-bound store");
+        let generation = startup_store.quality_generation();
+        assert!(
+            startup_store
+                .record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment::from_attempts(
+                        "node-a".to_string(),
+                        vec![
+                            ProbeOutcome::Reachable { delay_ms: 40 },
+                            ProbeOutcome::Reachable { delay_ms: 41 },
+                            ProbeOutcome::Reachable { delay_ms: 42 },
+                        ],
+                    ),
+                )
+                .expect("write startup reachability fact")
+        );
+        drop(startup_store);
+
+        let commit = commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "password":"same-secret", "server_port":443,
+                    "server":"same.example", "tag":"node-a", "type":"trojan"
+                })],
+            }],
+            true,
+        )
+        .expect("commit unchanged active refresh");
+
+        assert!(commit.node_history_reconciled);
+        assert!(!commit.node_history_changed);
+        assert_eq!(commit.node_quality_generation, Some(generation));
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+        assert_eq!(
+            BenchmarkStore::open(&request.node_quality_db_path)
+                .expect("reopen reconciled store")
+                .recent_benchmarks(10)
+                .expect("read retained benchmark")
+                .into_iter()
+                .map(|record| record.node)
+                .collect::<Vec<_>>(),
+            vec!["node-a"]
+        );
+        assert_eq!(
+            workflow
+                .persist_benchmark_for_test("node-a")
+                .expect("unchanged generation remains writable"),
+            Some(true)
+        );
+
+        drop(workflow);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_binding_and_independent_subscription_refresh_share_the_config_lock() {
+        let dir = temp_dir("subscription-startup-binding-concurrency");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write old config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+
+        let startup_config = config_path.clone();
+        let startup_database = request.node_quality_db_path.clone();
+        let (startup_locked_tx, startup_locked_rx) = mpsc::channel();
+        let (startup_release_tx, startup_release_rx) = mpsc::channel();
+        let (startup_opened_tx, startup_opened_rx) = mpsc::channel();
+        let (attempt_write_tx, attempt_write_rx) = mpsc::channel();
+        let (old_write_tx, old_write_rx) = mpsc::channel();
+        let startup = thread::spawn(move || {
+            let workflow = BenchmarkWorkflow::open_with_binding_hook_for_test(
+                "http://127.0.0.1:9992".to_string(),
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("test client"),
+                &startup_config,
+                &startup_database,
+                || {
+                    startup_locked_tx
+                        .send(())
+                        .expect("report startup config snapshot");
+                    startup_release_rx
+                        .recv()
+                        .expect("wait before binding startup snapshot");
+                },
+            )
+            .expect("bind startup snapshot");
+            startup_opened_tx.send(()).expect("report startup open");
+            attempt_write_rx
+                .recv()
+                .expect("wait until subscription refresh commits");
+            old_write_tx
+                .send(workflow.persist_benchmark_for_test("node-a"))
+                .expect("report old-generation write");
+        });
+        startup_locked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup holds canonical config lock");
+
+        let refresh_request = request.clone();
+        let (refresh_done_tx, refresh_done_rx) = mpsc::channel();
+        let refresh = thread::spawn(move || {
+            refresh_done_tx
+                .send(commit_subscription_config_as_independent_process(
+                    &refresh_request,
+                    vec![ProviderNodeRefresh {
+                        provider_name: "provider-a".to_string(),
+                        nodes: vec![serde_json::json!({
+                            "type":"trojan", "tag":"node-a", "server":"new.example",
+                            "server_port":443, "password":"new-secret"
+                        })],
+                    }],
+                    || {},
+                    || {},
+                ))
+                .expect("report independent refresh");
+        });
+        assert!(
+            matches!(
+                refresh_done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "independent refresh must wait until startup identity binding releases the config lock"
+        );
+
+        startup_release_tx.send(()).expect("release startup binder");
+        startup_opened_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup binding finishes");
+        let refresh_commit = refresh_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("refresh resumes after startup binding")
+            .expect("independent refresh commits");
+        assert!(refresh_commit.node_history_changed);
+        attempt_write_tx
+            .send(())
+            .expect("attempt stale startup writer");
+        assert_eq!(
+            old_write_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("old writer returns")
+                .expect("old writer checks generation"),
+            Some(false)
+        );
+        startup.join().expect("startup worker exits");
+        refresh.join().expect("refresh worker exits");
+
+        let committed: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read final config"))
+                .expect("parse final config");
+        assert!(
+            committed["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .any(|outbound| {
+                    outbound["tag"] == "node-a" && outbound["server"] == "new.example"
+                })
+        );
+        let identities = BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("reopen final store")
+            .stored_node_identities()
+            .expect("read final identities");
+        let expected_path = dir.join("expected-identities.sqlite3");
+        let expected_store =
+            BenchmarkStore::open(&expected_path).expect("open expected identity store");
+        expected_store
+            .reconcile_node_history(&committed)
+            .expect("fingerprint final committed config");
+        assert_eq!(
+            identities,
+            expected_store
+                .stored_node_identities()
+                .expect("read expected final identities"),
+            "the quality DB must bind the exact config snapshot committed by the later writer"
+        );
+        drop(expected_store);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn output_only_refresh_does_not_reconcile_active_history() {
+        let dir = temp_dir("subscription-history-output-only");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("active.json");
+        let merged_path = dir.join("preview.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"secret-a"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write active config");
+        let request = request_for(&dir, config_path.clone(), merged_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type":"trojan", "tag":"node-a", "server":"new.example",
+                    "server_port":443, "password":"secret-b"
+                })],
+            }],
+            true,
+        )
+        .expect("preview config writes");
+
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+        let active_after_preview = serde_json::from_str::<Value>(
+            &fs::read_to_string(&config_path).expect("read active config"),
+        )
+        .expect("parse active config");
+        assert!(
+            active_after_preview == old_config,
+            "writing a preview must not mutate the active config"
+        );
+        let preview: Value =
+            serde_json::from_str(&fs::read_to_string(&merged_path).expect("read preview config"))
+                .expect("parse preview config");
+        assert!(preview.to_string().contains("new.example"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_output_reconciles_when_it_resolves_to_the_active_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("subscription-history-same-symlink-target");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("active.json");
+        let merged_path = dir.join("active-link.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"secret-a"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write active config");
+        symlink(
+            config_path.file_name().expect("active config file name"),
+            &merged_path,
+        )
+        .expect("link alternate output path to active config");
+        let request = request_for(&dir, config_path.clone(), merged_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        let commit = commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type":"trojan", "tag":"node-a", "server":"new.example",
+                    "server_port":443, "password":"secret-b"
+                })],
+            }],
+            true,
+        )
+        .expect("symlinked active refresh succeeds");
+
+        assert!(commit.node_history_reconciled);
+        assert!(history_nodes(&request.node_quality_db_path).is_empty());
+        assert!(
+            fs::symlink_metadata(&merged_path)
+                .expect("inspect output alias")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read active config")
+                .contains("new.example")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_cache_fallback_after_download_failure_preserves_all_history() {
+        let dir = temp_dir("subscription-history-stale-cache");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-old", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-old"]);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve local port");
+        let subscription_url = format!(
+            "http://{}/subscription?token=download-secret",
+            listener.local_addr().expect("read local address")
+        );
+        drop(listener);
+        fs::write(&request.input, format!("provider-a = {subscription_url}\n"))
+            .expect("write subscription source");
+        SubscriptionCacheStore::new(&request.cache_path)
+            .save(&SubscriptionCache {
+                entries: BTreeMap::from([(
+                    "provider-a".to_string(),
+                    CachedSubscription {
+                        url_hash: hash_url(&subscription_url),
+                        fetched_at_unix: 1,
+                        subscription_json: serde_json::json!({
+                            "outbounds": [{
+                                "type":"trojan", "tag":"node-new", "server":"cached.example",
+                                "server_port":443, "password":"cached-secret"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                )]),
+            })
+            .expect("write stale cache");
+
+        let report = refresh_subscriptions(&request).expect("stale cache fallback remains usable");
+
+        assert_eq!(report.providers[0].status, "stale-cache");
+        assert!(!report.config_updated);
+        assert_eq!(
+            history_nodes(&request.node_quality_db_path),
+            vec!["node-old"]
+        );
+        assert!(
+            fs::read_to_string(&config_path).expect("read active config") == old_text,
+            "a stale-cache fallback must leave an existing active config byte-for-byte unchanged"
+        );
+        let report_text = serde_json::to_string(&report).expect("serialize report");
+        assert!(!report_text.contains("download-secret"));
+        assert!(!report_text.contains("cached-secret"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_cache_failure_does_not_create_a_missing_active_config_or_rebind_old_facts() {
+        let dir = temp_dir("subscription-history-stale-cache-missing-active");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        let old_identities = BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("open old quality store")
+            .stored_node_identities()
+            .expect("read old identities");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve local port");
+        let subscription_url = format!(
+            "http://{}/subscription?token=download-secret",
+            listener.local_addr().expect("read local address")
+        );
+        drop(listener);
+        fs::write(&request.input, format!("provider-a = {subscription_url}\n"))
+            .expect("write subscription source");
+        SubscriptionCacheStore::new(&request.cache_path)
+            .save(&SubscriptionCache {
+                entries: BTreeMap::from([(
+                    "provider-a".to_string(),
+                    CachedSubscription {
+                        url_hash: hash_url(&subscription_url),
+                        fetched_at_unix: 1,
+                        subscription_json: serde_json::json!({
+                            "outbounds": [{
+                                "type":"trojan", "tag":"node-a", "server":"cached-new.example",
+                                "server_port":443, "password":"cached-secret"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                )]),
+            })
+            .expect("write stale cache");
+
+        let report = refresh_subscriptions(&request).expect("stale cache report remains available");
+
+        assert_eq!(report.providers[0].status, "stale-cache");
+        assert!(!report.config_updated);
+        assert!(
+            !config_path.exists(),
+            "a failed download must not create an active config from stale cache"
+        );
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+        assert_eq!(
+            BenchmarkStore::open(&request.node_quality_db_path)
+                .expect("reopen old quality store")
+                .stored_node_identities()
+                .expect("read preserved identities"),
+            old_identities
+        );
+        let report_text = serde_json::to_string(&report).expect("serialize report");
+        assert!(!report_text.contains("download-secret"));
+        assert!(!report_text.contains("cached-secret"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fresh_cache_refresh_reconciles_config_drift() {
+        let dir = temp_dir("subscription-history-fresh-cache");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"manually-drifted.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write active config");
+        let mut request = request_for(&dir, config_path.clone(), config_path.clone());
+        request.force = false;
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        let subscription_url = "https://example.invalid/subscription?token=cache-secret";
+        fs::write(&request.input, format!("provider-a = {subscription_url}\n"))
+            .expect("write subscription source");
+        SubscriptionCacheStore::new(&request.cache_path)
+            .save(&SubscriptionCache {
+                entries: BTreeMap::from([(
+                    "provider-a".to_string(),
+                    CachedSubscription {
+                        url_hash: hash_url(subscription_url),
+                        fetched_at_unix: unix_now().expect("read current time"),
+                        subscription_json: serde_json::json!({
+                            "outbounds": [{
+                                "type":"trojan", "tag":"node-a", "server":"cached.example",
+                                "server_port":443, "password":"cached-secret"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                )]),
+            })
+            .expect("write fresh cache");
+
+        let report = refresh_subscriptions(&request).expect("fresh cache refresh succeeds");
+
+        assert_eq!(report.providers[0].status, "cached");
+        assert!(report.config_updated);
+        assert!(report.node_history_reconciled);
+        assert!(report.node_history_changed);
+        assert!(history_nodes(&request.node_quality_db_path).is_empty());
+        let committed = fs::read_to_string(&config_path).expect("read refreshed config");
+        assert!(committed.contains("cached.example"));
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("serialize report")
+                .contains("cache-secret")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subscription_parse_failure_preserves_config_and_history() {
+        let dir = temp_dir("subscription-history-parse-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        let mut request = request_for(&dir, config_path.clone(), config_path.clone());
+        request.force = false;
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        let subscription_url = "https://example.invalid/subscription?token=parse-secret";
+        fs::write(&request.input, format!("provider-a = {subscription_url}\n"))
+            .expect("write subscription source");
+        SubscriptionCacheStore::new(&request.cache_path)
+            .save(&SubscriptionCache {
+                entries: BTreeMap::from([(
+                    "provider-a".to_string(),
+                    CachedSubscription {
+                        url_hash: hash_url(subscription_url),
+                        fetched_at_unix: unix_now().expect("read current time"),
+                        subscription_json: "{not valid subscription json".to_string(),
+                    },
+                )]),
+            })
+            .expect("write invalid cached subscription");
+
+        let error = refresh_subscriptions(&request).expect_err("subscription parse must fail");
+
+        assert!(!format!("{error:#}").contains("parse-secret"));
+        assert!(
+            fs::read_to_string(&config_path).expect("read config") == old_text,
+            "parse failure must leave the active config byte-for-byte unchanged"
+        );
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn active_pre_rename_write_failure_preserves_config_identities_and_all_facts() {
+        let dir = temp_dir("subscription-history-write-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_bytes = serde_json::to_vec_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_bytes).expect("write active config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        let before =
+            BenchmarkStore::open(&request.node_quality_db_path).expect("open seeded quality store");
+        let old_identities = before
+            .stored_node_identities()
+            .expect("read seeded identities");
+        let old_benchmarks = before
+            .recent_benchmarks(10)
+            .expect("read seeded benchmarks");
+        drop(before);
+        let new_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"new.example",
+            "server_port":443, "password":"new-secret"
+        })]);
+
+        let error = commit_active_node_config_with_writer_for_test(
+            &config_path,
+            &request.node_quality_db_path,
+            || Ok(new_config),
+            || Ok(()),
+            || Ok(None),
+            |_, _| {
+                Err(DurableAtomicWriteError::DestinationUnchanged(
+                    anyhow::anyhow!("injected pre-rename write failure"),
+                ))
+            },
+        )
+        .expect_err("pre-rename failure must abort the active transaction");
+
+        assert!(!format!("{error:#}").contains("new-secret"));
+        assert!(format!("{error:#}").contains("injected pre-rename write failure"));
+        assert_eq!(
+            fs::read(&config_path).expect("read preserved config"),
+            old_bytes
+        );
+        let after = BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("reopen preserved quality store");
+        assert_eq!(
+            after
+                .stored_node_identities()
+                .expect("read preserved identities"),
+            old_identities
+        );
+        assert_eq!(
+            after
+                .recent_benchmarks(10)
+                .expect("read preserved benchmarks"),
+            old_benchmarks
+        );
+        drop(after);
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+        let mut marker = request.node_quality_db_path.as_os_str().to_os_string();
+        marker.push(".node-quality-writes-blocked");
+        assert!(!std::path::PathBuf::from(marker).exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backup_failure_preserves_config_and_history() {
+        let dir = temp_dir("subscription-history-backup-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        fs::create_dir(subscription_config_backup_path(&config_path))
+            .expect("occupy backup path with a directory");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        merge_and_commit_subscription_config(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type":"trojan", "tag":"node-a", "server":"new.example",
+                    "server_port":443, "password":"new-secret"
+                })],
+            }],
+        )
+        .expect_err("backup path collision must fail before the config write");
+
+        assert!(
+            fs::read_to_string(&config_path).expect("read config") == old_text,
+            "backup failure must leave the active config byte-for-byte unchanged"
+        );
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_rule_set_failure_preserves_config_and_history() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("subscription-history-rule-set-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        symlink(
+            dir.join("missing-directory").join("rules.json"),
+            dir.join(DEFAULT_BYPASS_RULE_SET_PATH),
+        )
+        .expect("create dangling rule-set symlink");
+
+        let error = commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type":"trojan", "tag":"node-a", "server":"new.example",
+                    "server_port":443, "password":"new-secret"
+                })],
+            }],
+            true,
+        )
+        .expect_err("required rule-set write must fail");
+
+        assert!(!format!("{error:#}").contains("new-secret"));
+        assert!(
+            fs::read_to_string(&config_path).expect("read active config") == old_text,
+            "a required rule-set failure must leave the active config byte-for-byte unchanged"
+        );
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconciliation_failure_restores_config_and_rolls_back_identity_and_history() {
+        let dir = temp_dir("subscription-history-reconcile-rollback");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+        let before_identities = BenchmarkStore::open(&request.node_quality_db_path)
+            .expect("open quality store")
+            .stored_node_identities()
+            .expect("read old identities");
+        let invalid_config = provider_config(vec![
+            serde_json::json!({
+                "type":"trojan", "tag":"node-a", "server":"new.example",
+                "server_port":443, "password":"new-secret"
+            }),
+            serde_json::json!({
+                "type":"trojan", "tag":"node-a", "server":"duplicate.example",
+                "server_port":443, "password":"duplicate-secret"
+            }),
+        ]);
+        let error = commit_active_node_config(
+            &config_path,
+            &request.node_quality_db_path,
+            || Ok(invalid_config),
+            || Ok(()),
+            || Ok(None),
+        )
+        .expect_err("duplicate identity must fail after the config write");
+
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("duplicate node tag node-a"));
+        assert!(!diagnostic.contains("new-secret"));
+        assert!(!diagnostic.contains("duplicate-secret"));
+        assert!(
+            fs::read_to_string(&config_path).expect("read restored config") == old_text,
+            "reconciliation failure must atomically restore the active config"
+        );
+        assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
+        let recovered_store =
+            BenchmarkStore::open(&request.node_quality_db_path).expect("reopen quality store");
+        assert_eq!(
+            recovered_store
+                .stored_node_identities()
+                .expect("read restored identities"),
+            before_identities
+        );
+        assert!(
+            recovered_store
+                .record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment::from_attempts(
+                        "node-a".to_string(),
+                        vec![
+                            ProbeOutcome::Reachable { delay_ms: 31 },
+                            ProbeOutcome::Reachable { delay_ms: 32 },
+                            ProbeOutcome::Reachable { delay_ms: 33 },
+                        ],
+                    ),
+                )
+                .expect("write after complete rollback"),
+            "a complete config and DB rollback must clear this attempt's write block"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconciliation_failure_removes_a_config_created_by_this_attempt() {
+        let dir = temp_dir("subscription-new-config-reconcile-rollback");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        let old_identity = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-old", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        seed_quality_history(&request.node_quality_db_path, &old_identity, &["node-old"]);
+        let invalid_config = provider_config(vec![
+            serde_json::json!({
+                "type":"trojan", "tag":"node-new", "server":"new.example",
+                "server_port":443, "password":"new-secret"
+            }),
+            serde_json::json!({
+                "type":"trojan", "tag":"node-new", "server":"duplicate.example",
+                "server_port":443, "password":"duplicate-secret"
+            }),
+        ]);
+        let error = commit_active_node_config(
+            &config_path,
+            &request.node_quality_db_path,
+            || Ok(invalid_config),
+            || Ok(()),
+            || Ok(None),
+        )
+        .expect_err("duplicate identity must fail after creating the config");
+
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("duplicate node tag node-new"));
+        assert!(!diagnostic.contains("new-secret"));
+        assert!(!diagnostic.contains("duplicate-secret"));
+        assert!(
+            !config_path.exists(),
+            "a failed reconciliation must remove the config created by this attempt"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            history_nodes(&request.node_quality_db_path),
+            vec!["node-old"]
+        );
+        #[cfg(not(unix))]
+        {
+            assert!(diagnostic.contains("quality reads and writes remain blocked"));
+            assert!(history_nodes(&request.node_quality_db_path).is_empty());
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quality_store_open_failure_preserves_active_config() {
+        let dir = temp_dir("subscription-history-quality-open-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        let old_text = serde_json::to_string_pretty(&old_config).expect("serialize old config");
+        fs::write(&config_path, &old_text).expect("write active config");
+        let mut request = request_for(&dir, config_path.clone(), config_path.clone());
+        request.node_quality_db_path = dir.join("invalid-quality.sqlite3");
+        fs::create_dir(&request.node_quality_db_path)
+            .expect("occupy quality path with a directory");
+
+        let error = commit_subscription_config_and_quality(
+            &request,
+            vec![ProviderNodeRefresh {
+                provider_name: "provider-a".to_string(),
+                nodes: vec![serde_json::json!({
+                    "type":"trojan", "tag":"node-a", "server":"new.example",
+                    "server_port":443, "password":"new-secret"
+                })],
+            }],
+            true,
+        )
+        .expect_err("invalid quality store must fail before the active config write");
+
+        assert!(!format!("{error:#}").contains("new-secret"));
+        assert!(
+            fs::read_to_string(&config_path).expect("read active config") == old_text,
+            "a quality-store open failure must leave the active config byte-for-byte unchanged"
+        );
+        assert!(
+            request.node_quality_db_path.is_dir(),
+            "a failed quality-store open must preserve the existing path"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_active_target_is_compared_by_its_resolved_parent_and_file_name() {
+        let dir = temp_dir("subscription-missing-target-identity");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let active = dir.join("new-config.json");
+
+        assert!(paths_refer_to_same_target(&active, &active).expect("compare identical target"));
+        assert!(
+            !paths_refer_to_same_target(&active, &dir.join("preview.json"))
+                .expect("compare distinct target")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn subscription_commit_waits_for_the_shared_config_mutation_lock() {
         let dir = temp_dir("subscription-mutation-lock");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -1578,6 +2946,7 @@ mod tests {
             cache_path: dir.join("cache.json"),
             config_path: config_path.clone(),
             merged_path: config_path.clone(),
+            node_quality_db_path: dir.join("quality.sqlite3"),
             replace_nodes: false,
             include_geosite_rules: false,
             include_tun_mode: false,
@@ -1595,7 +2964,7 @@ mod tests {
             })],
         }];
 
-        let guard = lock_config_mutation();
+        let guard = lock_config_mutation_for(&config_path).expect("lock active config");
         let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -1638,6 +3007,376 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn route_writer_waits_for_reconciliation_and_preserves_refreshed_nodes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("subscription-atomic-config-quality-commit");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write old config");
+        let config_alias = dir.join("active-config-alias.json");
+        symlink(
+            config_path.file_name().expect("config file name"),
+            &config_alias,
+        )
+        .expect("create route-writer alias");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        let (reconcile_reached_tx, reconcile_reached_rx) = mpsc::channel();
+        let (reconcile_release_tx, reconcile_release_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let commit_worker = thread::spawn(move || {
+            commit_tx
+                .send(commit_subscription_config_as_independent_process(
+                    &request,
+                    vec![ProviderNodeRefresh {
+                        provider_name: "provider-a".to_string(),
+                        nodes: vec![serde_json::json!({
+                            "type":"trojan", "tag":"node-a", "server":"new.example",
+                            "server_port":443, "password":"new-secret"
+                        })],
+                    }],
+                    || {
+                        reconcile_reached_tx
+                            .send(())
+                            .expect("report reconciliation barrier");
+                        reconcile_release_rx
+                            .recv()
+                            .expect("wait for reconciliation release");
+                    },
+                    || {},
+                ))
+                .expect("report subscription commit");
+        });
+
+        reconcile_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("subscription writer reaches reconciliation barrier");
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read committed config")
+                .contains("new.example"),
+            "the subscription writer must reach the SQLite reconciliation barrier"
+        );
+
+        let (editor_tx, editor_rx) = mpsc::channel();
+        let editor_path = config_alias.clone();
+        let editor = thread::spawn(move || {
+            editor_tx
+                .send(set_internet_tun_mode(&editor_path, true, None))
+                .expect("report route editor outcome");
+        });
+        assert!(
+            matches!(
+                editor_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the route writer must remain blocked until node reconciliation commits"
+        );
+
+        reconcile_release_tx
+            .send(())
+            .expect("release reconciliation barrier");
+        commit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("subscription commit completes after quality lock release")
+            .expect("subscription commit succeeds");
+        let route_update = editor_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("route writer enters after reconciliation")
+            .expect("route writer succeeds");
+        assert!(route_update.changed);
+        commit_worker.join().expect("subscription writer exits");
+        editor.join().expect("second editor exits");
+
+        let final_config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read final config"))
+                .expect("parse final config");
+        assert!(
+            final_config["outbounds"]
+                .as_array()
+                .expect("outbounds array")
+                .iter()
+                .any(|outbound| {
+                    outbound["tag"] == "node-a" && outbound["server"] == "new.example"
+                }),
+            "the route writer must derive its edit from the subscription's committed nodes"
+        );
+        assert!(
+            final_config["inbounds"]
+                .as_array()
+                .expect("inbounds array")
+                .iter()
+                .any(|inbound| inbound["tag"] == "tun-in")
+        );
+        assert!(
+            fs::symlink_metadata(&config_alias)
+                .expect("inspect route writer alias")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(history_nodes(&dir.join("quality.sqlite3")).is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subscription_waits_for_config_only_writer_and_reconciles_its_committed_snapshot() {
+        let dir = temp_dir("config-writer-before-subscription");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write old config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        let (route_read_tx, route_read_rx) = mpsc::channel();
+        let (route_release_tx, route_release_rx) = mpsc::channel();
+        let (route_done_tx, route_done_rx) = mpsc::channel();
+        let route_path = config_path.clone();
+        let route_writer = thread::spawn(move || {
+            route_done_tx
+                .send(set_internet_tun_mode_after_read_for_test(
+                    &route_path,
+                    true,
+                    None,
+                    || {
+                        route_read_tx.send(()).expect("report route snapshot read");
+                        route_release_rx.recv().expect("wait before route commit");
+                    },
+                ))
+                .expect("report route writer outcome");
+        });
+        route_read_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("route writer reads the old config while holding its guard");
+
+        let (subscription_done_tx, subscription_done_rx) = mpsc::channel();
+        let subscription_writer = thread::spawn(move || {
+            subscription_done_tx
+                .send(commit_subscription_config_and_quality(
+                    &request,
+                    vec![ProviderNodeRefresh {
+                        provider_name: "provider-a".to_string(),
+                        nodes: vec![serde_json::json!({
+                            "type":"trojan", "tag":"node-a", "server":"new.example",
+                            "server_port":443, "password":"new-secret"
+                        })],
+                    }],
+                    true,
+                ))
+                .expect("report subscription outcome");
+        });
+        assert!(
+            matches!(
+                subscription_done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the subscription build must wait until the config-only writer commits its snapshot"
+        );
+
+        route_release_tx.send(()).expect("release route writer");
+        route_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("route writer completes")
+            .expect("route writer succeeds");
+        subscription_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("subscription resumes after route commit")
+            .expect("subscription commit succeeds");
+        route_writer.join().expect("route writer exits");
+        subscription_writer
+            .join()
+            .expect("subscription writer exits");
+
+        let final_config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read final config"))
+                .expect("parse final config");
+        assert!(
+            final_config["inbounds"]
+                .as_array()
+                .expect("inbounds array")
+                .iter()
+                .any(|inbound| inbound["tag"] == "tun-in")
+        );
+        assert!(
+            final_config["outbounds"]
+                .as_array()
+                .expect("outbounds array")
+                .iter()
+                .any(|outbound| {
+                    outbound["tag"] == "node-a" && outbound["server"] == "new.example"
+                })
+        );
+        assert!(history_nodes(&dir.join("quality.sqlite3")).is_empty());
+        let actual_identities = BenchmarkStore::open(dir.join("quality.sqlite3"))
+            .expect("open reconciled quality store")
+            .stored_node_identities()
+            .expect("read reconciled identities");
+        let expected_store = BenchmarkStore::open(dir.join("expected.sqlite3"))
+            .expect("open expected identity store");
+        expected_store
+            .reconcile_node_history(&final_config)
+            .expect("fingerprint final config");
+        assert_eq!(
+            actual_identities,
+            expected_store
+                .stored_node_identities()
+                .expect("read expected identities"),
+            "quality identity must fingerprint the config snapshot committed after the route edit"
+        );
+
+        drop(expected_store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconciliation_file_lock_spans_db_commit_and_marker_cleanup() {
+        let dir = temp_dir("subscription-cross-process-serialization");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("config.json");
+        let old_config = provider_config(vec![serde_json::json!({
+            "type":"trojan", "tag":"node-a", "server":"old.example",
+            "server_port":443, "password":"old-secret"
+        })]);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&old_config).expect("serialize old config"),
+        )
+        .expect("write old config");
+        let request = request_for(&dir, config_path.clone(), config_path.clone());
+        seed_quality_history(&request.node_quality_db_path, &old_config, &["node-a"]);
+
+        let first_request = request.clone();
+        let (first_reached_tx, first_reached_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let first = thread::spawn(move || {
+            let result = commit_subscription_config_as_independent_process(
+                &first_request,
+                vec![ProviderNodeRefresh {
+                    provider_name: "provider-a".to_string(),
+                    nodes: vec![serde_json::json!({
+                        "type":"trojan", "tag":"node-a", "server":"writer-a.example",
+                        "server_port":443, "password":"writer-a-secret"
+                    })],
+                }],
+                || {},
+                || {
+                    first_reached_tx
+                        .send(())
+                        .expect("report first post-commit cleanup barrier");
+                    first_release_rx
+                        .recv()
+                        .expect("wait for first marker cleanup release");
+                },
+            );
+            first_done_tx.send(result).expect("report first result");
+        });
+
+        first_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first writer commits DB and pauses before marker cleanup");
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read first writer config")
+                .contains("writer-a.example")
+        );
+
+        let second_request = request.clone();
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            second_started_tx
+                .send(())
+                .expect("report second process attempt");
+            let result = commit_subscription_config_as_independent_process(
+                &second_request,
+                vec![ProviderNodeRefresh {
+                    provider_name: "provider-a".to_string(),
+                    nodes: vec![serde_json::json!({
+                        "type":"trojan", "tag":"node-a", "server":"writer-b.example",
+                        "server_port":443, "password":"writer-b-secret"
+                    })],
+                }],
+                || {},
+                || {},
+            );
+            second_done_tx.send(result).expect("report second result");
+        });
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second process reaches reconciliation call");
+        assert!(
+            matches!(
+                second_done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the second process must not acquire reconciliation ownership before marker cleanup"
+        );
+        assert!(
+            fs::read_to_string(&config_path)
+                .expect("read config while first writer is blocked")
+                .contains("writer-a.example")
+        );
+
+        first_release_tx
+            .send(())
+            .expect("release first marker cleanup");
+        first_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first writer finishes")
+            .expect("first writer succeeds");
+        second_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second writer finishes")
+            .expect("second writer succeeds");
+        first.join().expect("first writer exits");
+        second.join().expect("second writer exits");
+
+        let final_config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read final config"))
+                .expect("parse final config");
+        let final_text = final_config.to_string();
+        assert!(final_text.contains("writer-b.example"));
+        assert!(!final_text.contains("writer-a.example"));
+        let actual_store =
+            BenchmarkStore::open(&request.node_quality_db_path).expect("open final quality store");
+        let expected_store = BenchmarkStore::open(dir.join("expected.sqlite3"))
+            .expect("open expected quality store");
+        expected_store
+            .reconcile_node_history(&final_config)
+            .expect("fingerprint final config");
+        assert_eq!(
+            actual_store
+                .stored_node_identities()
+                .expect("read final identities"),
+            expected_store
+                .stored_node_identities()
+                .expect("read expected identities")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn subscription_commit_preserves_a_symlinked_config_path() {
         use std::os::unix::fs::symlink;
 
@@ -1668,6 +3407,7 @@ mod tests {
             cache_path: dir.join("cache.json"),
             config_path: link.clone(),
             merged_path: link.clone(),
+            node_quality_db_path: dir.join("quality.sqlite3"),
             replace_nodes: false,
             include_geosite_rules: false,
             include_tun_mode: false,

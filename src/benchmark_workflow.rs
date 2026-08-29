@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -9,13 +12,16 @@ use anyhow::{Context, Result};
 use reqwest::Client as AsyncClient;
 
 use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
+use crate::config::parse_sing_box_config_text;
+use crate::config_mutation::lock_config_mutation_for;
 use crate::controller::{
     BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
     NodeReachabilityAssessment, spawn_benchmark_worker, spawn_reachability_assessment_worker,
 };
 use crate::defaults::SINGLE_NODE_RETEST_DEBOUNCE;
+use crate::node_quality_path::ensure_active_config_paths_are_distinct;
 use crate::storage::{
-    BenchmarkRecord, BenchmarkStore, NodeLatencySample, default_benchmark_db_path,
+    BenchmarkRecord, BenchmarkStore, NodeLatencySample, lock_node_quality_reconciliation,
 };
 
 pub(crate) struct BenchmarkWorkflow {
@@ -28,7 +34,6 @@ pub(crate) struct BenchmarkWorkflow {
     store: Option<BenchmarkStore>,
     latency_order: bool,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BenchmarkStart {
     Started,
@@ -88,12 +93,75 @@ struct BenchmarkJob {
 }
 
 impl BenchmarkWorkflow {
-    pub(crate) fn open(base_url: String, client: AsyncClient) -> Result<Self> {
-        Ok(Self::new(
+    pub(crate) fn open(
+        base_url: String,
+        client: AsyncClient,
+        config_path: &Path,
+        database_path: &Path,
+    ) -> Result<Self> {
+        Self::open_with_binding_hook(base_url, client, config_path, database_path, || {})
+    }
+
+    fn open_with_binding_hook<Hook>(
+        base_url: String,
+        client: AsyncClient,
+        config_path: &Path,
+        database_path: &Path,
+        after_config_read: Hook,
+    ) -> Result<Self>
+    where
+        Hook: FnOnce(),
+    {
+        ensure_active_config_paths_are_distinct(config_path, database_path, &[])?;
+        let _config_guard = lock_config_mutation_for(config_path)?;
+        let config_text = match fs::read_to_string(config_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(Self::new(base_url, client, None));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read active sing-box config {} before opening node-quality persistence",
+                        config_path.display()
+                    )
+                });
+            }
+        };
+        let config = parse_sing_box_config_text(&config_text).with_context(|| {
+            format!(
+                "failed to parse active sing-box config {} before opening node-quality persistence",
+                config_path.display()
+            )
+        })?;
+        after_config_read();
+        let quality_guard = lock_node_quality_reconciliation(database_path)?;
+        let store =
+            BenchmarkStore::open_while_reconciliation_locked(database_path, &quality_guard)?;
+        store.bind_node_history_while_reconciliation_locked(&quality_guard, &config)?;
+        // `Self::new` loads the persisted projection and takes the quality lock itself.
+        drop(quality_guard);
+        Ok(Self::new(base_url, client, Some(store)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_binding_hook_for_test<Hook>(
+        base_url: String,
+        client: AsyncClient,
+        config_path: &Path,
+        database_path: &Path,
+        after_config_read: Hook,
+    ) -> Result<Self>
+    where
+        Hook: FnOnce(),
+    {
+        Self::open_with_binding_hook(
             base_url,
             client,
-            Some(BenchmarkStore::open(default_benchmark_db_path())?),
-        ))
+            config_path,
+            database_path,
+            after_config_read,
+        )
     }
 
     fn new(base_url: String, client: AsyncClient, store: Option<BenchmarkStore>) -> Self {
@@ -438,6 +506,7 @@ impl BenchmarkWorkflow {
                 completed: result.completed,
                 job_kind: kind.label(),
             })
+            .map(|_| ())
             .with_context(|| format!("failed to record benchmark result for {}", result.name))
             .unwrap_or_else(|error| eprintln!("warning: {error:#}"));
     }
@@ -446,6 +515,7 @@ impl BenchmarkWorkflow {
         let Some(store) = &self.store else { return };
         store
             .record_reachability_assessment(group, assessment)
+            .map(|_| ())
             .with_context(|| {
                 format!(
                     "failed to record reachability assessment for {}",
@@ -460,8 +530,15 @@ impl BenchmarkWorkflow {
         Self::new(base_url, client, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_store(&mut self, store: Option<BenchmarkStore>) {
+    fn install_store(&mut self, store: Option<BenchmarkStore>) {
+        for job in &self.jobs {
+            if let Some(cancellation) = &job.cancellation {
+                cancellation.store(true, Ordering::Relaxed);
+            }
+        }
+        self.jobs.clear();
+        self.summaries.clear();
+        self.last_single_node = None;
         self.reachability_assessments = store
             .as_ref()
             .and_then(|store| store.latest_reachability_assessments().ok())
@@ -470,6 +547,15 @@ impl BenchmarkWorkflow {
             .map(|(selector, assessment)| ((selector, assessment.name.clone()), assessment))
             .collect();
         self.store = store;
+    }
+
+    pub(crate) fn pause_quality_persistence(&mut self) {
+        self.install_store(None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_store(&mut self, store: Option<BenchmarkStore>) {
+        self.install_store(store);
     }
 
     #[cfg(test)]
@@ -494,6 +580,44 @@ impl BenchmarkWorkflow {
             .find(|job| job.group == group)
             .map(|job| job.nodes.as_slice())
     }
+
+    #[cfg(test)]
+    pub(crate) fn quality_persistence_enabled(&self) -> bool {
+        self.store.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_benchmark_for_test(&self, node: &str) -> Result<Option<bool>> {
+        self.store
+            .as_ref()
+            .map(|store| {
+                store.record_benchmark(&BenchmarkRecord {
+                    selector: "select",
+                    node,
+                    filter: "test",
+                    delay_ms: Some(42),
+                    completed: true,
+                    job_kind: "test",
+                })
+            })
+            .transpose()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_pending_job_for_test(&mut self, group: &str, node: &str) -> Arc<AtomicBool> {
+        let (_sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.jobs.push(BenchmarkJob {
+            group: group.to_string(),
+            nodes: vec![node.to_string()],
+            filter: "test".to_string(),
+            kind: BenchmarkKind::AutoSelect,
+            receiver,
+            worker: std::thread::spawn(|| {}),
+            cancellation: Some(cancellation.clone()),
+        });
+        cancellation
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +628,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::node_quality_path::QUALITY_WRITE_BLOCK_SUFFIX;
 
     fn workflow(store: Option<BenchmarkStore>) -> BenchmarkWorkflow {
         BenchmarkWorkflow::new(
@@ -560,6 +685,185 @@ mod tests {
         std::env::temp_dir().join(format!("sing-box-tui-benchmark-workflow-{nanos}.sqlite3"))
     }
 
+    fn quality_marker_path(database_path: &Path) -> PathBuf {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(QUALITY_WRITE_BLOCK_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    fn remove_workflow_fixture(config_path: &Path, database_path: &Path) {
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(database_path);
+        for suffix in [
+            "-wal",
+            "-shm",
+            "-journal",
+            QUALITY_WRITE_BLOCK_SUFFIX,
+            ".node-quality-reconciliation.lock",
+        ] {
+            let mut path = database_path.as_os_str().to_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(path));
+        }
+        let mut config_lock = config_path.as_os_str().to_os_string();
+        config_lock.push(".sing-box-tui-config-mutation.lock");
+        let _ = std::fs::remove_file(PathBuf::from(config_lock));
+    }
+
+    #[test]
+    fn production_open_binds_jsonc_active_config_before_accepting_facts() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                // production configs may contain JSONC comments
+                "outbounds": [
+                    {"type":"selector","tag":"select","outbounds":["node-a","direct"]},
+                    {"type":"direct","tag":"direct"},
+                    {"type":"trojan","tag":"node-a","server":"same.example","server_port":443,"password":"secret"},
+                ],
+            }"#,
+        )
+        .expect("write JSONC active config");
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_config = config_path.clone();
+        let worker_database = database_path.clone();
+        let worker = thread::spawn(move || {
+            let result = BenchmarkWorkflow::open(
+                "http://127.0.0.1:9992".to_string(),
+                AsyncClient::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("test client"),
+                &worker_config,
+                &worker_database,
+            )
+            .and_then(|workflow| workflow.persist_benchmark_for_test("node-a"));
+            opened_tx.send(result).expect("return startup result");
+        });
+        assert_eq!(
+            opened_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("startup binding must not reacquire its own quality lock")
+                .expect("open workflow and record bound fact"),
+            Some(true)
+        );
+        worker.join().expect("join startup binding worker");
+        let store = BenchmarkStore::open(&database_path).expect("reopen bound store");
+        assert_eq!(
+            store
+                .stored_node_identities()
+                .expect("read startup identities")
+                .into_iter()
+                .map(|(tag, _)| tag)
+                .collect::<Vec<_>>(),
+            vec!["direct", "node-a", "select"]
+        );
+
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
+    #[test]
+    fn production_open_without_active_config_keeps_persistence_disabled_and_marker_untouched() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("missing-config.json");
+        let marker_path = quality_marker_path(&database_path);
+        std::fs::write(&marker_path, b"preexisting marker").expect("seed quality marker");
+
+        let workflow = BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            AsyncClient::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &database_path,
+        )
+        .expect("missing active config disables persistence");
+
+        assert!(!workflow.quality_persistence_enabled());
+        assert!(
+            !database_path.exists(),
+            "missing config must not create the DB"
+        );
+        assert_eq!(
+            std::fs::read(&marker_path).expect("marker remains present"),
+            b"preexisting marker"
+        );
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
+    #[test]
+    fn production_open_with_invalid_active_config_does_not_initialize_or_unblock_quality() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("invalid-config.json");
+        let marker_path = quality_marker_path(&database_path);
+        std::fs::write(&config_path, b"{ invalid JSONC").expect("write invalid config");
+        std::fs::write(&marker_path, b"preexisting marker").expect("seed quality marker");
+
+        let error = match BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            AsyncClient::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &database_path,
+        ) {
+            Ok(_) => panic!("invalid active config must reject quality persistence"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("failed to parse active sing-box config"));
+        assert!(
+            !database_path.exists(),
+            "invalid config must not create the DB"
+        );
+        assert_eq!(
+            std::fs::read(&marker_path).expect("marker remains present"),
+            b"preexisting marker"
+        );
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
+    #[test]
+    fn production_open_repairs_existing_marker_from_committed_config() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("repair-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}]}"#,
+        )
+        .expect("write active config");
+        let store = BenchmarkStore::open(&database_path).expect("create unbound quality store");
+        store
+            .ensure_quality_writes_blocked()
+            .expect("seed fail-closed marker");
+        drop(store);
+
+        let workflow = BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            AsyncClient::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &database_path,
+        )
+        .expect("committed config repairs quality binding");
+
+        assert!(workflow.quality_persistence_enabled());
+        assert_eq!(
+            workflow.persist_benchmark_for_test("direct").unwrap(),
+            Some(true)
+        );
+        assert!(!quality_marker_path(&database_path).exists());
+        drop(workflow);
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
     #[test]
     fn poll_updates_summary_and_reports_typed_completion() {
         let mut workflow = workflow(None);
@@ -597,6 +901,14 @@ mod tests {
     fn progress_is_recorded_with_stable_run_metadata() {
         let path = test_db_path();
         let store = BenchmarkStore::open(&path).expect("open benchmark store");
+        store
+            .reconcile_node_history(&serde_json::json!({
+                "outbounds": [
+                    {"type":"selector", "tag":"select", "outbounds":["美国-a"]},
+                    {"type":"direct", "tag":"美国-a"}
+                ]
+            }))
+            .expect("bind test node identities");
         let mut workflow = workflow(Some(store));
         queue_job(
             &mut workflow,

@@ -11,6 +11,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+pub(crate) enum DurableAtomicWriteError {
+    DestinationUnchanged(anyhow::Error),
+    DurabilityUncertain(anyhow::Error),
+}
+
+impl DurableAtomicWriteError {
+    pub(crate) fn into_parts(self) -> (anyhow::Error, bool) {
+        match self {
+            Self::DestinationUnchanged(error) => (error, false),
+            Self::DurabilityUncertain(error) => (error, true),
+        }
+    }
+}
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Durably replaces one file without exposing a truncated or partially written destination.
@@ -19,6 +33,36 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// are flushed before the rename; on Unix the containing directory is then flushed when the
 /// filesystem supports it. The function returns an error only while the destination is unchanged.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent_directory = replace_atomic(path, contents)?;
+    sync_parent_directory_after_commit(parent_directory);
+    Ok(())
+}
+
+/// Durably replaces one file and reports whether a failure happened before or after rename.
+///
+/// A post-rename directory-sync failure means the new file is visible but its survival across a
+/// host crash is uncertain. Callers coordinating other durable state must keep their fail-closed
+/// guard in place rather than treating that outcome as an unchanged destination.
+pub(crate) fn write_atomic_durable(
+    path: &Path,
+    contents: &[u8],
+) -> std::result::Result<(), DurableAtomicWriteError> {
+    let parent_directory =
+        replace_atomic(path, contents).map_err(DurableAtomicWriteError::DestinationUnchanged)?;
+    if let Some(parent_directory) = parent_directory {
+        parent_directory.sync_all().map_err(|error| {
+            DurableAtomicWriteError::DurabilityUncertain(anyhow::Error::from(error).context(
+                format!(
+                    "{} was replaced but its directory could not be durably flushed",
+                    path.display()
+                ),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn replace_atomic(path: &Path, contents: &[u8]) -> Result<Option<File>> {
     let destination = resolve_destination(path)?;
     let temp_path = temp_path_for(&destination)?;
     let result = (|| {
@@ -43,8 +87,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
                 temp_path.display()
             )
         })?;
-        sync_parent_directory_after_commit(parent_directory);
-        Ok(())
+        Ok(parent_directory)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);

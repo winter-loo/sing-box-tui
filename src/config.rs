@@ -2,19 +2,23 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::atomic_file::write_atomic;
+use crate::config_mutation::{lock_config_mutation_for, paths_refer_to_same_target};
 use crate::defaults::{
     AUTO_SELECTOR_TAG_ALIASES, BLOCK_TAG_ALIASES, DEFAULT_AD_BLOCK_SELECTOR_TAG,
     DEFAULT_AUTO_SELECTOR_TAG, DEFAULT_BLOCK_TAG, DEFAULT_BYPASS_RULE_SET_PATH,
     DEFAULT_BYPASS_RULE_SET_TAG, DEFAULT_DELAY_TEST_URL, DEFAULT_DIRECT_TAG, DEFAULT_LOCAL_DNS_TAG,
     DEFAULT_REMOTE_DNS_TAG, DEFAULT_SELECTOR_TAG, DIRECT_TAG_ALIASES, SELECTOR_TAG_ALIASES,
     default_clash_api_external_controller,
+};
+use crate::node_quality_path::{
+    canonical_config_target, default_benchmark_db_path_for_config,
+    ensure_active_config_paths_are_distinct,
 };
 
 // Tailscale uses RFC6598 CGNAT addresses, which should stay on the overlay.
@@ -29,17 +33,6 @@ const TAILSCALE_IPV6_CIDR: &str = "fd7a:115c:a1e0::/48";
 const DEFAULT_REMOTE_DNS_SERVER: &str = "223.6.6.6";
 const LEGACY_REMOTE_DNS_SERVER: &str = "8.8.8.8";
 const DEFAULT_REMOTE_DNS_PORT: u64 = 853;
-
-// Every config editor performs a read-modify-write cycle. Atomic replacement protects readers
-// from partial files, while this process-wide lock prevents concurrent editors from committing
-// changes derived from the same stale snapshot and silently overwriting each other.
-static CONFIG_MUTATION_LOCK: Mutex<()> = Mutex::new(());
-
-pub(crate) fn lock_config_mutation() -> MutexGuard<'static, ()> {
-    CONFIG_MUTATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 // China split-routing rule-set tags. These are the binary rule-sets the China IP routing
 // toggle adds or removes, distinct from the AdGuard ad-block rule-set.
@@ -173,11 +166,7 @@ pub(crate) fn build_full_config_with_options(
 pub(crate) fn ensure_bypass_rule_set_file_for_config(
     config_path: &Path,
 ) -> Result<Option<PathBuf>> {
-    let config_dir = config_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let bypass_path = config_dir.join(DEFAULT_BYPASS_RULE_SET_PATH);
+    let bypass_path = resolved_bypass_rule_set_path_for_config(config_path)?;
     if bypass_path.exists() {
         return Ok(None);
     }
@@ -190,6 +179,20 @@ pub(crate) fn ensure_bypass_rule_set_file_for_config(
     fs::write(&bypass_path, format!("{contents}\n"))
         .with_context(|| format!("failed to write {}", bypass_path.display()))?;
     Ok(Some(bypass_path))
+}
+
+pub(crate) fn bypass_rule_set_path_for_config(config_path: &Path) -> PathBuf {
+    let config_dir = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    config_dir.join(DEFAULT_BYPASS_RULE_SET_PATH)
+}
+
+pub(crate) fn resolved_bypass_rule_set_path_for_config(config_path: &Path) -> Result<PathBuf> {
+    Ok(bypass_rule_set_path_for_config(&canonical_config_target(
+        config_path,
+    )?))
 }
 
 pub(crate) fn parse_sing_box_config_text(text: &str) -> Result<Value> {
@@ -350,7 +353,39 @@ pub(crate) fn run_private_access_route_table_config(
     write: bool,
     options: PrivateAccessRouteTableOptions,
 ) -> Result<bool> {
-    let _config_guard = lock_config_mutation();
+    let database_path = (write || output.is_some())
+        .then(|| default_benchmark_db_path_for_config(config_path))
+        .transpose()?;
+    run_private_access_route_table_config_with_database(
+        config_path,
+        output,
+        write,
+        options,
+        database_path.as_deref(),
+    )
+}
+
+fn run_private_access_route_table_config_with_database(
+    config_path: &Path,
+    output: Option<&PathBuf>,
+    write: bool,
+    options: PrivateAccessRouteTableOptions,
+    database_path: Option<&Path>,
+) -> Result<bool> {
+    if write || output.is_some() {
+        let mut auxiliary = Vec::new();
+        if let Some(output) = output
+            && !paths_refer_to_same_target(config_path, output)?
+        {
+            auxiliary.push(("private-access route output", output.as_path()));
+        }
+        ensure_active_config_paths_are_distinct(
+            config_path,
+            database_path.context("file route output requires node-quality path binding")?,
+            &auxiliary,
+        )?;
+    }
+    let _config_guard = lock_config_mutation_for(config_path)?;
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
@@ -377,7 +412,7 @@ pub(crate) fn run_private_access_tun_baseline_config(
     write: bool,
     carrier_domains: &[String],
 ) -> Result<bool> {
-    let _config_guard = lock_config_mutation();
+    let _config_guard = lock_config_mutation_for(config_path)?;
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
@@ -432,11 +467,36 @@ pub(crate) fn set_internet_tun_mode(
     enable: bool,
     restore_auto_detect_interface: Option<RouteAutoDetectInterfaceState>,
 ) -> Result<InternetTunModeUpdate> {
-    let _config_guard = lock_config_mutation();
+    set_internet_tun_mode_with_read_hook(config_path, enable, restore_auto_detect_interface, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn set_internet_tun_mode_after_read_for_test(
+    config_path: &Path,
+    enable: bool,
+    restore_auto_detect_interface: Option<RouteAutoDetectInterfaceState>,
+    after_read: impl FnOnce(),
+) -> Result<InternetTunModeUpdate> {
+    set_internet_tun_mode_with_read_hook(
+        config_path,
+        enable,
+        restore_auto_detect_interface,
+        after_read,
+    )
+}
+
+fn set_internet_tun_mode_with_read_hook(
+    config_path: &Path,
+    enable: bool,
+    restore_auto_detect_interface: Option<RouteAutoDetectInterfaceState>,
+    after_read: impl FnOnce(),
+) -> Result<InternetTunModeUpdate> {
+    let _config_guard = lock_config_mutation_for(config_path)?;
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    after_read();
     let tun_state = tun_config_state(&config)?;
     let auto_detect_interface_before_enable = tun_state.auto_detect_interface;
     let has_managed_internet_tun = tun_state.managed_internet_tun;
@@ -678,12 +738,12 @@ fn china_ip_routing_local_rule_sets(ruleset_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-pub(crate) fn china_ip_routing_ruleset_dir(config_path: &Path) -> PathBuf {
-    config_path
+pub(crate) fn china_ip_routing_ruleset_dir(config_path: &Path) -> Result<PathBuf> {
+    Ok(canonical_config_target(config_path)?
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
-        .join(CHINA_IP_ROUTING_RULESET_DIR)
+        .join(CHINA_IP_ROUTING_RULESET_DIR))
 }
 
 fn china_ip_routing_route_rules(direct_tag: &str) -> Vec<Value> {
@@ -771,13 +831,13 @@ fn config_has_china_ip_routing_value(config: &Value) -> bool {
 /// Adds or removes the China split-routing rule-sets and rules in the sing-box config,
 /// writing the result back in place when it changed. Returns whether the config was modified.
 pub(crate) fn set_china_ip_routing(config_path: &Path, enable: bool) -> Result<bool> {
-    let _config_guard = lock_config_mutation();
+    let _config_guard = lock_config_mutation_for(config_path)?;
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config: Value = parse_sing_box_config_text(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
     let original = config.clone();
-    let ruleset_dir = china_ip_routing_ruleset_dir(config_path);
+    let ruleset_dir = china_ip_routing_ruleset_dir(config_path)?;
     ensure_china_ip_routing(&mut config, enable, &ruleset_dir)?;
     let changed = config != original;
     if changed {
@@ -801,7 +861,7 @@ pub(crate) fn set_tailscale_config(
     config_path: &Path,
     options: Option<TailscaleConfigOptions>,
 ) -> Result<bool> {
-    let _config_guard = lock_config_mutation();
+    let _config_guard = lock_config_mutation_for(config_path)?;
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut config = parse_sing_box_config_text(&text)
@@ -3104,16 +3164,18 @@ mod tests {
         PrivateAccessRouteTableOptions, ProviderNodeSet, RouteAutoDetectInterfaceState,
         TAILSCALE_DNS_TAG, TAILSCALE_ENDPOINT_TAG, TAILSCALE_IPV6_CIDR, TailscaleConfigOptions,
         TailscaleConfigState, build_default_config, build_default_config_with_options,
-        build_full_config_with_provider_node_sets, config_has_china_ip_routing,
-        config_has_internet_tun_inbound, default_tun_inbound,
+        build_full_config_with_provider_node_sets, china_ip_routing_ruleset_dir,
+        config_has_china_ip_routing, config_has_internet_tun_inbound, default_tun_inbound,
         ensure_bypass_rule_set_file_for_config, ensure_hillstone_route_table,
         ensure_private_access_route_table, inspect_tailscale_config, inspect_tun_config,
-        is_managed_tailscale_control_plane_dns_rule, lock_config_mutation,
-        merge_into_existing_config, run_private_access_route_table_config,
+        is_managed_tailscale_control_plane_dns_rule, merge_into_existing_config,
+        run_private_access_route_table_config, run_private_access_route_table_config_with_database,
         run_private_access_tun_baseline_config, set_china_ip_routing, set_internet_tun_mode,
         set_tailscale_config,
     };
+    use crate::config_mutation::lock_config_mutation_for;
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, DEFAULT_BYPASS_RULE_SET_TAG};
+    use crate::ruleset::china_ip_routing_ruleset_paths;
     use serde_json::{Value, json};
     use std::fs;
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -3282,7 +3344,12 @@ mod tests {
     #[test]
     fn creates_missing_bypass_rule_set_next_to_config() {
         let config_path = temp_config_path("bypass-rule-set");
-        let bypass_path = config_path.with_file_name(DEFAULT_BYPASS_RULE_SET_PATH);
+        let bypass_path = config_path
+            .parent()
+            .expect("temporary config parent")
+            .canonicalize()
+            .expect("canonicalize temporary directory")
+            .join(DEFAULT_BYPASS_RULE_SET_PATH);
         let _ = fs::remove_file(&bypass_path);
 
         let created = ensure_bypass_rule_set_file_for_config(&config_path)
@@ -3742,6 +3809,44 @@ mod tests {
                 .expect("idempotent update succeeds")
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn private_access_route_output_rejects_quality_sidecar_before_reading_config() {
+        let path = temp_config_path("private-access-output-alias");
+        fs::write(&path, b"invalid config sentinel\n").expect("write invalid config sentinel");
+        let database = path.with_extension("quality.sqlite3");
+        let mut output = database.as_os_str().to_os_string();
+        output.push("-wal");
+        let output = std::path::PathBuf::from(output);
+        fs::write(&output, b"quality-sidecar-canary\n").expect("write output canary");
+
+        let error = run_private_access_route_table_config_with_database(
+            &path,
+            Some(&output),
+            false,
+            PrivateAccessRouteTableOptions {
+                profile_id: "hillstone".to_string(),
+                cidrs: vec!["10.22.0.0/16".to_string()],
+                domains: Vec::new(),
+                domain_suffixes: Vec::new(),
+                previous_cidrs: Vec::new(),
+                previous_domains: Vec::new(),
+                previous_domain_suffixes: Vec::new(),
+                carrier_domains: Vec::new(),
+                proxy: None,
+            },
+            Some(&database),
+        )
+        .expect_err("quality sidecar alias must fail before config parsing");
+        assert!(format!("{error:#}").contains("must not alias"));
+        assert_eq!(
+            fs::read(&output).expect("read preserved output canary"),
+            b"quality-sidecar-canary\n"
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(output);
     }
 
     #[test]
@@ -4588,7 +4693,7 @@ mod tests {
         )
         .expect("writes config");
 
-        let guard = lock_config_mutation();
+        let guard = lock_config_mutation_for(&path).expect("lock config mutation");
         let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let worker_path = path.clone();
@@ -4996,6 +5101,79 @@ mod tests {
         assert!(!rule_set_tags.contains(&"geoip-cn"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_relative_resources_follow_a_cross_directory_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_config_path("cross-directory-resources");
+        let real_dir = root.join("real");
+        let alias_dir = root.join("alias");
+        fs::create_dir_all(&real_dir).expect("create real config directory");
+        fs::create_dir_all(&alias_dir).expect("create alias config directory");
+        let real_config = real_dir.join("config.json");
+        let alias_config = alias_dir.join("config.json");
+        let base = json!({
+            "outbounds": [
+                { "type": "direct", "tag": "国内直连" },
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] }
+            ],
+            "dns": { "servers": [], "rules": [] },
+            "route": { "rules": [], "rule_set": [] }
+        });
+        fs::write(
+            &real_config,
+            serde_json::to_vec_pretty(&base).expect("serialize base config"),
+        )
+        .expect("write real config");
+        symlink("../real/config.json", &alias_config).expect("create cross-directory alias");
+        let real_dir = real_dir
+            .canonicalize()
+            .expect("canonicalize real directory");
+
+        let bypass = ensure_bypass_rule_set_file_for_config(&alias_config)
+            .expect("create resolved bypass prerequisite")
+            .expect("bypass prerequisite was absent");
+        assert_eq!(bypass, real_dir.join(DEFAULT_BYPASS_RULE_SET_PATH));
+        assert!(!alias_dir.join(DEFAULT_BYPASS_RULE_SET_PATH).exists());
+
+        let ruleset_dir =
+            china_ip_routing_ruleset_dir(&alias_config).expect("resolve China ruleset directory");
+        assert_eq!(ruleset_dir, real_dir.join("sing-box-tui-rulesets"));
+        fs::create_dir_all(&ruleset_dir).expect("create resolved ruleset directory");
+        for path in china_ip_routing_ruleset_paths(&ruleset_dir) {
+            fs::write(path, b"test-ruleset\n").expect("write resolved ruleset fixture");
+        }
+
+        assert!(set_china_ip_routing(&alias_config, true).expect("enable China routing"));
+        let updated: Value = serde_json::from_slice(
+            &fs::read(&real_config).expect("read config through resolved destination"),
+        )
+        .expect("parse updated config");
+        for rule_set in updated["route"]["rule_set"]
+            .as_array()
+            .expect("local rule sets")
+        {
+            let Some(path) = rule_set.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = std::path::PathBuf::from(path);
+            let resolved = if path.is_absolute() {
+                path
+            } else {
+                real_dir.join(path)
+            };
+            assert!(
+                resolved.exists(),
+                "missing local rule set {}",
+                resolved.display()
+            );
+        }
+        assert!(!alias_dir.join("sing-box-tui-rulesets").exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

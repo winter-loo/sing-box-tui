@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -32,8 +32,10 @@ pub(crate) async fn download_china_ip_routing_rulesets(
         .context("failed to build rule-set download client")?;
     fs::create_dir_all(ruleset_dir)
         .with_context(|| format!("failed to create {}", ruleset_dir.display()))?;
-    for &(tag, url) in CHINA_IP_ROUTING_RULE_SETS {
-        let path = ruleset_dir.join(format!("{tag}.srs"));
+    for (&(tag, url), path) in CHINA_IP_ROUTING_RULE_SETS
+        .iter()
+        .zip(china_ip_routing_ruleset_paths(ruleset_dir))
+    {
         let response = client
             .get(url)
             .send()
@@ -49,4 +51,11 @@ pub(crate) async fn download_china_ip_routing_rulesets(
         fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+pub(crate) fn china_ip_routing_ruleset_paths(ruleset_dir: &Path) -> Vec<PathBuf> {
+    CHINA_IP_ROUTING_RULE_SETS
+        .iter()
+        .map(|(tag, _)| ruleset_dir.join(format!("{tag}.srs")))
+        .collect()
 }
