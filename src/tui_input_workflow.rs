@@ -125,9 +125,9 @@ mod tests {
         app.groups[0].members = vec!["hk-1".into(), "us-x2".into(), "hk-2".into()];
         app.member_index = 1;
         app.apply_benchmark_filter("hk,!x2".to_string()).unwrap();
-        assert_eq!(app.displayed_members(), vec!["hk-1", "hk-2"]);
-        assert_eq!(app.member_index, 0);
-        assert_eq!(app.displayed_member_index(), Some(0));
+        assert_eq!(app.displayed_members(), vec!["hk-1", "us-x2", "hk-2"]);
+        assert_eq!(app.member_index, 1);
+        assert_eq!(app.displayed_member_index(), Some(1));
     }
 
     #[test]

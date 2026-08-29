@@ -2,6 +2,7 @@ use super::*;
 use crate::private_access::PrivateAccessRoute;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use std::time::{Duration, Instant};
 
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
@@ -19,7 +20,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         candidate_rows: vec![CandidateRow {
             name: "node-a".to_string(),
             is_current: true,
-            marker: "42ms".to_string(),
+            marker: "3/3 stable reachable".to_string(),
             tone: CandidateTone::Success,
         }],
         candidate_selected: Some(0),
@@ -67,7 +68,7 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(text.contains("Internet Proxy"));
     assert!(text.contains("select"));
     assert!(text.contains("node-a"));
-    assert!(text.contains("42ms"));
+    assert!(text.contains("3/3 stable reachable"));
     assert!(text.contains("System Proxy: disabled"));
     assert!(text.contains("Tun Mode: enabled"));
     assert!(!text.contains("Intranet Proxy"));
@@ -105,6 +106,35 @@ fn settings_overlay_uses_typed_rows() {
     assert!(text.contains("Settings"));
     assert!(text.contains("Latency URL"));
     assert!(text.contains("https://example.test/ping"));
+}
+
+#[test]
+fn reachability_detail_renders_three_attempts_and_assessment() {
+    let mut snapshot = dashboard_snapshot();
+    let chart = LatencyChartState {
+        selector: "select".into(),
+        node: "node-a".into(),
+        samples: Vec::new(),
+        window: Duration::from_secs(3600),
+        threshold_ms: 600,
+        last_refresh: Instant::now(),
+        reachability_assessment: Some(NodeReachabilityAssessment {
+            name: "node-a".into(),
+            attempts: vec![
+                ProbeOutcome::Reachable { delay_ms: 42 },
+                ProbeOutcome::Timeout,
+                ProbeOutcome::Reachable { delay_ms: 51 },
+            ],
+            assessment: Some(crate::controller::ReachabilityAssessment::Reachable),
+        }),
+    };
+    snapshot.latency_chart = Some(&chart);
+
+    let text = rendered_lines(&snapshot).join("\n");
+    assert!(text.contains("Assessment: 2/3 reachable"));
+    assert!(text.contains("Attempt 1: reachable (42ms)"));
+    assert!(text.contains("Attempt 2: timeout"));
+    assert!(text.contains("Attempt 3: reachable (51ms)"));
 }
 
 #[test]

@@ -17,6 +17,7 @@ pub(crate) struct LatencyChartState {
     pub(crate) window: Duration,
     pub(crate) threshold_ms: u64,
     pub(crate) last_refresh: Instant,
+    pub(crate) reachability_assessment: Option<NodeReachabilityAssessment>,
 }
 
 fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
@@ -69,6 +70,32 @@ fn latency_chart_windowed_samples(
 pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
     let area = centered_rect(90, 20, frame.area());
     frame.render_widget(Clear, area);
+    let [quality_area, area] = if chart.reachability_assessment.is_some() {
+        Layout::vertical([Constraint::Length(7), Constraint::Min(8)]).areas(area)
+    } else {
+        Layout::vertical([Constraint::Length(0), Constraint::Min(8)]).areas(area)
+    };
+    if let Some(assessment) = &chart.reachability_assessment {
+        let mut lines = vec![Line::from(format!(
+            "Assessment: {}",
+            assessment.compact_evidence()
+        ))];
+        for (index, outcome) in assessment.attempts.iter().enumerate() {
+            lines.push(Line::from(format!(
+                "Attempt {}: {}",
+                index + 1,
+                probe_outcome_label(outcome)
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title("Reachability evidence")
+                    .borders(Borders::ALL),
+            ),
+            quality_area,
+        );
+    }
 
     let visible_samples = latency_chart_windowed_samples(&chart.samples, chart.window);
     let segments = latency_chart_segments(&visible_samples);
@@ -177,6 +204,17 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
                 ]),
         );
     frame.render_widget(chart_widget, area);
+}
+
+fn probe_outcome_label(outcome: &ProbeOutcome) -> String {
+    match outcome {
+        ProbeOutcome::Reachable { delay_ms } => format!("reachable ({delay_ms}ms)"),
+        ProbeOutcome::Timeout => "timeout".to_string(),
+        ProbeOutcome::TransportFailure { detail } => format!("transport failure ({detail})"),
+        ProbeOutcome::ControllerFailure { status } => format!("controller failure (HTTP {status})"),
+        ProbeOutcome::InvalidMeasurement => "invalid measurement".to_string(),
+        ProbeOutcome::Cancelled => "cancelled".to_string(),
+    }
 }
 
 fn latency_chart_segments(samples: &[NodeLatencySample]) -> Vec<Vec<(u64, u64)>> {

@@ -13,7 +13,9 @@ use ratatui::widgets::{
 };
 use zeroize::Zeroize;
 
-use crate::controller::{ConnectionInfo, ConnectionsSnapshot};
+use crate::controller::{
+    ConnectionInfo, ConnectionsSnapshot, NodeReachabilityAssessment, ProbeOutcome,
+};
 use crate::private_access::{PrivateAccessAuthField, PrivateAccessState};
 use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRuntime};
 use crate::storage::NodeLatencySample;

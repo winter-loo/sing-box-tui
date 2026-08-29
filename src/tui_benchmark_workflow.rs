@@ -40,6 +40,10 @@ impl App {
                 group.name, self.benchmark_filter
             )),
             BenchmarkStart::Debounced => {}
+            BenchmarkStart::CancellationRequested => self.set_status_only(format!(
+                "Cancelling reachability assessment for {}",
+                group.name
+            )),
         }
         Ok(())
     }
@@ -86,16 +90,20 @@ impl App {
                 group.name, member
             )),
             BenchmarkStart::NoCandidates => {}
+            BenchmarkStart::CancellationRequested => self.set_status_only(format!(
+                "Cancelling reachability assessment for {} / {}",
+                group.name, member
+            )),
         }
         Ok(())
     }
 
     pub(super) fn toggle_latency_sort_mode(&mut self) {
         let status = if self.benchmark_workflow.toggle_latency_order() {
-            "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
+            "Sort order: LATENCY ORDER (sort successful nodes by delay, retain all members)"
                 .to_string()
         } else {
-            "Sort order: SELECTOR ORDER (original selector order with current filter)".to_string()
+            "Sort order: SELECTOR ORDER (complete original selector order)".to_string()
         };
         self.set_status_only(status);
     }
@@ -182,7 +190,9 @@ impl App {
                     self.benchmark_scope_label()
                 ));
             }
-            BenchmarkStart::AlreadyRunning | BenchmarkStart::Debounced => {}
+            BenchmarkStart::AlreadyRunning
+            | BenchmarkStart::Debounced
+            | BenchmarkStart::CancellationRequested => {}
         }
         Ok(())
     }
@@ -292,20 +302,10 @@ impl App {
             BenchmarkUpdate::Disconnected { group } => {
                 self.set_status_only(format!("Latency test worker for {group} disconnected"));
             }
-            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, best }) => {
-                if let Some(best) = best {
-                    self.set_status_only(format!(
-                        "Latency tested {}: best is {} ({})",
-                        group,
-                        best.name,
-                        best.display_delay()
-                    ));
-                } else {
-                    self.set_status_only(format!(
-                        "Latency tested {} but no healthy node matched",
-                        group
-                    ));
-                }
+            BenchmarkUpdate::Finished(BenchmarkCompletion::Group { group, assessed }) => {
+                self.set_status_only(format!(
+                    "Reachability assessed {assessed} node(s) in {group}"
+                ));
             }
             BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect { group, summary }) => {
                 self.finish_auto_select_benchmark(&group, &summary)?;
@@ -313,17 +313,14 @@ impl App {
             BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
                 group,
                 node,
-                result,
+                assessment,
             }) => {
-                let status = match result {
-                    Some(result) if result.delay.is_some() => format!(
-                        "Latency tested {} / {}: {}",
-                        group,
-                        node,
-                        result.display_delay()
+                let status = match assessment {
+                    Some(assessment) => format!(
+                        "Reachability assessed {group} / {node}: {}",
+                        assessment.compact_evidence()
                     ),
-                    Some(_) => format!("Latency tested {} / {}: failed", group, node),
-                    None => format!("Latency test finished for {} / {}", group, node),
+                    None => format!("Reachability assessment incomplete for {group} / {node}"),
                 };
                 self.set_status_only(status);
             }

@@ -6,10 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
+use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, derive_reachability_assessment};
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const BENCHMARK_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BENCHMARK_PRUNE_BATCH_SIZE: usize = 50_000;
+const NODE_QUALITY_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) fn default_benchmark_db_path() -> PathBuf {
     env::var("SING_BOX_TUI_DB")
@@ -51,6 +54,7 @@ pub(crate) struct BenchmarkStore {
 
 impl BenchmarkStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+        reset_legacy_database(path.as_ref())?;
         let connection = Connection::open(path.as_ref()).with_context(|| {
             format!("failed to open SQLite database {}", path.as_ref().display())
         })?;
@@ -82,10 +86,121 @@ impl BenchmarkStore {
                 DROP INDEX IF EXISTS idx_benchmark_results_selector_node;
                 CREATE INDEX IF NOT EXISTS idx_benchmark_results_selector_node_recent
                     ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS reachability_assessments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS probe_attempts (
+                    assessment_id INTEGER NOT NULL REFERENCES reachability_assessments(id) ON DELETE CASCADE,
+                    attempt_index INTEGER NOT NULL,
+                    outcome_kind TEXT NOT NULL,
+                    delay_ms INTEGER,
+                    detail TEXT,
+                    controller_status INTEGER,
+                    PRIMARY KEY (assessment_id, attempt_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reachability_assessments_selector_node_recent
+                    ON reachability_assessments(selector, node, recorded_at_ms DESC, id DESC);
+                PRAGMA user_version = 2;
                 "#,
             )
             .context("failed to initialize benchmark_results SQLite schema")?;
         Ok(())
+    }
+
+    pub(crate) fn record_reachability_assessment(
+        &self,
+        selector: &str,
+        assessment: &NodeReachabilityAssessment,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO reachability_assessments (recorded_at_ms, selector, node) VALUES (?1, ?2, ?3)",
+            params![current_timestamp_ms()?, selector, assessment.name],
+        ).context("failed to insert reachability assessment")?;
+        let assessment_id = self.connection.last_insert_rowid();
+        for (index, outcome) in assessment.attempts.iter().enumerate() {
+            let (delay_ms, detail, status): (Option<i64>, Option<&str>, Option<i64>) = match outcome
+            {
+                ProbeOutcome::Reachable { delay_ms } => (Some(*delay_ms as i64), None, None),
+                ProbeOutcome::Timeout => (None, None, None),
+                ProbeOutcome::TransportFailure { detail } => (None, Some(detail), None),
+                ProbeOutcome::ControllerFailure { status } => (None, None, Some(*status as i64)),
+                ProbeOutcome::InvalidMeasurement | ProbeOutcome::Cancelled => (None, None, None),
+            };
+            let kind = outcome.storage_kind();
+            self.connection.execute(
+                "INSERT INTO probe_attempts (assessment_id, attempt_index, outcome_kind, delay_ms, detail, controller_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![assessment_id, index as i64, kind, delay_ms, detail, status],
+            ).context("failed to insert probe attempt")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn latest_reachability_assessments(
+        &self,
+    ) -> Result<Vec<(String, NodeReachabilityAssessment)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+            SELECT a.selector, a.node, t.outcome_kind, t.delay_ms, t.detail, t.controller_status
+            FROM reachability_assessments a
+            JOIN probe_attempts t ON t.assessment_id = a.id
+            WHERE a.id IN (
+                SELECT id FROM reachability_assessments newer
+                WHERE newer.selector = a.selector AND newer.node = a.node
+                ORDER BY recorded_at_ms DESC, id DESC LIMIT 1
+            )
+            ORDER BY a.selector, a.node, t.attempt_index
+            "#,
+            )
+            .context("failed to prepare latest reachability assessment query")?;
+        let rows = statement
+            .query_map([], |row| {
+                let kind: String = row.get(2)?;
+                let delay_ms: Option<i64> = row.get(3)?;
+                let detail: Option<String> = row.get(4)?;
+                let status: Option<i64> = row.get(5)?;
+                let outcome = ProbeOutcome::from_storage(
+                    &kind,
+                    delay_ms.map(|value| value as u64),
+                    detail,
+                    status.map(|value| value as u16),
+                )
+                .map_err(|message| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, message).into(),
+                    )
+                })?;
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, outcome))
+            })
+            .context("failed to query latest reachability assessments")?;
+        let mut grouped: Vec<(String, NodeReachabilityAssessment)> = Vec::new();
+        for row in rows {
+            let (selector, node, outcome) =
+                row.context("failed to read reachability assessment row")?;
+            if let Some((last_selector, assessment)) = grouped.last_mut()
+                && *last_selector == selector
+                && assessment.name == node
+            {
+                assessment.attempts.push(outcome);
+                assessment.assessment = derive_reachability_assessment(&assessment.attempts);
+            } else {
+                grouped.push((
+                    selector,
+                    NodeReachabilityAssessment {
+                        name: node,
+                        attempts: vec![outcome],
+                        assessment: None,
+                    },
+                ));
+            }
+        }
+        Ok(grouped)
     }
 
     pub(crate) fn record_benchmark(&self, record: &BenchmarkRecord<'_>) -> Result<()> {
@@ -237,6 +352,37 @@ fn current_timestamp_ms() -> Result<i64> {
         .as_millis() as i64)
 }
 
+fn reset_legacy_database(path: &Path) -> Result<()> {
+    if !path.exists() || path == Path::new(":memory:") {
+        return Ok(());
+    }
+    let legacy = Connection::open(path)
+        .and_then(|connection| {
+            connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        })
+        .unwrap_or_default()
+        != NODE_QUALITY_SCHEMA_VERSION;
+    if !legacy {
+        return Ok(());
+    }
+    std::fs::remove_file(path)
+        .with_context(|| format!("failed to delete legacy SQLite database {}", path.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            std::fs::remove_file(&sidecar).with_context(|| {
+                format!(
+                    "failed to delete legacy SQLite sidecar {}",
+                    sidecar.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Result<()> {
     connection
         .busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -258,6 +404,7 @@ fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{BenchmarkRecord, BenchmarkStore};
+    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::thread;
@@ -281,6 +428,62 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-wal"));
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, "-shm"));
+    }
+
+    #[test]
+    fn first_node_quality_open_recreates_legacy_database() {
+        let path = test_db_path();
+        let legacy = rusqlite::Connection::open(&path).expect("open legacy database");
+        legacy
+            .execute_batch("CREATE TABLE legacy_latency (delay INTEGER); INSERT INTO legacy_latency VALUES (42);")
+            .expect("create legacy schema");
+        drop(legacy);
+
+        let store = BenchmarkStore::open(&path).expect("open node-quality store");
+        let legacy_exists: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'legacy_latency'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect recreated schema");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(legacy_exists, 0);
+        assert_eq!(version, 2);
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn reachability_assessment_round_trips_factual_attempts() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open node-quality store");
+        let assessment = NodeReachabilityAssessment {
+            name: "node-a".into(),
+            attempts: vec![
+                ProbeOutcome::Reachable { delay_ms: 42 },
+                ProbeOutcome::Timeout,
+                ProbeOutcome::TransportFailure {
+                    detail: "connection reset".into(),
+                },
+            ],
+            assessment: Some(ReachabilityAssessment::Degraded),
+        };
+        store
+            .record_reachability_assessment("select", &assessment)
+            .expect("record facts");
+
+        assert_eq!(
+            store.latest_reachability_assessments().expect("load facts"),
+            vec![("select".into(), assessment)]
+        );
+        drop(store);
+        remove_test_db(&path);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,6 +15,7 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use urlencoding::encode;
 
 use crate::defaults::{DEFAULT_CONTROLLER, DEFAULT_MIXED_PROXY_SERVER};
@@ -575,6 +578,135 @@ pub(crate) fn spawn_benchmark_worker(
     })
 }
 
+pub(crate) fn spawn_reachability_assessment_worker(
+    base_url: String,
+    client: AsyncClient,
+    request: BenchmarkRequest,
+    tx: Sender<BenchmarkEvent>,
+    cancelled: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let runtime = match TokioRuntimeBuilder::new_multi_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = tx.send(BenchmarkEvent::Finished);
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let candidates = match request.nodes.clone() {
+                Some(nodes) => nodes,
+                None => match fetch_selector_for_benchmark(&client, &base_url, &request.selector)
+                    .await
+                {
+                    Ok(selector) => filter_benchmark_candidates(&selector.all, &request),
+                    Err(_) => Vec::new(),
+                },
+            };
+            let mut tasks = JoinSet::new();
+            let mut pending = candidates.into_iter();
+            for _ in 0..request.max_concurrency.clamp(1, 8) {
+                let Some(name) = pending.next() else { break };
+                spawn_reachability_assessment_task(
+                    &mut tasks,
+                    client.clone(),
+                    base_url.clone(),
+                    name,
+                    request.url.clone(),
+                    cancelled.clone(),
+                );
+            }
+            while let Some(joined) = tasks.join_next().await {
+                if let Ok(result) = joined {
+                    let _ = tx.send(BenchmarkEvent::ReachabilityProgress(result));
+                }
+                if let Some(name) = pending.next() {
+                    spawn_reachability_assessment_task(
+                        &mut tasks,
+                        client.clone(),
+                        base_url.clone(),
+                        name,
+                        request.url.clone(),
+                        cancelled.clone(),
+                    );
+                }
+            }
+            let _ = tx.send(BenchmarkEvent::Finished);
+        });
+    })
+}
+
+fn spawn_reachability_assessment_task(
+    tasks: &mut JoinSet<NodeReachabilityAssessment>,
+    client: AsyncClient,
+    base_url: String,
+    name: String,
+    url: String,
+    cancelled: Arc<AtomicBool>,
+) {
+    tasks.spawn(async move {
+        let mut attempts = Vec::with_capacity(3);
+        for attempt_index in 0..3 {
+            if cancelled.load(Ordering::Relaxed) {
+                attempts.resize(3, ProbeOutcome::Cancelled);
+                break;
+            }
+            attempts.push(
+                measure_probe_outcome(
+                    client.clone(),
+                    &base_url,
+                    &name,
+                    &url,
+                    Duration::from_secs(5),
+                )
+                .await,
+            );
+            if attempt_index < 2 {
+                sleep(Duration::from_millis(300)).await;
+            }
+        }
+        NodeReachabilityAssessment::from_attempts(name, attempts)
+    });
+}
+
+async fn measure_probe_outcome(
+    client: AsyncClient,
+    base_url: &str,
+    proxy_name: &str,
+    url: &str,
+    timeout: Duration,
+) -> ProbeOutcome {
+    let request = client
+        .get(format!(
+            "{}/proxies/{}/delay?timeout={}&url={}",
+            base_url,
+            encode(proxy_name),
+            timeout.as_millis(),
+            encode(url)
+        ))
+        .timeout(timeout);
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return ProbeOutcome::Timeout,
+        Err(error) => {
+            return ProbeOutcome::TransportFailure {
+                detail: error.to_string(),
+            };
+        }
+    };
+    if !response.status().is_success() {
+        return ProbeOutcome::ControllerFailure {
+            status: response.status().as_u16(),
+        };
+    }
+    match response.json::<DelayResponse>().await {
+        Ok(DelayResponse {
+            delay: Some(delay_ms),
+        }) if delay_ms > 0 => ProbeOutcome::Reachable { delay_ms },
+        _ => ProbeOutcome::InvalidMeasurement,
+    }
+}
+
 async fn fetch_selector_for_benchmark(
     client: &AsyncClient,
     base_url: &str,
@@ -643,6 +775,133 @@ async fn measure_delay(
         .ok()?;
     let payload: DelayResponse = response.json().await.ok()?;
     payload.delay
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ProbeOutcome {
+    Reachable { delay_ms: u64 },
+    Timeout,
+    TransportFailure { detail: String },
+    ControllerFailure { status: u16 },
+    InvalidMeasurement,
+    Cancelled,
+}
+
+impl ProbeOutcome {
+    pub(crate) fn is_node_attributable(&self) -> bool {
+        matches!(
+            self,
+            Self::Reachable { .. } | Self::Timeout | Self::TransportFailure { .. }
+        )
+    }
+
+    pub(crate) fn storage_kind(&self) -> &'static str {
+        match self {
+            Self::Reachable { .. } => "reachable",
+            Self::Timeout => "timeout",
+            Self::TransportFailure { .. } => "transport_failure",
+            Self::ControllerFailure { .. } => "controller_failure",
+            Self::InvalidMeasurement => "invalid_measurement",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) fn from_storage(
+        kind: &str,
+        delay_ms: Option<u64>,
+        detail: Option<String>,
+        controller_status: Option<u16>,
+    ) -> std::result::Result<Self, String> {
+        match kind {
+            "reachable" => delay_ms
+                .filter(|delay| *delay > 0)
+                .map(|delay_ms| Self::Reachable { delay_ms })
+                .ok_or_else(|| "reachable outcome is missing a positive delay".to_string()),
+            "timeout" => Ok(Self::Timeout),
+            "transport_failure" => Ok(Self::TransportFailure {
+                detail: detail.unwrap_or_default(),
+            }),
+            "controller_failure" => controller_status
+                .map(|status| Self::ControllerFailure { status })
+                .ok_or_else(|| "controller failure is missing an HTTP status".to_string()),
+            "invalid_measurement" => Ok(Self::InvalidMeasurement),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(format!("unknown probe outcome kind {kind}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReachabilityAssessment {
+    StableReachable,
+    Reachable,
+    Degraded,
+    Unreachable,
+}
+
+impl ReachabilityAssessment {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::StableReachable => "stable reachable",
+            Self::Reachable => "reachable",
+            Self::Degraded => "degraded",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct NodeReachabilityAssessment {
+    pub(crate) name: String,
+    pub(crate) attempts: Vec<ProbeOutcome>,
+    pub(crate) assessment: Option<ReachabilityAssessment>,
+}
+
+impl NodeReachabilityAssessment {
+    pub(crate) fn from_attempts(name: String, attempts: Vec<ProbeOutcome>) -> Self {
+        let assessment = derive_reachability_assessment(&attempts);
+        Self {
+            name,
+            attempts,
+            assessment,
+        }
+    }
+
+    pub(crate) fn compact_evidence(&self) -> String {
+        let reachable = self
+            .attempts
+            .iter()
+            .filter(|attempt| matches!(attempt, ProbeOutcome::Reachable { .. }))
+            .count();
+        match self.assessment {
+            Some(assessment) => format!("{reachable}/3 {}", assessment.label()),
+            None => format!("{reachable}/{} incomplete", self.attempts.len()),
+        }
+    }
+}
+
+pub(crate) fn derive_reachability_assessment(
+    attempts: &[ProbeOutcome],
+) -> Option<ReachabilityAssessment> {
+    if attempts.len() != 3
+        || attempts
+            .iter()
+            .any(|outcome| !outcome.is_node_attributable())
+    {
+        return None;
+    }
+    let reachable = attempts
+        .iter()
+        .filter(|outcome| matches!(outcome, ProbeOutcome::Reachable { .. }))
+        .count();
+    Some(match reachable {
+        3 => ReachabilityAssessment::StableReachable,
+        2 => ReachabilityAssessment::Reachable,
+        1 => ReachabilityAssessment::Degraded,
+        _ => ReachabilityAssessment::Unreachable,
+    })
 }
 
 #[derive(Deserialize)]
@@ -821,6 +1080,7 @@ pub(crate) struct BenchmarkSummary {
 
 pub(crate) enum BenchmarkEvent {
     Progress(BenchmarkResult),
+    ReachabilityProgress(NodeReachabilityAssessment),
     Finished,
 }
 
@@ -1137,12 +1397,154 @@ fn format_http_version(version: Version) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
     use super::{
         BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
         ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest,
         filter_benchmark_candidates, matches_filter, selectors_from_payload, status_from_parts,
         verification_check_label,
     };
+
+    #[test]
+    fn reachability_assessment_requires_three_node_attributable_attempts() {
+        use super::{ProbeOutcome::*, ReachabilityAssessment, derive_reachability_assessment};
+
+        assert_eq!(
+            derive_reachability_assessment(&[
+                Reachable { delay_ms: 40 },
+                Reachable { delay_ms: 50 },
+                Reachable { delay_ms: 60 },
+            ]),
+            Some(ReachabilityAssessment::StableReachable)
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[
+                Reachable { delay_ms: 40 },
+                Timeout,
+                Reachable { delay_ms: 60 },
+            ]),
+            Some(ReachabilityAssessment::Reachable)
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[
+                TransportFailure {
+                    detail: "reset".into(),
+                },
+                Reachable { delay_ms: 60 },
+                Timeout,
+            ]),
+            Some(ReachabilityAssessment::Degraded)
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[
+                Timeout,
+                TransportFailure {
+                    detail: "reset".into(),
+                },
+                Timeout,
+            ]),
+            Some(ReachabilityAssessment::Unreachable)
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[
+                Reachable { delay_ms: 40 },
+                ControllerFailure { status: 503 },
+                Timeout,
+            ]),
+            None
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[
+                Reachable { delay_ms: 40 },
+                InvalidMeasurement,
+                Timeout,
+            ]),
+            None
+        );
+        assert_eq!(
+            derive_reachability_assessment(&[Reachable { delay_ms: 40 }, Cancelled, Timeout,]),
+            None
+        );
+    }
+
+    fn one_response_server(status: &str, body: &str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test controller");
+        let address = listener.local_addr().expect("test controller address");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            thread::sleep(delay);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn live_delay_endpoint_returns_structured_outcomes() {
+        use super::{ProbeOutcome, measure_probe_outcome};
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let reachable = one_response_server("200 OK", r#"{"delay":42}"#, Duration::ZERO);
+        assert_eq!(
+            measure_probe_outcome(
+                client.clone(),
+                &reachable,
+                "node/a",
+                "https://example.com",
+                Duration::from_secs(1)
+            )
+            .await,
+            ProbeOutcome::Reachable { delay_ms: 42 }
+        );
+
+        let controller = one_response_server("503 Service Unavailable", "{}", Duration::ZERO);
+        assert_eq!(
+            measure_probe_outcome(
+                client.clone(),
+                &controller,
+                "node-a",
+                "https://example.com",
+                Duration::from_secs(1)
+            )
+            .await,
+            ProbeOutcome::ControllerFailure { status: 503 }
+        );
+
+        let invalid = one_response_server("200 OK", r#"{"delay":0}"#, Duration::ZERO);
+        assert_eq!(
+            measure_probe_outcome(
+                client.clone(),
+                &invalid,
+                "node-a",
+                "https://example.com",
+                Duration::from_secs(1)
+            )
+            .await,
+            ProbeOutcome::InvalidMeasurement
+        );
+
+        let timeout = one_response_server("200 OK", r#"{"delay":42}"#, Duration::from_millis(100));
+        assert_eq!(
+            measure_probe_outcome(
+                client,
+                &timeout,
+                "node-a",
+                "https://example.com",
+                Duration::from_millis(10)
+            )
+            .await,
+            ProbeOutcome::Timeout
+        );
+    }
 
     #[test]
     fn benchmark_summary_picks_lowest_successful_delay() {

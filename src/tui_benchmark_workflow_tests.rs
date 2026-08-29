@@ -1,7 +1,10 @@
 use super::super::test_support::{internet_routes_app, test_app};
 use crate::auto_pick::AutoPickDecision;
 use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkUpdate};
-use crate::controller::{BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ProxyGroup};
+use crate::controller::{
+    BenchmarkRequest, BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome,
+    ProxyGroup,
+};
 use crossterm::event::KeyCode;
 
 #[test]
@@ -10,15 +13,21 @@ fn single_node_benchmark_finish_does_not_flash() {
     app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
         group: "select".to_string(),
         node: "node-a".to_string(),
-        result: Some(BenchmarkResult {
-            name: "node-a".to_string(),
-            delay: Some(42),
-            completed: true,
-        }),
+        assessment: Some(NodeReachabilityAssessment::from_attempts(
+            "node-a".to_string(),
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 42 },
+                ProbeOutcome::Reachable { delay_ms: 45 },
+                ProbeOutcome::Reachable { delay_ms: 48 },
+            ],
+        )),
     }))
     .expect("apply completion");
 
-    assert_eq!(app.status, "Latency tested select / node-a: 42ms");
+    assert_eq!(
+        app.status,
+        "Reachability assessed select / node-a: 3/3 stable reachable"
+    );
     assert!(app.flash.is_none());
 }
 
@@ -32,7 +41,7 @@ fn toggling_latency_sort_mode_does_not_flash() {
     assert!(app.benchmark_workflow.latency_order());
     assert_eq!(
         app.status,
-        "Sort order: LATENCY ORDER (hide failed-tested nodes, sort successful nodes by delay)"
+        "Sort order: LATENCY ORDER (sort successful nodes by delay, retain all members)"
     );
     assert!(app.flash.is_none());
 }
@@ -42,15 +51,11 @@ fn group_benchmark_finish_does_not_flash() {
     let mut app = test_app();
     app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
         group: "select".to_string(),
-        best: Some(BenchmarkResult {
-            name: "node-a".to_string(),
-            delay: Some(42),
-            completed: true,
-        }),
+        assessed: 1,
     }))
     .expect("apply completion");
 
-    assert_eq!(app.status, "Latency tested select: best is node-a (42ms)");
+    assert_eq!(app.status, "Reachability assessed 1 node(s) in select");
     assert!(app.flash.is_none());
 }
 
