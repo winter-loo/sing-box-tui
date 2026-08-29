@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn production_open_binds_jsonc_active_config_before_accepting_facts() {
+    fn production_open_binds_jsonc_config_but_waits_for_runtime_observation() {
         let database_path = test_db_path();
         let config_path = database_path.with_extension("config.json");
         std::fs::write(
@@ -799,7 +799,20 @@ mod tests {
                 &worker_config,
                 &worker_database,
             )
-            .and_then(|workflow| workflow.persist_benchmark_for_test("node-a"));
+            .and_then(|mut workflow| {
+                let initially_enabled = workflow.quality_persistence_enabled();
+                let initially_fenced = runtime_reload_fence_path(&worker_database).exists();
+                workflow.confirm_managed_runtime_reload(
+                    &worker_config,
+                    &worker_database,
+                    || Ok(()),
+                )?;
+                Ok((
+                    initially_enabled,
+                    initially_fenced,
+                    workflow.persist_benchmark_for_test("node-a")?,
+                ))
+            });
             opened_tx.send(result).expect("return startup result");
         });
         assert_eq!(
@@ -807,7 +820,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("startup binding must not reacquire its own quality lock")
                 .expect("open workflow and record bound fact"),
-            Some(true)
+            (false, true, Some(true))
         );
         worker.join().expect("join startup binding worker");
         let store = BenchmarkStore::open(&database_path).expect("reopen bound store");
@@ -888,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn production_open_repairs_existing_marker_from_committed_config() {
+    fn production_open_repairs_existing_marker_but_requires_runtime_observation() {
         let database_path = test_db_path();
         let config_path = database_path.with_extension("repair-config.json");
         std::fs::write(
@@ -902,7 +915,7 @@ mod tests {
             .expect("seed fail-closed marker");
         drop(store);
 
-        let workflow = BenchmarkWorkflow::open(
+        let mut workflow = BenchmarkWorkflow::open(
             "http://127.0.0.1:9992".to_string(),
             AsyncClient::builder()
                 .no_proxy()
@@ -913,13 +926,90 @@ mod tests {
         )
         .expect("committed config repairs quality binding");
 
+        assert!(!workflow.quality_persistence_enabled());
+        assert!(!quality_marker_path(&database_path).exists());
+        assert!(runtime_reload_fence_path(&database_path).exists());
+        workflow
+            .confirm_managed_runtime_reload(&config_path, &database_path, || Ok(()))
+            .expect("observed runtime enables the repaired binding");
         assert!(workflow.quality_persistence_enabled());
         assert_eq!(
             workflow.persist_benchmark_for_test("direct").unwrap(),
             Some(true)
         );
-        assert!(!quality_marker_path(&database_path).exists());
+        assert!(!runtime_reload_fence_path(&database_path).exists());
         drop(workflow);
+        remove_workflow_fixture(&config_path, &database_path);
+    }
+
+    #[test]
+    fn startup_identity_drift_stays_fenced_until_the_new_config_is_observed() {
+        let database_path = test_db_path();
+        let config_path = database_path.with_extension("startup-drift-config.json");
+        let old_config = serde_json::json!({
+            "outbounds": [{
+                "type":"trojan", "tag":"node-a", "server":"old.example",
+                "server_port":443, "password":"old-secret"
+            }]
+        });
+        let new_config = serde_json::json!({
+            "outbounds": [{
+                "type":"trojan", "tag":"node-a", "server":"new.example",
+                "server_port":443, "password":"new-secret"
+            }]
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&old_config).expect("serialize old config"),
+        )
+        .expect("write old active config");
+        let stale_store = BenchmarkStore::open(&database_path).expect("open old runtime store");
+        stale_store
+            .reconcile_node_history(&old_config)
+            .expect("bind the old runtime identities");
+
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&new_config).expect("serialize new config"),
+        )
+        .expect("replace active config outside the managed mutation path");
+        let mut workflow = BenchmarkWorkflow::open(
+            "http://127.0.0.1:9992".to_string(),
+            AsyncClient::builder()
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            &config_path,
+            &database_path,
+        )
+        .expect("startup binds the externally changed identity");
+
+        assert!(!workflow.quality_persistence_enabled());
+        assert!(runtime_reload_fence_path(&database_path).exists());
+        assert!(
+            !stale_store
+                .record_benchmark(&BenchmarkRecord {
+                    selector: "select",
+                    node: "node-a",
+                    filter: "all",
+                    delay_ms: Some(40),
+                    completed: true,
+                    job_kind: "auto",
+                })
+                .expect("old same-tag writer is safely rejected")
+        );
+
+        workflow
+            .confirm_managed_runtime_reload(&config_path, &database_path, || Ok(()))
+            .expect("observing the new runtime releases the fence");
+        assert!(workflow.quality_persistence_enabled());
+        assert_eq!(
+            workflow.persist_benchmark_for_test("node-a").unwrap(),
+            Some(true)
+        );
+
+        drop(workflow);
+        drop(stale_store);
         remove_workflow_fixture(&config_path, &database_path);
     }
 

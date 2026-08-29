@@ -98,16 +98,35 @@ impl App {
         }
         let state_store = self.state_store.clone();
         let mut runtime_state = self.runtime_state();
-        let Some(outcome) = self
-            .internet_tun
-            .poll(&mut self.sing_box, &self.client, |tun| {
+        let internet_tun = &mut self.internet_tun;
+        let benchmark_workflow = &mut self.benchmark_workflow;
+        let sing_box = &mut self.sing_box;
+        let client = &self.client;
+        let config_path = &self.system_proxy_config_path;
+        let database_path = &self.node_quality_db_path;
+        let Some(outcome) = internet_tun.poll(
+            || {
+                let report =
+                    super::managed_process::restart_managed_sing_box_with_quality_confirmation(
+                        benchmark_workflow,
+                        sing_box,
+                        client,
+                        config_path,
+                        database_path,
+                    )?;
+                Ok(crate::internet_tun::InternetTunRestart {
+                    report,
+                    controller_error: None,
+                })
+            },
+            |tun| {
                 apply_internet_tun_persistence(&mut runtime_state, tun);
                 if let Some(store) = &state_store {
                     store.save(&runtime_state)?;
                 }
                 Ok(())
-            })
-        else {
+            },
+        ) else {
             return;
         };
         match outcome {
@@ -167,7 +186,7 @@ impl App {
                         }
                     }
                     Err(error) => self.set_status_with_flash(format!(
-                        "TUN mode {state} but sing-box restart failed: {error}{}",
+                        "TUN mode {state} but sing-box reload confirmation failed: {error}{}",
                         persist_note.as_deref().unwrap_or("")
                     )),
                 }

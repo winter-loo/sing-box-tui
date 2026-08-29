@@ -521,7 +521,14 @@ impl BenchmarkStore {
         committed_config: &Value,
     ) -> Result<NodeHistoryReconciliation> {
         let cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
-        self.bind_node_history_while_reconciliation_locked(&cross_process_guard, committed_config)
+        let reconciliation = self.bind_node_history_while_reconciliation_locked(
+            &cross_process_guard,
+            committed_config,
+        )?;
+        // Unit tests use this helper as their stand-in for a runtime that has loaded the supplied
+        // config. Production callers must instead clear the fence through readiness observation.
+        self.clear_runtime_reload_required()?;
+        Ok(reconciliation)
     }
 
     pub(crate) fn bind_node_history_while_reconciliation_locked(
@@ -552,6 +559,25 @@ impl BenchmarkStore {
                 };
             }
         };
+        if reconciliation.identities_changed
+            && let Err(error) = self.ensure_runtime_reload_required()
+        {
+            let rollback = transaction.rollback();
+            if rollback.is_ok() && marker_created {
+                self.clear_quality_write_block()?;
+            }
+            return match rollback {
+                Ok(()) => Err(error).context(
+                    "failed to fence node-quality persistence before publishing changed identities",
+                ),
+                Err(rollback_error) => Err(anyhow!(
+                    "failed to fence changed node identities: {error:#}; node-quality transaction rollback failed: {rollback_error:#}; quality writes remain blocked"
+                )),
+            };
+        }
+        // Startup may discover identity drift without going through a config mutation. The
+        // durable runtime fence must therefore exist before the new generation becomes visible,
+        // just as it does for subscription refreshes.
         transaction.commit(reconciliation)?;
         self.clear_quality_write_block()
             .context("node history committed but quality writes remain blocked")?;
