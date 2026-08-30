@@ -536,6 +536,11 @@ pub(crate) fn spawn_reachability_assessment_worker(
             };
             let mut tasks = JoinSet::new();
             let mut pending = candidates.into_iter();
+            let probe = ReachabilityProbeConfig {
+                url: request.url.clone(),
+                controller_timeout_ms: request.timeout_ms,
+                request_timeout: Duration::from_secs_f64(request.request_timeout),
+            };
             for _ in 0..request.max_concurrency.clamp(1, 8) {
                 let Some(name) = pending.next() else { break };
                 spawn_reachability_assessment_task(
@@ -543,7 +548,7 @@ pub(crate) fn spawn_reachability_assessment_worker(
                     client.clone(),
                     base_url.clone(),
                     name,
-                    request.url.clone(),
+                    probe.clone(),
                     cancelled.clone(),
                 );
             }
@@ -557,7 +562,7 @@ pub(crate) fn spawn_reachability_assessment_worker(
                         client.clone(),
                         base_url.clone(),
                         name,
-                        request.url.clone(),
+                        probe.clone(),
                         cancelled.clone(),
                     );
                 }
@@ -567,12 +572,19 @@ pub(crate) fn spawn_reachability_assessment_worker(
     })
 }
 
+#[derive(Clone)]
+struct ReachabilityProbeConfig {
+    url: String,
+    controller_timeout_ms: u64,
+    request_timeout: Duration,
+}
+
 fn spawn_reachability_assessment_task(
     tasks: &mut JoinSet<NodeReachabilityAssessment>,
     client: AsyncClient,
     base_url: String,
     name: String,
-    url: String,
+    probe: ReachabilityProbeConfig,
     cancelled: Arc<AtomicBool>,
 ) {
     tasks.spawn(async move {
@@ -587,8 +599,9 @@ fn spawn_reachability_assessment_task(
                     client.clone(),
                     &base_url,
                     &name,
-                    &url,
-                    Duration::from_secs(5),
+                    &probe.url,
+                    probe.controller_timeout_ms,
+                    probe.request_timeout,
                 )
                 .await,
             );
@@ -605,17 +618,20 @@ async fn measure_probe_outcome(
     base_url: &str,
     proxy_name: &str,
     url: &str,
-    timeout: Duration,
+    controller_timeout_ms: u64,
+    request_timeout: Duration,
 ) -> ProbeOutcome {
+    // The delay API's cutoff and our HTTP deadline are intentionally independent: the
+    // controller still needs time to return a measurement after its own probe expires.
     let request = client
         .get(format!(
             "{}/proxies/{}/delay?timeout={}&url={}",
             base_url,
             encode(proxy_name),
-            timeout.as_millis(),
+            controller_timeout_ms,
             encode(url)
         ))
-        .timeout(timeout);
+        .timeout(request_timeout);
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_timeout() => return ProbeOutcome::Timeout,
@@ -1317,10 +1333,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
-        ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest,
-        filter_benchmark_candidates, matches_filter, selectors_from_payload, status_from_parts,
-        verification_check_label,
+        BenchmarkEvent, BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
+        ConnectionsResponse, ProbeOutcome, ProxiesResponse, ShellCheck, TrafficSnapshot,
+        UpdateConfigRequest, filter_benchmark_candidates, matches_filter, selectors_from_payload,
+        spawn_reachability_assessment_worker, status_from_parts, verification_check_label,
     };
 
     #[test]
@@ -1386,20 +1402,41 @@ mod tests {
     }
 
     fn one_response_server(status: &str, body: &str, delay: Duration) -> String {
+        recording_response_server(status, body, delay).0
+    }
+
+    fn recording_response_server(
+        status: &str,
+        body: &str,
+        delay: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        recording_response_server_for(1, status, body, delay)
+    }
+
+    fn recording_response_server_for(
+        request_count: usize,
+        status: &str,
+        body: &str,
+        delay: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test controller");
         let address = listener.local_addr().expect("test controller address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept test request");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            thread::sleep(delay);
-            let _ = stream.write_all(response.as_bytes());
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                let mut request = [0_u8; 2048];
+                let read = stream.read(&mut request).unwrap_or_default();
+                let _ = request_tx.send(String::from_utf8_lossy(&request[..read]).into_owned());
+                thread::sleep(delay);
+                let _ = stream.write_all(response.as_bytes());
+            }
         });
-        format!("http://{address}")
+        (format!("http://{address}"), request_rx)
     }
 
     #[tokio::test]
@@ -1407,18 +1444,24 @@ mod tests {
         use super::{ProbeOutcome, measure_probe_outcome};
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
-        let reachable = one_response_server("200 OK", r#"{"delay":42}"#, Duration::ZERO);
+        let (reachable, request_rx) =
+            recording_response_server("200 OK", r#"{"delay":42}"#, Duration::ZERO);
         assert_eq!(
             measure_probe_outcome(
                 client.clone(),
                 &reachable,
                 "node/a",
                 "https://example.com",
+                137,
                 Duration::from_secs(1)
             )
             .await,
             ProbeOutcome::Reachable { delay_ms: 42 }
         );
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture delay request");
+        assert!(request.contains("/delay?timeout=137&url="));
 
         let controller = one_response_server("503 Service Unavailable", "{}", Duration::ZERO);
         assert_eq!(
@@ -1427,6 +1470,7 @@ mod tests {
                 &controller,
                 "node-a",
                 "https://example.com",
+                1_000,
                 Duration::from_secs(1)
             )
             .await,
@@ -1440,6 +1484,7 @@ mod tests {
                 &invalid,
                 "node-a",
                 "https://example.com",
+                1_000,
                 Duration::from_secs(1)
             )
             .await,
@@ -1453,11 +1498,60 @@ mod tests {
                 &timeout,
                 "node-a",
                 "https://example.com",
+                5_000,
                 Duration::from_millis(10)
             )
             .await,
             ProbeOutcome::Timeout
         );
+    }
+
+    #[test]
+    fn reachability_worker_honors_benchmark_request_timeouts() {
+        let (controller, request_rx) = recording_response_server_for(
+            3,
+            "200 OK",
+            r#"{"delay":42}"#,
+            Duration::from_millis(100),
+        );
+        let request = BenchmarkRequest {
+            selector: "select".to_string(),
+            pattern: String::new(),
+            url: "https://example.com".to_string(),
+            timeout_ms: 137,
+            request_timeout: 0.01,
+            max_concurrency: 1,
+            nodes: Some(vec!["node-a".to_string()]),
+        };
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let worker = spawn_reachability_assessment_worker(
+            controller,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            request,
+            event_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let assessment = match event_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("receive reachability progress")
+        {
+            BenchmarkEvent::ReachabilityProgress(assessment) => assessment,
+            BenchmarkEvent::Finished => panic!("worker finished without an assessment"),
+        };
+        assert_eq!(assessment.attempts, vec![ProbeOutcome::Timeout; 3]);
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(BenchmarkEvent::Finished)
+        ));
+        worker.join().expect("join reachability worker");
+
+        for _ in 0..3 {
+            let request = request_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("capture delay request");
+            assert!(request.contains("/delay?timeout=137&url="));
+        }
     }
 
     #[test]
