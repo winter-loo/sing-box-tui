@@ -319,6 +319,7 @@ mod tests {
             last_refresh: std::time::Instant::now(),
             reachability_assessment: None,
             sustained_quality: None,
+            auto_selection_detail: None,
         });
         install_completed_refresh(&mut app, &path, true);
 

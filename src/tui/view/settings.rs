@@ -147,7 +147,7 @@ pub(crate) fn settings_field_label(field: SettingsField) -> &'static str {
         SettingsField::RequestTimeoutSec => "Request timeout sec",
         SettingsField::MaxConcurrency => "Max concurrency",
         SettingsField::VerifyTargets => "Verification targets",
-        SettingsField::AutoPickThresholdMs => "Auto-pick threshold ms",
+        SettingsField::AutoPickThresholdMs => "Latency chart guide ms (legacy)",
         SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
         SettingsField::SystemProxyServer => "System proxy server",
         SettingsField::ChinaIpRouting => "China IP routing",

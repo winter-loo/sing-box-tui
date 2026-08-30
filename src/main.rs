@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 
 mod atomic_file;
 mod auto_pick;
+mod automatic_selection;
 mod benchmark_workflow;
 mod clash;
 mod cli;

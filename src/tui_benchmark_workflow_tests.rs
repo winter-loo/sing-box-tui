@@ -1,13 +1,165 @@
 use super::super::test_support::{internet_routes_app, test_app};
-use crate::auto_pick::AutoPickDecision;
+use crate::automatic_selection::{NodeViewId, SelectionScope};
 use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkUpdate, SustainedKind};
 use crate::controller::{
-    BenchmarkRequest, BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome,
-    ProxyGroup,
+    ApiClient, BenchmarkRequest, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
+    NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
 };
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
 use crossterm::event::KeyCode;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+struct FakeController {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    address: std::net::SocketAddr,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl FakeController {
+    fn start(final_current: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake controller");
+        listener
+            .set_nonblocking(true)
+            .expect("set fake controller nonblocking");
+        let address = listener.local_addr().expect("fake controller address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_requests = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("fake controller accept failed: {error}"),
+                };
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted fake connection blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set fake controller read timeout");
+                let request = read_http_request(&mut stream);
+                recorded_requests
+                    .lock()
+                    .expect("record fake request")
+                    .push(request.clone());
+                let request_line = request.lines().next().unwrap_or_default();
+                let body = if request_line == "GET /configs HTTP/1.1" {
+                    r#"{"mode":"rule","mode-list":["rule"]}"#.to_string()
+                } else if request_line == "GET /proxies HTTP/1.1" {
+                    format!(
+                        r#"{{"proxies":{{"select":{{"name":"select","type":"Selector","now":"{final_current}","all":["node-a","node-b"]}}}}}}"#
+                    )
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fake controller response");
+            }
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            requests,
+            stop,
+            address,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for FakeController {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.address);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    loop {
+        let read = stream.read(&mut buffer).expect("read fake request");
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("request content length")
+                })
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + content_length {
+            break;
+        }
+    }
+    String::from_utf8(request).expect("fake request is UTF-8")
+}
+
+fn reachability(name: &str, delays: [u64; 3]) -> NodeReachabilityAssessment {
+    NodeReachabilityAssessment::from_attempts(
+        name.to_string(),
+        delays
+            .into_iter()
+            .map(|delay_ms| ProbeOutcome::Reachable { delay_ms })
+            .collect(),
+    )
+}
+
+fn auto_selection_scope() -> SelectionScope {
+    SelectionScope {
+        quality_generation: 0,
+        selector: "select".to_string(),
+        panel: NodeViewId::current_selector(),
+        current_node: "node-a".to_string(),
+    }
+}
+
+fn seed_idle_transfer_window(app: &mut super::App) {
+    let now = Instant::now();
+    app.active_node_traffic.observe(
+        auto_selection_scope(),
+        now - Duration::from_secs(10),
+        &ConnectionsSnapshot::default(),
+    );
+    app.active_node_traffic
+        .observe(auto_selection_scope(), now, &ConnectionsSnapshot::default());
+}
 
 #[test]
 fn single_node_benchmark_finish_does_not_flash() {
@@ -125,6 +277,385 @@ fn runtime_change_after_current_completion_defers_sustained_without_exiting_tui(
 }
 
 #[test]
+fn auto_select_requires_two_public_completion_rounds_before_controller_write() {
+    let controller = FakeController::start("node-b");
+    let mut app = test_app();
+    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
+    app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
+    app.benchmark_filter.clear();
+    let current = reachability("node-a", [100, 100, 100]);
+    let candidate = reachability("node-b", [70, 70, 70]);
+    app.benchmark_workflow
+        .set_reachability_assessment("select", current.clone());
+    app.benchmark_workflow
+        .set_reachability_assessment("select", candidate.clone());
+    seed_idle_transfer_window(&mut app);
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 41,
+        assessments: vec![current.clone(), candidate.clone()],
+        quality_current: true,
+    }))
+    .expect("first auto-selection round is handled");
+
+    assert!(app.status.contains("awaiting confirmation 1/2"));
+    assert!(
+        controller
+            .requests
+            .lock()
+            .expect("inspect fake requests")
+            .is_empty(),
+        "the first completed assessment must never write to the controller"
+    );
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 42,
+        assessments: vec![current, candidate],
+        quality_current: true,
+    }))
+    .expect("second auto-selection round switches");
+
+    let requests = controller
+        .requests
+        .lock()
+        .expect("inspect fake requests")
+        .clone();
+    let switch_requests = requests
+        .iter()
+        .filter(|request| request.starts_with("PUT /proxies/select "))
+        .collect::<Vec<_>>();
+    assert_eq!(switch_requests.len(), 1);
+    assert!(switch_requests[0].contains(r#"{"name":"node-b"}"#));
+    assert!(app.status.contains("Auto-pick switched select to node-b"));
+    assert_eq!(app.groups[0].current.as_deref(), Some("node-b"));
+    let explanation = app
+        .last_auto_selection_explanation
+        .as_ref()
+        .expect("switch explanation is retained");
+    assert!(explanation.matches("select", &NodeViewId::current_selector()));
+    assert!(
+        explanation
+            .detail
+            .contains("node-b won two complete rounds")
+    );
+}
+
+#[test]
+fn streaming_auto_select_discovers_untested_nodes_before_they_become_selectable() {
+    let controller = FakeController::start("node-b");
+    let mut app = test_app();
+    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
+    app.groups[0].members = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+    app.benchmark_filter = "node-b".to_string();
+    app.move_node_view_next();
+    app.auto_select_enabled = true;
+    app.sustained_runtime_environment = Some((
+        PathBuf::from("missing-test-config.json"),
+        PathBuf::from("/usr/bin/false"),
+    ));
+    let current = reachability("node-a", [100, 100, 100]);
+    let candidate = reachability("node-b", [70, 70, 70]);
+    let panel_rejected = reachability("node-c", [10, 10, 10]);
+    for assessment in [&current, &candidate, &panel_rejected] {
+        app.benchmark_workflow
+            .set_reachability_assessment("select", assessment.clone());
+    }
+
+    app.maybe_start_auto_select_benchmark()
+        .expect("streaming evidence assessment starts");
+    assert_eq!(
+        app.benchmark_workflow.active_nodes("select"),
+        Some(["node-a".to_string(), "node-b".to_string()].as_slice()),
+        "untested filter-matching nodes need quick evidence, while rejected nodes stay excluded"
+    );
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 70,
+        assessments: vec![current.clone(), candidate.clone(), panel_rejected.clone()],
+        quality_current: true,
+    }))
+    .expect("fresh streaming panel schedules missing sustained evidence");
+    assert_eq!(
+        app.benchmark_workflow.active_sustained_nodes("select"),
+        Some(vec!["node-a".to_string(), "node-b".to_string()]),
+        "bounded sustained discovery must include the untested panel candidate"
+    );
+    assert!(
+        controller
+            .requests
+            .lock()
+            .expect("inspect pre-evidence requests")
+            .iter()
+            .all(|request| !request.starts_with("PUT /proxies/select ")),
+        "a discovery candidate is not selectable until its panel facts are complete"
+    );
+
+    for (node, throughput) in [("node-b", 1024 * 1024), ("node-c", 8 * 1024 * 1024)] {
+        app.benchmark_workflow.set_sustained_quality(
+            "select",
+            NodeSustainedQuality {
+                name: node.to_string(),
+                outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                    first_byte_ms: 100,
+                    completion_ms: 600,
+                    bytes_read: 512 * 1024,
+                    throughput_bytes_per_second: throughput,
+                }),
+            },
+        );
+    }
+    let scope = SelectionScope {
+        quality_generation: 0,
+        selector: "select".to_string(),
+        panel: NodeViewId::streaming(),
+        current_node: "node-a".to_string(),
+    };
+    let now = Instant::now();
+    app.active_node_traffic.observe(
+        scope.clone(),
+        now - Duration::from_secs(10),
+        &ConnectionsSnapshot::default(),
+    );
+    app.active_node_traffic
+        .observe(scope, now, &ConnectionsSnapshot::default());
+
+    for round_id in [71, 72] {
+        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+            group: "select".to_string(),
+            round_id,
+            assessments: vec![current.clone(), candidate.clone(), panel_rejected.clone()],
+            quality_current: true,
+        }))
+        .expect("completed streaming evidence is evaluated");
+    }
+
+    let switch_requests = controller
+        .requests
+        .lock()
+        .expect("inspect streaming switch requests")
+        .iter()
+        .filter(|request| request.starts_with("PUT /proxies/select "))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(switch_requests.len(), 1);
+    assert!(switch_requests[0].contains(r#"{"name":"node-b"}"#));
+    assert!(!switch_requests[0].contains("node-c"));
+}
+
+#[test]
+fn auto_select_public_completion_defers_while_current_node_has_active_traffic() {
+    let mut app = test_app();
+    app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
+    app.benchmark_filter.clear();
+    let current = reachability("node-a", [100, 100, 100]);
+    let candidate = reachability("node-b", [70, 70, 70]);
+    app.benchmark_workflow
+        .set_reachability_assessment("select", current.clone());
+    app.benchmark_workflow
+        .set_reachability_assessment("select", candidate.clone());
+    let now = Instant::now();
+    let baseline = ConnectionsSnapshot {
+        connections: vec![ConnectionInfo {
+            id: "current-flow".to_string(),
+            download: 1_000,
+            upload: 0,
+            start: None,
+            chains: vec!["node-a".to_string()],
+            rule: None,
+            rule_payload: None,
+            metadata: ConnectionMetadata::default(),
+        }],
+        ..ConnectionsSnapshot::default()
+    };
+    let active = ConnectionsSnapshot {
+        connections: vec![ConnectionInfo {
+            id: "current-flow".to_string(),
+            download: 1_000 + 64 * 1024 + 1,
+            ..baseline.connections[0].clone()
+        }],
+        ..ConnectionsSnapshot::default()
+    };
+    app.active_node_traffic.observe(
+        auto_selection_scope(),
+        now - Duration::from_secs(10),
+        &baseline,
+    );
+    app.active_node_traffic
+        .observe(auto_selection_scope(), now, &active);
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 51,
+        assessments: vec![current, candidate],
+        quality_current: true,
+    }))
+    .expect("traffic deferral is a normal application result");
+
+    assert!(
+        app.status
+            .contains("current-node connections grew by 65537 bytes in 10s"),
+        "unexpected status: {}",
+        app.status
+    );
+    assert_eq!(
+        app.last_auto_selection_explanation
+            .as_ref()
+            .map(|explanation| explanation.detail.as_str()),
+        Some("switch deferred: current-node connections grew by 65537 bytes in 10s")
+    );
+}
+
+#[test]
+fn emergency_requires_zero_growth_and_restarts_after_one_byte_of_traffic() {
+    let controller = FakeController::start("node-b");
+    let mut app = test_app();
+    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
+    app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
+    app.benchmark_filter.clear();
+    let current = NodeReachabilityAssessment::from_attempts(
+        "node-a".to_string(),
+        vec![ProbeOutcome::Timeout; 3],
+    );
+    let candidate = reachability("node-b", [70, 70, 70]);
+    app.benchmark_workflow
+        .set_reachability_assessment("select", current.clone());
+    app.benchmark_workflow
+        .set_reachability_assessment("select", candidate.clone());
+    let now = Instant::now();
+    let baseline = ConnectionsSnapshot {
+        connections: vec![ConnectionInfo {
+            id: "current-flow".to_string(),
+            download: 1_000,
+            upload: 0,
+            start: None,
+            chains: vec!["node-a".to_string()],
+            rule: None,
+            rule_payload: None,
+            metadata: ConnectionMetadata::default(),
+        }],
+        ..ConnectionsSnapshot::default()
+    };
+    let one_byte = ConnectionsSnapshot {
+        connections: vec![ConnectionInfo {
+            download: 1_001,
+            ..baseline.connections[0].clone()
+        }],
+        ..ConnectionsSnapshot::default()
+    };
+    app.active_node_traffic.observe(
+        auto_selection_scope(),
+        now - Duration::from_secs(10),
+        &baseline,
+    );
+    app.active_node_traffic
+        .observe(auto_selection_scope(), now, &one_byte);
+
+    for round_id in [81, 82] {
+        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+            group: "select".to_string(),
+            round_id,
+            assessments: vec![current.clone(), candidate.clone()],
+            quality_current: true,
+        }))
+        .expect("positive-growth emergency evidence is handled");
+    }
+    assert!(app.status.contains("measured 0/3"));
+    assert!(app.status.contains("grew by 1 bytes"));
+    assert!(
+        controller
+            .requests
+            .lock()
+            .expect("inspect anomaly requests")
+            .iter()
+            .all(|request| !request.starts_with("PUT /proxies/select ")),
+        "even one observed byte must prevent an emergency controller write"
+    );
+
+    app.active_node_traffic = Default::default();
+    let zero_now = Instant::now();
+    app.active_node_traffic.observe(
+        auto_selection_scope(),
+        zero_now - Duration::from_secs(10),
+        &ConnectionsSnapshot::default(),
+    );
+    app.active_node_traffic.observe(
+        auto_selection_scope(),
+        zero_now,
+        &ConnectionsSnapshot::default(),
+    );
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 83,
+        assessments: vec![current.clone(), candidate.clone()],
+        quality_current: true,
+    }))
+    .expect("first zero-growth outage round is retained");
+    assert!(app.status.contains("emergency confirmation 1/2"));
+    assert!(
+        controller
+            .requests
+            .lock()
+            .expect("inspect first recovery round")
+            .iter()
+            .all(|request| !request.starts_with("PUT /proxies/select "))
+    );
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 84,
+        assessments: vec![current, candidate],
+        quality_current: true,
+    }))
+    .expect("second zero-growth outage round switches");
+    let switch_requests = controller
+        .requests
+        .lock()
+        .expect("inspect emergency switch")
+        .iter()
+        .filter(|request| request.starts_with("PUT /proxies/select "))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(switch_requests.len(), 1);
+    assert!(switch_requests[0].contains(r#"{"name":"node-b"}"#));
+}
+
+#[test]
+fn auto_select_reconciliation_race_is_explained_and_nonfatal() {
+    let mut app = test_app();
+    app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
+    app.benchmark_filter.clear();
+    app.benchmark_workflow.require_persisted_quality_for_test();
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".to_string(),
+        round_id: 61,
+        assessments: vec![
+            reachability("node-a", [100, 100, 100]),
+            reachability("node-b", [70, 70, 70]),
+        ],
+        quality_current: true,
+    }))
+    .expect("a lease race must not tear down the application loop");
+
+    assert!(app.status.contains("Auto-pick deferred for select"));
+    assert!(app.status.contains("confirmed managed runtime receipt"));
+    assert!(
+        app.last_auto_selection_explanation
+            .as_ref()
+            .is_some_and(|explanation| explanation
+                .detail
+                .contains("confirmed managed runtime receipt"))
+    );
+    assert!(app.flash.is_none());
+}
+
+#[test]
 fn sustained_infrastructure_outcomes_are_reported_as_incomplete() {
     let mut app = test_app();
     app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::Sustained {
@@ -139,40 +670,6 @@ fn sustained_infrastructure_outcomes_are_reported_as_incomplete() {
 
     assert!(app.status.contains("incomplete"));
     assert!(app.status.contains("1 infrastructure, 1 cancelled"));
-}
-
-#[test]
-fn auto_select_plan_selects_internet_route_even_when_node_is_kept() {
-    let app = internet_routes_app();
-    let group = app.group_by_name("AirTCP").expect("Internet Route").clone();
-    let summary = BenchmarkSummary {
-        selector: "AirTCP".to_string(),
-        current: Some("air-1".to_string()),
-        pattern: String::new(),
-        url: "https://www.gstatic.com/generate_204".to_string(),
-        timeout_ms: 5000,
-        max_concurrency: 4,
-        results: vec![
-            BenchmarkResult {
-                name: "air-1".to_string(),
-                delay: Some(80),
-                completed: true,
-            },
-            BenchmarkResult {
-                name: "air-2".to_string(),
-                delay: Some(90),
-                completed: true,
-            },
-        ],
-    };
-
-    assert_eq!(
-        app.auto_select_switch_plan(&group, &summary),
-        AutoPickDecision {
-            target_node: None,
-            parent_switch: Some(("手动选择".to_string(), "AirTCP".to_string())),
-        }
-    );
 }
 
 #[test]
@@ -202,7 +699,7 @@ fn auto_select_uses_single_internet_route_selector_members() {
 
     assert_eq!(
         app.benchmark_workflow.active_nodes("airtcp"),
-        Some(["美国-b".to_string()].as_slice())
+        Some(["香港-a".to_string(), "美国-b".to_string()].as_slice())
     );
     let summary = app
         .benchmark_workflow
@@ -215,7 +712,7 @@ fn auto_select_uses_single_internet_route_selector_members() {
             .iter()
             .map(|result| result.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["美国-b"]
+        vec!["香港-a", "美国-b"]
     );
 }
 
@@ -229,7 +726,7 @@ fn auto_select_toggle_allows_empty_filter() {
     assert!(app.auto_select_enabled);
     assert_eq!(
         app.status,
-        "Auto-pick enabled for select (all nodes, 600ms threshold, every 30s)"
+        "Auto-pick enabled for select [current-selector / balanced] (all nodes, 20% material gate, two-round confirmation, every 30s)"
     );
 }
 

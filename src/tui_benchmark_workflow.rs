@@ -1,14 +1,18 @@
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use super::App;
-use crate::auto_pick::AutoPickDecision;
+use crate::automatic_selection::{
+    AutoSelectionExplanation, AutoSelectionPlan, AutoSelectionReason, NodeQualityFacts,
+    NodeViewProjection, PanelMembership, ReachabilityTier, SelectionScope,
+};
 use crate::benchmark_workflow::{
     BenchmarkCompletion, BenchmarkStart, BenchmarkUpdate, SustainedKind,
     assessment_is_quick_eligible,
 };
-use crate::controller::{BenchmarkRequest, BenchmarkSummary, ProxyGroup};
+use crate::controller::{BenchmarkRequest, NodeReachabilityAssessment, ProbeOutcome, ProxyGroup};
 use crate::defaults::REFRESH_DEBOUNCE;
 use crate::sustained_quality::SustainedProbeRequest;
 
@@ -142,6 +146,9 @@ impl App {
         if self.auto_select_enabled {
             self.auto_select_enabled = false;
             self.auto_select_selector = None;
+            self.automatic_selection_state = Default::default();
+            self.active_node_traffic = Default::default();
+            self.last_auto_selection_explanation = None;
             self.save_runtime_state()?;
             if self.background_worker_management_enabled() {
                 self.stop_live_background_auto_pick_task()?;
@@ -156,24 +163,31 @@ impl App {
         };
         self.auto_select_enabled = true;
         self.auto_select_selector = Some(group_name.clone());
+        self.auto_select_node_view = self.node_view_panel.id();
+        self.auto_select_ranking_policy = self.node_view_panel.ranking_policy();
+        self.automatic_selection_state = Default::default();
+        self.active_node_traffic = Default::default();
+        self.last_auto_selection_explanation = None;
         self.last_auto_select_benchmark = None;
         self.save_runtime_state()?;
         if self.background_worker_management_enabled() {
             let worker = self.ensure_auto_pick_background_worker()?;
             self.set_status_only(format!(
-                "Auto-pick enabled for {} via background worker pid {} ({}, {}ms threshold, every {}s)",
+                "Auto-pick enabled for {} [{} / {}] via background worker pid {} ({}, 20% material gate, two-round confirmation, every {}s)",
                 group_name,
+                self.auto_select_node_view,
+                self.auto_select_ranking_policy.label(),
                 worker.pid(),
                 self.benchmark_scope_label(),
-                self.auto_select_threshold_ms,
                 self.auto_select_interval.as_secs()
             ));
         } else {
             self.set_status_only(format!(
-                "Auto-pick enabled for {} ({}, {}ms threshold, every {}s)",
+                "Auto-pick enabled for {} [{} / {}] ({}, 20% material gate, two-round confirmation, every {}s)",
                 group_name,
+                self.auto_select_node_view,
+                self.auto_select_ranking_policy.label(),
                 self.benchmark_scope_label(),
-                self.auto_select_threshold_ms,
                 self.auto_select_interval.as_secs()
             ));
         }
@@ -193,7 +207,7 @@ impl App {
         let Some(group) = self.auto_select_group().cloned() else {
             return Ok(());
         };
-        let candidate_names = self.benchmark_candidates_for_group(&group);
+        let candidate_names = self.auto_selection_evidence_members_for_group(&group);
         let request = BenchmarkRequest {
             selector: group.name.clone(),
             pattern: self.benchmark_filter.clone(),
@@ -238,25 +252,118 @@ impl App {
             .or_else(|| self.selected_group())
     }
 
-    pub(super) fn auto_select_switch_plan(
+    pub(super) fn active_auto_selection_scope(&self) -> Option<SelectionScope> {
+        if !self.auto_select_enabled {
+            return None;
+        }
+        let group = self.auto_select_group()?;
+        let current_node = group.current.clone()?;
+        Some(SelectionScope {
+            quality_generation: self
+                .benchmark_workflow
+                .runtime_receipt()?
+                .quality_generation(),
+            selector: group.name.clone(),
+            panel: self.auto_select_node_view.clone(),
+            current_node,
+        })
+    }
+
+    fn auto_selection_evidence_members_for_group(&self, group: &ProxyGroup) -> Vec<String> {
+        let built_in_view = self.auto_select_node_view
+            == crate::automatic_selection::NodeViewId::current_selector()
+            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming();
+        // Decision projection stays Included-only, but evidence acquisition is intentionally
+        // wider: an Untested Streaming node must be probed before it can ever earn membership.
+        // Future manifest views can provide their own discovery projection instead of inheriting
+        // this built-in selector-wide behavior.
+        let mut candidates = if built_in_view {
+            self.benchmark_candidates_for_group(group)
+        } else {
+            Vec::new()
+        };
+        if let Some(current) = group
+            .current
+            .as_ref()
+            .filter(|current| group.members.contains(*current))
+            && !candidates.contains(current)
+        {
+            candidates.insert(0, current.clone());
+        }
+        candidates
+    }
+
+    fn auto_selection_panel_projection(
         &self,
         group: &ProxyGroup,
-        summary: &BenchmarkSummary,
-    ) -> AutoPickDecision {
-        self.auto_pick_config().switch_decision(
-            group,
-            summary,
-            self.implicit_root_parent_switch_for_group(&group.name),
-        )
+        facts: &[NodeQualityFacts],
+    ) -> NodeViewProjection {
+        let members = group
+            .members
+            .iter()
+            .map(|node| {
+                let membership = if !self.member_matches_filter(node) {
+                    PanelMembership::Rejected
+                } else if self.auto_select_node_view
+                    == crate::automatic_selection::NodeViewId::current_selector()
+                {
+                    PanelMembership::Included
+                } else if self.auto_select_node_view
+                    == crate::automatic_selection::NodeViewId::streaming()
+                {
+                    match facts.iter().find(|facts| facts.node == *node) {
+                        Some(facts)
+                            if facts.reachability.is_some_and(|tier| tier.successes() >= 2)
+                                && facts.throughput_bytes_per_second.is_some() =>
+                        {
+                            PanelMembership::Included
+                        }
+                        Some(facts) if facts.reachability.is_none() => {
+                            if facts.recent_quick_rounds == 0 {
+                                PanelMembership::Untested
+                            } else {
+                                PanelMembership::Incomplete
+                            }
+                        }
+                        Some(_) => PanelMembership::Rejected,
+                        None => PanelMembership::Untested,
+                    }
+                } else {
+                    // Unknown IDs belong to future manifest panels. Until their projection is
+                    // registered, fail closed instead of silently expanding to every selector node.
+                    PanelMembership::Untested
+                };
+                (node.clone(), membership)
+            })
+            .collect::<BTreeMap<_, _>>();
+        NodeViewProjection {
+            id: self.auto_select_node_view.clone(),
+            label: match self.auto_select_node_view.as_str() {
+                crate::automatic_selection::CURRENT_SELECTOR_VIEW_ID => {
+                    "Current selector".to_string()
+                }
+                crate::automatic_selection::STREAMING_VIEW_ID => "Streaming".to_string(),
+                id => id.to_string(),
+            },
+            ranking_policy: self.auto_select_ranking_policy,
+            members,
+        }
     }
 
     pub(super) fn finish_auto_select_benchmark(
         &mut self,
         group_name: &str,
-        summary: &BenchmarkSummary,
+        round_id: u64,
+        assessments: &[NodeReachabilityAssessment],
+        quality_current: bool,
     ) -> Result<()> {
-        let _quality_lease = self.benchmark_workflow.acquire_quality_read_lease()?;
-        let _quality_generation = _quality_lease.generation();
+        if !quality_current {
+            self.defer_auto_selection_after_quality_change(
+                group_name,
+                "managed runtime changed before completion".to_string(),
+            );
+            return Ok(());
+        }
         let Some(group) = self
             .groups
             .iter()
@@ -269,54 +376,153 @@ impl App {
             ));
             return Ok(());
         };
-
-        let plan = self.auto_select_switch_plan(&group, summary);
-        if plan.target_node.is_none() && plan.parent_switch.is_none() {
-            let current = group.current.as_deref().unwrap_or("unset");
+        let Some(current_node) = group.current.clone() else {
             self.set_status_only(format!(
-                "Auto-pick kept {} on {} (threshold {}ms)",
-                group_name, current, self.auto_select_threshold_ms
+                "Auto-pick deferred for {group_name}: current node unset"
             ));
             return Ok(());
-        }
+        };
 
-        if let Some(target) = &plan.target_node {
-            self.client
-                .switch_proxy(group_name, target)
-                .with_context(|| {
-                    format!("auto-pick failed to switch {} to {}", group_name, target)
-                })?;
-        }
-        if let Some((parent, route_group)) = &plan.parent_switch {
-            self.client
-                .switch_proxy(parent, route_group)
-                .with_context(|| {
-                    format!("auto-pick failed to switch {} to {}", parent, route_group)
-                })?;
-        }
-        if REFRESH_DEBOUNCE > Duration::ZERO {
-            std::thread::sleep(REFRESH_DEBOUNCE);
-        }
-        self.refresh()?;
-        self.save_runtime_state()?;
-        match (&plan.target_node, &plan.parent_switch) {
-            (Some(target), Some((_, route_group))) => self.set_status_only(format!(
-                "Auto-pick switched {} to {} and selected {}",
-                group_name, target, route_group
-            )),
-            (Some(target), None) => {
-                self.set_status_only(format!("Auto-pick switched {} to {}", group_name, target))
+        let quality_lease = match self.benchmark_workflow.acquire_auto_selection_read_lease() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.defer_auto_selection_after_quality_change(group_name, format!("{error:#}"));
+                return Ok(());
             }
-            (None, Some((_, route_group))) => {
-                let current = group.current.as_deref().unwrap_or("unset");
-                self.set_status_only(format!(
-                    "Auto-pick selected {}; kept {} on {} (threshold {}ms)",
-                    route_group, group_name, current, self.auto_select_threshold_ms
-                ));
+        };
+        let mut facts = match self.benchmark_workflow.node_quality_facts_with_lease(
+            &quality_lease,
+            group_name,
+            &group.members,
+        ) {
+            Ok(facts) => facts,
+            Err(error) => {
+                self.defer_auto_selection_after_quality_change(group_name, format!("{error:#}"));
+                return Ok(());
             }
-            (None, None) => {}
+        };
+        let current_round = assessments
+            .iter()
+            .map(|assessment| (assessment.name.as_str(), assessment))
+            .collect::<BTreeMap<_, _>>();
+        for facts in &mut facts {
+            facts.reachability = current_round
+                .get(facts.node.as_str())
+                .and_then(|assessment| reachability_tier(assessment));
         }
+        let panel = self.auto_selection_panel_projection(&group, &facts);
+        let parent_switch = self.implicit_root_parent_switch_for_group(group_name);
+        let scope = SelectionScope {
+            quality_generation: quality_lease.generation(),
+            selector: group_name.to_string(),
+            panel: panel.id.clone(),
+            current_node,
+        };
+        let transfer = self.active_node_traffic.status(&scope, Instant::now());
+        let decision = self.automatic_selection_state.evaluate(
+            scope.clone(),
+            round_id,
+            parent_switch.is_some(),
+            &panel,
+            &facts,
+            transfer,
+        );
+        self.last_auto_selection_explanation = Some(AutoSelectionExplanation::new(
+            group_name,
+            panel.id.clone(),
+            &decision.reason,
+        ));
+        let parent_switch = decision.activate_route.then_some(parent_switch).flatten();
+        let plan = AutoSelectionPlan::new(decision, parent_switch, quality_lease);
+        let detail = plan.decision.reason.detail();
+        let mut status = if plan.decision.target_node.is_none() && plan.parent_switch.is_none() {
+            format!("Auto-pick {} [{}]: {detail}", group_name, panel.label)
+        } else {
+            // Keep `plan` intact until both controller writes return: its read lease is the proof
+            // that ranked facts cannot be reconciled between selection and route activation.
+            if let Some(target) = &plan.decision.target_node {
+                self.client
+                    .switch_proxy(group_name, target)
+                    .with_context(|| {
+                        format!("auto-pick failed to switch {} to {}", group_name, target)
+                    })?;
+            }
+            if let Some((parent, route_group)) = &plan.parent_switch {
+                self.client
+                    .switch_proxy(parent, route_group)
+                    .with_context(|| {
+                        format!("auto-pick failed to switch {} to {}", parent, route_group)
+                    })?;
+            }
+            if REFRESH_DEBOUNCE > Duration::ZERO {
+                std::thread::sleep(REFRESH_DEBOUNCE);
+            }
+            self.refresh()?;
+            self.save_runtime_state()?;
+            match (&plan.decision.target_node, &plan.parent_switch) {
+                (Some(target), Some((_, route_group))) => format!(
+                    "Auto-pick switched {} to {} and selected {}: {}",
+                    group_name, target, route_group, detail
+                ),
+                (Some(target), None) => format!(
+                    "Auto-pick switched {} to {}: {}",
+                    group_name, target, detail
+                ),
+                (None, Some((_, route_group))) => format!(
+                    "Auto-pick selected {}; kept {} on {}: {}",
+                    route_group,
+                    group_name,
+                    group.current.as_deref().unwrap_or("unset"),
+                    detail
+                ),
+                (None, None) => unreachable!("action branch requires a controller write"),
+            }
+        };
+
+        let duplicate_round = matches!(
+            plan.decision.reason,
+            AutoSelectionReason::DuplicateRound { .. }
+        );
+        drop(plan);
+        if !duplicate_round {
+            let sustained_members = self.auto_selection_evidence_members_for_group(&group);
+            let nodes = self.benchmark_workflow.automatic_sustained_candidates(
+                group_name,
+                Some(&scope.current_node),
+                &sustained_members,
+                assessments,
+            );
+            match self.start_sustained_nodes(
+                group_name.to_string(),
+                nodes.clone(),
+                SustainedKind::Automatic,
+            ) {
+                Ok(BenchmarkStart::Started) => status.push_str(&format!(
+                    "; sustained probing {} evidence candidate(s) in background",
+                    nodes.len()
+                )),
+                Ok(_) => {}
+                Err(error) => status.push_str(&format!(
+                    "; sustained probing deferred after runtime change: {error}"
+                )),
+            }
+        }
+        self.set_status_only(status);
         Ok(())
+    }
+
+    fn defer_auto_selection_after_quality_change(&mut self, group: &str, detail: String) {
+        let reason = AutoSelectionReason::QualityFactsUnavailable { detail };
+        self.set_status_only(format!(
+            "Auto-pick deferred for {group}: {}",
+            reason.detail()
+        ));
+        self.last_auto_selection_explanation = Some(AutoSelectionExplanation::new(
+            group,
+            self.auto_select_node_view.clone(),
+            &reason,
+        ));
+        self.automatic_selection_state = Default::default();
     }
 
     pub(super) fn poll_benchmark_updates(&mut self) -> Result<()> {
@@ -384,8 +590,13 @@ impl App {
                     )),
                 }
             }
-            BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect { group, summary }) => {
-                self.finish_auto_select_benchmark(&group, &summary)?;
+            BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+                group,
+                round_id,
+                assessments,
+                quality_current,
+            }) => {
+                self.finish_auto_select_benchmark(&group, round_id, &assessments, quality_current)?
             }
             BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
                 group,
@@ -454,6 +665,18 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn reachability_tier(assessment: &NodeReachabilityAssessment) -> Option<ReachabilityTier> {
+    assessment.assessment.map(|_| {
+        ReachabilityTier::from_successes(
+            assessment
+                .attempts
+                .iter()
+                .filter(|outcome| matches!(outcome, ProbeOutcome::Reachable { .. }))
+                .count() as u8,
+        )
+    })
 }
 
 #[cfg(test)]

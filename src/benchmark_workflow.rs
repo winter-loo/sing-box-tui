@@ -14,11 +14,12 @@ use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
 
 use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
+use crate::automatic_selection::{NodeQualityFacts, ReachabilityTier};
 use crate::config::parse_sing_box_config_text;
 use crate::config_mutation::lock_config_mutation_for;
 use crate::controller::{
     BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
-    NodeReachabilityAssessment, spawn_benchmark_worker, spawn_reachability_assessment_worker,
+    NodeReachabilityAssessment, ProbeOutcome, spawn_reachability_assessment_worker,
 };
 use crate::defaults::SINGLE_NODE_RETEST_DEBOUNCE;
 use crate::node_quality_path::{
@@ -27,7 +28,7 @@ use crate::node_quality_path::{
 use crate::node_runtime_manager::IsolatedRuntimeSnapshot;
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, NodeQualityReadLease, NodeQuickHistory,
-    SustainedSuccessStats, lock_node_quality_reconciliation,
+    PersistedNodeQualityProjection, SustainedSuccessStats, lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
     NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
@@ -124,6 +125,7 @@ pub(crate) struct BenchmarkWorkflow {
     last_single_node: Option<(String, String, Instant)>,
     store: Option<BenchmarkStore>,
     runtime_receipt: Option<QualityRuntimeReceipt>,
+    next_auto_selection_round_id: u64,
     latency_order: bool,
     #[cfg(test)]
     allow_unpersisted_quality_for_test: bool,
@@ -131,6 +133,8 @@ pub(crate) struct BenchmarkWorkflow {
     after_sustained_persist_hook: Option<Box<dyn FnMut()>>,
     #[cfg(test)]
     skip_active_environment_check_for_test: bool,
+    #[cfg(test)]
+    background_projection_reload_count: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BenchmarkStart {
@@ -165,7 +169,9 @@ pub(crate) enum BenchmarkCompletion {
     },
     AutoSelect {
         group: String,
-        summary: BenchmarkSummary,
+        round_id: u64,
+        assessments: Vec<NodeReachabilityAssessment>,
+        quality_current: bool,
     },
     SingleNode {
         group: String,
@@ -217,6 +223,7 @@ struct BenchmarkJob {
     current_assessments: BTreeMap<String, NodeReachabilityAssessment>,
     quality_receipt: Option<QualityRuntimeReceipt>,
     quality_projection_current: bool,
+    auto_selection_round_id: Option<u64>,
 }
 
 struct SustainedJob {
@@ -536,6 +543,7 @@ impl BenchmarkWorkflow {
             last_single_node: None,
             store,
             runtime_receipt: None,
+            next_auto_selection_round_id: 1,
             latency_order: false,
             #[cfg(test)]
             allow_unpersisted_quality_for_test: false,
@@ -543,6 +551,8 @@ impl BenchmarkWorkflow {
             after_sustained_persist_hook: None,
             #[cfg(test)]
             skip_active_environment_check_for_test: false,
+            #[cfg(test)]
+            background_projection_reload_count: 0,
         }
     }
 
@@ -571,6 +581,10 @@ impl BenchmarkWorkflow {
             .get(&(group.to_string(), node.to_string()))
     }
 
+    pub(crate) fn sustained_target_identity(&self) -> &str {
+        &self.sustained_target_identity
+    }
+
     pub(crate) fn quick_eligible(&self, group: &str, node: &str) -> bool {
         self.reachability_assessment(group, node)
             .is_some_and(assessment_is_quick_eligible)
@@ -597,33 +611,115 @@ impl BenchmarkWorkflow {
             .context("node-quality identity generation changed; rerun the assessment")
     }
 
+    pub(crate) fn acquire_auto_selection_read_lease(&self) -> Result<NodeQualityReadLease> {
+        #[cfg(test)]
+        if self.allow_unpersisted_quality_for_test && self.store.is_none() {
+            return Ok(NodeQualityReadLease::for_test(0));
+        }
+        let receipt = self
+            .runtime_receipt()
+            .context("automatic selection requires a confirmed managed runtime receipt")?;
+        let lease = self.acquire_quality_read_lease()?;
+        // The generic lease proves store generation only. A selector write additionally requires
+        // the receipt for the exact managed controller runtime that will receive that write.
+        anyhow::ensure!(
+            lease.generation() == receipt.quality_generation,
+            "node-quality runtime receipt generation is stale"
+        );
+        Ok(lease)
+    }
+
+    pub(crate) fn node_quality_facts_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        group: &str,
+        members: &[String],
+    ) -> Result<Vec<NodeQualityFacts>> {
+        match self.store.as_ref() {
+            Some(store) => store.validate_quality_read_lease(lease)?,
+            #[cfg(test)]
+            None if self.allow_unpersisted_quality_for_test => {}
+            None => anyhow::bail!("node-quality persistence is not active"),
+        }
+
+        Ok(members
+            .iter()
+            .enumerate()
+            .map(|(config_order, node)| {
+                let key = (group.to_string(), node.clone());
+                let assessment = self.reachability_assessments.get(&key);
+                let reachability = assessment.and_then(|assessment| {
+                    assessment.assessment.map(|_| {
+                        ReachabilityTier::from_successes(
+                            assessment
+                                .attempts
+                                .iter()
+                                .filter(|outcome| matches!(outcome, ProbeOutcome::Reachable { .. }))
+                                .count() as u8,
+                        )
+                    })
+                });
+                let quick = self.quick_history(group, node);
+                let sustained = self.sustained_quality.get(&key);
+                let sustained_stats = self
+                    .sustained_stats_cache
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default();
+                NodeQualityFacts {
+                    node: node.clone(),
+                    reachability,
+                    recent_quick_successes: quick.successful_rounds,
+                    recent_quick_rounds: quick.rounds,
+                    warm_median_ms: quick.warm_median_ms,
+                    p95_ms: quick.p95_ms,
+                    cold_start_ms: quick.cold_start_ms,
+                    sustained_successes: sustained_stats.successes,
+                    sustained_attempts: sustained_stats.attempts,
+                    throughput_bytes_per_second: sustained
+                        .and_then(NodeSustainedQuality::completed)
+                        .map(|completion| completion.throughput_bytes_per_second),
+                    config_order,
+                }
+            })
+            .collect())
+    }
+
     pub(crate) fn activate_sustained_target(&mut self, target_url: &str) -> Result<()> {
         let identity = sustained_target_identity(target_url)?;
         if identity == self.sustained_target_identity {
             return Ok(());
         }
+        let sustained_quality = match self.store.as_ref() {
+            Some(store) => store.latest_sustained_quality(&identity)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|(selector, result)| ((selector, result.name.clone()), result))
+        .collect::<BTreeMap<_, _>>();
+        let mut sustained_stats = BTreeMap::new();
+        if let Some(store) = self.store.as_ref() {
+            let keys = self
+                .reachability_assessments
+                .keys()
+                .chain(sustained_quality.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for (group, node) in keys {
+                sustained_stats.insert(
+                    (group.clone(), node.clone()),
+                    store.sustained_success_stats(&group, &node, &identity, 10)?,
+                );
+            }
+        }
+
+        // Build the new target projection completely before changing identity or cancelling work.
+        // A failed SQLite read therefore leaves the prior target/config generation intact.
         for job in &self.sustained_jobs {
             job.cancellation.store(true, Ordering::Relaxed);
         }
         self.sustained_target_identity = identity;
-        self.sustained_quality = self
-            .store
-            .as_ref()
-            .and_then(|store| {
-                store
-                    .latest_sustained_quality(&self.sustained_target_identity)
-                    .ok()
-            })
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(selector, result)| ((selector, result.name.clone()), result))
-            .collect();
-        let (_, sustained_stats) = load_metric_caches(
-            self.store.as_ref(),
-            &self.reachability_assessments,
-            &self.sustained_quality,
-            &self.sustained_target_identity,
-        );
+        self.sustained_quality = sustained_quality;
         self.sustained_stats_cache = sustained_stats;
         Ok(())
     }
@@ -964,7 +1060,7 @@ impl BenchmarkWorkflow {
         NodeQuickHistory {
             successful_rounds: usize::from(self.quick_eligible(group, node)),
             rounds: usize::from(assessment.assessment.is_some()),
-            warm_median_ms: delays.get((delays.len().saturating_sub(1)) / 2).copied(),
+            warm_median_ms: assessment_warm_median_ms(assessment),
             p95_ms: delays.last().copied(),
             cold_start_ms: assessment
                 .attempts
@@ -984,21 +1080,6 @@ impl BenchmarkWorkflow {
             let mut finished = false;
             loop {
                 match self.jobs[index].receiver.try_recv() {
-                    Ok(BenchmarkEvent::Progress(result)) => {
-                        let group = self.jobs[index].group.clone();
-                        let filter = self.jobs[index].filter.clone();
-                        let kind = self.jobs[index].kind.clone();
-                        let best_label = self
-                            .summaries
-                            .get_mut(&group)
-                            .map(|summary| {
-                                summary.update_result(result.clone());
-                                summary.best_label()
-                            })
-                            .unwrap_or_else(|| "pending".to_string());
-                        self.record_result(&group, &filter, &kind, &result);
-                        updates.push(BenchmarkUpdate::Progress { group, best_label });
-                    }
                     Ok(BenchmarkEvent::ReachabilityProgress(assessment)) => {
                         let group = self.jobs[index].group.clone();
                         let quality_receipt = self.jobs[index].quality_receipt.clone();
@@ -1017,13 +1098,27 @@ impl BenchmarkWorkflow {
                                     false
                                 });
                         let best_label = if persisted {
+                            let result = BenchmarkResult {
+                                name: assessment.name.clone(),
+                                delay: assessment_warm_median_ms(&assessment),
+                                completed: assessment.assessment.is_some(),
+                            };
+                            if let Some(summary) = self.summaries.get_mut(&group) {
+                                summary.update_result(result.clone());
+                            }
+                            self.record_result(
+                                &group,
+                                &self.jobs[index].filter,
+                                &self.jobs[index].kind,
+                                &result,
+                            );
                             assessment.compact_evidence()
                         } else {
                             self.jobs[index].quality_projection_current = false;
                             self.jobs[index].current_assessments.clear();
                             "quality runtime changed; result discarded".to_string()
                         };
-                        if persisted && assessment.assessment.is_some() {
+                        if persisted {
                             self.jobs[index]
                                 .current_assessments
                                 .insert(assessment.name.clone(), assessment.clone());
@@ -1033,21 +1128,16 @@ impl BenchmarkWorkflow {
                     Ok(BenchmarkEvent::Finished) => {
                         finished = true;
                         let group = self.jobs[index].group.clone();
-                        let kind = self.jobs[index].kind.clone();
-                        let projection_lease = if matches!(kind, BenchmarkKind::AutoSelect) {
-                            None
-                        } else {
-                            self.quick_projection_lease(index)
-                                .unwrap_or_else(|error| {
-                                    eprintln!(
-                                        "warning: failed to validate completed reachability assessment: {error:#}"
-                                    );
-                                    None
-                                })
-                        };
-                        let quality_current =
-                            matches!(kind, BenchmarkKind::AutoSelect) || projection_lease.is_some();
-                        if quality_current && !matches!(kind, BenchmarkKind::AutoSelect) {
+                        let projection_lease = self.quick_projection_lease(index).unwrap_or_else(
+                            |error| {
+                                eprintln!(
+                                    "warning: failed to validate completed reachability assessment: {error:#}"
+                                );
+                                None
+                            },
+                        );
+                        let quality_current = projection_lease.is_some();
+                        if quality_current {
                             let lease = projection_lease
                                 .as_ref()
                                 .expect("current quick projection owns a read lease");
@@ -1067,11 +1157,11 @@ impl BenchmarkWorkflow {
                             for node in nodes {
                                 self.refresh_quick_history_cache_with_lease(lease, &group, &node);
                             }
-                        } else if !matches!(kind, BenchmarkKind::AutoSelect) {
+                        } else {
                             self.jobs[index].quality_projection_current = false;
                             self.jobs[index].current_assessments.clear();
                         }
-                        if let Some(completion) = self.completion(group, kind, quality_current) {
+                        if let Some(completion) = self.completion(index, quality_current) {
                             updates.push(BenchmarkUpdate::Finished(completion));
                         }
                         drop(projection_lease);
@@ -1254,7 +1344,7 @@ impl BenchmarkWorkflow {
         &mut self,
         latency: &BackgroundLatencySnapshot,
         active_filter: &str,
-    ) -> bool {
+    ) -> Result<bool> {
         let generation_matches = self
             .runtime_receipt()
             .is_some_and(|receipt| receipt.quality_generation == latency.quality_generation);
@@ -1263,19 +1353,24 @@ impl BenchmarkWorkflow {
             || (self.allow_unpersisted_quality_for_test
                 && self.store.is_none()
                 && latency.quality_generation == 0);
-        if !generation_matches
-            || latency.pattern != active_filter
+        anyhow::ensure!(
+            generation_matches,
+            "background node-quality snapshot generation {} is not current",
+            latency.quality_generation
+        );
+        if latency.pattern != active_filter
             || self.jobs.iter().any(|job| {
                 job.group == latency.selector && !matches!(job.kind, BenchmarkKind::AutoSelect)
             })
         {
-            return false;
+            return Ok(false);
         }
 
-        let summary = self
+        let mut summary = self
             .summaries
-            .entry(latency.selector.clone())
-            .or_insert_with(|| BenchmarkSummary::empty(latency.selector.clone()));
+            .get(&latency.selector)
+            .cloned()
+            .unwrap_or_else(|| BenchmarkSummary::empty(latency.selector.clone()));
         summary.current = latency.current.clone();
         summary.pattern = latency.pattern.clone();
         summary.url = latency.url.clone();
@@ -1288,7 +1383,77 @@ impl BenchmarkWorkflow {
                 completed: result.completed,
             });
         }
-        true
+
+        // The status protocol is only a bounded notification channel, not a second fact store. On
+        // an accepted same-generation snapshot, reload when shared SQLite data_version advances so
+        // foreground panels/details cannot diverge from the worker's persisted evidence.
+        self.reload_persisted_quality_projection(latency.quality_generation)?;
+        self.summaries.insert(latency.selector.clone(), summary);
+        Ok(true)
+    }
+
+    fn reload_persisted_quality_projection(&mut self, expected_generation: u64) -> Result<bool> {
+        #[cfg(test)]
+        if self.allow_unpersisted_quality_for_test && self.store.is_none() {
+            return Ok(false);
+        }
+        let receipt = self
+            .runtime_receipt()
+            .context("background fact refresh requires a confirmed managed runtime receipt")?;
+        anyhow::ensure!(
+            receipt.quality_generation == expected_generation,
+            "background fact refresh receipt generation changed"
+        );
+        let Some(observed_data_version) = self
+            .store
+            .as_ref()
+            .context("background fact refresh requires node-quality persistence")?
+            .changed_data_version()?
+        else {
+            return Ok(false);
+        };
+        let lease = self.acquire_quality_read_lease()?;
+        anyhow::ensure!(
+            lease.generation() == expected_generation,
+            "background fact refresh lease generation changed"
+        );
+        let projection = self
+            .store
+            .as_ref()
+            .expect("store checked above")
+            .node_quality_projection_with_lease(&lease, &self.sustained_target_identity, 10)?;
+        let PersistedNodeQualityProjection {
+            reachability_assessments,
+            sustained_quality,
+            quick_history,
+            sustained_stats,
+        } = projection;
+        let reachability_assessments = reachability_assessments
+            .into_iter()
+            .map(|(selector, assessment)| ((selector, assessment.name.clone()), assessment))
+            .collect();
+        let sustained_quality = sustained_quality
+            .into_iter()
+            .map(|(selector, quality)| ((selector, quality.name.clone()), quality))
+            .collect();
+        // All owned maps are complete before this mutation point. Any query/generation failure
+        // above therefore leaves the prior coherent foreground projection untouched.
+        self.reachability_assessments = reachability_assessments;
+        self.sustained_quality = sustained_quality;
+        self.quick_history_cache = quick_history;
+        self.sustained_stats_cache = sustained_stats;
+        // Record exactly the pre-read version. If another connection committed after our snapshot,
+        // the newer version remains detectable on the next poll instead of being skipped.
+        self.store
+            .as_ref()
+            .expect("store remains installed during foreground refresh")
+            .mark_data_version_observed(observed_data_version);
+        #[cfg(test)]
+        {
+            self.background_projection_reload_count += 1;
+        }
+        drop(lease);
+        Ok(true)
     }
 
     pub(crate) fn background_snapshot(&self, group: &str) -> Option<BackgroundLatencySnapshot> {
@@ -1384,25 +1549,20 @@ impl BenchmarkWorkflow {
         let nodes = request.nodes.clone().unwrap_or_default();
         let filter = request.pattern.clone();
         let (quality_receipt, quality_projection_current) = self.quality_job_scope();
+        let auto_selection_round_id = matches!(&kind, BenchmarkKind::AutoSelect).then(|| {
+            let round_id = self.next_auto_selection_round_id;
+            self.next_auto_selection_round_id = self.next_auto_selection_round_id.saturating_add(1);
+            round_id
+        });
         let (tx, receiver) = mpsc::channel();
-        let (worker, cancellation) = if matches!(kind, BenchmarkKind::AutoSelect) {
-            (
-                spawn_benchmark_worker(self.base_url.clone(), self.client.clone(), request, tx),
-                None,
-            )
-        } else {
-            let cancellation = Arc::new(AtomicBool::new(false));
-            (
-                spawn_reachability_assessment_worker(
-                    self.base_url.clone(),
-                    self.client.clone(),
-                    request,
-                    tx,
-                    cancellation.clone(),
-                ),
-                Some(cancellation),
-            )
-        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker = spawn_reachability_assessment_worker(
+            self.base_url.clone(),
+            self.client.clone(),
+            request,
+            tx,
+            cancellation.clone(),
+        );
         self.jobs.push(BenchmarkJob {
             group,
             nodes,
@@ -1410,48 +1570,34 @@ impl BenchmarkWorkflow {
             kind,
             receiver,
             worker,
-            cancellation,
+            cancellation: Some(cancellation),
             current_assessments: BTreeMap::new(),
             quality_receipt,
             quality_projection_current,
+            auto_selection_round_id,
         });
     }
 
-    fn completion(
-        &self,
-        group: String,
-        kind: BenchmarkKind,
-        quality_current: bool,
-    ) -> Option<BenchmarkCompletion> {
-        Some(match kind {
+    fn completion(&self, job_index: usize, quality_current: bool) -> Option<BenchmarkCompletion> {
+        let job = self.jobs.get(job_index)?;
+        let group = job.group.clone();
+        Some(match &job.kind {
             BenchmarkKind::Group => BenchmarkCompletion::Group {
-                assessments: self
-                    .jobs
-                    .iter()
-                    .find(|job| job.group == group)
-                    .map(|job| job.current_assessments.values().cloned().collect())
-                    .unwrap_or_default(),
-                assessed: self
-                    .jobs
-                    .iter()
-                    .find(|job| job.group == group)
-                    .map_or(0, |job| job.current_assessments.len()),
+                assessments: job.current_assessments.values().cloned().collect(),
+                assessed: job.current_assessments.len(),
                 group,
                 quality_current,
             },
             BenchmarkKind::AutoSelect => BenchmarkCompletion::AutoSelect {
-                summary: self.summaries.get(&group)?.clone(),
+                round_id: job.auto_selection_round_id?,
+                assessments: job.current_assessments.values().cloned().collect(),
                 group,
+                quality_current,
             },
             BenchmarkKind::SingleNode { node } => BenchmarkCompletion::SingleNode {
-                assessment: self
-                    .jobs
-                    .iter()
-                    .find(|job| job.group == group)
-                    .and_then(|job| job.current_assessments.get(&node))
-                    .cloned(),
+                assessment: job.current_assessments.get(node).cloned(),
                 group,
-                node,
+                node: node.clone(),
                 quality_current,
             },
         })
@@ -1704,8 +1850,79 @@ impl BenchmarkWorkflow {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_sustained_nodes(&self, group: &str) -> Option<Vec<String>> {
+        self.sustained_jobs
+            .iter()
+            .find(|job| job.group == group)
+            .map(|job| job.outstanding_nodes.iter().cloned().collect())
+    }
+
+    #[cfg(test)]
     pub(crate) fn quality_persistence_enabled(&self) -> bool {
         self.store.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adopt_runtime_receipt_for_test(
+        &mut self,
+        config_path: &Path,
+        database_path: &Path,
+        receipt: QualityRuntimeReceipt,
+    ) -> Result<()> {
+        self.skip_active_environment_check_for_test = true;
+        self.adopt_runtime_receipt(config_path, database_path, receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_quality_projection_for_test(
+        &self,
+        group: &str,
+        assessment: &NodeReachabilityAssessment,
+        sustained: &NodeSustainedQuality,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            assessment.name == sustained.name,
+            "test facts must name one node"
+        );
+        let receipt = self
+            .runtime_receipt()
+            .cloned()
+            .context("test writer requires an adopted runtime receipt")?;
+        anyhow::ensure!(
+            self.record_reachability_assessment(Some(&receipt), group, assessment)?,
+            "test reachability fact was fenced"
+        );
+        anyhow::ensure!(
+            self.record_sustained_quality(group, &self.sustained_target_identity, sustained)?,
+            "test sustained fact was fenced"
+        );
+        let delay_ms = assessment
+            .attempts
+            .iter()
+            .find_map(|attempt| match attempt {
+                ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+                _ => None,
+            });
+        anyhow::ensure!(
+            self.store
+                .as_ref()
+                .context("test writer requires node-quality persistence")?
+                .record_benchmark(&BenchmarkRecord {
+                    selector: group,
+                    node: &assessment.name,
+                    filter: "test",
+                    delay_ms,
+                    completed: true,
+                    job_kind: "auto",
+                })?,
+            "test latency fact was fenced"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_projection_reload_count(&self) -> usize {
+        self.background_projection_reload_count
     }
 
     #[cfg(test)]
@@ -1741,6 +1958,7 @@ impl BenchmarkWorkflow {
             current_assessments: BTreeMap::new(),
             quality_receipt,
             quality_projection_current,
+            auto_selection_round_id: Some(1),
         });
         cancellation
     }
@@ -1807,6 +2025,31 @@ pub(crate) fn assessment_is_quick_eligible(assessment: &NodeReachabilityAssessme
                 | crate::controller::ReachabilityAssessment::Reachable
         )
     })
+}
+
+fn assessment_warm_median_ms(assessment: &NodeReachabilityAssessment) -> Option<u64> {
+    let mut warm = assessment
+        .attempts
+        .iter()
+        .skip(1)
+        .filter_map(|attempt| match attempt {
+            ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if warm.is_empty() {
+        warm.extend(
+            assessment
+                .attempts
+                .iter()
+                .filter_map(|attempt| match attempt {
+                    ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+                    _ => None,
+                }),
+        );
+    }
+    warm.sort_unstable();
+    warm.get((warm.len().saturating_sub(1)) / 2).copied()
 }
 
 fn compare_optional_ascending(left: Option<u64>, right: Option<u64>) -> CmpOrdering {
@@ -1881,6 +2124,12 @@ mod tests {
             sender.send(event).expect("queue benchmark event");
         }
         let (quality_receipt, quality_projection_current) = workflow.quality_job_scope();
+        let auto_selection_round_id = matches!(&kind, BenchmarkKind::AutoSelect).then(|| {
+            let round_id = workflow.next_auto_selection_round_id;
+            workflow.next_auto_selection_round_id =
+                workflow.next_auto_selection_round_id.saturating_add(1);
+            round_id
+        });
         workflow.jobs.push(BenchmarkJob {
             group: request.selector.clone(),
             nodes: request.nodes.clone().unwrap_or_default(),
@@ -1892,6 +2141,7 @@ mod tests {
             current_assessments: BTreeMap::new(),
             quality_receipt,
             quality_projection_current,
+            auto_selection_round_id,
         });
         keep_open.then_some(sender)
     }
@@ -2482,11 +2732,7 @@ mod tests {
             request("select", &["node-a"]),
             BenchmarkKind::Group,
             [
-                BenchmarkEvent::Progress(BenchmarkResult {
-                    name: "node-a".to_string(),
-                    delay: Some(42),
-                    completed: true,
-                }),
+                BenchmarkEvent::ReachabilityProgress(reachable("node-a", [42, 42, 42])),
                 BenchmarkEvent::Finished,
             ],
             false,
@@ -2497,16 +2743,16 @@ mod tests {
         assert!(matches!(
             &updates[0],
             BenchmarkUpdate::Progress { group, best_label }
-                if group == "select" && best_label == "node-a (42ms)"
+                if group == "select" && best_label == "3/3 stable reachable"
         ));
         assert!(matches!(
             &updates[1],
             BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
                 group,
-                assessed: 0,
+                assessed: 1,
                 assessments,
                 quality_current: true,
-            }) if group == "select" && assessments.is_empty()
+            }) if group == "select" && assessments.len() == 1
         ));
         assert!(workflow.active_nodes("select").is_none());
     }
@@ -2533,14 +2779,14 @@ mod tests {
             false,
         );
         let group_updates = group_workflow.poll();
-        assert!(group_workflow.quick_eligible("select", "node-a"));
+        assert!(!group_workflow.quick_eligible("select", "node-a"));
         assert!(matches!(
             group_updates.last(),
             Some(BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
-                assessed: 0,
+                assessed: 1,
                 assessments,
                 ..
-            })) if assessments.is_empty()
+            })) if assessments.len() == 1 && assessments[0].assessment.is_none()
         ));
 
         let mut single_workflow = workflow(None);
@@ -2558,13 +2804,13 @@ mod tests {
             false,
         );
         let single_updates = single_workflow.poll();
-        assert!(single_workflow.quick_eligible("select", "node-a"));
+        assert!(!single_workflow.quick_eligible("select", "node-a"));
         assert!(matches!(
             single_updates.last(),
             Some(BenchmarkUpdate::Finished(BenchmarkCompletion::SingleNode {
-                assessment: None,
+                assessment: Some(assessment),
                 ..
-            }))
+            })) if assessment.assessment.is_none()
         ));
     }
 
@@ -2723,20 +2969,17 @@ mod tests {
                 ]
             }))
             .expect("bind test node identities");
-        let mut workflow = workflow(Some(store));
-        queue_job(
-            &mut workflow,
-            request("select", &["美国-a"]),
-            BenchmarkKind::AutoSelect,
-            [BenchmarkEvent::Progress(BenchmarkResult {
+        let workflow = workflow(Some(store));
+        workflow.record_result(
+            "select",
+            "美国",
+            &BenchmarkKind::AutoSelect,
+            &BenchmarkResult {
                 name: "美国-a".to_string(),
                 delay: Some(88),
                 completed: true,
-            })],
-            false,
+            },
         );
-
-        workflow.poll();
 
         let store = BenchmarkStore::open(&path).expect("reopen benchmark store");
         let rows = store.recent_benchmarks(10).expect("read rows");
@@ -2777,7 +3020,11 @@ mod tests {
             }],
         };
 
-        assert!(!workflow.apply_background_snapshot(&snapshot, "美国"));
+        assert!(
+            !workflow
+                .apply_background_snapshot(&snapshot, "美国")
+                .expect("manual foreground job rejects background snapshot")
+        );
         let result = workflow
             .summary("select")
             .and_then(|summary| summary.find_result("node-a"))

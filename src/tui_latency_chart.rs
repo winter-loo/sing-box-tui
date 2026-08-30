@@ -39,9 +39,15 @@ impl App {
             .benchmark_workflow
             .sustained_quality(&group_name, &node)
             .cloned();
+        let auto_selection_detail = self
+            .last_auto_selection_explanation
+            .as_ref()
+            .filter(|explanation| explanation.matches(&group_name, &self.node_view_panel.id()))
+            .map(|explanation| explanation.detail.clone());
         if samples.iter().all(|sample| sample.delay_ms.is_none())
             && reachability_assessment.is_none()
             && sustained_quality.is_none()
+            && auto_selection_detail.is_none()
         {
             self.set_status_only(format!("No latency history for {}", node));
             return Ok(());
@@ -56,6 +62,7 @@ impl App {
             last_refresh: Instant::now(),
             reachability_assessment,
             sustained_quality,
+            auto_selection_detail,
         });
         self.set_status_only(format!("Showing {} latency samples for {}", count, node));
         Ok(())
@@ -80,6 +87,8 @@ impl App {
     }
 
     pub(super) fn maybe_refresh_latency_chart(&mut self) -> Result<()> {
+        let active_panel = self.node_view_panel.id();
+        let explanation = self.last_auto_selection_explanation.clone();
         let Some(chart) = self.latency_chart.as_mut() else {
             return Ok(());
         };
@@ -101,6 +110,10 @@ impl App {
             .benchmark_workflow
             .sustained_quality(&chart.selector, &chart.node)
             .cloned();
+        chart.auto_selection_detail = explanation
+            .as_ref()
+            .filter(|explanation| explanation.matches(&chart.selector, &active_panel))
+            .map(|explanation| explanation.detail.clone());
         chart.last_refresh = Instant::now();
         Ok(())
     }
@@ -115,6 +128,7 @@ mod tests {
     use super::super::AUTO_SELECT_THRESHOLD_MS;
     use super::super::test_support::{test_app, test_db_path};
     use super::{LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL, LatencyChartState};
+    use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId};
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::storage::{BenchmarkRecord, BenchmarkStore, NodeLatencySample};
 
@@ -136,6 +150,8 @@ mod tests {
     fn pressing_i_opens_latency_chart_for_selected_node() {
         let path = test_db_path();
         let mut app = test_app();
+        app.auto_select_enabled = true;
+        app.auto_select_selector = Some("select".to_string());
         app.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
         app.member_index = 1;
         let store = BenchmarkStore::open(&path).expect("open benchmark store");
@@ -151,6 +167,11 @@ mod tests {
             })
             .expect("record benchmark");
         app.benchmark_workflow.replace_store(Some(store));
+        app.apply_background_auto_selection_explanation(Some(AutoSelectionExplanation {
+            selector: "select".to_string(),
+            panel: NodeViewId::current_selector(),
+            detail: "node-b leads; awaiting confirmation 1/2".to_string(),
+        }));
 
         app.handle_key(KeyCode::Char('i')).expect("open chart");
 
@@ -159,6 +180,10 @@ mod tests {
         assert_eq!(chart.node, "node-b");
         assert_eq!(chart.samples.len(), 1);
         assert_eq!(chart.samples[0].delay_ms, Some(93));
+        assert_eq!(
+            chart.auto_selection_detail.as_deref(),
+            Some("node-b leads; awaiting confirmation 1/2")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -177,6 +202,7 @@ mod tests {
             last_refresh: Instant::now(),
             reachability_assessment: None,
             sustained_quality: None,
+            auto_selection_detail: None,
         });
         app.handle_key(KeyCode::Char('z')).expect("zoom in");
         assert_eq!(
@@ -216,6 +242,7 @@ mod tests {
             last_refresh: Instant::now() - LATENCY_CHART_REFRESH_INTERVAL,
             reachability_assessment: None,
             sustained_quality: None,
+            auto_selection_detail: None,
         });
         app.maybe_refresh_latency_chart().expect("refresh chart");
         assert_eq!(

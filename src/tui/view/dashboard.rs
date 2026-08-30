@@ -1,4 +1,5 @@
 use super::*;
+use crate::automatic_selection::{NodeViewId, RankingPolicy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -18,6 +19,28 @@ impl NodeViewPanel {
         match self {
             Self::CurrentSelector => 0,
             Self::Streaming => 1,
+        }
+    }
+
+    pub(crate) fn id(self) -> NodeViewId {
+        match self {
+            Self::CurrentSelector => NodeViewId::current_selector(),
+            Self::Streaming => NodeViewId::streaming(),
+        }
+    }
+
+    pub(crate) fn ranking_policy(self) -> RankingPolicy {
+        match self {
+            Self::CurrentSelector => RankingPolicy::Balanced,
+            Self::Streaming => RankingPolicy::Throughput,
+        }
+    }
+
+    pub(crate) fn from_id(id: &NodeViewId) -> Self {
+        if id == &NodeViewId::streaming() {
+            Self::Streaming
+        } else {
+            Self::CurrentSelector
         }
     }
 }

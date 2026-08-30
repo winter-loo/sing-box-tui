@@ -202,6 +202,7 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
                 },
             ),
         }),
+        auto_selection_detail: Some("candidate leads; awaiting confirmation 1/2".into()),
     };
     snapshot.latency_chart = Some(&chart);
 
@@ -211,6 +212,7 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
     assert!(text.contains("Attempt 2: timeout"));
     assert!(text.contains("Attempt 3: reachable (51ms)"));
     assert!(text.contains("Sustained: 1.0 MiB/s, 524288 bytes"));
+    assert!(text.contains("Auto-selection: candidate leads; awaiting confirmation 1/2"));
 }
 
 #[test]

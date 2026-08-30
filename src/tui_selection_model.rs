@@ -281,10 +281,24 @@ impl App {
             NodeViewPanel::Streaming => NodeViewPanel::CurrentSelector,
         };
         self.sync_selection_to_displayed_members();
-        self.set_status_only(match self.node_view_panel {
+        let status = match self.node_view_panel {
             NodeViewPanel::CurrentSelector => "Node view: current selector".to_string(),
             NodeViewPanel::Streaming => "Node view: Streaming".to_string(),
-        });
+        };
+        self.auto_select_node_view = self.node_view_panel.id();
+        self.auto_select_ranking_policy = self.node_view_panel.ranking_policy();
+        self.automatic_selection_state = Default::default();
+        self.active_node_traffic = Default::default();
+        self.last_auto_selection_explanation = None;
+        self.last_auto_select_benchmark = None;
+        if let Err(error) = self
+            .save_runtime_state()
+            .and_then(|_| self.ensure_auto_pick_background_worker_after_state_change())
+        {
+            self.set_status_with_flash(format!("{status}; failed to persist node view: {error:#}"));
+        } else {
+            self.set_status_only(status);
+        }
     }
 
     pub(super) fn move_node_view_previous(&mut self) {

@@ -1,4 +1,5 @@
 use super::super::test_support::test_app;
+use crate::automatic_selection::NodeViewId;
 use crate::controller::ProxyGroup;
 use crate::private_access::PrivateAccessState;
 use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState};
@@ -188,4 +189,21 @@ fn app_applies_persisted_auto_pick_without_filter() {
 
     assert!(app.benchmark_filter.is_empty());
     assert!(app.auto_select_enabled);
+}
+
+#[test]
+fn unknown_stable_panel_id_survives_restart_for_future_manifest_ownership() {
+    let mut app = test_app();
+    let dynamic = NodeViewId::new("agy-gemini").expect("valid dynamic view id");
+
+    app.apply_runtime_state(TuiRuntimeState {
+        auto_pick_enabled: true,
+        auto_pick_selector: Some("select".to_string()),
+        active_node_view: Some(dynamic.clone()),
+        ..TuiRuntimeState::default()
+    })
+    .expect("state applies");
+
+    assert_eq!(app.auto_select_node_view, dynamic);
+    assert_eq!(app.runtime_state().active_node_view, Some(dynamic));
 }

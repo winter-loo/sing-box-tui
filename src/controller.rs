@@ -509,75 +509,6 @@ pub(crate) fn matches_filter(value: &str, filter: &str) -> bool {
     !has_include || include_matched
 }
 
-pub(crate) fn spawn_benchmark_worker(
-    base_url: String,
-    client: AsyncClient,
-    request: BenchmarkRequest,
-    tx: Sender<BenchmarkEvent>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let runtime = match TokioRuntimeBuilder::new_multi_thread().enable_all().build() {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                let _ = tx.send(BenchmarkEvent::Finished);
-                return;
-            }
-        };
-
-        runtime.block_on(async move {
-            let selector_name = request.selector.clone();
-            let selector =
-                match fetch_selector_for_benchmark(&client, &base_url, &selector_name).await {
-                    Ok(selector) => selector,
-                    Err(_) => {
-                        let _ = tx.send(BenchmarkEvent::Finished);
-                        return;
-                    }
-                };
-
-            let candidates = filter_benchmark_candidates(&selector.all, &request);
-
-            let max_concurrency = request.max_concurrency.max(1);
-            let mut tasks = JoinSet::new();
-            let mut pending = candidates.into_iter();
-
-            for _ in 0..max_concurrency {
-                let Some(name) = pending.next() else {
-                    break;
-                };
-                spawn_benchmark_task(
-                    &mut tasks,
-                    client.clone(),
-                    base_url.clone(),
-                    name,
-                    request.url.clone(),
-                    request.timeout_ms,
-                    request.request_timeout,
-                );
-            }
-
-            while let Some(result) = tasks.join_next().await {
-                if let Ok(result) = result {
-                    let _ = tx.send(BenchmarkEvent::Progress(result));
-                }
-                if let Some(name) = pending.next() {
-                    spawn_benchmark_task(
-                        &mut tasks,
-                        client.clone(),
-                        base_url.clone(),
-                        name,
-                        request.url.clone(),
-                        request.timeout_ms,
-                        request.request_timeout,
-                    );
-                }
-            }
-
-            let _ = tx.send(BenchmarkEvent::Finished);
-        });
-    })
-}
-
 pub(crate) fn spawn_reachability_assessment_worker(
     base_url: String,
     client: AsyncClient,
@@ -1079,7 +1010,6 @@ pub(crate) struct BenchmarkSummary {
 }
 
 pub(crate) enum BenchmarkEvent {
-    Progress(BenchmarkResult),
     ReachabilityProgress(NodeReachabilityAssessment),
     Finished,
 }
@@ -1133,25 +1063,9 @@ impl BenchmarkSummary {
         }
     }
 
-    pub(crate) fn best_label(&self) -> String {
-        self.best_success()
-            .map(|item| format!("{} ({})", item.name, item.display_delay()))
-            .unwrap_or_else(|| "pending".to_string())
-    }
-
     pub(crate) fn best_success(&self) -> Option<&BenchmarkResult> {
         self.results
             .iter()
-            .filter(|item| item.completed)
-            .filter_map(|item| item.delay.map(|delay| (item, delay)))
-            .min_by_key(|(_, delay)| *delay)
-            .map(|(item, _)| item)
-    }
-
-    pub(crate) fn best_success_matching_filter(&self) -> Option<&BenchmarkResult> {
-        self.results
-            .iter()
-            .filter(|item| matches_filter(&item.name, &self.pattern))
             .filter(|item| item.completed)
             .filter_map(|item| item.delay.map(|delay| (item, delay)))
             .min_by_key(|(_, delay)| *delay)
