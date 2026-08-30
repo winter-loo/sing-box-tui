@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::NodeQuickHistory;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NodeQualityDetailState {
@@ -6,6 +7,7 @@ pub(crate) struct NodeQualityDetailState {
     pub(crate) node: String,
     pub(crate) last_refresh: Instant,
     pub(crate) reachability_assessment: Option<NodeReachabilityAssessment>,
+    pub(crate) quick_history: NodeQuickHistory,
     pub(crate) sustained_quality: Option<NodeSustainedQuality>,
     pub(crate) auto_selection_detail: Option<String>,
     pub(crate) usability_details: Vec<UsabilityCriterionDetail>,
@@ -64,6 +66,20 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
         }
     } else {
         lines.push(Line::from("Reachability assessment: untested"));
+    }
+    if detail.quick_history.rounds == 0 {
+        lines.push(Line::from("Recent quick success: untested"));
+    } else {
+        lines.push(Line::from(format!(
+            "Recent quick success: {}/{} rounds",
+            detail.quick_history.successful_rounds, detail.quick_history.rounds
+        )));
+        lines.push(Line::from(format!(
+            "Quick history: warm median {}  P95 {}  cold-start {}",
+            metric_label(detail.quick_history.warm_median_ms),
+            metric_label(detail.quick_history.p95_ms),
+            metric_label(detail.quick_history.cold_start_ms),
+        )));
     }
     if let Some(sustained) = &detail.sustained_quality {
         match &sustained.outcome {
@@ -138,6 +154,12 @@ fn probe_outcome_label(outcome: &ProbeOutcome) -> String {
     }
 }
 
+fn metric_label(value: Option<u64>) -> String {
+    value
+        .map(|milliseconds| format!("{milliseconds}ms"))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +179,13 @@ mod tests {
                 ],
                 assessment: Some(ReachabilityAssessment::Degraded),
             }),
+            quick_history: NodeQuickHistory {
+                successful_rounds: 4,
+                rounds: 5,
+                warm_median_ms: Some(40),
+                p95_ms: Some(90),
+                cold_start_ms: Some(75),
+            },
             sustained_quality: None,
             auto_selection_detail: None,
             usability_details: Vec::new(),
@@ -182,6 +211,16 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("Sustained quality: untested"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Recent quick success: 4/5 rounds"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("P95 90ms") && line.contains("cold-start 75ms"))
         );
     }
 }

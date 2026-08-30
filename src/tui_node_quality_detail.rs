@@ -36,6 +36,7 @@ impl App {
                 .benchmark_workflow
                 .reachability_assessment(&group_name, &node)
                 .cloned(),
+            quick_history: self.benchmark_workflow.quick_history(&group_name, &node),
             sustained_quality: self
                 .benchmark_workflow
                 .sustained_quality(&group_name, &node)
@@ -85,6 +86,7 @@ impl App {
             .benchmark_workflow
             .reachability_assessment(&selector, &node)
             .cloned();
+        let quick_history = self.benchmark_workflow.quick_history(&selector, &node);
         let sustained_quality = self
             .benchmark_workflow
             .sustained_quality(&selector, &node)
@@ -100,6 +102,7 @@ impl App {
             .as_mut()
             .expect("node-quality detail remained open during refresh");
         detail.reachability_assessment = reachability_assessment;
+        detail.quick_history = quick_history;
         detail.sustained_quality = sustained_quality;
         detail.auto_selection_detail = auto_selection_detail;
         detail.usability_details = usability_details;
