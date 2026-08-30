@@ -190,21 +190,6 @@ fn single_node_benchmark_finish_does_not_flash() {
 }
 
 #[test]
-fn toggling_latency_sort_mode_does_not_flash() {
-    let mut app = test_app();
-    app.set_status_with_flash("existing flash");
-
-    app.toggle_latency_sort_mode();
-
-    assert!(app.benchmark_workflow.latency_order());
-    assert_eq!(
-        app.status,
-        "Sort order: LATENCY ORDER (sort successful nodes by delay, retain all members)"
-    );
-    assert!(app.flash.is_none());
-}
-
-#[test]
 fn group_benchmark_finish_does_not_flash() {
     let mut app = test_app();
     app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
@@ -331,7 +316,10 @@ fn auto_select_requires_two_public_completion_rounds_before_controller_write() {
         .collect::<Vec<_>>();
     assert_eq!(switch_requests.len(), 1);
     assert!(switch_requests[0].contains(r#"{"name":"node-b"}"#));
-    assert!(app.status.contains("Auto-pick switched select to node-b"));
+    assert!(
+        app.status
+            .contains("Automatic selection switched select to node-b")
+    );
     assert_eq!(app.groups[0].current.as_deref(), Some("node-b"));
     let explanation = app
         .last_auto_selection_explanation
@@ -796,7 +784,10 @@ fn auto_select_reconciliation_race_is_explained_and_nonfatal() {
     }))
     .expect("a lease race must not tear down the application loop");
 
-    assert!(app.status.contains("Auto-pick deferred for select"));
+    assert!(
+        app.status
+            .contains("Automatic selection deferred for select")
+    );
     assert!(app.status.contains("confirmed managed runtime receipt"));
     assert!(
         app.last_auto_selection_explanation
@@ -879,7 +870,7 @@ fn auto_select_toggle_allows_empty_filter() {
     assert!(app.auto_select_enabled);
     assert_eq!(
         app.status,
-        "Auto-pick enabled for select [current-selector / balanced] (all nodes, 20% material gate, two-round confirmation, every 30s)"
+        "Automatic selection enabled for select [current-selector / balanced] (all nodes, 20% material gate, two-round confirmation, every 30s)"
     );
 }
 

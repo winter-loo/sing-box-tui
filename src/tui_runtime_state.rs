@@ -134,9 +134,6 @@ impl App {
         if let Some(value) = normalize_optional_setting(state.verify_targets) {
             self.verify_targets = value;
         }
-        if let Some(value) = state.auto_select_threshold_ms.filter(|value| *value > 0) {
-            self.auto_select_threshold_ms = value;
-        }
         if let Some(value) = state.auto_select_interval_secs.filter(|value| *value > 0) {
             self.auto_select_interval = Duration::from_secs(value);
         }
@@ -207,7 +204,6 @@ impl App {
             benchmark_request_timeout: Some(self.benchmark_request_timeout),
             benchmark_max_concurrency: Some(self.benchmark_max_concurrency),
             verify_targets: normalize_optional_setting(Some(self.verify_targets.clone())),
-            auto_select_threshold_ms: Some(self.auto_select_threshold_ms),
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy.server().to_string()),
             system_proxy_server_override: self.system_proxy.server_is_overridden(),

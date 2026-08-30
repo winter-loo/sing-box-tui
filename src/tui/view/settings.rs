@@ -8,7 +8,6 @@ pub(crate) enum SettingsField {
     RequestTimeoutSec,
     MaxConcurrency,
     VerifyTargets,
-    AutoPickThresholdMs,
     AutoPickIntervalSec,
     SystemProxyServer,
     ChinaIpRouting,
@@ -35,7 +34,6 @@ pub(crate) const SETTINGS_FIELDS: &[SettingsField] = &[
     SettingsField::RequestTimeoutSec,
     SettingsField::MaxConcurrency,
     SettingsField::VerifyTargets,
-    SettingsField::AutoPickThresholdMs,
     SettingsField::AutoPickIntervalSec,
     SettingsField::SystemProxyServer,
     SettingsField::ChinaIpRouting,
@@ -141,14 +139,13 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
 
 pub(crate) fn settings_field_label(field: SettingsField) -> &'static str {
     match field {
-        SettingsField::BenchmarkUrl => "Latency URL",
+        SettingsField::BenchmarkUrl => "Quick probe HTTPS target",
         SettingsField::SustainedTargetUrl => "Sustained HTTPS target",
-        SettingsField::BenchmarkTimeoutMs => "Latency timeout ms",
+        SettingsField::BenchmarkTimeoutMs => "Quick attempt timeout ms",
         SettingsField::RequestTimeoutSec => "Request timeout sec",
         SettingsField::MaxConcurrency => "Max concurrency",
         SettingsField::VerifyTargets => "Verification targets",
-        SettingsField::AutoPickThresholdMs => "Latency chart guide ms (legacy)",
-        SettingsField::AutoPickIntervalSec => "Auto-pick interval sec",
+        SettingsField::AutoPickIntervalSec => "Automatic-selection interval sec",
         SettingsField::SystemProxyServer => "System proxy server",
         SettingsField::ChinaIpRouting => "China IP routing",
         SettingsField::TailscaleEnabled => "Tailscale endpoint",

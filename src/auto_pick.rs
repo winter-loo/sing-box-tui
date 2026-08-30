@@ -24,7 +24,7 @@ use crate::sustained_quality::{normalize_sustained_target, sustained_target_iden
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
 // Model 4 transports explicit per-manifest schedule authorization. Reusing a model-3 worker would
 // silently drop a user's P-toggle or, worse, leave an older authorization running after revocation.
-pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 4;
+pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 5;
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -48,7 +48,6 @@ pub(crate) struct AutoPickConfig {
     pub(crate) request_timeout: f64,
     pub(crate) max_concurrency: usize,
     /// Backward-compatible chart guide transported to older workers; selection no longer uses it.
-    pub(crate) threshold_ms: u64,
     pub(crate) interval_secs: u64,
     #[serde(default)]
     pub(crate) scheduled_usability_probes: Vec<ScheduledUsabilityProbeConfig>,
@@ -1267,7 +1266,6 @@ mod tests {
             timeout_ms: 1_000,
             request_timeout: 2.0,
             max_concurrency: 4,
-            threshold_ms: 600,
             interval_secs: 30,
             scheduled_usability_probes: Vec::new(),
         }

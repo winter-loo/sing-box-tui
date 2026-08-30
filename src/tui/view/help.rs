@@ -69,11 +69,6 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Switch the controller between available Clash modes.",
     },
     HelpBinding {
-        key: "s",
-        summary: "Toggle latency sort order",
-        detail: "Toggle candidate display between selector order and successful latency order.",
-    },
-    HelpBinding {
         key: "T",
         summary: "Quick-assess current scope",
         detail: "Run three live-controller reachability attempts for each node in the active selector or node-view scope.",
@@ -95,7 +90,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "/",
-        summary: "Edit latency filter",
+        summary: "Edit node-name filter",
         detail: "Open the filter editor. Comma-separated values include matches; prefix with ! or - to exclude.",
     },
     HelpBinding {
@@ -106,17 +101,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "i",
         summary: "Open node quality detail",
-        detail: "Show quick attempts, sustained evidence, and SQLite-backed history for the highlighted node.",
-    },
-    HelpBinding {
-        key: "z",
-        summary: "Zoom latency chart in",
-        detail: "When the latency chart is open, narrow the displayed time window.",
-    },
-    HelpBinding {
-        key: "Z",
-        summary: "Zoom latency chart out",
-        detail: "When the latency chart is open, widen the displayed time window.",
+        detail: "Show probe outcomes, reachability assessment, sustained quality, usability criteria, and the latest automatic-selection explanation.",
     },
     HelpBinding {
         key: "c",
@@ -161,7 +146,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "o",
         summary: "Open settings",
-        detail: "Edit TUI latency, auto-pick, and system proxy settings.",
+        detail: "Edit quick assessment, sustained quality, automatic selection, and system proxy settings.",
     },
     HelpBinding {
         key: "r",

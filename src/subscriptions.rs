@@ -1115,7 +1115,7 @@ mod tests {
     };
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome};
     use crate::defaults::{DEFAULT_BYPASS_RULE_SET_PATH, default_clash_api_external_controller};
-    use crate::storage::{BenchmarkRecord, BenchmarkStore};
+    use crate::storage::BenchmarkStore;
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1173,18 +1173,6 @@ mod tests {
             .reconcile_node_history(config)
             .expect("seed node identities");
         for (index, node) in nodes.iter().enumerate() {
-            assert!(
-                store
-                    .record_benchmark(&BenchmarkRecord {
-                        selector: "select",
-                        node,
-                        filter: "seed",
-                        delay_ms: Some(40 + index as u64),
-                        completed: true,
-                        job_kind: "test",
-                    })
-                    .expect("seed benchmark history")
-            );
             store
                 .record_reachability_assessment(
                     "select",
@@ -2079,7 +2067,7 @@ mod tests {
             .expect("observed startup runtime enables quality persistence");
         assert_eq!(
             workflow
-                .persist_benchmark_for_test("node-a")
+                .persist_reachability_for_test("node-a")
                 .expect("write startup benchmark"),
             Some(true)
         );
@@ -2121,18 +2109,8 @@ mod tests {
         assert_eq!(commit.node_quality_generation, Some(generation));
         assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);
         assert_eq!(
-            BenchmarkStore::open(&request.node_quality_db_path)
-                .expect("reopen reconciled store")
-                .recent_benchmarks(10)
-                .expect("read retained benchmark")
-                .into_iter()
-                .map(|record| record.node)
-                .collect::<Vec<_>>(),
-            vec!["node-a"]
-        );
-        assert_eq!(
             workflow
-                .persist_benchmark_for_test("node-a")
+                .persist_reachability_for_test("node-a")
                 .expect("unchanged generation remains writable"),
             Some(true)
         );
@@ -2197,7 +2175,7 @@ mod tests {
                 .recv()
                 .expect("wait until subscription refresh commits");
             old_write_tx
-                .send(workflow.persist_benchmark_for_test("node-a"))
+                .send(workflow.persist_reachability_for_test("node-a"))
                 .expect("report old-generation write");
         });
         startup_locked_rx
@@ -2632,9 +2610,9 @@ mod tests {
         let old_identities = before
             .stored_node_identities()
             .expect("read seeded identities");
-        let old_benchmarks = before
-            .recent_benchmarks(10)
-            .expect("read seeded benchmarks");
+        let old_assessments = before
+            .latest_reachability_assessments()
+            .expect("read seeded reachability assessments");
         drop(before);
         let new_config = provider_config(vec![serde_json::json!({
             "type":"trojan", "tag":"node-a", "server":"new.example",
@@ -2671,9 +2649,9 @@ mod tests {
         );
         assert_eq!(
             after
-                .recent_benchmarks(10)
-                .expect("read preserved benchmarks"),
-            old_benchmarks
+                .latest_reachability_assessments()
+                .expect("read preserved reachability assessments"),
+            old_assessments
         );
         drop(after);
         assert_eq!(history_nodes(&request.node_quality_db_path), vec!["node-a"]);

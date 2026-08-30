@@ -110,7 +110,6 @@ pub(super) fn test_app() -> App {
         auto_select_selector: None,
         auto_select_node_view: crate::automatic_selection::NodeViewId::current_selector(),
         auto_select_ranking_policy: crate::automatic_selection::RankingPolicy::Balanced,
-        auto_select_threshold_ms: 600,
         auto_select_interval: Duration::from_secs(30),
         last_auto_select_benchmark: None,
         automatic_selection_state: Default::default(),
@@ -120,7 +119,7 @@ pub(super) fn test_app() -> App {
         background_auto_pick: Default::default(),
         state_store: None,
         bypass_rule_set_store: None,
-        latency_chart: None,
+        node_quality_detail: None,
         clash_mode: Some(RULE_CLASH_MODE.to_string()),
         clash_modes: vec![
             GLOBAL_CLASH_MODE.to_string(),

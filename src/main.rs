@@ -39,11 +39,7 @@ mod usability_probe;
 
 use cli::{BackgroundAction, CliCommand};
 use config::{HillstoneRouteOptions, run_hillstone_route_config};
-use controller::{
-    BenchmarkOptions, SelectorsOptions, StatusOptions, VerificationTarget, run_benchmark,
-    run_selectors, run_status,
-};
-use defaults::DEFAULT_VERIFICATION_TARGETS;
+use controller::{SelectorsOptions, StatusOptions, run_selectors, run_status};
 use hillstone::{HillstoneProbeOptions, run_hillstone_probe};
 use import::{SubscribeImportOptions, run_import, run_subscribe_import};
 use private_access::run_private_access_service_stdio;
@@ -165,29 +161,6 @@ fn main() -> Result<()> {
             write,
             force,
             interval_days,
-        }),
-        CliCommand::Benchmark {
-            controller,
-            selector,
-            pattern,
-            url,
-            timeout_ms,
-            request_timeout,
-            max_concurrency,
-            switch,
-            verify,
-            verify_urls,
-        } => run_benchmark(BenchmarkOptions {
-            controller,
-            selector,
-            pattern,
-            url,
-            timeout_ms,
-            request_timeout,
-            max_concurrency,
-            switch,
-            verify,
-            verification_targets: verification_targets_from_specs(&verify_urls)?,
         }),
         CliCommand::SyncProvider {
             provider,
@@ -311,45 +284,6 @@ fn parse_hillstone_route_target(target: &str) -> Result<Ipv4Addr> {
         .parse::<SocketAddrV4>()
         .map(|address| *address.ip())
         .with_context(|| format!("invalid --target IPv4 or IPv4:PORT: {target}"))
-}
-
-fn verification_targets_from_specs(specs: &[String]) -> Result<Vec<VerificationTarget>> {
-    let mut targets = default_verification_targets();
-    targets.extend(
-        specs
-            .iter()
-            .map(|spec| verification_target_from_spec(spec))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    Ok(targets)
-}
-
-fn default_verification_targets() -> Vec<VerificationTarget> {
-    DEFAULT_VERIFICATION_TARGETS
-        .iter()
-        .map(|(name, url)| VerificationTarget {
-            name: (*name).to_string(),
-            url: (*url).to_string(),
-        })
-        .collect()
-}
-
-fn verification_target_from_spec(spec: &str) -> Result<VerificationTarget> {
-    let (name, url) = spec
-        .split_once('=')
-        .with_context(|| format!("verification target must be NAME=URL, got {spec}"))?;
-    let name = name.trim();
-    let url = url.trim();
-    if name.is_empty() {
-        bail!("verification target name cannot be empty");
-    }
-    if url.is_empty() {
-        bail!("verification target URL cannot be empty");
-    }
-    Ok(VerificationTarget {
-        name: name.to_string(),
-        url: url.to_string(),
-    })
 }
 
 #[cfg(test)]

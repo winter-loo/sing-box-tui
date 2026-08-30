@@ -22,7 +22,7 @@ impl App {
         match code {
             KeyCode::Esc | KeyCode::Char(' ') => {
                 self.filter_input = None;
-                self.set_status_only("Latency filter edit canceled");
+                self.set_status_only("Node-name filter edit canceled");
             }
             KeyCode::Enter => {
                 let value = buffer.trim().to_string();
@@ -66,9 +66,12 @@ impl App {
         self.sync_selection_to_displayed_members();
         self.last_auto_select_benchmark = None;
         if self.benchmark_filter.is_empty() {
-            self.set_status_only("Latency filter cleared");
+            self.set_status_only("Node-name filter cleared");
         } else {
-            self.set_status_only(format!("Latency filter set to '{}'", self.benchmark_filter));
+            self.set_status_only(format!(
+                "Node-name filter set to '{}'",
+                self.benchmark_filter
+            ));
         }
         self.save_runtime_state()?;
         self.ensure_auto_pick_background_worker_after_state_change()?;
@@ -107,7 +110,7 @@ mod tests {
         app.handle_key(KeyCode::Char('x')).unwrap();
         app.handle_key(KeyCode::Esc).unwrap();
         assert_eq!(app.benchmark_filter, "hk");
-        assert_eq!(app.status, "Latency filter edit canceled");
+        assert_eq!(app.status, "Node-name filter edit canceled");
 
         app.handle_key(KeyCode::Char('/')).unwrap();
         app.handle_key(KeyCode::Backspace).unwrap();
@@ -116,7 +119,7 @@ mod tests {
         app.handle_key(KeyCode::Char('s')).unwrap();
         app.handle_key(KeyCode::Enter).unwrap();
         assert_eq!(app.benchmark_filter, "us");
-        assert_eq!(app.status, "Latency filter set to 'us'");
+        assert_eq!(app.status, "Node-name filter set to 'us'");
     }
 
     #[test]

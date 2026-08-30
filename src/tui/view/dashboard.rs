@@ -100,7 +100,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
     pub(crate) status: StatusSnapshot,
     pub(crate) flash: Option<String>,
-    pub(crate) latency_chart: Option<&'a LatencyChartState>,
+    pub(crate) node_quality_detail: Option<&'a NodeQualityDetailState>,
     pub(crate) connections: Option<ConnectionsPanelSnapshot<'a>>,
     pub(crate) help_index: Option<usize>,
     pub(crate) usability_probe_diagnostics: &'a [ManifestDiagnostic],
@@ -399,8 +399,8 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             area,
         );
     }
-    if let Some(chart) = snapshot.latency_chart {
-        draw_latency_chart(frame, chart);
+    if let Some(chart) = snapshot.node_quality_detail {
+        draw_node_quality_detail(frame, chart);
     }
     if let Some(connections) = snapshot.connections.as_ref() {
         draw_connections_panel(frame, connections);

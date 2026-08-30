@@ -81,12 +81,12 @@ mod connections;
 mod dashboard_snapshot;
 #[path = "../tui_input_workflow.rs"]
 mod input_workflow;
-#[path = "../tui_latency_chart.rs"]
-mod latency_chart;
 #[path = "../tui_managed_process.rs"]
 mod managed_process;
 #[path = "../tui_network_mode.rs"]
 mod network_mode;
+#[path = "../tui_node_quality_detail.rs"]
+mod node_quality_detail;
 #[path = "../tui_onboarding.rs"]
 mod onboarding;
 #[path = "../tui_private_access.rs"]
@@ -117,18 +117,16 @@ use verification::{VerifyJob, default_verification_targets_setting};
 #[cfg(test)]
 use view::private_access_auth_display_value;
 use view::{
-    Focus, LatencyChartState, LeftPaneSection, NodeViewPanel, OnboardingState,
+    Focus, LeftPaneSection, NodeQualityDetailState, NodeViewPanel, OnboardingState,
     PrivateAccessAuthModal, PrivateAccessProgressEntry, PrivateAccessProgressModal,
     PrivateAccessProgressTone, SettingsEditState, help_item_count,
     private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
-const AUTO_SELECT_THRESHOLD_MS: u64 = 600;
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const LATENCY_CHART_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const NODE_QUALITY_DETAIL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const LATENCY_CHART_DEFAULT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const DIRECT_CLASH_MODE: &str = "直连";
 const RULE_CLASH_MODE: &str = "规则";
 const GLOBAL_CLASH_MODE: &str = "全局";
@@ -295,7 +293,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_verify_updates();
         app.poll_background_auto_pick_status()?;
         app.maybe_start_subscription_refresh();
-        app.maybe_refresh_latency_chart()?;
+        app.maybe_refresh_node_quality_detail()?;
         app.maybe_refresh_connections();
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
@@ -412,7 +410,6 @@ struct App {
     auto_select_selector: Option<String>,
     auto_select_node_view: NodeViewId,
     auto_select_ranking_policy: RankingPolicy,
-    auto_select_threshold_ms: u64,
     auto_select_interval: Duration,
     last_auto_select_benchmark: Option<Instant>,
     automatic_selection_state: AutomaticSelectionState,
@@ -422,7 +419,7 @@ struct App {
     background_auto_pick: BackgroundAutoPickManager,
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
-    latency_chart: Option<LatencyChartState>,
+    node_quality_detail: Option<NodeQualityDetailState>,
     clash_mode: Option<String>,
     clash_modes: Vec<String>,
     connections: ConnectionsSnapshot,
@@ -615,7 +612,6 @@ impl App {
             auto_select_selector: None,
             auto_select_node_view: NodeViewId::current_selector(),
             auto_select_ranking_policy: RankingPolicy::Balanced,
-            auto_select_threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             auto_select_interval: AUTO_SELECT_INTERVAL,
             last_auto_select_benchmark: None,
             automatic_selection_state: AutomaticSelectionState::default(),
@@ -625,7 +621,7 @@ impl App {
             background_auto_pick: Default::default(),
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(bypass_rule_set_path)),
-            latency_chart: None,
+            node_quality_detail: None,
             clash_mode: None,
             clash_modes: Vec::new(),
             connections: ConnectionsSnapshot::default(),
@@ -826,16 +822,14 @@ impl App {
             }
             return Ok(true);
         }
-        if self.latency_chart.is_some() {
+        if self.node_quality_detail.is_some() {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
-                    self.latency_chart = None;
-                    self.set_status_only("Latency chart closed");
+                    self.node_quality_detail = None;
+                    self.set_status_only("Node quality detail closed");
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_latency_chart_evidence_down(),
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_latency_chart_evidence_up(),
-                KeyCode::Char('z') => self.zoom_latency_chart_in(),
-                KeyCode::Char('Z') => self.zoom_latency_chart_out(),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_node_quality_detail_down(),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_node_quality_detail_up(),
                 KeyCode::Char('q') => return Ok(false),
                 _ => {}
             }
@@ -867,14 +861,13 @@ impl App {
             KeyCode::Char('P') => self.toggle_background_usability_probe()?,
             KeyCode::Char('T') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
-            KeyCode::Char('s') => self.toggle_latency_sort_mode(),
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('b') => self.open_bypass_modal(),
             KeyCode::Char('B') => return self.keep_sing_box_running_in_background(),
             KeyCode::Char('p') => self.set_system_proxy(),
             KeyCode::Char('\\') => self.toggle_tun_mode(),
-            KeyCode::Char('i') => self.open_latency_chart()?,
+            KeyCode::Char('i') => self.open_node_quality_detail()?,
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('V') => self.toggle_private_access_with_progress()?,

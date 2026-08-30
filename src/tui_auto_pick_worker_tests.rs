@@ -492,7 +492,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
         .handle_key(KeyCode::Char('i'))
         .expect("open public quality detail");
     let detail = foreground
-        .latency_chart
+        .node_quality_detail
         .as_ref()
         .expect("quality detail opens");
     assert_eq!(detail.node, "node-b");

@@ -122,9 +122,10 @@ curl -sS http://127.0.0.1:9992/proxies \
   | jq '.proxies["节点选择"] | {now, all_count:(.all|length), all}'
 ```
 
-## 5. Benchmark Nodes
+## 5. Inspect the raw Delay Endpoint
 
-The Clash API delay endpoint benchmarks one node at a time:
+The Clash API Delay Endpoint can diagnose one concrete outbound at a time. One response is a raw
+probe outcome, not a node-quality assessment and not a reason to hide or switch a node:
 
 ```bash
 NODE='L1|日本04|直连|流媒体|2x'
@@ -134,7 +135,9 @@ curl -sS \
   "http://127.0.0.1:9992/proxies/$ENCODED_NODE/delay?timeout=5000&url=https://www.gstatic.com/generate_204"
 ```
 
-For a full benchmark, run concurrent probes and sort successful results by latency:
+The following historical diagnostic samples several outbounds concurrently. Do not treat its
+single values or latency ordering as the TUI's node-quality model; use `T`, `t`, and `i` in the TUI
+for three-attempt reachability, bounded sustained quality, and explainable panel ranking:
 
 ```bash
 python3 - <<'PY'

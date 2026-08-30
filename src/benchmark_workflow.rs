@@ -29,9 +29,9 @@ use crate::node_quality_path::{
 };
 use crate::node_runtime_manager::IsolatedRuntimeSnapshot;
 use crate::storage::{
-    BenchmarkRecord, BenchmarkStore, NodeLatencySample, NodeQualityReadLease, NodeQuickHistory,
-    PersistedNodeQualityProjection, StoredUsabilityProbeRun, SustainedSuccessStats,
-    UsabilityProbeRunFinalization, lock_node_quality_reconciliation,
+    BenchmarkStore, NodeQualityReadLease, NodeQuickHistory, PersistedNodeQualityProjection,
+    StoredUsabilityProbeRun, SustainedSuccessStats, UsabilityProbeRunFinalization,
+    lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
     NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
@@ -129,7 +129,6 @@ pub(crate) struct BenchmarkWorkflow {
     store: Option<BenchmarkStore>,
     runtime_receipt: Option<QualityRuntimeReceipt>,
     next_auto_selection_round_id: u64,
-    latency_order: bool,
     #[cfg(test)]
     allow_unpersisted_quality_for_test: bool,
     #[cfg(test)]
@@ -207,20 +206,9 @@ enum BenchmarkKind {
     SingleNode { node: String },
 }
 
-impl BenchmarkKind {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Group => "group",
-            Self::AutoSelect => "auto",
-            Self::SingleNode { .. } => "single",
-        }
-    }
-}
-
 struct BenchmarkJob {
     group: String,
     nodes: Vec<String>,
-    filter: String,
     kind: BenchmarkKind,
     receiver: mpsc::Receiver<BenchmarkEvent>,
     worker: JoinHandle<()>,
@@ -549,7 +537,6 @@ impl BenchmarkWorkflow {
             store,
             runtime_receipt: None,
             next_auto_selection_round_id: 1,
-            latency_order: false,
             #[cfg(test)]
             allow_unpersisted_quality_for_test: false,
             #[cfg(test)]
@@ -595,15 +582,6 @@ impl BenchmarkWorkflow {
     pub(crate) fn quick_eligible(&self, group: &str, node: &str) -> bool {
         self.reachability_assessment(group, node)
             .is_some_and(assessment_is_quick_eligible)
-    }
-
-    pub(crate) fn latency_order(&self) -> bool {
-        self.latency_order
-    }
-
-    pub(crate) fn toggle_latency_order(&mut self) -> bool {
-        self.latency_order = !self.latency_order;
-        self.latency_order
     }
 
     pub(crate) fn acquire_quality_read_lease(&self) -> Result<NodeQualityReadLease> {
@@ -1218,12 +1196,6 @@ impl BenchmarkWorkflow {
                             if let Some(summary) = self.summaries.get_mut(&group) {
                                 summary.update_result(result.clone());
                             }
-                            self.record_result(
-                                &group,
-                                &self.jobs[index].filter,
-                                &self.jobs[index].kind,
-                                &result,
-                            );
                             assessment.compact_evidence()
                         } else {
                             self.jobs[index].quality_projection_current = false;
@@ -1596,18 +1568,6 @@ impl BenchmarkWorkflow {
         })
     }
 
-    pub(crate) fn node_latency_history(
-        &self,
-        selector: &str,
-        node: &str,
-        limit: usize,
-    ) -> Result<Option<Vec<NodeLatencySample>>> {
-        self.store
-            .as_ref()
-            .map(|store| store.node_latency_history(selector, node, limit))
-            .transpose()
-    }
-
     fn start_group_kind(
         &mut self,
         request: BenchmarkRequest,
@@ -1659,7 +1619,6 @@ impl BenchmarkWorkflow {
     fn spawn(&mut self, request: BenchmarkRequest, kind: BenchmarkKind) {
         let group = request.selector.clone();
         let nodes = request.nodes.clone().unwrap_or_default();
-        let filter = request.pattern.clone();
         let (quality_receipt, quality_projection_current) = self.quality_job_scope();
         let auto_selection_round_id = matches!(&kind, BenchmarkKind::AutoSelect).then(|| {
             let round_id = self.next_auto_selection_round_id;
@@ -1678,7 +1637,6 @@ impl BenchmarkWorkflow {
         self.jobs.push(BenchmarkJob {
             group,
             nodes,
-            filter,
             kind,
             receiver,
             worker,
@@ -1713,30 +1671,6 @@ impl BenchmarkWorkflow {
                 quality_current,
             },
         })
-    }
-
-    fn record_result(
-        &self,
-        group: &str,
-        filter: &str,
-        kind: &BenchmarkKind,
-        result: &BenchmarkResult,
-    ) {
-        let Some(store) = &self.store else {
-            return;
-        };
-        store
-            .record_benchmark(&BenchmarkRecord {
-                selector: group,
-                node: &result.name,
-                filter,
-                delay_ms: result.delay,
-                completed: result.completed,
-                job_kind: kind.label(),
-            })
-            .map(|_| ())
-            .with_context(|| format!("failed to record benchmark result for {}", result.name))
-            .unwrap_or_else(|error| eprintln!("warning: {error:#}"));
     }
 
     fn quality_job_scope(&self) -> (Option<QualityRuntimeReceipt>, bool) {
@@ -2008,27 +1942,6 @@ impl BenchmarkWorkflow {
             self.record_sustained_quality(group, &self.sustained_target_identity, sustained)?,
             "test sustained fact was fenced"
         );
-        let delay_ms = assessment
-            .attempts
-            .iter()
-            .find_map(|attempt| match attempt {
-                ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
-                _ => None,
-            });
-        anyhow::ensure!(
-            self.store
-                .as_ref()
-                .context("test writer requires node-quality persistence")?
-                .record_benchmark(&BenchmarkRecord {
-                    selector: group,
-                    node: &assessment.name,
-                    filter: "test",
-                    delay_ms,
-                    completed: true,
-                    job_kind: "auto",
-                })?,
-            "test latency fact was fenced"
-        );
         Ok(())
     }
 
@@ -2038,18 +1951,24 @@ impl BenchmarkWorkflow {
     }
 
     #[cfg(test)]
-    pub(crate) fn persist_benchmark_for_test(&self, node: &str) -> Result<Option<bool>> {
+    pub(crate) fn persist_reachability_for_test(&self, node: &str) -> Result<Option<bool>> {
         self.store
             .as_ref()
             .map(|store| {
-                store.record_benchmark(&BenchmarkRecord {
-                    selector: "select",
-                    node,
-                    filter: "test",
-                    delay_ms: Some(42),
-                    completed: true,
-                    job_kind: "test",
-                })
+                store.record_reachability_assessment(
+                    "select",
+                    &NodeReachabilityAssessment {
+                        name: node.to_string(),
+                        attempts: vec![
+                            ProbeOutcome::Reachable { delay_ms: 42 },
+                            ProbeOutcome::Reachable { delay_ms: 43 },
+                            ProbeOutcome::Reachable { delay_ms: 44 },
+                        ],
+                        assessment: Some(
+                            crate::controller::ReachabilityAssessment::StableReachable,
+                        ),
+                    },
+                )
             })
             .transpose()
     }
@@ -2062,7 +1981,6 @@ impl BenchmarkWorkflow {
         self.jobs.push(BenchmarkJob {
             group: group.to_string(),
             nodes: vec![node.to_string()],
-            filter: "test".to_string(),
             kind: BenchmarkKind::AutoSelect,
             receiver,
             worker: std::thread::spawn(|| {}),
@@ -2245,7 +2163,6 @@ mod tests {
         workflow.jobs.push(BenchmarkJob {
             group: request.selector.clone(),
             nodes: request.nodes.clone().unwrap_or_default(),
-            filter: request.pattern.clone(),
             kind,
             receiver,
             worker: thread::spawn(|| {}),
@@ -2367,7 +2284,7 @@ mod tests {
                 Ok((
                     initially_enabled,
                     initially_fenced,
-                    workflow.persist_benchmark_for_test("node-a")?,
+                    workflow.persist_reachability_for_test("node-a")?,
                 ))
             });
             opened_tx.send(result).expect("return startup result");
@@ -2496,7 +2413,7 @@ mod tests {
             .expect("observed runtime enables the repaired binding");
         assert!(workflow.quality_persistence_enabled());
         assert_eq!(
-            workflow.persist_benchmark_for_test("direct").unwrap(),
+            workflow.persist_reachability_for_test("direct").unwrap(),
             Some(true)
         );
         assert!(!runtime_reload_fence_path(&database_path).exists());
@@ -2551,14 +2468,7 @@ mod tests {
         assert!(runtime_reload_fence_path(&database_path).exists());
         assert!(
             !stale_store
-                .record_benchmark(&BenchmarkRecord {
-                    selector: "select",
-                    node: "node-a",
-                    filter: "all",
-                    delay_ms: Some(40),
-                    completed: true,
-                    job_kind: "auto",
-                })
+                .record_reachability_assessment("select", &reachable("node-a", [40, 41, 42]))
                 .expect("old same-tag writer is safely rejected")
         );
 
@@ -2569,7 +2479,7 @@ mod tests {
             .expect("observing the new runtime releases the fence");
         assert!(workflow.quality_persistence_enabled());
         assert_eq!(
-            workflow.persist_benchmark_for_test("node-a").unwrap(),
+            workflow.persist_reachability_for_test("node-a").unwrap(),
             Some(true)
         );
 
@@ -2635,7 +2545,7 @@ mod tests {
         assert!(workflow.quality_persistence_enabled());
         assert!(!runtime_reload_fence_path(&database_path).exists());
         assert_eq!(
-            workflow.persist_benchmark_for_test("direct").unwrap(),
+            workflow.persist_reachability_for_test("direct").unwrap(),
             Some(true)
         );
 
@@ -2680,14 +2590,7 @@ mod tests {
         assert!(runtime_reload_fence_path(&database_path).exists());
         assert!(
             !other_process_store
-                .record_benchmark(&BenchmarkRecord {
-                    selector: "select",
-                    node: "direct",
-                    filter: "all",
-                    delay_ms: Some(20),
-                    completed: true,
-                    job_kind: "auto",
-                })
+                .record_reachability_assessment("select", &reachable("direct", [20, 21, 22]))
                 .expect("other process writer fails closed")
         );
         assert!(!workflow.quality_persistence_enabled());
@@ -3066,42 +2969,6 @@ mod tests {
         assert!(workflow.quick_eligible("select", "node-a"));
         assert_eq!(workflow.quick_history("select", "node-a").rounds, 1);
         drop(workflow);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn progress_is_recorded_with_stable_run_metadata() {
-        let path = test_db_path();
-        let store = BenchmarkStore::open(&path).expect("open benchmark store");
-        store
-            .reconcile_node_history(&serde_json::json!({
-                "outbounds": [
-                    {"type":"selector", "tag":"select", "outbounds":["美国-a"]},
-                    {"type":"direct", "tag":"美国-a"}
-                ]
-            }))
-            .expect("bind test node identities");
-        let workflow = workflow(Some(store));
-        workflow.record_result(
-            "select",
-            "美国",
-            &BenchmarkKind::AutoSelect,
-            &BenchmarkResult {
-                name: "美国-a".to_string(),
-                delay: Some(88),
-                completed: true,
-            },
-        );
-
-        let store = BenchmarkStore::open(&path).expect("reopen benchmark store");
-        let rows = store.recent_benchmarks(10).expect("read rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].selector, "select");
-        assert_eq!(rows[0].node, "美国-a");
-        assert_eq!(rows[0].filter, "美国");
-        assert_eq!(rows[0].delay_ms, Some(88));
-        assert!(rows[0].completed);
-        assert_eq!(rows[0].job_kind, "auto");
         let _ = std::fs::remove_file(path);
     }
 

@@ -275,34 +275,7 @@ impl App {
             }
             NodeViewPanel::CurrentSelector => {}
         }
-        let Some(summary) = self.selected_benchmark() else {
-            return group.members.clone();
-        };
-        if !self.benchmark_workflow.latency_order() {
-            return group.members.clone();
-        }
-
-        let mut successes = Vec::new();
-        let mut pending_or_untested = Vec::new();
-        for (index, member) in group.members.iter().enumerate() {
-            match summary.find_result(member) {
-                Some(result) if result.completed => {
-                    if let Some(delay) = result.delay {
-                        successes.push((delay, index, member.clone()));
-                    } else {
-                        pending_or_untested.push((index, member.clone()));
-                    }
-                }
-                _ => pending_or_untested.push((index, member.clone())),
-            }
-        }
-        successes.sort_by_key(|(delay, index, _)| (*delay, *index));
-        let mut out = successes
-            .into_iter()
-            .map(|(_, _, member)| member)
-            .collect::<Vec<_>>();
-        out.extend(pending_or_untested.into_iter().map(|(_, member)| member));
-        out
+        group.members.clone()
     }
 
     #[cfg(test)]
