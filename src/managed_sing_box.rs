@@ -35,7 +35,7 @@ const SING_BOX_START_MAX_ATTEMPTS: usize = 9;
 const SING_BOX_START_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(500);
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SING_BOX_STOP_GRACE: Duration = Duration::from_secs(3);
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -735,7 +735,7 @@ fn managed_sing_box_pid_is_alive(pid: u32) -> bool {
     process_alive_via_ps(pid)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn managed_sing_box_pid_is_alive(pid: u32) -> bool {
     process_exists(pid)
 }
@@ -745,7 +745,7 @@ fn managed_sing_box_pid_is_alive(_pid: u32) -> bool {
     false
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn ensure_managed_sing_box_pid_identity(
     pid: u32,
     executable: &Path,
@@ -801,17 +801,7 @@ fn ensure_owned_elevated_sing_box_pid_identity(
     ensure_managed_sing_box_pid_identity(pid, executable, config_path)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn ensure_owned_elevated_sing_box_pid_identity(
-    pid: u32,
-    _wrapper_pid: u32,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<bool> {
-    ensure_managed_sing_box_pid_identity(pid, executable, config_path)
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(test, windows, target_os = "macos", target_os = "linux")))]
 fn ensure_managed_sing_box_pid_identity(
     _pid: u32,
     _executable: &Path,

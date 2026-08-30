@@ -5,6 +5,7 @@ use std::process::Command;
 enum ProcessStatus {
     Alive,
     Exited,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Unknown,
 }
 

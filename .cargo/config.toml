@@ -1,0 +1,2 @@
+[alias]
+lint = "clippy --locked -- -D warnings -A clippy::all"

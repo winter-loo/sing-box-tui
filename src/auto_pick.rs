@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::{QUALITY_RUNTIME_RECEIPT_ENV, QualityRuntimeReceipt};
+#[cfg(any(unix, test))]
 use crate::process_command::{command_program_name_matches, command_tokens};
 use crate::process_inspection::process_is_alive as process_exists;
 use crate::sustained_quality::{normalize_sustained_target, sustained_target_identity};
@@ -1156,6 +1157,7 @@ fn process_command(pid: u32) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[cfg(any(unix, test))]
 fn command_matches_worker(command: &str) -> bool {
     let args = command_tokens(command);
     args.first()

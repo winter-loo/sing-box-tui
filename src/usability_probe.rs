@@ -40,6 +40,7 @@ const MIN_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BACKGROUND_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_RESULT_TTL: Duration = Duration::from_secs(1);
 const MAX_RESULT_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+#[cfg(unix)]
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy)]

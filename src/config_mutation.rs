@@ -475,11 +475,6 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to flush directory {}", parent.display()))
 }
 
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
