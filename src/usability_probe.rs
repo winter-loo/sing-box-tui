@@ -656,7 +656,22 @@ fn run_program_probe(
             Err(RecvTimeoutError::Disconnected) => stdout_closed = true,
         }
     }
-    let status = child.wait();
+    // Protocol EOF and process exit are independent: a probe may close stdout and keep serving
+    // application traffic. Keep polling instead of blocking in `wait` so TUI shutdown can still
+    // cancel that child after the JSON Lines reader has disconnected.
+    let status = loop {
+        if cancellation.load(Ordering::Relaxed) {
+            if fatal_error.is_none() {
+                fatal_error = Some("usability probe was cancelled".to_string());
+            }
+            let _ = child.kill();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => break Err(error),
+        }
+    };
     let _ = stdout_worker.join();
     let stderr = stderr_worker.join().unwrap_or_default();
     if fatal_error.is_none() {
@@ -1318,6 +1333,55 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_remains_active_after_executable_closes_stdout() {
+        let directory = temp_dir("cancel-after-stdout-eof");
+        let ready = directory.join("stdout-closed");
+        let manifest = UsabilityProbeManifest {
+            id: NodeViewId::new("stdout-eof").unwrap(),
+            label: "Stdout EOF".to_string(),
+            ranking_policy: RankingPolicy::Balanced,
+            source: UsabilityProbeSource::Executable {
+                executable: compile_program_fixture(&directory),
+                args: vec!["--close-stdout".to_string(), ready.display().to_string()],
+            },
+            source_path: directory.join("stdout-eof.json"),
+        };
+        let client = AsyncClient::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let mut job = spawn_usability_probe_job(
+            manifest,
+            vec!["node-a".to_string()],
+            "http://127.0.0.1:1".to_string(),
+            client,
+        )
+        .expect("spawn stdout EOF fixture");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "fixture must close stdout before cancellation"
+        );
+
+        let (joined_sender, joined_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            job.cancel();
+            job.join();
+            let _ = joined_sender.send(());
+        });
+        assert!(
+            joined_receiver.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "cancellation must still terminate a child after protocol EOF"
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
     #[test]
     fn executable_output_is_single_line_printable_before_presentation() {
         let directory = temp_dir("program-controls");
@@ -1620,6 +1684,19 @@ mod tests {
             r##"
                 fn main() {
                     let args = std::env::args().collect::<Vec<_>>();
+                    #[cfg(unix)]
+                    if args.get(1).map(String::as_str) == Some("--close-stdout") {
+                        use std::io::Write;
+                        unsafe extern "C" {
+                            fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+                        }
+                        println!("{}", r#"{"type":"summary","complete":true}"#);
+                        std::io::stdout().flush().unwrap();
+                        unsafe { close(1); }
+                        std::fs::write(&args[2], "ready").unwrap();
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
                     if args.get(1).map(String::as_str) == Some("--flood") {
                         if args.len() != 3 {
                             std::process::exit(8);
