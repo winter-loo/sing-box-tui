@@ -1720,7 +1720,12 @@ impl BenchmarkStore {
                 r#"
                 SELECT id, completed_at_ms, status, diagnostic
                 FROM usability_probe_runs
-                WHERE criterion_id = ?1 AND selector = ?2 AND completed_at_ms IS NOT NULL
+                WHERE criterion_id = ?1
+                  AND selector = ?2
+                  AND completed_at_ms IS NOT NULL
+                  AND generation = (
+                    SELECT generation FROM node_quality_state WHERE singleton = 1
+                  )
                 ORDER BY completed_at_ms DESC, id DESC LIMIT 1
                 "#,
                 params![criterion_id, selector],
@@ -1736,7 +1741,20 @@ impl BenchmarkStore {
             .optional()
             .context("failed to query latest usability-probe attempt")?;
         let Some((run_id, completed_at_ms, expires_at_ms, summary)) = run else {
-            return Ok(None);
+            let Some(latest_attempt) = latest_attempt else {
+                return Ok(None);
+            };
+            // A failed first attempt has no published result rows, but it is still terminal audit
+            // evidence. Return an empty projection so the UI can show its bounded diagnostic
+            // without making any node eligible for automatic selection.
+            return Ok(Some(StoredUsabilityProbeRun {
+                run_id: latest_attempt.run_id,
+                completed_at_ms: latest_attempt.completed_at_ms,
+                expires_at_ms: None,
+                summary: None,
+                results: Vec::new(),
+                latest_attempt: Some(latest_attempt),
+            }));
         };
         let allowed = selector_members.iter().collect::<BTreeSet<_>>();
         let mut statement = connection
@@ -5031,6 +5049,42 @@ mod tests {
         assert_eq!(failure.run_id, failed_run);
         assert!(!failure.complete);
         assert_eq!(failure.diagnostic.as_deref(), Some("authentication failed"));
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn first_failed_custom_attempt_is_returned_without_publishing_results() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a"]);
+        let (failed_run, generation) = store
+            .begin_usability_probe_run("agy", "select", store.quality_generation())
+            .expect("begin failed run")
+            .expect("quality generation current");
+        assert!(
+            !store
+                .finish_usability_probe_run(
+                    failed_run,
+                    generation,
+                    false,
+                    None,
+                    Some("authentication failed"),
+                    &[],
+                )
+                .expect("finalize failed run")
+        );
+
+        let state = store
+            .latest_usability_probe_run("agy", "select", &["node-a".to_string()])
+            .expect("read failed-only state")
+            .expect("terminal failure remains inspectable");
+        assert_eq!(state.run_id, failed_run);
+        assert!(state.results.is_empty());
+        let attempt = state.latest_attempt.expect("latest attempt is attached");
+        assert!(!attempt.complete);
+        assert_eq!(attempt.diagnostic.as_deref(), Some("authentication failed"));
 
         drop(store);
         remove_test_db(&path);
