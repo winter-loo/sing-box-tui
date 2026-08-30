@@ -27,7 +27,7 @@ pub(crate) struct LatencyChartState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UsabilityCriterionDetail {
     pub(crate) label: String,
-    pub(crate) usable: bool,
+    pub(crate) usable: Option<bool>,
     pub(crate) detail: Option<String>,
     pub(crate) expired: bool,
     pub(crate) latest_failure: Option<String>,
@@ -148,25 +148,23 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
             }
         }
         for criterion in &chart.usability_details {
-            lines.push(Line::from(format!(
-                "{} criterion: {}{}",
-                criterion.label,
-                if criterion.usable {
-                    "usable"
-                } else {
-                    "rejected"
-                },
-                criterion
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(" ({})", truncate_for_width(detail, 56)))
-                    .unwrap_or_default()
-            )));
-            if criterion.expired {
+            if let Some(usable) = criterion.usable {
                 lines.push(Line::from(format!(
-                    "{} criterion result: expired (excluded from candidates)",
-                    criterion.label
+                    "{} criterion: {}{}",
+                    criterion.label,
+                    if usable { "usable" } else { "rejected" },
+                    criterion
+                        .detail
+                        .as_deref()
+                        .map(|detail| format!(" ({})", truncate_for_width(detail, 56)))
+                        .unwrap_or_default()
                 )));
+                if criterion.expired {
+                    lines.push(Line::from(format!(
+                        "{} criterion result: expired (excluded from candidates)",
+                        criterion.label
+                    )));
+                }
             }
             if let Some(failure) = &criterion.latest_failure {
                 lines.push(Line::from(format!(

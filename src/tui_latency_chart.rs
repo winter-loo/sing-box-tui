@@ -9,6 +9,36 @@ use super::view::{
 use super::{App, LATENCY_CHART_DEFAULT_WINDOW, LATENCY_CHART_REFRESH_INTERVAL};
 
 impl App {
+    fn usability_criterion_details(
+        &self,
+        selector: &str,
+        node: &str,
+        selector_members: &[String],
+    ) -> Vec<UsabilityCriterionDetail> {
+        self.usability_probe_manifests
+            .iter()
+            .filter_map(|manifest| {
+                self.custom_usability_run(&manifest.id, selector, selector_members)
+                    .and_then(|run| {
+                        let expired = self.custom_usability_run_is_expired(&run);
+                        let latest_failure = self.custom_usability_latest_failure(&run);
+                        let result = run.results.into_iter().find(|result| result.node == node);
+                        // WHY: a failed attempt is criterion-level audit evidence. Preserve it in
+                        // node detail even when no complete run has ever published a node result.
+                        (result.is_some() || latest_failure.is_some()).then(|| {
+                            UsabilityCriterionDetail {
+                                label: manifest.label.clone(),
+                                usable: result.as_ref().map(|result| result.usable),
+                                detail: result.and_then(|result| result.detail),
+                                expired,
+                                latest_failure,
+                            }
+                        })
+                    })
+            })
+            .collect()
+    }
+
     pub(super) fn open_latency_chart(&mut self) -> Result<()> {
         if self.showing_intranet_details() {
             self.set_status_only("Latency history is available for Internet Proxy nodes only");
@@ -49,27 +79,8 @@ impl App {
             .selected_member_panel_group()
             .map(|group| group.members.clone())
             .unwrap_or_default();
-        let usability_details = self
-            .usability_probe_manifests
-            .iter()
-            .filter_map(|manifest| {
-                self.custom_usability_run(&manifest.id, &group_name, &selector_members)
-                    .and_then(|run| {
-                        let expired = self.custom_usability_run_is_expired(&run);
-                        let latest_failure = self.custom_usability_latest_failure(&run);
-                        run.results
-                            .into_iter()
-                            .find(|result| result.node == node)
-                            .map(|result| UsabilityCriterionDetail {
-                                label: manifest.label.clone(),
-                                usable: result.usable,
-                                detail: result.detail,
-                                expired,
-                                latest_failure,
-                            })
-                    })
-            })
-            .collect::<Vec<_>>();
+        let usability_details =
+            self.usability_criterion_details(&group_name, &node, &selector_members);
         if samples.iter().all(|sample| sample.delay_ms.is_none())
             && reachability_assessment.is_none()
             && sustained_quality.is_none()
@@ -149,27 +160,8 @@ impl App {
             .find(|group| group.name == selector)
             .map(|group| group.members.clone())
             .unwrap_or_default();
-        let usability_details = self
-            .usability_probe_manifests
-            .iter()
-            .filter_map(|manifest| {
-                self.custom_usability_run(&manifest.id, &selector, &selector_members)
-                    .and_then(|run| {
-                        let expired = self.custom_usability_run_is_expired(&run);
-                        let latest_failure = self.custom_usability_latest_failure(&run);
-                        run.results
-                            .into_iter()
-                            .find(|result| result.node == node)
-                            .map(|result| UsabilityCriterionDetail {
-                                label: manifest.label.clone(),
-                                usable: result.usable,
-                                detail: result.detail,
-                                expired,
-                                latest_failure,
-                            })
-                    })
-            })
-            .collect::<Vec<_>>();
+        let usability_details =
+            self.usability_criterion_details(&selector, &node, &selector_members);
         let Some(samples) = self
             .benchmark_workflow
             .node_latency_history(&selector, &node, 200)?
@@ -214,8 +206,8 @@ mod tests {
     use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::storage::{
-        BenchmarkRecord, BenchmarkStore, NodeLatencySample, StoredUsabilityProbeRun,
-        UsabilityProbeFactRecord,
+        BenchmarkRecord, BenchmarkStore, NodeLatencySample, StoredUsabilityProbeAttempt,
+        StoredUsabilityProbeRun, UsabilityProbeFactRecord,
     };
     use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 
@@ -330,12 +322,58 @@ mod tests {
             .and_then(|chart| chart.usability_details.first())
             .expect("criterion detail is visible");
         assert_eq!(detail.label, "GitHub Web");
-        assert!(detail.usable);
+        assert_eq!(detail.usable, Some(true));
         assert_eq!(
             detail.detail.as_deref(),
             Some("HTTP 404 is still a valid response")
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_first_attempt_is_visible_in_detail_without_a_node_result() {
+        let mut app = test_app();
+        app.usability_probe_manifests.push(UsabilityProbeManifest {
+            id: NodeViewId::new("agy").unwrap(),
+            label: "Agy".to_string(),
+            ranking_policy: RankingPolicy::Balanced,
+            source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: Duration::from_secs(60),
+            source_path: std::path::PathBuf::from("agy.json"),
+        });
+        app.usability_probe_projection_cache.insert(
+            (NodeViewId::new("agy").unwrap(), "select".to_string()),
+            StoredUsabilityProbeRun {
+                run_id: 14,
+                completed_at_ms: 200,
+                expires_at_ms: None,
+                summary: None,
+                results: Vec::new(),
+                latest_attempt: Some(StoredUsabilityProbeAttempt {
+                    run_id: 14,
+                    completed_at_ms: 200,
+                    complete: false,
+                    diagnostic: Some("authentication failed".to_string()),
+                }),
+            },
+        );
+
+        let details = app.usability_criterion_details(
+            "select",
+            "node-a",
+            &["node-a".to_string(), "node-b".to_string()],
+        );
+
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].label, "Agy");
+        assert_eq!(details[0].usable, None);
+        assert_eq!(
+            details[0].latest_failure.as_deref(),
+            Some("run #14 failed: authentication failed")
+        );
     }
 
     #[test]
@@ -395,7 +433,7 @@ mod tests {
             .and_then(|chart| chart.usability_details.first())
             .expect("rejected fact remains visible");
         assert_eq!(detail.label, "GitHub Web");
-        assert!(!detail.usable);
+        assert_eq!(detail.usable, Some(false));
         assert_eq!(detail.detail.as_deref(), Some("application login failed"));
         let _ = std::fs::remove_file(path);
     }
