@@ -86,3 +86,48 @@ terminal display.
 Invalid manifests are skipped and reported with bounded, actionable diagnostics during startup.
 Press `?`, then select each invalid-manifest row to inspect every reported path and reason. Fix the
 reported files and restart the TUI to rediscover them.
+
+## Agy Gemini example panel
+
+[`examples/usability-probes/agy-gemini.json`](../examples/usability-probes/agy-gemini.json)
+wires the existing Agy adapter into a custom **Agy Gemini** panel. It uses `balanced` network
+ranking and declares no background schedule, so it runs only when the user presses `U`. Copy the
+manifest into the active `usability-probes` directory while keeping its executable path relative
+to `scripts/agy-gemini-node-probe.py`, or update that path for the installed layout. On Unix, make
+the adapter executable if the checkout did not preserve its executable bit.
+
+The adapter's `--tui-jsonl` mode keeps stdout reserved for the progressive protocol. It publishes
+only the node tag, a successful result, and bounded timing; it never publishes the Agy response,
+account, project, prompt, environment, proxy URL, configuration path, or manager diagnostic text.
+Only a zero-exit real `agy --agent gemini --print ...` invocation emits `usable:true`. Authentication
+requirements, non-zero process exits, timeouts, spawn failures, and isolated-runtime failures stop
+the assessment with `complete:false`; they do not manufacture `usable:false` facts. Consequently,
+the TUI preserves the previous complete panel instead of blaming a node for an infrastructure or
+account failure.
+
+Automated coverage uses local fixture manager and Agy executables and redirects all proxy variables
+to an unbound loopback port. It needs no account, quota, or public network access:
+
+```sh
+python3 -m unittest scripts.tests.test_agy_gemini_node_probe
+```
+
+### Optional authenticated manual smoke
+
+This smoke test consumes a real authenticated Agy Gemini request and may use account quota. Run it
+only after confirming the intended account and quota policy. It uses `node-runtime-manager`, so the
+request travels through an isolated probe runtime and does not switch the live selector:
+
+```sh
+./scripts/agy-gemini-node-probe.py \
+  --manager ./target/debug/sing-box-tui \
+  --agy /absolute/path/to/agy \
+  --config /absolute/path/to/config.json \
+  --sing-box /absolute/path/to/sing-box \
+  --limit 1
+```
+
+First run one interactive authenticated `agy --agent gemini` request if the CLI requests login.
+The standalone `--limit 1` command intentionally keeps its human-readable report mode; remove the
+limit and let the TUI launch `--tui-jsonl` only when a complete panel assessment is desired. Review
+the isolated result file, then delete it if its node tags are sensitive in your environment.

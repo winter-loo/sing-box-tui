@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Probe every reachable sing-box node with a real Agy Gemini request."""
 
 from __future__ import annotations
@@ -16,41 +17,65 @@ DEFAULT_PREFILTER_URL = "https://gemini.google.com/"
 DEFAULT_PROMPT = "Reply with exactly: OK"
 
 
+class ProbeInfrastructureError(RuntimeError):
+    """A non-node-attributable failure that makes the whole run incomplete."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class Manager:
     def __init__(self, executable: Path) -> None:
-        self.process = subprocess.Popen(
-            [str(executable), "node-runtime-manager", "--stdio"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-        )
+        try:
+            self.process = subprocess.Popen(
+                [str(executable), "node-runtime-manager", "--stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except OSError as error:
+            raise ProbeInfrastructureError("manager_start_failed") from error
         if self.process.stdin is None or self.process.stdout is None:
-            raise RuntimeError("failed to open node runtime manager pipes")
+            raise ProbeInfrastructureError("manager_pipe_failed")
         self._request_id = 0
 
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._request_id += 1
         request = {"id": self._request_id, "method": method, "params": params}
-        self.process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-        self.process.stdin.flush()
-        line = self.process.stdout.readline()
+        try:
+            self.process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self.process.stdin.flush()
+            line = self.process.stdout.readline()
+        except OSError as error:
+            raise ProbeInfrastructureError("manager_io_failed") from error
         if not line:
-            raise RuntimeError(
-                f"node runtime manager exited unexpectedly ({self.process.poll()})"
-            )
-        response = json.loads(line)
+            raise ProbeInfrastructureError("manager_exited")
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ProbeInfrastructureError("manager_protocol_error") from error
         if response.get("id") != self._request_id:
-            raise RuntimeError("node runtime manager returned an unexpected response id")
+            raise ProbeInfrastructureError("manager_protocol_error")
         if "error" in response:
             error = response["error"]
-            raise RuntimeError(f"{error['code']}: {error['message']}")
-        return response["result"]
+            code = error.get("code", "unknown") if isinstance(error, dict) else "unknown"
+            # Manager messages may mention configuration paths. Preserve only the bounded RPC
+            # code so neither TUI JSONL nor its captured stderr can disclose source config data.
+            raise ProbeInfrastructureError(f"manager_{safe_error_code(code)}")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ProbeInfrastructureError("manager_protocol_error")
+        return result
 
     def close(self) -> None:
-        if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
+        try:
+            if self.process.stdin and not self.process.stdin.closed:
+                self.process.stdin.close()
+        except OSError:
+            self.process.kill()
         try:
             self.process.wait(timeout=15)
         except subprocess.TimeoutExpired:
@@ -80,7 +105,14 @@ def run_agy(
     if model:
         command.extend(["--model", model])
     environment = os.environ.copy()
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
         environment[name] = proxy_url
 
     started = time.monotonic()
@@ -95,30 +127,89 @@ def run_agy(
         diagnostic_text = (completed.stdout + completed.stderr).decode(
             "utf-8", errors="replace"
         )
-        if "Authentication required" in diagnostic_text:
-            return {"usable": False, "error": "agy_authentication_required"}
+        if authentication_required(diagnostic_text):
+            raise ProbeInfrastructureError("agy_authentication_required")
+        if completed.returncode != 0:
+            raise ProbeInfrastructureError("agy_process_failed")
         return {
-            "usable": completed.returncode == 0,
-            "agy_exit_code": completed.returncode,
+            "usable": True,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
     except subprocess.TimeoutExpired as error:
         diagnostic_text = ((error.stdout or b"") + (error.stderr or b"")).decode(
             "utf-8", errors="replace"
         )
-        if "Authentication required" in diagnostic_text:
-            return {"usable": False, "error": "agy_authentication_required"}
-        return {
-            "usable": False,
-            "error": "agy_timeout",
-            "elapsed_ms": round((time.monotonic() - started) * 1000),
-        }
+        if authentication_required(diagnostic_text):
+            raise ProbeInfrastructureError("agy_authentication_required") from error
+        raise ProbeInfrastructureError("agy_timeout") from error
     except OSError as error:
-        return {
-            "usable": False,
-            "error": f"agy_start_failed: {error}",
-            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        raise ProbeInfrastructureError("agy_start_failed") from error
+
+
+def authentication_required(text: str) -> bool:
+    normalized = text.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "authentication required",
+            "not authenticated",
+            "unauthenticated",
+            "login required",
+        )
+    )
+
+
+def safe_error_code(value: Any) -> str:
+    if not isinstance(value, str) or not (1 <= len(value) <= 64):
+        return "unknown"
+    if not all(
+        character.isascii() and (character.isalnum() or character == "_")
+        for character in value
+    ):
+        return "unknown"
+    return value
+
+
+def emit_tui_record(record: dict[str, Any]) -> None:
+    print(json.dumps(record, ensure_ascii=False), flush=True)
+
+
+def emit_incomplete(code: str) -> None:
+    # Keep stdout protocol-safe and stderr non-sensitive. The TUI deliberately preserves the
+    # previous complete run when it receives this terminal record.
+    emit_tui_record(
+        {
+            "type": "summary",
+            "complete": False,
+            "message": f"Agy Gemini probe incomplete ({code})",
         }
+    )
+    print(f"Agy Gemini probe incomplete: {code}", file=sys.stderr, flush=True)
+
+
+def runtime_fields(runtime: dict[str, Any]) -> tuple[str, str, int]:
+    runtime_id = runtime.get("runtime_id")
+    proxy = runtime.get("proxy")
+    proxy_url = proxy.get("http") if isinstance(proxy, dict) else None
+    total_candidates = runtime.get("total_candidates")
+    if (
+        not isinstance(runtime_id, str)
+        or not isinstance(proxy_url, str)
+        or not isinstance(total_candidates, int)
+    ):
+        raise ProbeInfrastructureError("manager_protocol_error")
+    return runtime_id, proxy_url, total_candidates
+
+
+def candidate_node(candidate: dict[str, Any]) -> str | None:
+    end = candidate.get("end")
+    if end is True:
+        return None
+    node = candidate.get("node")
+    tag = node.get("tag") if isinstance(node, dict) else None
+    if end is not False or not isinstance(tag, str):
+        raise ProbeInfrastructureError("manager_protocol_error")
+    return tag
 
 
 def write_results(path: Path, payload: dict[str, Any]) -> None:
@@ -144,6 +235,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
+        "--tui-jsonl",
+        action="store_true",
+        help="publish safe progressive usability records for a TUI executable manifest",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("agy-gemini-node-probe-results.json")
     )
     args = parser.parse_args()
@@ -154,10 +250,15 @@ def main() -> int:
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least one")
 
-    manager = Manager(args.manager)
+    if args.tui_jsonl and args.limit is not None:
+        emit_incomplete("partial_runs_are_not_supported")
+        return 2
+
+    manager: Manager | None = None
     runtime_id: str | None = None
     results: list[dict[str, Any]] = []
     try:
+        manager = Manager(args.manager)
         initialization: dict[str, Any] = {}
         if args.config is not None:
             initialization = {
@@ -166,43 +267,69 @@ def main() -> int:
             }
         manager.call("initialize", initialization)
         runtime = manager.call("create_runtime", {"url": args.url})
-        runtime_id = runtime["runtime_id"]
-        proxy_url = runtime["proxy"]["http"]
-        total_candidates = runtime["total_candidates"]
+        runtime_id, proxy_url, total_candidates = runtime_fields(runtime)
 
         while args.limit is None or len(results) < args.limit:
             candidate = manager.call("next", {"runtime_id": runtime_id})
-            if candidate["end"]:
+            node_tag = candidate_node(candidate)
+            if node_tag is None:
                 runtime_id = None
                 break
-            node = candidate["node"]
             outcome = run_agy(args.agy, proxy_url, args.prompt, args.timeout, args.model)
-            if outcome.get("error") == "agy_authentication_required":
-                raise RuntimeError(
-                    "Agy is not authenticated; run one interactive `agy --agent gemini` "
-                    "request first, then rerun this probe"
-                )
-            result = {**node, **outcome}
+            result = {"tag": node_tag, **outcome}
             results.append(result)
-            write_results(
-                args.output,
-                {"probe": "agy_gemini", "prefilter_url": args.url, "results": results},
-            )
-            state = "USABLE" if result["usable"] else "FAILED"
-            print(f"[{len(results)}/{total_candidates}] {state}  {node['tag']}")
+            if args.tui_jsonl:
+                emit_tui_record(
+                    {
+                        "type": "node_result",
+                        "node": node_tag,
+                        "usable": True,
+                        "detail": f"Agy Gemini command succeeded in {outcome['elapsed_ms']}ms",
+                    }
+                )
+                print(
+                    f"[{len(results)}/{total_candidates}] INCLUDED",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                write_results(
+                    args.output,
+                    {"probe": "agy_gemini", "prefilter_url": args.url, "results": results},
+                )
+                print(f"[{len(results)}/{total_candidates}] USABLE  {node_tag}")
+    except ProbeInfrastructureError as error:
+        if args.tui_jsonl:
+            emit_incomplete(error.code)
+        else:
+            print(f"probe incomplete: {error.code}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
-        print("interrupted", file=sys.stderr)
+        if args.tui_jsonl:
+            emit_incomplete("interrupted")
+        else:
+            print("interrupted", file=sys.stderr)
         return 130
     finally:
-        if runtime_id is not None:
+        if runtime_id is not None and manager is not None:
             try:
                 manager.call("close_runtime", {"runtime_id": runtime_id})
             except (OSError, RuntimeError):
                 pass
-        manager.close()
+        if manager is not None:
+            manager.close()
 
     usable = sum(1 for result in results if result["usable"])
-    print(f"usable: {usable}/{len(results)}; results: {args.output}")
+    if args.tui_jsonl:
+        emit_tui_record(
+            {
+                "type": "summary",
+                "complete": True,
+                "message": f"Agy Gemini command succeeded on {usable} node(s)",
+            }
+        )
+    else:
+        print(f"usable: {usable}/{len(results)}; results: {args.output}")
     return 0
 
 
