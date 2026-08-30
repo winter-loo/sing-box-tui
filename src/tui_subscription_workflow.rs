@@ -328,6 +328,7 @@ mod tests {
             node: "node-old".to_string(),
             last_refresh: std::time::Instant::now(),
             reachability_assessment: None,
+            quick_history: Default::default(),
             sustained_quality: None,
             auto_selection_detail: None,
             usability_details: Vec::new(),

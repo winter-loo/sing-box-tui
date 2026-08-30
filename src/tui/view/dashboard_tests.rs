@@ -215,6 +215,13 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
             ],
             assessment: Some(crate::controller::ReachabilityAssessment::Reachable),
         }),
+        quick_history: crate::storage::NodeQuickHistory {
+            successful_rounds: 3,
+            rounds: 4,
+            warm_median_ms: Some(45),
+            p95_ms: Some(80),
+            cold_start_ms: Some(60),
+        },
         sustained_quality: Some(crate::sustained_quality::NodeSustainedQuality {
             name: "node-a".into(),
             outcome: crate::sustained_quality::SustainedProbeOutcome::Completed(

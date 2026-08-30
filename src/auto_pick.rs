@@ -47,7 +47,8 @@ pub(crate) struct AutoPickConfig {
     pub(crate) timeout_ms: u64,
     pub(crate) request_timeout: f64,
     pub(crate) max_concurrency: usize,
-    /// Backward-compatible chart guide transported to older workers; selection no longer uses it.
+    /// Seconds between scheduled quality assessments; model-version checks prevent old workers
+    /// from interpreting the current scheduling contract with legacy selection semantics.
     pub(crate) interval_secs: u64,
     #[serde(default)]
     pub(crate) scheduled_usability_probes: Vec<ScheduledUsabilityProbeConfig>,
