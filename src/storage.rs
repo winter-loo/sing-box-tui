@@ -154,6 +154,7 @@ pub(crate) struct NodeQualityReadLease {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DatabasePreparation {
     Initialize,
+    MigrateVersion6,
     Current,
 }
 
@@ -256,6 +257,7 @@ impl BenchmarkStore {
         };
         match preparation {
             DatabasePreparation::Initialize => store.initialize()?,
+            DatabasePreparation::MigrateVersion6 => store.migrate_version_6()?,
             DatabasePreparation::Current => {}
         }
         let generation = store.read_quality_generation_unlocked()?;
@@ -374,6 +376,30 @@ impl BenchmarkStore {
         transaction
             .commit()
             .context("failed to commit node-quality schema initialization")
+    }
+
+    fn migrate_version_6(&self) -> Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("failed to begin node-quality schema v6 migration")?;
+        if !version_6_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality schema v6 changed before migration acquired its lock");
+        }
+        // WHY: v6 already owns the append-only quality facts promised by ADR 0001. Dropping the
+        // obsolete single-delay table (and its table-owned indexes) preserves those facts while
+        // making it impossible for current code to recover or rank by the retired model.
+        transaction
+            .execute_batch("DROP TABLE benchmark_results")
+            .context("failed to remove legacy single-delay storage")?;
+        transaction
+            .pragma_update(None, "user_version", NODE_QUALITY_SCHEMA_VERSION)
+            .context("failed to set migrated node-quality schema version")?;
+        if !current_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality schema v6 migration did not produce the current schema");
+        }
+        transaction
+            .commit()
+            .context("failed to commit node-quality schema v6 migration")
     }
 
     pub(crate) fn begin_node_history_reconciliation(
@@ -2071,7 +2097,16 @@ fn prepare_node_quality_database(path: &Path) -> Result<DatabasePreparation> {
                 path.display()
             );
         }
-        legacy_version if legacy_version < NODE_QUALITY_SCHEMA_VERSION => {
+        6 => {
+            if version_6_schema_is_recognized(&connection)? {
+                return Ok(DatabasePreparation::MigrateVersion6);
+            }
+            anyhow::bail!(
+                "refusing to modify unrecognized version 6 database {}",
+                path.display()
+            );
+        }
+        legacy_version if legacy_version < 6 => {
             // WHY: pre-release schemas mixed factual node-quality tables with the obsolete
             // single-delay cache. Rebuilding is the contract boundary that guarantees no caller
             // can silently recover or rank by those legacy values after the migration completes.
@@ -2188,6 +2223,95 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
     Ok(singleton_rows == 1)
 }
 
+fn version_6_schema_is_recognized(connection: &Connection) -> Result<bool> {
+    if user_table_names(connection)?
+        != [
+            "benchmark_results",
+            "node_identities",
+            "node_quality_state",
+            "probe_attempts",
+            "reachability_assessments",
+            "sustained_probe_results",
+            "usability_probe_facts",
+            "usability_probe_results",
+            "usability_probe_runs",
+        ]
+        || !current_table_schemas_are_recognized(connection)?
+        || !table_has_exact_columns(
+            connection,
+            "benchmark_results",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("recorded_at_ms", "INTEGER", true, 0),
+                ("selector", "TEXT", true, 0),
+                ("node", "TEXT", true, 0),
+                ("filter", "TEXT", true, 0),
+                ("delay_ms", "INTEGER", false, 0),
+                ("completed", "INTEGER", true, 0),
+                ("job_kind", "TEXT", true, 0),
+            ],
+        )?
+        || user_index_names(connection)?
+            != [
+                "idx_benchmark_results_recorded_at",
+                "idx_benchmark_results_selector_node_recent",
+                "idx_reachability_assessments_selector_node_recent",
+                "idx_sustained_probe_selector_node_target_recent",
+                "idx_usability_probe_runs_criterion_selector_recent",
+            ]
+        || !index_has_exact_key(
+            connection,
+            "idx_benchmark_results_recorded_at",
+            &[("recorded_at_ms", false)],
+        )?
+        || !index_has_exact_key(
+            connection,
+            "idx_benchmark_results_selector_node_recent",
+            &[
+                ("selector", false),
+                ("node", false),
+                ("recorded_at_ms", true),
+                ("id", true),
+            ],
+        )?
+        || !current_nonlegacy_indexes_are_recognized(connection)?
+        || !current_sql_is_recognized(connection)?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "benchmark_results",
+            &[BENCHMARK_RESULTS_TABLE_SQL],
+        )?
+        || !object_sql_matches(
+            connection,
+            "index",
+            "idx_benchmark_results_recorded_at",
+            &[
+                "CREATE INDEX idx_benchmark_results_recorded_at ON benchmark_results(recorded_at_ms)",
+            ],
+        )?
+        || !object_sql_matches(
+            connection,
+            "index",
+            "idx_benchmark_results_selector_node_recent",
+            &[
+                "CREATE INDEX idx_benchmark_results_selector_node_recent ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC)",
+            ],
+        )?
+        || !user_behavior_objects(connection)?.is_empty()
+        || !probe_foreign_key_is_recognized(connection)?
+        || !usability_probe_foreign_keys_are_recognized(connection)?
+    {
+        return Ok(false);
+    }
+    let singleton_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM node_quality_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(singleton_rows == 1)
+}
+
 fn current_table_schemas_are_recognized(connection: &Connection) -> Result<bool> {
     Ok(table_has_exact_columns(
         connection,
@@ -2281,39 +2405,41 @@ fn current_indexes_are_recognized(connection: &Connection) -> Result<bool> {
             "idx_sustained_probe_selector_node_target_recent",
             "idx_usability_probe_runs_criterion_selector_recent",
         ]
-        && index_has_exact_key(
-            connection,
-            "idx_reachability_assessments_selector_node_recent",
-            &[
-                ("selector", false),
-                ("node", false),
-                ("recorded_at_ms", true),
-                ("id", true),
-            ],
-        )?
-        && index_has_exact_key(
-            connection,
-            "idx_sustained_probe_selector_node_target_recent",
-            &[
-                ("selector", false),
-                ("node_tag", false),
-                ("target_identity", false),
-                ("recorded_at_ms", true),
-                ("id", true),
-            ],
-        )?
-        && index_has_exact_key(
-            connection,
-            "idx_usability_probe_runs_criterion_selector_recent",
-            &[
-                ("criterion_id", false),
-                ("selector", false),
-                ("status", false),
-                ("generation", false),
-                ("completed_at_ms", true),
-                ("id", true),
-            ],
-        )?)
+        && current_nonlegacy_indexes_are_recognized(connection)?)
+}
+
+fn current_nonlegacy_indexes_are_recognized(connection: &Connection) -> Result<bool> {
+    Ok(index_has_exact_key(
+        connection,
+        "idx_reachability_assessments_selector_node_recent",
+        &[
+            ("selector", false),
+            ("node", false),
+            ("recorded_at_ms", true),
+            ("id", true),
+        ],
+    )? && index_has_exact_key(
+        connection,
+        "idx_sustained_probe_selector_node_target_recent",
+        &[
+            ("selector", false),
+            ("node_tag", false),
+            ("target_identity", false),
+            ("recorded_at_ms", true),
+            ("id", true),
+        ],
+    )? && index_has_exact_key(
+        connection,
+        "idx_usability_probe_runs_criterion_selector_recent",
+        &[
+            ("criterion_id", false),
+            ("selector", false),
+            ("status", false),
+            ("generation", false),
+            ("completed_at_ms", true),
+            ("id", true),
+        ],
+    )?)
 }
 
 fn current_sql_is_recognized(connection: &Connection) -> Result<bool> {
@@ -2390,6 +2516,19 @@ const REACHABILITY_ASSESSMENTS_TABLE_SQL: &str = r#"
         selector TEXT NOT NULL,
         node TEXT NOT NULL,
         complete INTEGER NOT NULL
+    )
+"#;
+
+const BENCHMARK_RESULTS_TABLE_SQL: &str = r#"
+    CREATE TABLE benchmark_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at_ms INTEGER NOT NULL,
+        selector TEXT NOT NULL,
+        node TEXT NOT NULL,
+        filter TEXT NOT NULL,
+        delay_ms INTEGER,
+        completed INTEGER NOT NULL,
+        job_kind TEXT NOT NULL
     )
 "#;
 
@@ -3149,6 +3288,137 @@ mod tests {
             drop(store);
             remove_test_db(&path);
         }
+    }
+
+    #[test]
+    fn version_6_migration_removes_only_single_delay_storage() {
+        let path = test_db_path().with_extension("v6.sqlite3");
+        drop(BenchmarkStore::open(&path).expect("create current database fixture"));
+        let connection = rusqlite::Connection::open(&path).expect("open v6 fixture");
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO node_identities (tag, fingerprint) VALUES ('node-a', 'fingerprint-a');
+                UPDATE node_quality_state
+                    SET generation = 7, identities_initialized = 1 WHERE singleton = 1;
+                INSERT INTO reachability_assessments (
+                    id, recorded_at_ms, selector, node, complete
+                ) VALUES (11, 100, 'select', 'node-a', 1);
+                INSERT INTO probe_attempts (
+                    assessment_id, attempt_index, outcome_kind, delay_ms
+                ) VALUES (11, 0, 'reachable', 42);
+                INSERT INTO sustained_probe_results (
+                    id, recorded_at_ms, selector, node_tag, target_identity, outcome_kind,
+                    first_byte_ms, completion_ms, bytes_read
+                ) VALUES (12, 101, 'select', 'node-a', 'target-a', 'completed', 80, 500, 524288);
+                INSERT INTO usability_probe_runs (
+                    id, started_at_ms, completed_at_ms, criterion_id, selector, generation,
+                    status, summary, expires_at_ms
+                ) VALUES (13, 102, 103, 'criterion-a', 'select', 7, 'complete', 'usable', 1000);
+                INSERT INTO usability_probe_facts (
+                    run_id, sequence, node_tag, usable, detail
+                ) VALUES (13, 0, 'node-a', 1, 'fact-a');
+                INSERT INTO usability_probe_results (
+                    run_id, node_tag, usable, detail
+                ) VALUES (13, 'node-a', 1, 'result-a');
+                CREATE TABLE benchmark_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node TEXT NOT NULL,
+                    filter TEXT NOT NULL,
+                    delay_ms INTEGER,
+                    completed INTEGER NOT NULL,
+                    job_kind TEXT NOT NULL
+                );
+                CREATE INDEX idx_benchmark_results_recorded_at
+                    ON benchmark_results(recorded_at_ms);
+                CREATE INDEX idx_benchmark_results_selector_node_recent
+                    ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC);
+                INSERT INTO benchmark_results (
+                    recorded_at_ms, selector, node, filter, delay_ms, completed, job_kind
+                ) VALUES (99, 'select', 'node-a', 'all', 42, 1, 'manual');
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .expect("seed recognized v6 database");
+        drop(connection);
+
+        let store = BenchmarkStore::open(&path).expect("migrate recognized v6 database");
+        assert!(current_schema_is_recognized(&store.connection).unwrap());
+        assert_eq!(store.quality_generation(), 7);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'benchmark_results'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        for table in [
+            "reachability_assessments",
+            "probe_attempts",
+            "sustained_probe_results",
+            "usability_probe_runs",
+            "usability_probe_facts",
+            "usability_probe_results",
+        ] {
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1,
+                "v6 migration must preserve {table}"
+            );
+        }
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn malformed_version_6_schema_is_preserved() {
+        let path = test_db_path().with_extension("malformed-v6.sqlite3");
+        drop(BenchmarkStore::open(&path).expect("create current database fixture"));
+        let connection = rusqlite::Connection::open(&path).expect("open v6 fixture");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE benchmark_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node TEXT NOT NULL,
+                    filter TEXT NOT NULL,
+                    delay_ms INTEGER,
+                    completed INTEGER NOT NULL,
+                    job_kind TEXT NOT NULL
+                );
+                CREATE INDEX idx_benchmark_results_recorded_at
+                    ON benchmark_results(recorded_at_ms);
+                CREATE INDEX idx_benchmark_results_selector_node_recent
+                    ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC);
+                CREATE TRIGGER unexpected_v6_trigger AFTER INSERT ON benchmark_results
+                    BEGIN SELECT 1; END;
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .expect("seed malformed v6 database");
+        drop(connection);
+        let before = std::fs::read(&path).expect("read malformed v6 database");
+
+        let error = BenchmarkStore::open(&path)
+            .err()
+            .expect("malformed v6 database must fail closed");
+
+        assert!(format!("{error:#}").contains("unrecognized version 6"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        remove_test_db(&path);
     }
 
     #[test]

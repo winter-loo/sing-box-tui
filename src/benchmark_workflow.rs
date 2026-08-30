@@ -51,6 +51,11 @@ pub(crate) struct StreamingNodeProjection {
     pub(crate) quick_history: NodeQuickHistory,
 }
 
+pub(crate) enum ActiveQuickProbe<'a> {
+    Pending,
+    Assessment(&'a NodeReachabilityAssessment),
+}
+
 pub(crate) const QUALITY_RUNTIME_RECEIPT_ENV: &str = "SING_BOX_TUI_QUALITY_RUNTIME_RECEIPT";
 
 /// Proof that one observed controller process loaded one exact node-quality generation.
@@ -568,12 +573,25 @@ impl BenchmarkWorkflow {
             .get(&(group.to_string(), node.to_string()))
     }
 
+    #[cfg(test)]
     pub(crate) fn quick_probe_pending(&self, group: &str, node: &str) -> bool {
-        self.jobs.iter().any(|job| {
-            job.group == group
-                && job.nodes.iter().any(|candidate| candidate == node)
-                && !job.current_assessments.contains_key(node)
-        })
+        self.active_quick_probe(group, node).is_some()
+    }
+
+    pub(crate) fn active_quick_probe(
+        &self,
+        group: &str,
+        node: &str,
+    ) -> Option<ActiveQuickProbe<'_>> {
+        self.jobs
+            .iter()
+            .find(|job| job.group == group && job.nodes.iter().any(|candidate| candidate == node))
+            .map(|job| {
+                job.current_assessments
+                    .get(node)
+                    .map(ActiveQuickProbe::Assessment)
+                    .unwrap_or(ActiveQuickProbe::Pending)
+            })
     }
 
     pub(crate) fn sustained_target_identity(&self) -> &str {
@@ -1892,6 +1910,20 @@ impl BenchmarkWorkflow {
             auto_selection_round_id: Some(1),
         });
         cancellation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_active_reachability_assessment_for_test(
+        &mut self,
+        group: &str,
+        assessment: NodeReachabilityAssessment,
+    ) {
+        self.jobs
+            .iter_mut()
+            .find(|job| job.group == group && job.nodes.contains(&assessment.name))
+            .expect("test quick-probe job exists")
+            .current_assessments
+            .insert(assessment.name.clone(), assessment);
     }
 }
 
