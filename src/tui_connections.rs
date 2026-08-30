@@ -45,10 +45,18 @@ impl App {
         self.last_connection_refresh = Instant::now();
         match self.client.fetch_connections() {
             Ok(connections) => {
+                if let Some(scope) = self.active_auto_selection_scope() {
+                    self.active_node_traffic
+                        .observe(scope, Instant::now(), &connections);
+                }
                 self.connections = connections;
                 self.connection_error = None;
             }
-            Err(error) => self.connection_error = Some(error.to_string()),
+            Err(error) => {
+                let detail = error.to_string();
+                self.active_node_traffic.mark_unavailable(detail.clone());
+                self.connection_error = Some(detail);
+            }
         }
     }
 

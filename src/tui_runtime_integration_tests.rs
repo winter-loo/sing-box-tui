@@ -3,6 +3,7 @@ use super::test_support::{
     test_app, test_app_without_private_access, test_bypass_rule_set_path, test_state_path,
 };
 use super::{PrivateAccessMode, PrivateAccessProfileRuntime, PrivateAccessState};
+use crate::automatic_selection::NodeViewId;
 use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState, TuiStateStore};
 use crossterm::event::KeyCode;
 
@@ -132,6 +133,7 @@ fn tui_state_store_round_trips_filter_auto_pick_and_current_nodes() {
     let mut state = TuiRuntimeState {
         benchmark_filter: "美国,香港".to_string(),
         auto_pick_enabled: true,
+        active_node_view: Some(NodeViewId::streaming()),
         bypass_entries: vec!["example.com".to_string(), "10.0.0.0/8".to_string()],
         ..TuiRuntimeState::default()
     };
@@ -184,6 +186,7 @@ fn filter_and_auto_pick_changes_are_saved_to_tui_state() {
 
     app.apply_benchmark_filter("香港".to_string())
         .expect("apply filter");
+    app.move_node_view_next();
     app.handle_key(KeyCode::Char('a'))
         .expect("toggle auto-pick");
 
@@ -191,6 +194,7 @@ fn filter_and_auto_pick_changes_are_saved_to_tui_state() {
     assert_eq!(state.benchmark_filter, "香港");
     assert!(state.auto_pick_enabled);
     assert_eq!(state.auto_pick_selector.as_deref(), Some("select"));
+    assert_eq!(state.active_node_view, Some(NodeViewId::streaming()));
     assert_eq!(
         state.current_selected_nodes.get("select"),
         Some(&"node-a".to_string())

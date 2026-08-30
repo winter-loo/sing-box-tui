@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::atomic_file::write_atomic;
+use crate::automatic_selection::NodeViewId;
 use crate::config::RouteAutoDetectInterfaceState;
 use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
 use crate::node_quality_path::{canonical_config_target, canonical_file_target};
@@ -57,6 +58,8 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) auto_pick_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_pick_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_node_view: Option<NodeViewId>,
     #[serde(default)]
     pub(crate) current_selected_nodes: BTreeMap<String, String>,
     #[serde(default)]

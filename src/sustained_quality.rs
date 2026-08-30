@@ -150,6 +150,10 @@ pub(crate) fn validate_sustained_target(value: &str) -> Result<()> {
     ValidatedSustainedTarget::parse(value).map(|_| ())
 }
 
+pub(crate) fn normalize_sustained_target(value: &str) -> Result<String> {
+    ValidatedSustainedTarget::parse(value).map(|target| target.url)
+}
+
 /// Stable, non-reversible partition key for facts produced by one account-free target.
 pub(crate) fn sustained_target_identity(value: &str) -> Result<String> {
     let target = ValidatedSustainedTarget::parse(value)?;

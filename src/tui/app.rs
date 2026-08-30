@@ -21,6 +21,10 @@ use crate::auto_pick::{
     BACKGROUND_TASK_KIND, BackgroundAutoPickManager, background_task_log_path,
     background_task_state_path, registered_status_value, stop_registered_worker,
 };
+use crate::automatic_selection::{
+    ActiveNodeTrafficTracker, AutoSelectionExplanation, AutomaticSelectionState, NodeViewId,
+    RankingPolicy,
+};
 use crate::benchmark_workflow::{
     BenchmarkWorkflow, QUALITY_RUNTIME_RECEIPT_ENV, QualityRuntimeReceipt,
 };
@@ -390,9 +394,14 @@ struct App {
     bypass_entries: Vec<String>,
     auto_select_enabled: bool,
     auto_select_selector: Option<String>,
+    auto_select_node_view: NodeViewId,
+    auto_select_ranking_policy: RankingPolicy,
     auto_select_threshold_ms: u64,
     auto_select_interval: Duration,
     last_auto_select_benchmark: Option<Instant>,
+    automatic_selection_state: AutomaticSelectionState,
+    active_node_traffic: ActiveNodeTrafficTracker,
+    last_auto_selection_explanation: Option<AutoSelectionExplanation>,
     background_started_at_unix: u64,
     background_auto_pick: BackgroundAutoPickManager,
     state_store: Option<TuiStateStore>,
@@ -571,9 +580,14 @@ impl App {
             bypass_entries: Vec::new(),
             auto_select_enabled: false,
             auto_select_selector: None,
+            auto_select_node_view: NodeViewId::current_selector(),
+            auto_select_ranking_policy: RankingPolicy::Balanced,
             auto_select_threshold_ms: AUTO_SELECT_THRESHOLD_MS,
             auto_select_interval: AUTO_SELECT_INTERVAL,
             last_auto_select_benchmark: None,
+            automatic_selection_state: AutomaticSelectionState::default(),
+            active_node_traffic: ActiveNodeTrafficTracker::default(),
+            last_auto_selection_explanation: None,
             background_started_at_unix: current_unix_timestamp(),
             background_auto_pick: Default::default(),
             state_store: Some(state_store),

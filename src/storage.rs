@@ -62,6 +62,13 @@ pub(crate) struct NodeQuickHistory {
     pub(crate) cold_start_ms: Option<u64>,
 }
 
+pub(crate) struct PersistedNodeQualityProjection {
+    pub(crate) reachability_assessments: Vec<(String, NodeReachabilityAssessment)>,
+    pub(crate) sustained_quality: Vec<(String, NodeSustainedQuality)>,
+    pub(crate) quick_history: BTreeMap<(String, String), NodeQuickHistory>,
+    pub(crate) sustained_stats: BTreeMap<(String, String), SustainedSuccessStats>,
+}
+
 #[derive(Default)]
 struct SustainedStorageValues<'a> {
     first_byte_ms: Option<i64>,
@@ -86,6 +93,7 @@ pub(crate) struct BenchmarkStore {
     database_path: PathBuf,
     last_prune_at_ms: Cell<i64>,
     quality_generation: Cell<i64>,
+    observed_data_version: Cell<u64>,
 }
 
 pub(crate) struct NodeHistoryReconciliationTransaction<'store> {
@@ -199,11 +207,30 @@ impl BenchmarkStore {
             database_path,
             last_prune_at_ms: Cell::new(current_timestamp_ms()?),
             quality_generation: Cell::new(0),
+            observed_data_version: Cell::new(0),
         };
         store.initialize()?;
         let generation = store.read_quality_generation_unlocked()?;
         store.quality_generation.set(generation as i64);
+        store.observed_data_version.set(store.read_data_version()?);
         Ok(store)
+    }
+
+    fn read_data_version(&self) -> Result<u64> {
+        let version: i64 = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .context("failed to read node-quality SQLite data version")?;
+        u64::try_from(version).context("node-quality SQLite data version is negative")
+    }
+
+    pub(crate) fn changed_data_version(&self) -> Result<Option<u64>> {
+        let current = self.read_data_version()?;
+        Ok((current != self.observed_data_version.get()).then_some(current))
+    }
+
+    pub(crate) fn mark_data_version_observed(&self, observed: u64) {
+        self.observed_data_version.set(observed);
     }
 
     fn initialize(&self) -> Result<()> {
@@ -455,6 +482,69 @@ impl BenchmarkStore {
         }))
     }
 
+    pub(crate) fn validate_quality_read_lease(&self, lease: &NodeQualityReadLease) -> Result<()> {
+        // Generation alone is not globally unique: bind both the canonical database identity and
+        // generation so a lease cannot authorize facts after reconciliation or from another store.
+        if lease.database_path.as_ref() != Some(&self.database_path)
+            || lease.generation != self.quality_generation()
+        {
+            anyhow::bail!("node-quality read lease does not match this store generation");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn node_quality_projection_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        target_identity: &str,
+        history_limit: usize,
+    ) -> Result<PersistedNodeQualityProjection> {
+        self.validate_quality_read_lease(lease)?;
+        // The filesystem lease freezes identity/generation, while this SQLite read transaction
+        // freezes ordinary fact writes across every query. Without both, foreground could combine
+        // reachability from one background commit with sustained/history rows from another.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .context("failed to begin node-quality projection read transaction")?;
+        let reachability_assessments = self.latest_reachability_assessments_while_locked()?;
+        let sustained_quality = self.latest_sustained_quality_while_locked(target_identity)?;
+        let keys = reachability_assessments
+            .iter()
+            .map(|(selector, assessment)| (selector.clone(), assessment.name.clone()))
+            .chain(
+                sustained_quality
+                    .iter()
+                    .map(|(selector, quality)| (selector.clone(), quality.name.clone())),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut quick_history = BTreeMap::new();
+        let mut sustained_stats = BTreeMap::new();
+        for (selector, node) in keys {
+            quick_history.insert(
+                (selector.clone(), node.clone()),
+                self.node_quick_history_while_locked(&selector, &node, history_limit)?,
+            );
+            sustained_stats.insert(
+                (selector.clone(), node.clone()),
+                self.sustained_success_stats_while_locked(
+                    &selector,
+                    &node,
+                    target_identity,
+                    history_limit,
+                )?,
+            );
+        }
+        transaction
+            .commit()
+            .context("failed to finish node-quality projection read transaction")?;
+        Ok(PersistedNodeQualityProjection {
+            reachability_assessments,
+            sustained_quality,
+            quick_history,
+            sustained_stats,
+        })
+    }
+
     /// Keeps only tags bound to this store's generation while the caller holds its read lease.
     ///
     /// The pre-spawn membership check is deliberately performed under the same cross-process
@@ -465,11 +555,7 @@ impl BenchmarkStore {
         lease: &NodeQualityReadLease,
         tags: &mut Vec<String>,
     ) -> Result<()> {
-        if lease.database_path.as_ref() != Some(&self.database_path)
-            || lease.generation != self.quality_generation()
-        {
-            anyhow::bail!("node-quality read lease does not match this store generation");
-        }
+        self.validate_quality_read_lease(lease)?;
         let mut statement = self
             .connection
             .prepare("SELECT tag FROM node_identities")
@@ -573,6 +659,12 @@ impl BenchmarkStore {
         if !self.quality_session_current_while_locked()? {
             return Ok(Vec::new());
         }
+        self.latest_reachability_assessments_while_locked()
+    }
+
+    fn latest_reachability_assessments_while_locked(
+        &self,
+    ) -> Result<Vec<(String, NodeReachabilityAssessment)>> {
         let mut statement = self
             .connection
             .prepare(
@@ -787,6 +879,13 @@ impl BenchmarkStore {
         if !self.quality_session_current_while_locked()? {
             return Ok(Vec::new());
         }
+        self.latest_sustained_quality_while_locked(target_identity)
+    }
+
+    fn latest_sustained_quality_while_locked(
+        &self,
+        target_identity: &str,
+    ) -> Result<Vec<(String, NodeSustainedQuality)>> {
         let mut statement = self
             .connection
             .prepare(

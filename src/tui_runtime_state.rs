@@ -5,7 +5,7 @@ use anyhow::Result;
 use super::network_mode::apply_internet_tun_persistence;
 use super::private_access_workflow::private_access_process_exists;
 use super::settings::normalize_optional_setting;
-use super::view::{LeftPaneSection, truncate_for_width};
+use super::view::{LeftPaneSection, NodeViewPanel, truncate_for_width};
 use super::{App, REFRESH_DEBOUNCE, process_exists};
 use crate::config::{
     TailscaleConfigOptions, config_has_china_ip_routing, inspect_tailscale_config,
@@ -87,6 +87,12 @@ impl App {
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.auto_select_selector = state.auto_pick_selector;
+        let active_node_view = state.active_node_view.unwrap_or_default();
+        self.node_view_panel = NodeViewPanel::from_id(&active_node_view);
+        // Preserve an unknown stable ID even though #17 can only render built-in panels. This
+        // lets a #18 manifest own that ID later; this version fails its projection closed.
+        self.auto_select_node_view = active_node_view;
+        self.auto_select_ranking_policy = self.node_view_panel.ranking_policy();
         self.bypass_entries = state.bypass_entries;
         if let Some(value) = state.benchmark_url.filter(|value| !value.trim().is_empty()) {
             self.benchmark_url = value;
@@ -143,6 +149,11 @@ impl App {
             self.tailscale_hostname = value;
         }
         self.last_auto_select_benchmark = None;
+        // Confirmation and traffic windows are observational process state. Restoring either
+        // would turn pre-restart evidence into a false consecutive round or a false idle window.
+        self.automatic_selection_state = Default::default();
+        self.active_node_traffic = Default::default();
+        self.last_auto_selection_explanation = None;
         if let Some(group) = self.selected_group()
             && let Some(node) = state.current_selected_nodes.get(&group.name)
         {
@@ -159,6 +170,7 @@ impl App {
             benchmark_filter: self.benchmark_filter.clone(),
             auto_pick_enabled: self.auto_select_enabled,
             auto_pick_selector: self.auto_select_selector.clone(),
+            active_node_view: Some(self.auto_select_node_view.clone()),
             current_selected_nodes: self
                 .groups
                 .iter()

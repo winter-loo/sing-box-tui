@@ -91,7 +91,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "a",
         summary: "Toggle auto-pick",
-        detail: "Enable or disable periodic latency tests and automatic switching for the current filter, or all nodes when the filter is empty.",
+        detail: "Rank the active node-view panel periodically; switch after two complete wins, a same-tier 20% material improvement, and an idle current-node traffic window.",
     },
     HelpBinding {
         key: "i",

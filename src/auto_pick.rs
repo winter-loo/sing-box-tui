@@ -15,25 +15,37 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::{QUALITY_RUNTIME_RECEIPT_ENV, QualityRuntimeReceipt};
-use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};
 use crate::process_command::{command_program_name_matches, command_tokens};
 use crate::process_inspection::process_is_alive as process_exists;
+use crate::sustained_quality::{normalize_sustained_target, sustained_target_identity};
 
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
+pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 2;
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_BACKGROUND_CONTROL_ERROR_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AutoPickConfig {
+    #[serde(default)]
+    pub(crate) auto_selection_model_version: u32,
     pub(crate) enabled: bool,
     pub(crate) selector: Option<String>,
+    #[serde(default)]
+    pub(crate) active_node_view: NodeViewId,
+    #[serde(default)]
+    pub(crate) ranking_policy: RankingPolicy,
     pub(crate) filter: String,
     pub(crate) benchmark_url: String,
+    #[serde(default)]
+    pub(crate) sustained_target_url: String,
     pub(crate) timeout_ms: u64,
     pub(crate) request_timeout: f64,
     pub(crate) max_concurrency: usize,
+    /// Backward-compatible chart guide transported to older workers; selection no longer uses it.
     pub(crate) threshold_ms: u64,
     pub(crate) interval_secs: u64,
 }
@@ -53,40 +65,12 @@ impl AutoPickConfig {
                 now.duration_since(last) >= Duration::from_secs(self.interval_secs)
             })
     }
-
-    pub(crate) fn switch_decision(
-        &self,
-        group: &ProxyGroup,
-        summary: &BenchmarkSummary,
-        parent_switch: Option<(String, String)>,
-    ) -> AutoPickDecision {
-        let target_node = summary.best_success_matching_filter().and_then(|best| {
-            let current = group.current.as_deref();
-            let current_matches_filter =
-                current.is_some_and(|name| matches_filter(name, &summary.pattern));
-            let current_is_acceptable = current_matches_filter
-                && current
-                    .and_then(|name| summary.find_result(name))
-                    .and_then(|result| result.delay)
-                    .is_some_and(|delay| delay <= self.threshold_ms);
-            (!current_is_acceptable && current != Some(best.name.as_str()))
-                .then(|| best.name.clone())
-        });
-        AutoPickDecision {
-            target_node,
-            parent_switch,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AutoPickDecision {
-    pub(crate) target_node: Option<String>,
-    pub(crate) parent_switch: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct BackgroundStatusSnapshot {
+    #[serde(default)]
+    pub(crate) auto_selection_model_version: u32,
     pub(crate) kind: String,
     pub(crate) pid: u32,
     pub(crate) controller: String,
@@ -101,7 +85,17 @@ pub(crate) struct BackgroundStatusSnapshot {
     pub(crate) updated_at_unix: u64,
     pub(crate) auto_pick_enabled: bool,
     pub(crate) auto_pick_selector: Option<String>,
+    #[serde(default)]
+    pub(crate) active_node_view: NodeViewId,
+    #[serde(default)]
+    pub(crate) ranking_policy: RankingPolicy,
     pub(crate) filter: String,
+    #[serde(default)]
+    pub(crate) sustained_target_url: String,
+    #[serde(default)]
+    pub(crate) sustained_target_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_selection_explanation: Option<AutoSelectionExplanation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latency: Option<BackgroundLatencySnapshot>,
 }
@@ -167,6 +161,22 @@ impl HeadlessWorkerRequest {
             ok: true,
             error: None,
             status: Some(snapshot),
+        });
+    }
+
+    pub(crate) fn reject(self, error: impl Into<String>) {
+        let mut error = error.into();
+        if error.len() > MAX_BACKGROUND_CONTROL_ERROR_BYTES {
+            let mut boundary = MAX_BACKGROUND_CONTROL_ERROR_BYTES;
+            while !error.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            error.truncate(boundary);
+        }
+        let _ = self.response.send(BackgroundControlResponse {
+            ok: false,
+            error: Some(error),
+            status: None,
         });
     }
 }
@@ -260,6 +270,8 @@ pub(crate) struct BackgroundLaunchSpec {
     config_path: PathBuf,
     max_concurrency: usize,
     runtime_receipt: QualityRuntimeReceipt,
+    sustained_target_url: String,
+    sustained_target_identity: String,
 }
 
 impl BackgroundLaunchSpec {
@@ -268,20 +280,30 @@ impl BackgroundLaunchSpec {
         config_path: PathBuf,
         max_concurrency: usize,
         runtime_receipt: QualityRuntimeReceipt,
-    ) -> Self {
-        Self {
+        sustained_target_url: &str,
+    ) -> Result<Self> {
+        let sustained_target_url = normalize_sustained_target(sustained_target_url)?;
+        let sustained_target_identity = sustained_target_identity(&sustained_target_url)?;
+        Ok(Self {
             controller: controller.into(),
             config_path,
             max_concurrency,
             runtime_receipt,
-        }
+            sustained_target_url,
+            sustained_target_identity,
+        })
     }
 
     fn matches_snapshot(&self, snapshot: &BackgroundStatusSnapshot) -> bool {
-        snapshot.controller.trim_end_matches('/') == self.controller.trim_end_matches('/')
+        // Capability and target identity must both echo back: otherwise a new selector policy can
+        // silently rank facts from an old target partition in a still-running worker.
+        snapshot.auto_selection_model_version == AUTO_SELECTION_MODEL_VERSION
+            && snapshot.controller.trim_end_matches('/') == self.controller.trim_end_matches('/')
             && snapshot.config_path == self.config_path
             && snapshot.quality_generation == self.runtime_receipt.quality_generation()
             && snapshot.managed_pid == self.runtime_receipt.managed_pid()
+            && snapshot.sustained_target_url == self.sustained_target_url
+            && snapshot.sustained_target_identity == self.sustained_target_identity
     }
 }
 
@@ -309,12 +331,13 @@ impl BackgroundWorkerEnsure {
 #[derive(Clone, Debug)]
 pub(crate) struct BackgroundWorkerUpdate {
     pub(crate) latency: Option<BackgroundLatencySnapshot>,
+    pub(crate) auto_selection_explanation: Option<AutoSelectionExplanation>,
     pub(crate) status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackgroundPollEvent {
-    Update(BackgroundWorkerUpdate),
+    Update(Box<BackgroundWorkerUpdate>),
     Retry(String),
     Exited(String),
     Restarted(BackgroundWorkerEnsure),
@@ -498,10 +521,11 @@ impl BackgroundAutoPickManager {
                                     self.last_status_generation = snapshot.status_generation;
                                     snapshot.worker_status.clone()
                                 });
-                            BackgroundPollEvent::Update(BackgroundWorkerUpdate {
+                            BackgroundPollEvent::Update(Box::new(BackgroundWorkerUpdate {
                                 latency: snapshot.latency,
+                                auto_selection_explanation: snapshot.auto_selection_explanation,
                                 status,
-                            })
+                            }))
                         }
                         BackgroundStatusPollResolution::Retry(error) => {
                             BackgroundPollEvent::Retry(error)
@@ -675,7 +699,7 @@ impl BackgroundAutoPickManager {
                 return Err(error).context("background auto-pick worker did not initialize");
             }
         };
-        send_background_control_request(
+        let applied = send_background_control_request(
             &state.bind_addr,
             &state.token,
             BackgroundWorkerCommand::ApplyConfig {
@@ -687,7 +711,28 @@ impl BackgroundAutoPickManager {
                 "failed to apply initial background auto-pick config{}",
                 background_log_tail_context(&log_path)
             )
-        })?;
+        });
+        let snapshot = match applied {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if read_background_task_state()?.is_some_and(|state| state.pid == pid) {
+                    remove_background_task_state_file();
+                }
+                return Err(error);
+            }
+        };
+        if !launch.matches_snapshot(&snapshot) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if read_background_task_state()?.is_some_and(|state| state.pid == pid) {
+                remove_background_task_state_file();
+            }
+            bail!(
+                "new background worker did not echo the requested auto-selection model and sustained target"
+            );
+        }
         self.runtime = Some(BackgroundWorkerRuntime {
             pid,
             bind_addr: state.bind_addr,
@@ -1190,17 +1235,20 @@ fn wait_for_background_process_to_exit(_pid: u32, _timeout: Duration) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{BenchmarkResult, BenchmarkSummary};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn config() -> AutoPickConfig {
         AutoPickConfig {
+            auto_selection_model_version: AUTO_SELECTION_MODEL_VERSION,
             enabled: true,
             selector: Some("select".to_string()),
+            active_node_view: NodeViewId::current_selector(),
+            ranking_policy: RankingPolicy::Balanced,
             filter: "美国".to_string(),
             benchmark_url: "https://example.test/ping".to_string(),
+            sustained_target_url: "https://speed.example.test/payload?bytes=524288".to_string(),
             timeout_ms: 1_000,
             request_timeout: 2.0,
             max_concurrency: 4,
@@ -1209,40 +1257,9 @@ mod tests {
         }
     }
 
-    fn group(current: &str) -> ProxyGroup {
-        ProxyGroup {
-            name: "select".to_string(),
-            kind: "Selector".to_string(),
-            current: Some(current.to_string()),
-            members: vec!["美国-a".to_string(), "美国-b".to_string()],
-        }
-    }
-
-    fn summary(current_delay: Option<u64>, best_delay: u64) -> BenchmarkSummary {
-        BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("美国-a".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://example.test/ping".to_string(),
-            timeout_ms: 1_000,
-            max_concurrency: 4,
-            results: vec![
-                BenchmarkResult {
-                    name: "美国-a".to_string(),
-                    delay: current_delay,
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "美国-b".to_string(),
-                    delay: Some(best_delay),
-                    completed: true,
-                },
-            ],
-        }
-    }
-
     fn status_snapshot() -> BackgroundStatusSnapshot {
         BackgroundStatusSnapshot {
+            auto_selection_model_version: AUTO_SELECTION_MODEL_VERSION,
             kind: BACKGROUND_TASK_KIND.to_string(),
             pid: 42,
             controller: "http://127.0.0.1:9992".to_string(),
@@ -1256,7 +1273,19 @@ mod tests {
             updated_at_unix: 2,
             auto_pick_enabled: true,
             auto_pick_selector: Some("select".to_string()),
+            active_node_view: NodeViewId::current_selector(),
+            ranking_policy: RankingPolicy::Balanced,
             filter: "香港".to_string(),
+            sustained_target_url: "https://speed.example.test/payload?bytes=524288".to_string(),
+            sustained_target_identity: sustained_target_identity(
+                "https://speed.example.test/payload?bytes=524288",
+            )
+            .expect("test target identity"),
+            auto_selection_explanation: Some(AutoSelectionExplanation {
+                selector: "select".to_string(),
+                panel: NodeViewId::current_selector(),
+                detail: "node-b leads; awaiting confirmation 1/2".to_string(),
+            }),
             latency: None,
         }
     }
@@ -1284,47 +1313,6 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
-    }
-
-    #[test]
-    fn decision_keeps_a_healthy_current_node() {
-        let decision = config().switch_decision(&group("美国-a"), &summary(Some(90), 40), None);
-        assert_eq!(
-            decision,
-            AutoPickDecision {
-                target_node: None,
-                parent_switch: None,
-            }
-        );
-    }
-
-    #[test]
-    fn decision_switches_a_failed_or_slow_current_node() {
-        let slow = config().switch_decision(&group("美国-a"), &summary(Some(700), 40), None);
-        assert_eq!(slow.target_node.as_deref(), Some("美国-b"));
-
-        let failed = config().switch_decision(&group("美国-a"), &summary(None, 40), None);
-        assert_eq!(failed.target_node.as_deref(), Some("美国-b"));
-    }
-
-    #[test]
-    fn decision_switches_a_current_node_outside_the_filter() {
-        let decision = config().switch_decision(&group("日本-a"), &summary(Some(90), 40), None);
-        assert_eq!(decision.target_node.as_deref(), Some("美国-b"));
-    }
-
-    #[test]
-    fn decision_keeps_parent_route_selection_independent_from_node_switch() {
-        let decision = config().switch_decision(
-            &group("美国-a"),
-            &summary(Some(90), 40),
-            Some(("root".to_string(), "select".to_string())),
-        );
-        assert_eq!(decision.target_node, None);
-        assert_eq!(
-            decision.parent_switch,
-            Some(("root".to_string(), "select".to_string()))
-        );
     }
 
     #[test]
@@ -1370,12 +1358,43 @@ mod tests {
             PathBuf::from("config.json"),
             4,
             receipt,
-        );
+            "https://speed.example.test/payload?bytes=524288",
+        )
+        .expect("launch target validates");
         let mut snapshot = status_snapshot();
         snapshot.config_path = PathBuf::from("config.json");
         snapshot.quality_generation = 7;
         snapshot.managed_pid = Some(100);
         assert!(launch.matches_snapshot(&snapshot));
+
+        let mut legacy_value = serde_json::to_value(&snapshot).expect("encode snapshot");
+        let legacy_object = legacy_value.as_object_mut().expect("snapshot is an object");
+        legacy_object.remove("auto_selection_model_version");
+        legacy_object.remove("sustained_target_url");
+        legacy_object.remove("sustained_target_identity");
+        let legacy: BackgroundStatusSnapshot =
+            serde_json::from_value(legacy_value).expect("legacy snapshot decodes");
+        assert_eq!(legacy.auto_selection_model_version, 0);
+        assert!(legacy.sustained_target_url.is_empty());
+        assert!(legacy.sustained_target_identity.is_empty());
+        assert!(
+            !launch.matches_snapshot(&legacy),
+            "a pre-panel-aware worker must be restarted instead of keeping the 600ms policy"
+        );
+
+        snapshot.sustained_target_url =
+            "https://other.example.test/payload?bytes=524288".to_string();
+        snapshot.sustained_target_identity =
+            sustained_target_identity("https://other.example.test/payload?bytes=524288")
+                .expect("other target identity");
+        assert!(
+            !launch.matches_snapshot(&snapshot),
+            "a worker using another sustained target partition must be replaced"
+        );
+        snapshot = status_snapshot();
+        snapshot.config_path = PathBuf::from("config.json");
+        snapshot.quality_generation = 7;
+        snapshot.managed_pid = Some(100);
 
         snapshot.managed_pid = Some(101);
         assert!(
@@ -1478,6 +1497,53 @@ mod tests {
         assert_eq!(snapshot.pid, 42);
         assert_eq!(snapshot.status_generation, 7);
         assert_eq!(snapshot.filter, "香港");
+        assert_eq!(
+            snapshot
+                .auto_selection_explanation
+                .expect("explanation round trips")
+                .detail,
+            "node-b leads; awaiting confirmation 1/2"
+        );
+    }
+
+    #[test]
+    fn headless_control_returns_a_bounded_rejection_instead_of_success_status() {
+        let (addr, requests) = spawn_background_tcp_server("127.0.0.1:0", "secret".to_string())
+            .expect("TCP server starts");
+        let control = HeadlessWorkerControl { requests };
+        let client = thread::spawn(move || {
+            send_background_control_request(
+                &addr.to_string(),
+                "secret",
+                BackgroundWorkerCommand::ApplyConfig { config: config() },
+            )
+            .expect_err("rejected config must not masquerade as applied")
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            if let Some(request) = control.try_request() {
+                break request;
+            }
+            assert!(Instant::now() < deadline, "request timed out");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            request.command,
+            HeadlessWorkerCommand::ApplyConfig(_)
+        ));
+        request.reject("x".repeat(MAX_BACKGROUND_CONTROL_ERROR_BYTES * 4));
+
+        let error = client.join().expect("client joins");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("background worker rejected request"));
+        assert!(
+            rendered.len()
+                <= "background worker rejected request: ".len()
+                    + MAX_BACKGROUND_CONTROL_ERROR_BYTES,
+            "control rejection must remain bounded: {} bytes",
+            rendered.len()
+        );
     }
 
     #[test]

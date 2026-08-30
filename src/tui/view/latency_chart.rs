@@ -19,6 +19,7 @@ pub(crate) struct LatencyChartState {
     pub(crate) last_refresh: Instant,
     pub(crate) reachability_assessment: Option<NodeReachabilityAssessment>,
     pub(crate) sustained_quality: Option<NodeSustainedQuality>,
+    pub(crate) auto_selection_detail: Option<String>,
 }
 
 fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
@@ -71,14 +72,25 @@ fn latency_chart_windowed_samples(
 pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
     let area = centered_rect(90, 20, frame.area());
     frame.render_widget(Clear, area);
-    let [quality_area, area] =
-        if chart.reachability_assessment.is_some() || chart.sustained_quality.is_some() {
-            Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).areas(area)
-        } else {
-            Layout::vertical([Constraint::Length(0), Constraint::Min(8)]).areas(area)
-        };
-    if chart.reachability_assessment.is_some() || chart.sustained_quality.is_some() {
+    let [quality_area, area] = if chart.reachability_assessment.is_some()
+        || chart.sustained_quality.is_some()
+        || chart.auto_selection_detail.is_some()
+    {
+        Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).areas(area)
+    } else {
+        Layout::vertical([Constraint::Length(0), Constraint::Min(8)]).areas(area)
+    };
+    if chart.reachability_assessment.is_some()
+        || chart.sustained_quality.is_some()
+        || chart.auto_selection_detail.is_some()
+    {
         let mut lines = Vec::new();
+        if let Some(detail) = &chart.auto_selection_detail {
+            lines.push(Line::from(format!(
+                "Auto-selection: {}",
+                truncate_for_width(detail, 96)
+            )));
+        }
         if let Some(assessment) = &chart.reachability_assessment {
             lines.push(Line::from(format!(
                 "Assessment: {}",
