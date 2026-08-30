@@ -82,6 +82,12 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) benchmark_max_concurrency: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verify_targets: Option<String>,
+    /// Read-only migration sink for state written before the node-quality model replaced the
+    /// single-delay chart guide.
+    // WHY: keep `deny_unknown_fields` fail-closed for every other key while allowing an existing
+    // user's unrelated selector, proxy, TUN, and Private Access state to survive this upgrade.
+    #[serde(default, rename = "auto_select_threshold_ms", skip_serializing)]
+    pub(crate) legacy_auto_select_threshold_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_select_interval_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,7 +276,9 @@ fn is_ip_entry(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivateAccessProfileState, TuiRuntimeState, resolve_tui_bypass_rule_set_path};
+    use super::{
+        PrivateAccessProfileState, TuiRuntimeState, TuiStateStore, resolve_tui_bypass_rule_set_path,
+    };
     use crate::config::RouteAutoDetectInterfaceState;
     use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
     use std::fs;
@@ -484,6 +492,52 @@ mod tests {
             restored.tun_auto_detect_interface_before_enable,
             Some(RouteAutoDetectInterfaceState::RouteMissing)
         );
+    }
+
+    #[test]
+    fn legacy_auto_select_threshold_is_consumed_without_losing_unrelated_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sing-box-tui-legacy-state-{nonce}.json"));
+        fs::write(
+            &path,
+            r#"{
+              "auto_select_threshold_ms": 600,
+              "auto_pick_enabled": true,
+              "current_selected_nodes": {"select": "node-a"},
+              "system_proxy_enabled": true,
+              "tun_enabled": false,
+              "private_access_profiles": []
+            }"#,
+        )
+        .expect("write legacy state");
+
+        let store = TuiStateStore::new(&path);
+        let state = store.load().expect("load legacy state");
+        assert_eq!(state.legacy_auto_select_threshold_ms, Some(600));
+        assert!(state.auto_pick_enabled);
+        assert_eq!(
+            state
+                .current_selected_nodes
+                .get("select")
+                .map(String::as_str),
+            Some("node-a")
+        );
+        assert_eq!(state.system_proxy_enabled, Some(true));
+        assert_eq!(state.tun_enabled, Some(false));
+
+        store.save(&state).expect("rewrite migrated state");
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read rewritten state"))
+                .expect("parse rewritten state");
+        assert!(rewritten.get("auto_select_threshold_ms").is_none());
+        assert_eq!(rewritten["current_selected_nodes"]["select"], "node-a");
+        assert_eq!(rewritten["system_proxy_enabled"], true);
+        assert_eq!(rewritten["tun_enabled"], false);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

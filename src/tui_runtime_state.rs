@@ -78,6 +78,9 @@ impl App {
     /// launch sing-box once the cached sudo timestamp expires. Running `sudo -v` here re-authorizes
     /// interactively while the terminal is still in its normal (non-raw) mode.
     pub(super) fn apply_runtime_state(&mut self, state: TuiRuntimeState) -> Result<()> {
+        // WHY: reading the legacy value is the explicit migration boundary. It has no meaning in
+        // the node-quality model and `TuiRuntimeState` omits it the next time state is saved.
+        let _ = state.legacy_auto_select_threshold_ms;
         self.private_access
             .apply_state(&state, private_access_process_exists)?;
         if !self.private_access.is_configured() {
@@ -204,6 +207,7 @@ impl App {
             benchmark_request_timeout: Some(self.benchmark_request_timeout),
             benchmark_max_concurrency: Some(self.benchmark_max_concurrency),
             verify_targets: normalize_optional_setting(Some(self.verify_targets.clone())),
+            legacy_auto_select_threshold_ms: None,
             auto_select_interval_secs: Some(self.auto_select_interval.as_secs()),
             system_proxy_server: Some(self.system_proxy.server().to_string()),
             system_proxy_server_override: self.system_proxy.server_is_overridden(),
