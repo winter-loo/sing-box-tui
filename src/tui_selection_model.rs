@@ -6,7 +6,7 @@ use super::view::{
     IntranetDetailSection, IntranetDetailView, LeftPaneSection, NodeViewPanel,
     private_access_detail_view,
 };
-use crate::controller::{BenchmarkSummary, ProxyGroup, matches_filter};
+use crate::controller::{ProxyGroup, matches_filter};
 use crate::defaults::DEFAULT_SELECTOR_TAG;
 use crate::private_access_session::PrivateAccessProfileRuntime;
 
@@ -203,11 +203,6 @@ impl App {
     pub(super) fn selected_member_panel_is_manual_selector(&self) -> bool {
         self.selected_member_panel_group()
             .is_some_and(|group| group.kind.eq_ignore_ascii_case("selector"))
-    }
-
-    pub(super) fn selected_benchmark(&self) -> Option<&BenchmarkSummary> {
-        let group = self.selected_member_panel_group()?;
-        self.benchmark_workflow.summary(&group.name)
     }
 
     pub(super) fn member_matches_filter(&self, member: &str) -> bool {

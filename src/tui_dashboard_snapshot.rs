@@ -64,7 +64,6 @@ impl App {
                 .collect(),
             NodeViewPanel::Custom(_) | NodeViewPanel::CurrentSelector => self.displayed_members(),
         };
-        let selected_benchmark = self.selected_benchmark();
         let candidate_rows = selected_group
             .map(|group| {
                 if self.node_view_panel == NodeViewPanel::Streaming {
@@ -148,8 +147,6 @@ impl App {
                         let assessment = self
                             .benchmark_workflow
                             .reachability_assessment(&group.name, member);
-                        let result =
-                            selected_benchmark.and_then(|summary| summary.find_result(member));
                         let (reachability, marker, tone) = if let Some(assessment) = assessment {
                             let tone = match assessment.assessment {
                                 Some(
@@ -167,19 +164,13 @@ impl App {
                             let (reachability, marker) =
                                 split_reachability_evidence(&assessment.compact_evidence());
                             (reachability, marker, tone)
+                        } else if self
+                            .benchmark_workflow
+                            .quick_probe_pending(&group.name, member)
+                        {
+                            ("-/3".into(), "...".to_string(), CandidateTone::Pending)
                         } else {
-                            match result {
-                                Some(result) if !result.completed => {
-                                    ("-/3".into(), result.display_delay(), CandidateTone::Pending)
-                                }
-                                Some(result) if result.delay.is_some() => {
-                                    ("-/3".into(), result.display_delay(), CandidateTone::Success)
-                                }
-                                Some(result) => {
-                                    ("-/3".into(), result.display_delay(), CandidateTone::Error)
-                                }
-                                None => ("-/3".into(), "-".to_string(), CandidateTone::Missing),
-                            }
+                            ("-/3".into(), "-".to_string(), CandidateTone::Missing)
                         };
                         CandidateRow {
                             name: member.clone(),

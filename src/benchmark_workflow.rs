@@ -15,13 +15,12 @@ use anyhow::{Context, Result};
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
 
-use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
 use crate::automatic_selection::{NodeQualityFacts, ReachabilityTier};
 use crate::config::parse_sing_box_config_text;
 use crate::config_mutation::lock_config_mutation_for;
 use crate::controller::{
-    BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
-    NodeReachabilityAssessment, ProbeOutcome, spawn_reachability_assessment_worker,
+    BenchmarkEvent, BenchmarkRequest, NodeReachabilityAssessment, ProbeOutcome,
+    spawn_reachability_assessment_worker,
 };
 use crate::defaults::SINGLE_NODE_RETEST_DEBOUNCE;
 use crate::node_quality_path::{
@@ -117,7 +116,6 @@ impl<T> ManagedRuntimeObservation<T> {
 pub(crate) struct BenchmarkWorkflow {
     base_url: String,
     client: AsyncClient,
-    summaries: BTreeMap<String, BenchmarkSummary>,
     reachability_assessments: BTreeMap<NodeMetricKey, NodeReachabilityAssessment>,
     sustained_quality: BTreeMap<NodeMetricKey, NodeSustainedQuality>,
     sustained_target_identity: String,
@@ -525,7 +523,6 @@ impl BenchmarkWorkflow {
         Self {
             base_url,
             client,
-            summaries: BTreeMap::new(),
             reachability_assessments,
             sustained_quality,
             sustained_target_identity,
@@ -550,10 +547,6 @@ impl BenchmarkWorkflow {
         }
     }
 
-    pub(crate) fn summary(&self, group: &str) -> Option<&BenchmarkSummary> {
-        self.summaries.get(group)
-    }
-
     pub(crate) fn reachability_assessment(
         &self,
         group: &str,
@@ -573,6 +566,14 @@ impl BenchmarkWorkflow {
         }
         self.sustained_quality
             .get(&(group.to_string(), node.to_string()))
+    }
+
+    pub(crate) fn quick_probe_pending(&self, group: &str, node: &str) -> bool {
+        self.jobs.iter().any(|job| {
+            job.group == group
+                && job.nodes.iter().any(|candidate| candidate == node)
+                && !job.current_assessments.contains_key(node)
+        })
     }
 
     pub(crate) fn sustained_target_identity(&self) -> &str {
@@ -850,7 +851,6 @@ impl BenchmarkWorkflow {
         {
             return BenchmarkStart::Debounced;
         }
-        self.prepare_single_node(&request, &node);
         self.spawn(request, BenchmarkKind::SingleNode { node: node.clone() });
         self.last_single_node = Some((group, node, Instant::now()));
         BenchmarkStart::Started
@@ -1188,14 +1188,6 @@ impl BenchmarkWorkflow {
                                     false
                                 });
                         let best_label = if persisted {
-                            let result = BenchmarkResult {
-                                name: assessment.name.clone(),
-                                delay: assessment_warm_median_ms(&assessment),
-                                completed: assessment.assessment.is_some(),
-                            };
-                            if let Some(summary) = self.summaries.get_mut(&group) {
-                                summary.update_result(result.clone());
-                            }
                             assessment.compact_evidence()
                         } else {
                             self.jobs[index].quality_projection_current = false;
@@ -1424,56 +1416,26 @@ impl BenchmarkWorkflow {
         updates
     }
 
-    pub(crate) fn apply_background_snapshot(
+    pub(crate) fn refresh_background_projection(
         &mut self,
-        latency: &BackgroundLatencySnapshot,
-        active_filter: &str,
+        expected_generation: u64,
     ) -> Result<bool> {
         let generation_matches = self
             .runtime_receipt()
-            .is_some_and(|receipt| receipt.quality_generation == latency.quality_generation);
+            .is_some_and(|receipt| receipt.quality_generation == expected_generation);
         #[cfg(test)]
         let generation_matches = generation_matches
             || (self.allow_unpersisted_quality_for_test
                 && self.store.is_none()
-                && latency.quality_generation == 0);
+                && expected_generation == 0);
         anyhow::ensure!(
             generation_matches,
-            "background node-quality snapshot generation {} is not current",
-            latency.quality_generation
+            "background node-quality notification generation {} is not current",
+            expected_generation
         );
-        if latency.pattern != active_filter
-            || self.jobs.iter().any(|job| {
-                job.group == latency.selector && !matches!(job.kind, BenchmarkKind::AutoSelect)
-            })
-        {
-            return Ok(false);
-        }
-
-        let mut summary = self
-            .summaries
-            .get(&latency.selector)
-            .cloned()
-            .unwrap_or_else(|| BenchmarkSummary::empty(latency.selector.clone()));
-        summary.current = latency.current.clone();
-        summary.pattern = latency.pattern.clone();
-        summary.url = latency.url.clone();
-        summary.timeout_ms = latency.timeout_ms;
-        summary.max_concurrency = latency.max_concurrency;
-        for result in &latency.results {
-            summary.update_result(BenchmarkResult {
-                name: result.name.clone(),
-                delay: result.delay,
-                completed: result.completed,
-            });
-        }
-
-        // The status protocol is only a bounded notification channel, not a second fact store. On
-        // an accepted same-generation snapshot, reload when shared SQLite data_version advances so
-        // foreground panels/details cannot diverge from the worker's persisted evidence.
-        self.reload_persisted_quality_projection(latency.quality_generation)?;
-        self.summaries.insert(latency.selector.clone(), summary);
-        Ok(true)
+        // WHY: the worker status channel is only a generation-scoped wake-up. Node facts stay in
+        // shared SQLite so the foreground cannot fall back to a second, single-delay truth source.
+        self.reload_persisted_quality_projection(expected_generation)
     }
 
     fn reload_persisted_quality_projection(&mut self, expected_generation: u64) -> Result<bool> {
@@ -1540,34 +1502,6 @@ impl BenchmarkWorkflow {
         Ok(true)
     }
 
-    pub(crate) fn background_snapshot(&self, group: &str) -> Option<BackgroundLatencySnapshot> {
-        let quality_generation = match self.runtime_receipt() {
-            Some(receipt) => receipt.quality_generation,
-            #[cfg(test)]
-            None if self.allow_unpersisted_quality_for_test && self.store.is_none() => 0,
-            None => return None,
-        };
-        let summary = self.summaries.get(group)?;
-        Some(BackgroundLatencySnapshot {
-            quality_generation,
-            selector: summary.selector.clone(),
-            current: summary.current.clone(),
-            pattern: summary.pattern.clone(),
-            url: summary.url.clone(),
-            timeout_ms: summary.timeout_ms,
-            max_concurrency: summary.max_concurrency,
-            results: summary
-                .results
-                .iter()
-                .map(|result| BackgroundLatencyResult {
-                    name: result.name.clone(),
-                    delay: result.delay,
-                    completed: result.completed,
-                })
-                .collect(),
-        })
-    }
-
     fn start_group_kind(
         &mut self,
         request: BenchmarkRequest,
@@ -1585,35 +1519,8 @@ impl BenchmarkWorkflow {
         if request.nodes.as_ref().is_none_or(Vec::is_empty) {
             return BenchmarkStart::NoCandidates;
         }
-        self.prepare_group(&request);
         self.spawn(request, kind);
         BenchmarkStart::Started
-    }
-
-    fn prepare_group(&mut self, request: &BenchmarkRequest) {
-        let summary = self
-            .summaries
-            .entry(request.selector.clone())
-            .or_insert_with(|| BenchmarkSummary::empty(request.selector.clone()));
-        summary.selector = request.selector.clone();
-        summary.pattern = request.pattern.clone();
-        summary.url = request.url.clone();
-        summary.timeout_ms = request.timeout_ms;
-        summary.max_concurrency = request.max_concurrency.max(1);
-        summary.reset_pending(request.nodes.clone().unwrap_or_default());
-    }
-
-    fn prepare_single_node(&mut self, request: &BenchmarkRequest, node: &str) {
-        let summary = self
-            .summaries
-            .entry(request.selector.clone())
-            .or_insert_with(|| BenchmarkSummary::empty(request.selector.clone()));
-        summary.selector = request.selector.clone();
-        summary.pattern = request.pattern.clone();
-        summary.url = request.url.clone();
-        summary.timeout_ms = request.timeout_ms;
-        summary.max_concurrency = 1;
-        summary.upsert_pending(node.to_string());
     }
 
     fn spawn(&mut self, request: BenchmarkRequest, kind: BenchmarkKind) {
@@ -1808,7 +1715,6 @@ impl BenchmarkWorkflow {
             let _ = job.worker.join();
         }
         self.jobs.clear();
-        self.summaries.clear();
         self.last_single_node = None;
         self.reachability_assessments = store
             .as_ref()
@@ -1880,11 +1786,6 @@ impl BenchmarkWorkflow {
     pub(crate) fn set_sustained_quality(&mut self, group: &str, result: NodeSustainedQuality) {
         self.sustained_quality
             .insert((group.to_string(), result.name.clone()), result);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_summary(&mut self, summary: BenchmarkSummary) {
-        self.summaries.insert(summary.selector.clone(), summary);
     }
 
     #[cfg(test)]
@@ -2148,7 +2049,6 @@ mod tests {
         events: impl IntoIterator<Item = BenchmarkEvent>,
         keep_open: bool,
     ) -> Option<Sender<BenchmarkEvent>> {
-        workflow.prepare_group(&request);
         let (sender, receiver) = mpsc::channel();
         for event in events {
             sender.send(event).expect("queue benchmark event");
@@ -2740,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_updates_summary_and_reports_typed_completion() {
+    fn poll_publishes_factual_progress_and_typed_completion() {
         let mut workflow = workflow(None);
         queue_job(
             &mut workflow,
@@ -2973,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_run_blocks_background_snapshot_replacement() {
+    fn pending_quick_probe_is_derived_from_the_active_job() {
         let mut workflow = workflow(None);
         let sender = queue_job(
             &mut workflow,
@@ -2984,32 +2884,8 @@ mod tests {
             [],
             true,
         );
-        let snapshot = BackgroundLatencySnapshot {
-            quality_generation: 0,
-            selector: "select".to_string(),
-            current: Some("node-a".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 4,
-            results: vec![BackgroundLatencyResult {
-                name: "node-a".to_string(),
-                delay: Some(88),
-                completed: true,
-            }],
-        };
-
-        assert!(
-            !workflow
-                .apply_background_snapshot(&snapshot, "美国")
-                .expect("manual foreground job rejects background snapshot")
-        );
-        let result = workflow
-            .summary("select")
-            .and_then(|summary| summary.find_result("node-a"))
-            .expect("pending node");
-        assert!(!result.completed);
-        assert_eq!(result.delay, None);
+        assert!(workflow.quick_probe_pending("select", "node-a"));
+        assert!(!workflow.quick_probe_pending("select", "node-b"));
         drop(sender);
     }
 

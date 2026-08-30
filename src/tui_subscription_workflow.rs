@@ -227,7 +227,7 @@ mod tests {
 
     use super::super::NodeQualityDetailState;
     use super::{SubscriptionRefreshEvent, SubscriptionRefreshJob, SubscriptionRefreshState};
-    use crate::controller::{BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome};
+    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome};
     use crate::storage::{BenchmarkStore, StoredUsabilityProbeRun};
     use crate::subscriptions::{SubscriptionRefreshOutput, SubscriptionRefreshRequest};
 
@@ -309,8 +309,6 @@ mod tests {
                 latest_attempt: None,
             },
         );
-        app.benchmark_workflow
-            .set_summary(BenchmarkSummary::empty("select".to_string()));
         app.benchmark_workflow.set_reachability_assessment(
             "select",
             NodeReachabilityAssessment::from_attempts(
@@ -343,7 +341,6 @@ mod tests {
         assert!(!app.benchmark_workflow.quality_persistence_enabled());
         assert!(cancellation.load(Ordering::Relaxed));
         assert!(app.benchmark_workflow.active_nodes("select").is_none());
-        assert!(app.benchmark_workflow.summary("select").is_none());
         assert!(
             app.benchmark_workflow
                 .reachability_assessment("select", "node-old")

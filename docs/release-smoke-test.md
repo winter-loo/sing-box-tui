@@ -94,8 +94,9 @@ not selectable.
 2. Enable automatic selection with `a` on a panel that has a materially better eligible candidate.
 3. Allow two complete assessment rounds. Confirm the status explains that switching is deferred
    because of active current-node transfer and that the selector remains unchanged.
-4. Stop the transfer, wait for a fresh idle traffic window, and disable automatic selection. This
-   smoke does not require allowing the deferred switch to occur.
+4. Disable automatic selection **before** stopping the transfer, then stop the transfer and wait
+   for a fresh idle traffic window. This smoke does not authorize the deferred candidate to switch
+   after active-transfer protection is released.
 
 Pass evidence: two-round candidate evidence, an explicit active-transfer deferral explanation, and
 an unchanged selector while bytes are growing.

@@ -5,10 +5,9 @@ use anyhow::{Context, Result};
 
 use super::{App, current_unix_timestamp};
 use crate::auto_pick::{
-    AUTO_SELECTION_MODEL_VERSION, AutoPickConfig, BACKGROUND_TASK_KIND, BackgroundLatencySnapshot,
-    BackgroundLaunchSpec, BackgroundPollEvent, BackgroundStatusSnapshot, BackgroundWorkerEnsure,
-    HeadlessWorkerCommand, HeadlessWorkerControl, HeadlessWorkerMetadata,
-    ScheduledUsabilityProbeConfig,
+    AUTO_SELECTION_MODEL_VERSION, AutoPickConfig, BACKGROUND_TASK_KIND, BackgroundLaunchSpec,
+    BackgroundPollEvent, BackgroundStatusSnapshot, BackgroundWorkerEnsure, HeadlessWorkerCommand,
+    HeadlessWorkerControl, HeadlessWorkerMetadata, ScheduledUsabilityProbeConfig,
 };
 use crate::sustained_quality::normalize_sustained_target;
 
@@ -218,7 +217,7 @@ impl App {
         match event {
             BackgroundPollEvent::Update(update) => {
                 let quality_refresh =
-                    self.apply_background_latency_snapshot(update.latency.as_ref());
+                    self.apply_background_quality_notification(update.quality_generation);
                 self.apply_background_auto_selection_explanation(update.auto_selection_explanation);
                 if let Some(status) = update.status {
                     if background_status_requires_selector_refresh(&status) {
@@ -252,16 +251,13 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn apply_background_latency_snapshot(
+    pub(super) fn apply_background_quality_notification(
         &mut self,
-        latency: Option<&BackgroundLatencySnapshot>,
+        quality_generation: u64,
     ) -> Result<bool> {
-        let Some(latency) = latency else {
-            return Ok(false);
-        };
         let applied = self
             .benchmark_workflow
-            .apply_background_snapshot(latency, &self.benchmark_filter)?;
+            .refresh_background_projection(quality_generation)?;
         if applied {
             self.refresh_usability_probe_projection_cache();
             self.sync_selection_to_displayed_members();
@@ -357,14 +353,8 @@ impl App {
                 .sustained_target_identity()
                 .to_string(),
             auto_selection_explanation: self.last_auto_selection_explanation.clone(),
-            latency: self.background_latency_snapshot(),
             scheduled_usability_probes: self.auto_pick_config().scheduled_usability_probes,
         }
-    }
-
-    pub(super) fn background_latency_snapshot(&self) -> Option<BackgroundLatencySnapshot> {
-        let group = self.auto_select_group()?;
-        self.benchmark_workflow.background_snapshot(&group.name)
     }
 
     pub(super) fn run_headless_auto_pick_loop(&mut self) -> Result<()> {

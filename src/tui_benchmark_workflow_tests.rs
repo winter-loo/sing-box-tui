@@ -845,18 +845,13 @@ fn auto_select_uses_single_internet_route_selector_members() {
         app.benchmark_workflow.active_nodes("airtcp"),
         Some(["香港-a".to_string(), "美国-b".to_string()].as_slice())
     );
-    let summary = app
-        .benchmark_workflow
-        .summary("airtcp")
-        .expect("airtcp summary");
-    assert_eq!(summary.selector, "airtcp");
-    assert_eq!(
-        summary
-            .results
-            .iter()
-            .map(|result| result.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["香港-a", "美国-b"]
+    assert!(
+        app.benchmark_workflow
+            .quick_probe_pending("airtcp", "香港-a")
+    );
+    assert!(
+        app.benchmark_workflow
+            .quick_probe_pending("airtcp", "美国-b")
     );
 }
 
