@@ -1,8 +1,9 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -15,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, derive_reachability_assessment};
 use crate::node_quality_path::{
     QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX, node_quality_reserved_paths,
+    usability_probe_lock_path,
 };
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
 
@@ -63,11 +65,25 @@ pub(crate) struct UsabilityProbeFactRecord {
 pub(crate) struct UsabilityProbeRunFinalization<'a> {
     pub(crate) run_id: i64,
     pub(crate) generation: u64,
+    pub(crate) process_lease: &'a UsabilityProbeLockLease,
     pub(crate) complete: bool,
     pub(crate) summary: Option<&'a str>,
     pub(crate) diagnostic: Option<&'a str>,
     pub(crate) facts: &'a [UsabilityProbeFactRecord],
     pub(crate) result_ttl: Option<Duration>,
+}
+
+#[derive(Clone)]
+pub(crate) struct UsabilityProbeLockLease {
+    run_id: i64,
+    database_path: PathBuf,
+    _file: Option<Arc<File>>,
+}
+
+impl UsabilityProbeLockLease {
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +152,18 @@ pub(crate) struct BenchmarkStore {
     last_prune_at_ms: Cell<i64>,
     quality_generation: Cell<i64>,
     observed_data_version: Cell<u64>,
+    active_usability_probe_locks: RefCell<BTreeMap<i64, UsabilityProbeLockLease>>,
+}
+
+struct UsabilityProbeLockRelease<'a> {
+    locks: &'a RefCell<BTreeMap<i64, UsabilityProbeLockLease>>,
+    run_id: i64,
+}
+
+impl Drop for UsabilityProbeLockRelease<'_> {
+    fn drop(&mut self) {
+        self.locks.borrow_mut().remove(&self.run_id);
+    }
 }
 
 pub(crate) struct NodeHistoryReconciliationTransaction<'store> {
@@ -258,6 +286,7 @@ impl BenchmarkStore {
             last_prune_at_ms: Cell::new(current_timestamp_ms()?),
             quality_generation: Cell::new(0),
             observed_data_version: Cell::new(0),
+            active_usability_probe_locks: RefCell::new(BTreeMap::new()),
         };
         match preparation {
             DatabasePreparation::Initialize => store.initialize()?,
@@ -1321,16 +1350,58 @@ impl BenchmarkStore {
         if selector.is_empty() || selector.chars().count() > MAX_USABILITY_SELECTOR_CHARS {
             anyhow::bail!("usability selector must contain 1 to 256 characters");
         }
+        if !self.active_usability_probe_locks.borrow().is_empty() {
+            anyhow::bail!("a custom usability probe is already running in this process");
+        }
+        let process_lock = if self.database_path == Path::new(":memory:") {
+            None
+        } else {
+            let lock_path = usability_probe_lock_path(&self.database_path)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open usability-probe lock {}",
+                        lock_path.display()
+                    )
+                })?;
+            file.try_lock().with_context(|| {
+                format!(
+                    "another foreground or background usability probe is already running for {}",
+                    self.database_path.display()
+                )
+            })?;
+            Some(file)
+        };
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
         if !self.quality_session_current_while_locked()? {
             return Ok(None);
         }
-        // The runtime receipt's generation is checked inside the same immediate transaction that
-        // creates the running row. A stale lease therefore produces no row at all, instead of a
-        // dangling run that would require best-effort compensation after the fact.
+        // The runtime receipt's generation and per-criterion no-overlap rule are checked inside
+        // the same immediate transaction that creates the running row. The database is the only
+        // authority shared by foreground and headless processes, so an in-memory job flag cannot
+        // safely protect paid/application probes from being launched twice.
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .context("failed to begin usability-probe run transaction")?;
+        // WHY: successfully acquiring the OS lock proves no cooperating process still owns a
+        // custom probe. Recover a crash/SIGKILL remnant before inserting the new audit row; unlike
+        // a time lease, this never mistakes a legitimately slow paid probe for a dead owner.
+        transaction
+            .execute(
+                r#"
+                UPDATE usability_probe_runs
+                SET completed_at_ms = ?1, status = 'incomplete',
+                    diagnostic = 'probe owner exited before finalization'
+                WHERE criterion_id = ?2 AND selector = ?3 AND status = 'running'
+                "#,
+                params![current_timestamp_ms()?, criterion_id, selector],
+            )
+            .context("failed to recover an abandoned usability-probe run")?;
         let inserted = transaction
             .execute(
                 r#"
@@ -1360,7 +1431,26 @@ impl BenchmarkStore {
         transaction
             .commit()
             .context("failed to commit usability-probe run start")?;
+        self.active_usability_probe_locks.borrow_mut().insert(
+            run_id,
+            UsabilityProbeLockLease {
+                run_id,
+                database_path: self.database_path.clone(),
+                _file: process_lock.map(Arc::new),
+            },
+        );
         Ok(Some((run_id, expected_generation)))
+    }
+
+    pub(crate) fn usability_probe_lock_lease(
+        &self,
+        run_id: i64,
+    ) -> Result<UsabilityProbeLockLease> {
+        self.active_usability_probe_locks
+            .borrow()
+            .get(&run_id)
+            .cloned()
+            .with_context(|| format!("usability-probe run {run_id} has no active process lease"))
     }
 
     #[cfg(test)]
@@ -1373,9 +1463,11 @@ impl BenchmarkStore {
         diagnostic: Option<&str>,
         facts: &[UsabilityProbeFactRecord],
     ) -> Result<bool> {
+        let process_lease = self.usability_probe_lock_lease(run_id)?;
         self.finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
             run_id,
             generation,
+            process_lease: &process_lease,
             complete: requested_complete,
             summary,
             diagnostic,
@@ -1391,12 +1483,22 @@ impl BenchmarkStore {
         let UsabilityProbeRunFinalization {
             run_id,
             generation,
+            process_lease,
             complete: requested_complete,
             summary,
             diagnostic,
             facts,
             result_ttl,
         } = finalization;
+        if process_lease.run_id != run_id || process_lease.database_path != self.database_path {
+            anyhow::bail!("usability-probe run {run_id} has an invalid process lease");
+        }
+        // Always release the OS lock when finalization returns, including SQLite errors. A later
+        // process can then recover the still-running audit row instead of being blocked forever.
+        let _lock_release = UsabilityProbeLockRelease {
+            locks: &self.active_usability_probe_locks,
+            run_id,
+        };
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
         let generation_current = generation == self.quality_generation()
             && self.quality_session_current_while_locked()?;
@@ -4875,11 +4977,15 @@ mod tests {
             .begin_usability_probe_run("agy", "select", store.quality_generation())
             .expect("begin complete run")
             .expect("quality generation current");
+        let complete_lease = store
+            .usability_probe_lock_lease(complete_run)
+            .expect("clone complete-run lease");
         assert!(
             store
                 .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
                     run_id: complete_run,
                     generation,
+                    process_lease: &complete_lease,
                     complete: true,
                     summary: Some("accepted"),
                     diagnostic: None,
@@ -4892,6 +4998,7 @@ mod tests {
                 },)
                 .expect("publish expiring run")
         );
+        drop(complete_lease);
         let (failed_run, generation) = store
             .begin_usability_probe_run("agy", "select", store.quality_generation())
             .expect("begin failed run")
@@ -4951,6 +5058,142 @@ mod tests {
         assert_eq!(run_count, 0, "a stale lease must not create a running run");
 
         drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn foreground_and_background_stores_cannot_overlap_the_same_custom_probe() {
+        let path = test_db_path();
+        let foreground = BenchmarkStore::open(&path).expect("open foreground store");
+        bind_test_identities(&foreground, &["node-a"]);
+        let background = BenchmarkStore::open(&path).expect("open background store");
+
+        let (run_id, generation) = foreground
+            .begin_usability_probe_run("paid-criterion", "select", foreground.quality_generation())
+            .expect("begin foreground run")
+            .expect("quality generation is current");
+        let overlap = background
+            .begin_usability_probe_run("paid-criterion", "select", background.quality_generation())
+            .expect_err("a second process must not launch the same paid probe");
+        assert!(format!("{overlap:#}").contains("already running"));
+
+        foreground
+            .finish_usability_probe_run(run_id, generation, false, None, Some("cancelled"), &[])
+            .expect("finish foreground run");
+        assert!(
+            background
+                .begin_usability_probe_run(
+                    "paid-criterion",
+                    "select",
+                    background.quality_generation(),
+                )
+                .expect("begin after terminal state")
+                .is_some(),
+            "a terminal attempt must release the per-criterion launch slot"
+        );
+
+        drop(background);
+        drop(foreground);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn abandoned_custom_probe_lock_is_recovered_without_permanent_blocking() {
+        let path = test_db_path();
+        let abandoned_run = {
+            let foreground = BenchmarkStore::open(&path).expect("open foreground store");
+            bind_test_identities(&foreground, &["node-a"]);
+            foreground
+                .begin_usability_probe_run(
+                    "paid-criterion",
+                    "select",
+                    foreground.quality_generation(),
+                )
+                .expect("begin abandoned run")
+                .expect("quality generation is current")
+                .0
+        };
+
+        let recovered = BenchmarkStore::open(&path).expect("open recovery store");
+        let (replacement_run, generation) = recovered
+            .begin_usability_probe_run("paid-criterion", "select", recovered.quality_generation())
+            .expect("recover abandoned owner")
+            .expect("quality generation remains current");
+        let abandoned = recovered
+            .connection
+            .query_row(
+                "SELECT status, diagnostic FROM usability_probe_runs WHERE id = ?1",
+                [abandoned_run],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("read recovered audit row");
+        assert_eq!(abandoned.0, "incomplete");
+        assert_eq!(abandoned.1, "probe owner exited before finalization");
+
+        recovered
+            .finish_usability_probe_run(replacement_run, generation, false, None, None, &[])
+            .expect("finalize replacement run");
+        drop(recovered);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn active_probe_lease_outlives_a_replaced_store() {
+        let path = test_db_path();
+        let (active_run, generation, lease) = {
+            let foreground = BenchmarkStore::open(&path).expect("open foreground store");
+            bind_test_identities(&foreground, &["node-a"]);
+            let (run_id, generation) = foreground
+                .begin_usability_probe_run(
+                    "paid-criterion",
+                    "select",
+                    foreground.quality_generation(),
+                )
+                .expect("begin foreground run")
+                .expect("quality generation is current");
+            let lease = foreground
+                .usability_probe_lock_lease(run_id)
+                .expect("clone active probe lease");
+            (run_id, generation, lease)
+        };
+
+        let replacement = BenchmarkStore::open(&path).expect("open replacement store");
+        let overlap = replacement
+            .begin_usability_probe_run("paid-criterion", "select", replacement.quality_generation())
+            .expect_err("the active job lease must survive store replacement");
+        assert!(format!("{overlap:#}").contains("already running"));
+
+        replacement
+            .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+                run_id: active_run,
+                generation,
+                process_lease: &lease,
+                complete: false,
+                summary: None,
+                diagnostic: Some("store replaced while the probe was active"),
+                facts: &[],
+                result_ttl: None,
+            })
+            .expect("the replacement store can finalize through the active lease");
+        let status: String = replacement
+            .connection
+            .query_row(
+                "SELECT status FROM usability_probe_runs WHERE id = ?1",
+                [active_run],
+                |row| row.get(0),
+            )
+            .expect("read finalized run status");
+        assert_eq!(status, "incomplete");
+
+        drop(lease);
+        let (replacement_run, generation) = replacement
+            .begin_usability_probe_run("paid-criterion", "select", replacement.quality_generation())
+            .expect("recover after active job releases its lease")
+            .expect("quality generation remains current");
+        replacement
+            .finish_usability_probe_run(replacement_run, generation, false, None, None, &[])
+            .expect("finalize replacement run");
+        drop(replacement);
         remove_test_db(&path);
     }
 

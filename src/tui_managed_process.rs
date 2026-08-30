@@ -50,12 +50,19 @@ impl App {
         // A declared program may own isolated node-runtime-manager descendants. Stop it before
         // deciding whether the live sing-box stays up; the custom probe never inherits the TUI's
         // background ownership permission for the user's main proxy runtime.
-        self.cancel_active_usability_probe();
+        let mut errors = Vec::new();
+        if let Err(error) = self.cancel_active_usability_probe() {
+            errors.push(format!(
+                "failed to finalize cancelled usability probe: {error:#}"
+            ));
+        }
         if self.sing_box.is_leaving_running() {
-            return Ok(());
+            if errors.is_empty() {
+                return Ok(());
+            }
+            anyhow::bail!(errors.join("; "));
         }
 
-        let mut errors = Vec::new();
         if let Err(error) = self.save_runtime_state() {
             errors.push(format!("failed to preserve runtime intent: {error:#}"));
         }

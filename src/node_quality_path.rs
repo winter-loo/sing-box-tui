@@ -10,6 +10,7 @@ pub(crate) const CONFIG_MUTATION_LOCK_SUFFIX: &str = ".sing-box-tui-config-mutat
 pub(crate) const QUALITY_WRITE_BLOCK_SUFFIX: &str = ".node-quality-writes-blocked";
 pub(crate) const QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX: &str =
     ".node-quality-runtime-reload-required";
+pub(crate) const QUALITY_USABILITY_PROBE_LOCK_SUFFIX: &str = ".node-quality-usability-probe.lock";
 pub(crate) const QUALITY_RECONCILIATION_LOCK_SUFFIX: &str = ".node-quality-reconciliation.lock";
 
 pub(crate) fn canonical_config_target(path: &Path) -> Result<PathBuf> {
@@ -60,6 +61,7 @@ pub(crate) fn node_quality_reserved_paths(database_path: &Path) -> Result<Vec<Pa
         with_suffix(&database_path, "-journal"),
         with_suffix(&database_path, QUALITY_WRITE_BLOCK_SUFFIX),
         with_suffix(&database_path, QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX),
+        with_suffix(&database_path, QUALITY_USABILITY_PROBE_LOCK_SUFFIX),
         with_suffix(&database_path, QUALITY_RECONCILIATION_LOCK_SUFFIX),
     ]
     .into_iter()
@@ -94,6 +96,7 @@ pub(crate) fn ensure_active_config_paths_are_distinct(
         "node-quality rollback journal",
         "node-quality write block",
         "node-quality runtime reload fence",
+        "node-quality usability-probe lock",
         "node-quality reconciliation lock",
     ]
     .into_iter()
@@ -116,6 +119,14 @@ pub(crate) fn ensure_active_config_paths_are_distinct(
         }
     }
     Ok(())
+}
+
+pub(crate) fn usability_probe_lock_path(database_path: &Path) -> Result<PathBuf> {
+    let database_path = canonical_file_target(database_path, "node-quality database")?;
+    canonical_file_target(
+        &with_suffix(&database_path, QUALITY_USABILITY_PROBE_LOCK_SUFFIX),
+        "node-quality usability-probe lock",
+    )
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {

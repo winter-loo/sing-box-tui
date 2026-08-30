@@ -84,6 +84,8 @@ impl App {
         self.benchmark_workflow
             .activate_sustained_target(&sustained_target_url)?;
 
+        self.cancel_revoked_background_usability_probe(&enabled, &selectors)?;
+
         self.sustained_target_url = sustained_target_url;
         self.benchmark_filter = config.filter;
         self.auto_select_enabled = config.enabled;
@@ -392,15 +394,21 @@ impl App {
                         }
                     }
                     HeadlessWorkerCommand::Stop => {
+                        let cancellation = self.cancel_active_usability_probe_with_reason(
+                            "background worker stopped while the usability probe was running",
+                        );
                         status_generation = status_generation.saturating_add(1);
-                        request.respond(
-                            self.background_status_snapshot(
+                        match &cancellation {
+                            Ok(()) => request.respond(self.background_status_snapshot(
                                 "stopping".to_string(),
                                 status_generation,
-                            ),
-                        );
+                            )),
+                            Err(error) => request.reject(format!(
+                                "stopping after usability-probe finalization failed: {error:#}"
+                            )),
+                        }
                         control.unregister();
-                        return Ok(());
+                        return cancellation;
                     }
                 }
             }
