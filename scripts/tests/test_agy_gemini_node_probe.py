@@ -15,7 +15,12 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 ADAPTER = REPOSITORY / "scripts" / "agy-gemini-node-probe.py"
-MANIFEST = REPOSITORY / "examples" / "usability-probes" / "agy-gemini.json"
+UNIX_MANIFEST = (
+    REPOSITORY / "examples" / "usability-probes" / "unix" / "agy-gemini.json"
+)
+WINDOWS_MANIFEST = (
+    REPOSITORY / "examples" / "usability-probes" / "windows" / "agy-gemini.json"
+)
 
 
 class AgyGeminiProbeTests(unittest.TestCase):
@@ -197,12 +202,18 @@ print(json.dumps({"response": "OK", "private": "secret-response"}))
         self.assertIn("agy_timeout", records[-1]["message"])
         self.assertFalse(any(record.get("usable") is False for record in records))
 
-    def test_example_manifest_is_manual_and_balanced(self) -> None:
-        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ranking"], "balanced")
-        self.assertEqual(manifest["args"], ["--tui-jsonl"])
-        self.assertNotIn("background", manifest)
-        self.assertFalse(any("profile" in argument for argument in manifest["args"]))
+    def test_platform_manifests_are_manual_balanced_and_shell_free(self) -> None:
+        unix = json.loads(UNIX_MANIFEST.read_text(encoding="utf-8"))
+        windows = json.loads(WINDOWS_MANIFEST.read_text(encoding="utf-8"))
+        for manifest in (unix, windows):
+            self.assertEqual(manifest["id"], "agy-gemini")
+            self.assertEqual(manifest["ranking"], "balanced")
+            self.assertNotIn("background", manifest)
+            self.assertEqual(manifest["args"][-1], "--tui-jsonl")
+            self.assertFalse(any("profile" in argument for argument in manifest["args"]))
+        self.assertTrue(unix["executable"].endswith("agy-gemini-node-probe.py"))
+        self.assertTrue(windows["executable"].lower().endswith("python.exe"))
+        self.assertTrue(windows["args"][0].endswith("agy-gemini-node-probe.py"))
 
 
 if __name__ == "__main__":

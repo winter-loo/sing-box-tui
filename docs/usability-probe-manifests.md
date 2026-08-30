@@ -89,12 +89,17 @@ reported files and restart the TUI to rediscover them.
 
 ## Agy Gemini example panel
 
-[`examples/usability-probes/agy-gemini.json`](../examples/usability-probes/agy-gemini.json)
-wires the existing Agy adapter into a custom **Agy Gemini** panel. It uses `balanced` network
-ranking and declares no background schedule, so it runs only when the user presses `U`. Copy the
-manifest into the active `usability-probes` directory while keeping its executable path relative
-to `scripts/agy-gemini-node-probe.py`, or update that path for the installed layout. On Unix, make
-the adapter executable if the checkout did not preserve its executable bit.
+The [Unix manifest](../examples/usability-probes/unix/agy-gemini.json) and
+[Windows manifest](../examples/usability-probes/windows/agy-gemini.json) wire the existing Agy
+adapter into a custom **Agy Gemini** panel. Both use `balanced` network ranking and declare no
+background schedule, so they run only when the user presses `U`. Copy only the manifest for the
+current platform into the active `usability-probes` directory.
+
+On Unix, keep the manifest's executable path relative to `scripts/agy-gemini-node-probe.py` or
+update it for the installed layout, and make the adapter executable if the checkout did not
+preserve its executable bit. Windows does not interpret Python shebangs, so its manifest invokes
+`python.exe` directly without a shell; replace both `C:\\Path\\To` placeholders with absolute
+paths to the interpreter and checkout before registration.
 
 The adapter's `--tui-jsonl` mode keeps stdout reserved for the progressive protocol. It publishes
 only the node tag, a successful result, and bounded timing; it never publishes the Agy response,
