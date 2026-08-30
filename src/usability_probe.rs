@@ -502,7 +502,29 @@ fn run_url_probe_with_timeouts(
                 timeouts,
             );
         }
-        while let Some(joined) = tasks.join_next().await {
+        while !tasks.is_empty() {
+            // WHY: `join_next` can wait for the full manifest timeout. Poll cancellation on an
+            // independent timer so TUI shutdown can abort every in-flight HTTP future promptly.
+            let joined = tokio::select! {
+                joined = tasks.join_next() => joined,
+                () = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if !cancellation.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    tasks.abort_all();
+                    send_finished(
+                        &sender,
+                        false,
+                        None,
+                        Some("URL usability probe was cancelled".to_string()),
+                        results,
+                    );
+                    return;
+                }
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             if cancellation.load(Ordering::Relaxed) {
                 tasks.abort_all();
                 send_finished(
@@ -781,7 +803,7 @@ fn run_program_probe(
     // Protocol EOF and process exit are independent: a probe may close stdout and keep serving
     // application traffic. Keep polling instead of blocking in `wait` so TUI shutdown can still
     // cancel that child after the JSON Lines reader has disconnected.
-    let status = loop {
+    loop {
         if cancellation.load(Ordering::Relaxed) {
             if fatal_error.is_none() {
                 fatal_error = Some("usability probe was cancelled".to_string());
@@ -800,12 +822,17 @@ fn run_program_probe(
                 tree_terminated = true;
             }
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => break Err(error),
+        match probe_process_running_without_reaping(&mut child) {
+            Ok(false) => break,
+            Ok(true) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                if fatal_error.is_none() {
+                    fatal_error = Some(format!("failed to observe usability probe: {error}"));
+                }
+                break;
+            }
         }
-    };
+    }
     // A successful direct child may still have daemonized descendants holding inherited pipes.
     // The run contract is bounded, so contain the whole process group before waiting for reader
     // completion. Reader completion itself is also bounded to keep shutdown independent of a
@@ -813,6 +840,7 @@ fn run_program_probe(
     if !tree_terminated {
         terminate_probe_process_tree(&mut child);
     }
+    let status = child.wait();
     let reader_timeout = Duration::from_secs(1);
     if stdout_done_receiver.recv_timeout(reader_timeout).is_err() && fatal_error.is_none() {
         fatal_error =
@@ -1013,6 +1041,31 @@ fn terminate_probe_process_tree(child: &mut Child) {
     unsafe {
         libc::kill(process_group, libc::SIGKILL);
     }
+}
+
+#[cfg(unix)]
+fn probe_process_running_without_reaping(child: &mut Child) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // WHY: `Child::try_wait` reaps on Unix. WNOWAIT observes exit while retaining the group
+    // leader's PID, so the subsequent TERM/grace/KILL sequence cannot target a reused PGID.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } == 0)
+}
+
+#[cfg(not(unix))]
+fn probe_process_running_without_reaping(child: &mut Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_none())
 }
 
 #[cfg(not(unix))]
@@ -1387,7 +1440,7 @@ pub(crate) fn manifest_diagnostic(path: &Path, message: impl AsRef<str>) -> Mani
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::TcpListener;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2178,6 +2231,88 @@ mod tests {
         let timeouts = url_probe_timeouts(Duration::from_secs(60));
         assert_eq!(timeouts.target, Duration::from_secs(60));
         assert_eq!(timeouts.controller, Duration::from_secs(62));
+    }
+
+    #[test]
+    fn cancelling_stalled_url_probe_wakes_worker_before_manifest_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind cancellation fixture");
+        let address = listener.local_addr().expect("cancellation fixture address");
+        let (accepted_sender, accepted_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept cancellation request");
+            accepted_sender.send(()).expect("signal accepted request");
+            let mut discarded = Vec::new();
+            let _ = stream.read_to_end(&mut discarded);
+        });
+        let manifest = UsabilityProbeManifest {
+            id: NodeViewId::new("cancel-url").unwrap(),
+            label: "Cancel URL".to_string(),
+            ranking_policy: RankingPolicy::Balanced,
+            source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: Duration::from_secs(60),
+            source_path: PathBuf::from("cancel-url.json"),
+        };
+        let client = AsyncClient::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let mut job = spawn_usability_probe_job(
+            manifest,
+            vec!["node-a".to_string()],
+            format!("http://{address}"),
+            client,
+        )
+        .expect("spawn cancellable URL probe");
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("URL request reached stalled controller");
+
+        let started = Instant::now();
+        job.cancel();
+        job.join();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must not wait for the 60-second manifest timeout"
+        );
+        let (_, completion) = collect_job(&job);
+        assert!(!completion.complete);
+        assert_eq!(
+            completion.diagnostic.as_deref(),
+            Some("URL usability probe was cancelled")
+        );
+        server.join().expect("cancellation fixture exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_observation_keeps_group_leader_owned_until_cleanup() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived process group");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while probe_process_running_without_reaping(&mut child).expect("observe process exit")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !probe_process_running_without_reaping(&mut child).expect("observe terminal process"),
+            "short-lived group leader must become observable"
+        );
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, 0) },
+            0,
+            "WNOWAIT must retain the leader PID through process-group cleanup"
+        );
+        terminate_probe_process_tree(&mut child);
+        child.wait().expect("reap group leader after cleanup");
     }
 
     fn collect_job(
