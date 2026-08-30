@@ -416,7 +416,7 @@ impl App {
         run: &StoredUsabilityProbeRun,
     ) -> Option<String> {
         run.latest_attempt.as_ref().and_then(|attempt| {
-            (!attempt.complete && attempt.run_id != run.run_id).then(|| {
+            (!attempt.complete).then(|| {
                 format!(
                     "run #{} failed{}",
                     attempt.run_id,

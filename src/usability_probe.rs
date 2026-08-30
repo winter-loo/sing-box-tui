@@ -31,8 +31,7 @@ const MAX_STDERR_BYTES: usize = 16 * 1024;
 const MAX_RESULT_DETAIL_CHARS: usize = 512;
 const MAX_SELECTOR_MEMBERS: usize = 4096;
 const URL_PROBE_CONCURRENCY: usize = 8;
-const URL_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
-const URL_CONTROLLER_TIMEOUT: Duration = Duration::from_secs(7);
+const URL_CONTROLLER_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 const DEFAULT_PROGRAM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MIN_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -389,6 +388,7 @@ pub(crate) fn spawn_usability_probe_job(
                     client,
                     sender,
                     worker_cancellation,
+                    manifest.timeout,
                 );
             })
             .context("failed to start URL usability probe worker")?,
@@ -442,6 +442,7 @@ fn run_url_probe(
     client: AsyncClient,
     sender: mpsc::Sender<UsabilityProbeJobEvent>,
     cancellation: Arc<AtomicBool>,
+    timeout: Duration,
 ) {
     run_url_probe_with_timeouts(
         selector_members,
@@ -450,11 +451,17 @@ fn run_url_probe(
         client,
         sender,
         cancellation,
-        UrlProbeTimeouts {
-            target: URL_TARGET_TIMEOUT,
-            controller: URL_CONTROLLER_TIMEOUT,
-        },
+        url_probe_timeouts(timeout),
     );
+}
+
+fn url_probe_timeouts(timeout: Duration) -> UrlProbeTimeouts {
+    // WHY: sing-box must reach its target deadline before the controller request expires, or a
+    // normal node timeout is misclassified as controller infrastructure failure.
+    UrlProbeTimeouts {
+        target: timeout,
+        controller: timeout.saturating_add(URL_CONTROLLER_TIMEOUT_MARGIN),
+    }
 }
 
 fn run_url_probe_with_timeouts(
@@ -2164,6 +2171,13 @@ mod tests {
         assert!(preserved.results[0].usable);
         drop(store);
         fs::remove_dir_all(directory).expect("remove stalled-controller fixture database");
+    }
+
+    #[test]
+    fn url_manifest_timeout_controls_target_and_controller_deadlines() {
+        let timeouts = url_probe_timeouts(Duration::from_secs(60));
+        assert_eq!(timeouts.target, Duration::from_secs(60));
+        assert_eq!(timeouts.controller, Duration::from_secs(62));
     }
 
     fn collect_job(
