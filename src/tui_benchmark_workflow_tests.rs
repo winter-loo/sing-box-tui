@@ -363,6 +363,10 @@ fn custom_auto_select_uses_included_members_and_resets_confirmation_for_a_new_ru
         label: "GitHub Web".into(),
         ranking_policy: RankingPolicy::LowLatency,
         source: UsabilityProbeSource::Url("https://github.com/".into()),
+        background: false,
+        interval: None,
+        result_ttl: None,
+        timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("github-web.json"),
     });
     let install_run = |app: &mut super::App, run_id| {
@@ -371,7 +375,9 @@ fn custom_auto_select_uses_included_members_and_resets_confirmation_for_a_new_ru
             StoredUsabilityProbeRun {
                 run_id,
                 completed_at_ms: run_id as u64,
+                expires_at_ms: None,
                 summary: None,
+                latest_attempt: None,
                 results: vec![
                     UsabilityProbeFactRecord {
                         node: "node-a".into(),

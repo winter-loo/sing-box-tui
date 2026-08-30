@@ -150,7 +150,9 @@ impl App {
             self.active_node_traffic = Default::default();
             self.last_auto_selection_explanation = None;
             self.save_runtime_state()?;
-            if self.background_worker_management_enabled() {
+            if self.background_worker_management_enabled()
+                && self.background_probe_enabled.is_empty()
+            {
                 self.stop_live_background_auto_pick_task()?;
             }
             self.set_status_only("Auto-pick disabled; background worker stopped");

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -60,6 +60,10 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) auto_pick_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_node_view: Option<NodeViewId>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) background_probe_enabled: BTreeSet<NodeViewId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) background_probe_selectors: BTreeMap<NodeViewId, String>,
     #[serde(default)]
     pub(crate) current_selected_nodes: BTreeMap<String, String>,
     #[serde(default)]

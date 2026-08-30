@@ -92,6 +92,22 @@ impl App {
         // Preserve the stable ID even when its manifest is temporarily missing. Manifest ordering
         // is presentation only; falling back by index could silently authorize another panel.
         self.auto_select_node_view = active_node_view;
+        self.background_probe_enabled = state.background_probe_enabled;
+        self.background_probe_selectors = state.background_probe_selectors;
+        // Persisted user consent is necessary but never sufficient. Revalidate the manifest's
+        // current permission and selector target on every startup so a removed/edited manifest
+        // cannot keep a stale paid probe authorization alive.
+        self.background_probe_enabled.retain(|id| {
+            self.usability_probe_manifests
+                .iter()
+                .any(|manifest| &manifest.id == id && manifest.background)
+                && self
+                    .background_probe_selectors
+                    .get(id)
+                    .is_some_and(|selector| self.groups.iter().any(|group| &group.name == selector))
+        });
+        self.background_probe_selectors
+            .retain(|id, _| self.background_probe_enabled.contains(id));
         self.auto_select_ranking_policy = self.active_node_view_ranking_policy();
         self.bypass_entries = state.bypass_entries;
         if let Some(value) = state.benchmark_url.filter(|value| !value.trim().is_empty()) {
@@ -171,6 +187,8 @@ impl App {
             auto_pick_enabled: self.auto_select_enabled,
             auto_pick_selector: self.auto_select_selector.clone(),
             active_node_view: Some(self.auto_select_node_view.clone()),
+            background_probe_enabled: self.background_probe_enabled.clone(),
+            background_probe_selectors: self.background_probe_selectors.clone(),
             current_selected_nodes: self
                 .groups
                 .iter()
