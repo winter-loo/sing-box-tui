@@ -32,6 +32,9 @@ class Manager:
                 [str(executable), "node-runtime-manager", "--stdio"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
+                # Manager diagnostics may contain source configuration paths or runtime details.
+                # Its structured RPC code is the only diagnostic safe to expose through the TUI.
+                stderr=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 bufsize=1,
@@ -114,6 +117,10 @@ def run_agy(
         "all_proxy",
     ):
         environment[name] = proxy_url
+    # A caller's bypass list would silently route Gemini outside the candidate-bound runtime and
+    # make a direct-host success look like evidence for the node currently under assessment.
+    environment["NO_PROXY"] = ""
+    environment["no_proxy"] = ""
 
     started = time.monotonic()
     try:

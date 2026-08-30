@@ -31,6 +31,7 @@ import os
 import sys
 
 cursor = 0
+print("secret manager config: /private/source.json", file=sys.stderr, flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     method = request["method"]
@@ -74,7 +75,11 @@ import sys
 import time
 
 with open(os.environ["AGY_FIXTURE_CALLS"], "a", encoding="utf-8") as stream:
-    stream.write(json.dumps({"argv": sys.argv[1:]}) + "\n")
+    stream.write(json.dumps({
+        "argv": sys.argv[1:],
+        "NO_PROXY": os.environ.get("NO_PROXY"),
+        "no_proxy": os.environ.get("no_proxy"),
+    }) + "\n")
 mode = os.environ.get("AGY_FIXTURE_MODE", "success")
 if mode == "auth":
     print("Authentication required for secret-account@example.test", file=sys.stderr)
@@ -111,7 +116,8 @@ print(json.dumps({"response": "OK", "private": "secret-response"}))
             HTTP_PROXY="http://127.0.0.1:9",
             HTTPS_PROXY="http://127.0.0.1:9",
             ALL_PROXY="http://127.0.0.1:9",
-            NO_PROXY="",
+            NO_PROXY="gemini.google.com",
+            no_proxy="*",
         )
         return subprocess.run(
             [
@@ -146,11 +152,14 @@ print(json.dumps({"response": "OK", "private": "secret-response"}))
         self.assertEqual(records[-1]["type"], "summary")
         self.assertTrue(records[-1]["complete"])
         self.assertNotIn("secret-response", completed.stdout + completed.stderr)
+        self.assertNotIn("secret manager config", completed.stdout + completed.stderr)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertEqual(len(calls), 2)
         for call in calls:
             self.assertIn("--agent", call["argv"])
             self.assertIn("gemini", call["argv"])
+            self.assertEqual(call["NO_PROXY"], "")
+            self.assertEqual(call["no_proxy"], "")
 
     def test_authentication_and_process_failures_are_incomplete_not_unusable(self) -> None:
         for mode in ("auth", "process-error"):
