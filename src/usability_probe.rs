@@ -867,13 +867,15 @@ impl ProbeProcessContainment {
 
 #[cfg(windows)]
 struct ProbeProcessContainment {
-    job: windows::Win32::Foundation::HANDLE,
+    // `OwnedHandle` is Send and closes exactly once on the worker thread. Closing this handle is
+    // the Job Object's kill signal, so raw-handle aliasing would be a process-lifecycle bug.
+    _job: std::os::windows::io::OwnedHandle,
 }
 
 #[cfg(windows)]
 impl ProbeProcessContainment {
     fn attach(child: &Child) -> Result<Self> {
-        use std::os::windows::io::AsRawHandle as _;
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -912,7 +914,9 @@ impl ProbeProcessContainment {
             }
             return Err(error).context("failed to resume contained usability probe");
         }
-        Ok(Self { job })
+        Ok(Self {
+            _job: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job.0) },
+        })
     }
 }
 
@@ -965,17 +969,6 @@ fn resume_suspended_process_threads(process_id: u32) -> Result<()> {
         anyhow::bail!("suspended probe process exposed no resumable thread");
     }
     Ok(())
-}
-
-#[cfg(windows)]
-impl Drop for ProbeProcessContainment {
-    fn drop(&mut self) {
-        unsafe {
-            // KILL_ON_JOB_CLOSE terminates the manifest program and every runtime descendant
-            // assigned through the inherited Job before the TUI can finish shutdown.
-            let _ = windows::Win32::Foundation::CloseHandle(self.job);
-        }
-    }
 }
 
 #[cfg(unix)]

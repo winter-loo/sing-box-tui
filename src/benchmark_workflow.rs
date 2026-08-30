@@ -704,7 +704,7 @@ impl BenchmarkWorkflow {
         &self,
         criterion_id: &str,
         selector: &str,
-    ) -> Result<(i64, u64)> {
+    ) -> Result<(i64, u64, crate::storage::UsabilityProbeLockLease)> {
         let receipt = self
             .runtime_receipt()
             .context("usability probing requires a verified current sing-box runtime")?;
@@ -718,17 +718,27 @@ impl BenchmarkWorkflow {
         let (run_id, generation) = store
             .begin_usability_probe_run(criterion_id, selector, receipt.quality_generation)?
             .context("node-quality generation changed before the usability probe started")?;
-        Ok((run_id, generation))
+        let lease = store.usability_probe_lock_lease(run_id)?;
+        Ok((run_id, generation, lease))
     }
 
     pub(crate) fn finish_usability_probe_run_with_ttl(
         &self,
         finalization: UsabilityProbeRunFinalization<'_>,
     ) -> Result<bool> {
-        self.store
-            .as_ref()
-            .context("node-quality persistence is not active")?
-            .finish_usability_probe_run_with_ttl(finalization)
+        if let Some(store) = self.store.as_ref() {
+            return store.finish_usability_probe_run_with_ttl(finalization);
+        }
+
+        // A config mutation may pause/replace the projection store while an arbitrary external
+        // probe is still running. The lease is the capability to finalize that already-started
+        // audit row; reopening its canonical database here cannot authorize a new run, and the
+        // store's generation/runtime fence will downgrade changed state to incomplete.
+        let database_path = finalization.process_lease.database_path().to_path_buf();
+        let guard = crate::storage::lock_node_quality_reconciliation(&database_path)?;
+        let store = BenchmarkStore::open_while_reconciliation_locked(&database_path, &guard)?;
+        drop(guard);
+        store.finish_usability_probe_run_with_ttl(finalization)
     }
 
     pub(crate) fn latest_usability_probe_run(

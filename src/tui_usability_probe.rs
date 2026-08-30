@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::automatic_selection::{NodeViewId, NodeViewProjection, PanelMembership, RankingPolicy};
 use crate::storage::{
@@ -22,9 +22,13 @@ pub(super) struct ActiveUsabilityProbe {
     selector: String,
     run_id: i64,
     generation: u64,
+    // Keep the cross-process scheduler lock alive even if subscription reconciliation replaces
+    // the BenchmarkStore while this arbitrary external program is still running.
+    process_lease: crate::storage::UsabilityProbeLockLease,
     selector_member_count: usize,
     received: BTreeMap<String, UsabilityProbeNodeResult>,
     result_ttl: Option<Duration>,
+    background: bool,
     job: UsabilityProbeJob,
 }
 
@@ -71,7 +75,7 @@ impl App {
         if self.usability_probe_job.is_some() {
             bail!("a custom usability probe is already running");
         }
-        let (run_id, generation) = self
+        let (run_id, generation, process_lease) = self
             .benchmark_workflow
             .begin_usability_probe_run(manifest.id.as_str(), &group.name)?;
         let job = spawn_usability_probe_job(
@@ -86,6 +90,7 @@ impl App {
                 UsabilityProbeRunFinalization {
                     run_id,
                     generation,
+                    process_lease: &process_lease,
                     complete: false,
                     summary: None,
                     diagnostic: Some(&diagnostic),
@@ -100,9 +105,11 @@ impl App {
             selector: group.name,
             run_id,
             generation,
+            process_lease,
             selector_member_count: group.members.len(),
             received: BTreeMap::new(),
             result_ttl: manifest.result_ttl,
+            background,
             job,
         });
         self.set_status_only(format!(
@@ -262,6 +269,7 @@ impl App {
                         UsabilityProbeRunFinalization {
                             run_id: active.run_id,
                             generation: active.generation,
+                            process_lease: &active.process_lease,
                             complete: completion.complete,
                             summary: completion.summary.as_deref(),
                             diagnostic: completion.diagnostic.as_deref(),
@@ -290,9 +298,7 @@ impl App {
                                 self.ensure_auto_pick_background_worker_after_state_change()
                                     .err()
                                     .map(|error| {
-                                        format!(
-                                            "; background worker refresh deferred: {error:#}"
-                                        )
+                                        format!("; background worker refresh deferred: {error:#}")
                                     })
                                     .unwrap_or_default()
                             } else {
@@ -303,10 +309,18 @@ impl App {
                                 facts.len(),
                             ));
                         }
-                        Ok(false) => self.set_status_only(format!(
-                            "{label} probe incomplete; the previous complete result was preserved{}",
-                            usability_status_suffix(completion.diagnostic.as_deref())
-                        )),
+                        Ok(false) => {
+                            // The prior complete rows stay published, but the same cached state
+                            // also carries the newer failed-attempt diagnostic shown by panel/detail.
+                            self.refresh_cached_usability_run(
+                                &active.manifest_id,
+                                &active.selector,
+                            );
+                            self.set_status_only(format!(
+                                "{label} probe incomplete; the previous complete result was preserved{}",
+                                usability_status_suffix(completion.diagnostic.as_deref())
+                            ));
+                        }
                         Err(error) => self.set_status_only(format!(
                             "{label} probe could not publish results: {error:#}"
                         )),
@@ -316,9 +330,16 @@ impl App {
         }
     }
 
-    pub(super) fn cancel_active_usability_probe(&mut self) {
+    pub(super) fn cancel_active_usability_probe(&mut self) -> Result<()> {
+        self.cancel_active_usability_probe_with_reason("TUI shutdown cancelled the usability probe")
+    }
+
+    pub(super) fn cancel_active_usability_probe_with_reason(
+        &mut self,
+        diagnostic: &str,
+    ) -> Result<()> {
         let Some(mut active) = self.usability_probe_job.take() else {
-            return;
+            return Ok(());
         };
         active.job.cancel();
         active.job.join();
@@ -331,17 +352,41 @@ impl App {
                 detail: result.detail,
             })
             .collect::<Vec<_>>();
-        let _ = self.benchmark_workflow.finish_usability_probe_run_with_ttl(
+        let persisted = self.benchmark_workflow.finish_usability_probe_run_with_ttl(
             UsabilityProbeRunFinalization {
                 run_id: active.run_id,
                 generation: active.generation,
+                process_lease: &active.process_lease,
                 complete: false,
                 summary: None,
-                diagnostic: Some("TUI shutdown cancelled the usability probe"),
+                diagnostic: Some(diagnostic),
                 facts: &facts,
                 result_ttl: active.result_ttl,
             },
         );
+        persisted.context("failed to persist cancelled usability probe")?;
+        self.refresh_cached_usability_run(&active.manifest_id, &active.selector);
+        Ok(())
+    }
+
+    pub(super) fn cancel_revoked_background_usability_probe(
+        &mut self,
+        enabled: &std::collections::BTreeSet<NodeViewId>,
+        selectors: &std::collections::BTreeMap<NodeViewId, String>,
+    ) -> Result<()> {
+        let revoked = self.usability_probe_job.as_ref().is_some_and(|active| {
+            active.background
+                && (!enabled.contains(&active.manifest_id)
+                    || selectors.get(&active.manifest_id) != Some(&active.selector))
+        });
+        if revoked {
+            // User permission is a continuous condition. ApplyConfig revocation must stop an
+            // already-running paid probe, not merely prevent the next scheduled launch.
+            self.cancel_active_usability_probe_with_reason(
+                "background usability permission was revoked while the probe was running",
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn custom_usability_run(
