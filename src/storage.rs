@@ -1660,6 +1660,37 @@ impl BenchmarkStore {
         Ok(run)
     }
 
+    pub(crate) fn latest_usability_probe_started_at_ms(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+        expected_generation: u64,
+    ) -> Result<Option<u64>> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if expected_generation != self.quality_generation()
+            || !self.quality_session_current_while_locked()?
+        {
+            anyhow::bail!(
+                "node-quality generation changed before the usability schedule could be restored"
+            );
+        }
+        self.connection
+            .query_row(
+                r#"
+                SELECT started_at_ms
+                FROM usability_probe_runs
+                WHERE criterion_id = ?1 AND selector = ?2 AND generation = ?3
+                ORDER BY started_at_ms DESC, id DESC
+                LIMIT 1
+                "#,
+                params![criterion_id, selector, expected_generation as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("failed to query latest usability-probe start")
+            .map(|value| value.map(|started_at_ms| started_at_ms as u64))
+    }
+
     pub(crate) fn latest_usability_probe_run_with_lease(
         &self,
         lease: &NodeQualityReadLease,

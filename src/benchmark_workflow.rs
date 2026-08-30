@@ -756,6 +756,24 @@ impl BenchmarkWorkflow {
             .latest_usability_probe_run(criterion_id, selector, selector_members)
     }
 
+    pub(crate) fn latest_usability_probe_started_at_ms(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+    ) -> Result<Option<u64>> {
+        let receipt = self
+            .runtime_receipt()
+            .context("usability scheduling requires a verified current sing-box runtime")?;
+        self.store
+            .as_ref()
+            .context("node-quality persistence is not active")?
+            .latest_usability_probe_started_at_ms(
+                criterion_id,
+                selector,
+                receipt.quality_generation(),
+            )
+    }
+
     pub(crate) fn latest_usability_probe_run_with_lease(
         &self,
         lease: &NodeQualityReadLease,

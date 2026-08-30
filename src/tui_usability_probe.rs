@@ -169,7 +169,7 @@ impl App {
         if self.usability_probe_job.is_some() {
             return;
         }
-        let due = self
+        let schedules = self
             .background_probe_enabled
             .iter()
             .filter_map(|id| {
@@ -179,13 +179,50 @@ impl App {
                     .find(|manifest| &manifest.id == id && manifest.background)?;
                 let selector = self.background_probe_selectors.get(id)?;
                 let key = (id.clone(), selector.clone());
-                let due = self
-                    .last_background_probe_started
-                    .get(&key)
-                    .is_none_or(|last| now.duration_since(*last) >= manifest.background_interval());
-                due.then_some((manifest.clone(), selector.clone(), key))
+                Some((manifest.clone(), selector.clone(), key))
             })
-            .next();
+            .collect::<Vec<_>>();
+        let now_ms = current_time_ms();
+        let mut due = None;
+        for (manifest, selector, key) in schedules {
+            if !self.last_background_probe_started.contains_key(&key) {
+                match self
+                    .benchmark_workflow
+                    .latest_usability_probe_started_at_ms(manifest.id.as_str(), &selector)
+                {
+                    Ok(Some(started_at_ms)) => {
+                        // WHY: worker restarts lose their monotonic clock. Re-anchor the persisted
+                        // wall-clock start once, then continue on Instant so clock adjustments
+                        // cannot cause an early repeat of a paid application-level probe.
+                        if let Some(restored) = restored_probe_start(
+                            now,
+                            now_ms,
+                            started_at_ms,
+                            manifest.background_interval(),
+                        ) {
+                            self.last_background_probe_started
+                                .insert(key.clone(), restored);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.set_status_only(format!(
+                            "Scheduled {} probe deferred while restoring its interval: {error:#}",
+                            manifest.label
+                        ));
+                        return;
+                    }
+                }
+            }
+            if self
+                .last_background_probe_started
+                .get(&key)
+                .is_none_or(|last| now.duration_since(*last) >= manifest.background_interval())
+            {
+                due = Some((manifest, selector, key));
+                break;
+            }
+        }
         let Some((manifest, selector, key)) = due else {
             return;
         };
@@ -640,6 +677,16 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+pub(super) fn restored_probe_start(
+    now: Instant,
+    now_ms: u64,
+    started_at_ms: u64,
+    interval: Duration,
+) -> Option<Instant> {
+    let elapsed = Duration::from_millis(now_ms.saturating_sub(started_at_ms));
+    (elapsed < interval).then(|| now.checked_sub(elapsed).unwrap_or(now))
 }
 
 fn usability_run_expired(run: &StoredUsabilityProbeRun, now_ms: u64) -> bool {
