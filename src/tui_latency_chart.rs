@@ -55,6 +55,8 @@ impl App {
             .filter_map(|manifest| {
                 self.custom_usability_run(&manifest.id, &group_name, &selector_members)
                     .and_then(|run| {
+                        let expired = self.custom_usability_run_is_expired(&run);
+                        let latest_failure = self.custom_usability_latest_failure(&run);
                         run.results
                             .into_iter()
                             .find(|result| result.node == node)
@@ -62,6 +64,8 @@ impl App {
                                 label: manifest.label.clone(),
                                 usable: result.usable,
                                 detail: result.detail,
+                                expired,
+                                latest_failure,
                             })
                     })
             })
@@ -151,6 +155,8 @@ impl App {
             .filter_map(|manifest| {
                 self.custom_usability_run(&manifest.id, &selector, &selector_members)
                     .and_then(|run| {
+                        let expired = self.custom_usability_run_is_expired(&run);
+                        let latest_failure = self.custom_usability_latest_failure(&run);
                         run.results
                             .into_iter()
                             .find(|result| result.node == node)
@@ -158,6 +164,8 @@ impl App {
                                 label: manifest.label.clone(),
                                 usable: result.usable,
                                 detail: result.detail,
+                                expired,
+                                latest_failure,
                             })
                     })
             })
@@ -276,6 +284,10 @@ mod tests {
             label: "GitHub Web".to_string(),
             ranking_policy: RankingPolicy::LowLatency,
             source: UsabilityProbeSource::Url("https://github.com/".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: std::time::Duration::from_secs(600),
             source_path: std::path::PathBuf::from("github-web.json"),
         });
         app.usability_probe_projection_cache.insert(
@@ -283,7 +295,9 @@ mod tests {
             StoredUsabilityProbeRun {
                 run_id: 9,
                 completed_at_ms: 100,
+                expires_at_ms: None,
                 summary: Some("complete".to_string()),
+                latest_attempt: None,
                 results: vec![UsabilityProbeFactRecord {
                     node: "node-a".to_string(),
                     usable: true,
@@ -335,6 +349,10 @@ mod tests {
             label: "GitHub Web".to_string(),
             ranking_policy: RankingPolicy::LowLatency,
             source: UsabilityProbeSource::Url("https://github.com/".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: std::time::Duration::from_secs(600),
             source_path: std::path::PathBuf::from("github-web.json"),
         });
         app.usability_probe_projection_cache.insert(
@@ -342,7 +360,9 @@ mod tests {
             StoredUsabilityProbeRun {
                 run_id: 10,
                 completed_at_ms: 101,
+                expires_at_ms: None,
                 summary: Some("complete".to_string()),
+                latest_attempt: None,
                 results: vec![
                     UsabilityProbeFactRecord {
                         node: "node-a".to_string(),

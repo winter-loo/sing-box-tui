@@ -303,8 +303,10 @@ mod tests {
             StoredUsabilityProbeRun {
                 run_id: 1,
                 completed_at_ms: 1,
+                expires_at_ms: None,
                 summary: None,
                 results: Vec::new(),
+                latest_attempt: None,
             },
         );
         app.benchmark_workflow

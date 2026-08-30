@@ -89,6 +89,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Manually run the criterion declared by the active custom node-view tab. Manifest discovery alone never starts a program.",
     },
     HelpBinding {
+        key: "P",
+        summary: "Toggle custom probe schedule",
+        detail: "Explicitly allow or deny scheduled background execution for the active custom tab and selected selector. The manifest must also permit background execution.",
+    },
+    HelpBinding {
         key: "/",
         summary: "Edit latency filter",
         detail: "Open the filter editor. Comma-separated values include matches; prefix with ! or - to exclude.",

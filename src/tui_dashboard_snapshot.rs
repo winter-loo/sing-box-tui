@@ -4,7 +4,7 @@ use super::view::{
     CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
     IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab, SettingRow,
     SettingsPanelSnapshot, StatusFooter, StatusSnapshot, node_order_badge, pick_mode_badge,
-    settings_field_label,
+    settings_field_label, truncate_for_width,
 };
 
 impl App {
@@ -213,10 +213,25 @@ impl App {
                             self.custom_usability_probe_progress(id, &group.name)
                         {
                             format!(" · PROBING {received}/{total}")
-                        } else if custom_run.is_none() {
-                            " · UNTESTED".to_string()
                         } else {
-                            String::new()
+                            let Some(run) = custom_run.as_ref() else {
+                                return format!(
+                                    "Candidates for {} [{order}] · UNTESTED",
+                                    group.name
+                                );
+                            };
+                            let mut state = Vec::new();
+                            if self.custom_usability_run_is_expired(run) {
+                                state.push("EXPIRED".to_string());
+                            }
+                            if let Some(failure) = self.custom_usability_latest_failure(run) {
+                                state.push(format!("FAILED {}", truncate_for_width(&failure, 48)));
+                            }
+                            if state.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", state.join(" · "))
+                            }
                         }
                     }
                     _ => String::new(),

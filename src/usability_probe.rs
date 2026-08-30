@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client as AsyncClient;
@@ -33,6 +33,15 @@ const MAX_SELECTOR_MEMBERS: usize = 4096;
 const URL_PROBE_CONCURRENCY: usize = 8;
 const URL_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 const URL_CONTROLLER_TIMEOUT: Duration = Duration::from_secs(7);
+const DEFAULT_PROGRAM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MIN_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const DEFAULT_BACKGROUND_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const MIN_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_BACKGROUND_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MIN_RESULT_TTL: Duration = Duration::from_secs(1);
+const MAX_RESULT_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy)]
 struct UrlProbeTimeouts {
@@ -55,7 +64,17 @@ pub(crate) struct UsabilityProbeManifest {
     pub(crate) label: String,
     pub(crate) ranking_policy: RankingPolicy,
     pub(crate) source: UsabilityProbeSource,
+    pub(crate) background: bool,
+    pub(crate) interval: Option<Duration>,
+    pub(crate) result_ttl: Option<Duration>,
+    pub(crate) timeout: Duration,
     pub(crate) source_path: PathBuf,
+}
+
+impl UsabilityProbeManifest {
+    pub(crate) fn background_interval(&self) -> Duration {
+        self.interval.unwrap_or(DEFAULT_BACKGROUND_INTERVAL)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,17 +118,33 @@ pub(crate) struct UsabilityProbeJob {
 
 struct SpawnedProgramGuard {
     child: Option<Child>,
+    containment: Option<ProbeProcessContainment>,
 }
 
 impl SpawnedProgramGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+    fn new(mut child: Child) -> Result<Self> {
+        let containment = match ProbeProcessContainment::attach(&child) {
+            Ok(containment) => containment,
+            Err(error) => {
+                kill_and_wait(&mut child);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            containment: Some(containment),
+        })
     }
 
-    fn into_child(mut self) -> Child {
-        self.child
-            .take()
-            .expect("spawned program guard must contain its child")
+    fn into_parts(mut self) -> (Child, ProbeProcessContainment) {
+        (
+            self.child
+                .take()
+                .expect("spawned program guard must contain its child"),
+            self.containment
+                .take()
+                .expect("spawned program guard must contain process containment"),
+        )
     }
 }
 
@@ -176,6 +211,14 @@ struct ManifestDocument {
     executable: Option<String>,
     #[serde(default)]
     args: Option<Vec<String>>,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    interval_seconds: Option<u64>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 pub(crate) fn usability_probe_manifest_directory(config_path: &Path) -> PathBuf {
@@ -354,6 +397,7 @@ pub(crate) fn spawn_usability_probe_job(
             // `Command`; never introducing a shell is the security property promised by the
             // manifest format, not merely an escaping convention.
             let mut command = Command::new(&executable);
+            configure_probe_process_tree(&mut command);
             command
                 .args(&args)
                 .stdin(Stdio::null())
@@ -366,15 +410,19 @@ pub(crate) fn spawn_usability_probe_job(
                     executable.display()
                 )
             })?;
-            let child = SpawnedProgramGuard::new(child);
+            let child = SpawnedProgramGuard::new(child)
+                .context("failed to contain usability probe process tree")?;
             thread::Builder::new()
                 .name(format!("usability-program-{}", manifest.id))
                 .spawn(move || {
+                    let (child, containment) = child.into_parts();
                     run_program_probe(
-                        child.into_child(),
+                        child,
+                        containment,
                         selector_members,
                         sender,
                         worker_cancellation,
+                        manifest.timeout,
                     );
                 })
                 .context("failed to start executable usability probe worker")?
@@ -551,9 +599,11 @@ fn url_result_from_outcome(
 
 fn run_program_probe(
     mut child: Child,
+    _containment: ProbeProcessContainment,
     selector_members: Vec<String>,
     sender: mpsc::Sender<UsabilityProbeJobEvent>,
     cancellation: Arc<AtomicBool>,
+    timeout: Duration,
 ) {
     let Some(stdout) = child.stdout.take() else {
         kill_and_wait(&mut child);
@@ -578,18 +628,68 @@ fn run_program_probe(
         return;
     };
     let (line_sender, line_receiver) = mpsc::sync_channel(64);
-    let stdout_worker = thread::spawn(move || read_protocol_lines(stdout, line_sender));
-    let stderr_worker = thread::spawn(move || read_bounded_stderr(stderr));
+    let (stdout_done_sender, stdout_done_receiver) = mpsc::sync_channel(1);
+    let stdout_worker = thread::Builder::new()
+        .name("usability-probe-stdout".to_string())
+        .spawn(move || {
+            read_protocol_lines(stdout, line_sender);
+            let _ = stdout_done_sender.send(());
+        });
+    if let Err(error) = stdout_worker {
+        terminate_probe_process_tree(&mut child);
+        let _ = child.wait();
+        send_finished(
+            &sender,
+            false,
+            None,
+            Some(format!("failed to start usability stdout reader: {error}")),
+            BTreeMap::new(),
+        );
+        return;
+    }
+    let (stderr_done_sender, stderr_done_receiver) = mpsc::sync_channel(1);
+    let stderr_worker = thread::Builder::new()
+        .name("usability-probe-stderr".to_string())
+        .spawn(move || {
+            let diagnostic = read_bounded_stderr(stderr);
+            let _ = stderr_done_sender.send(diagnostic);
+        });
+    if let Err(error) = stderr_worker {
+        terminate_probe_process_tree(&mut child);
+        let _ = child.wait();
+        send_finished(
+            &sender,
+            false,
+            None,
+            Some(format!("failed to start usability stderr reader: {error}")),
+            BTreeMap::new(),
+        );
+        return;
+    }
     let allowed_nodes = selector_members.into_iter().collect::<BTreeSet<_>>();
     let mut results = BTreeMap::new();
     let mut terminal_summary = None;
     let mut fatal_error = None;
     let mut stdout_closed = false;
+    let deadline = Instant::now() + timeout;
+    let mut tree_terminated = false;
 
     while !stdout_closed {
         if cancellation.load(Ordering::Relaxed) && fatal_error.is_none() {
             fatal_error = Some("usability probe was cancelled".to_string());
-            let _ = child.kill();
+            if !tree_terminated {
+                terminate_probe_process_tree(&mut child);
+                tree_terminated = true;
+            }
+        } else if Instant::now() >= deadline && fatal_error.is_none() {
+            fatal_error = Some(format!(
+                "usability probe exceeded its {} second timeout",
+                timeout.as_secs()
+            ));
+            if !tree_terminated {
+                terminate_probe_process_tree(&mut child);
+                tree_terminated = true;
+            }
         }
         match line_receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(Ok(line)) => {
@@ -605,7 +705,10 @@ fn run_program_probe(
                         if terminal_summary.is_some() {
                             fatal_error =
                                 Some("node_result appeared after the terminal summary".to_string());
-                            let _ = child.kill();
+                            if !tree_terminated {
+                                terminate_probe_process_tree(&mut child);
+                                tree_terminated = true;
+                            }
                             continue;
                         }
                         if !allowed_nodes.contains(&node) {
@@ -618,7 +721,10 @@ fn run_program_probe(
                             fatal_error = Some(format!(
                                 "usability probe emitted duplicate result for node {node}"
                             ));
-                            let _ = child.kill();
+                            if !tree_terminated {
+                                terminate_probe_process_tree(&mut child);
+                                tree_terminated = true;
+                            }
                             continue;
                         }
                         let result = UsabilityProbeNodeResult {
@@ -635,21 +741,30 @@ fn run_program_probe(
                                 "usability probe emitted more than one terminal summary"
                                     .to_string(),
                             );
-                            let _ = child.kill();
+                            if !tree_terminated {
+                                terminate_probe_process_tree(&mut child);
+                                tree_terminated = true;
+                            }
                         } else {
                             terminal_summary = Some((complete, message.map(bounded_result_detail)));
                         }
                     }
                     Err(error) => {
                         fatal_error = Some(error);
-                        let _ = child.kill();
+                        if !tree_terminated {
+                            terminate_probe_process_tree(&mut child);
+                            tree_terminated = true;
+                        }
                     }
                 }
             }
             Ok(Err(error)) => {
                 if fatal_error.is_none() {
                     fatal_error = Some(error);
-                    let _ = child.kill();
+                    if !tree_terminated {
+                        terminate_probe_process_tree(&mut child);
+                        tree_terminated = true;
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -664,7 +779,19 @@ fn run_program_probe(
             if fatal_error.is_none() {
                 fatal_error = Some("usability probe was cancelled".to_string());
             }
-            let _ = child.kill();
+            if !tree_terminated {
+                terminate_probe_process_tree(&mut child);
+                tree_terminated = true;
+            }
+        } else if Instant::now() >= deadline && fatal_error.is_none() {
+            fatal_error = Some(format!(
+                "usability probe exceeded its {} second timeout",
+                timeout.as_secs()
+            ));
+            if !tree_terminated {
+                terminate_probe_process_tree(&mut child);
+                tree_terminated = true;
+            }
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -672,8 +799,28 @@ fn run_program_probe(
             Err(error) => break Err(error),
         }
     };
-    let _ = stdout_worker.join();
-    let stderr = stderr_worker.join().unwrap_or_default();
+    // A successful direct child may still have daemonized descendants holding inherited pipes.
+    // The run contract is bounded, so contain the whole process group before waiting for reader
+    // completion. Reader completion itself is also bounded to keep shutdown independent of a
+    // third-party program's descriptor hygiene.
+    if !tree_terminated {
+        terminate_probe_process_tree(&mut child);
+    }
+    let reader_timeout = Duration::from_secs(1);
+    if stdout_done_receiver.recv_timeout(reader_timeout).is_err() && fatal_error.is_none() {
+        fatal_error =
+            Some("usability probe stdout reader did not finish after cleanup".to_string());
+    }
+    let stderr = match stderr_done_receiver.recv_timeout(reader_timeout) {
+        Ok(stderr) => stderr,
+        Err(_) => {
+            if fatal_error.is_none() {
+                fatal_error =
+                    Some("usability probe stderr reader did not finish after cleanup".to_string());
+            }
+            String::new()
+        }
+    };
     if fatal_error.is_none() {
         match status {
             Ok(status) if !status.success() => {
@@ -704,8 +851,173 @@ fn run_program_probe(
 }
 
 fn kill_and_wait(child: &mut Child) {
-    let _ = child.kill();
+    terminate_probe_process_tree(child);
     let _ = child.wait();
+}
+
+#[cfg(not(windows))]
+struct ProbeProcessContainment;
+
+#[cfg(not(windows))]
+impl ProbeProcessContainment {
+    fn attach(_child: &Child) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+struct ProbeProcessContainment {
+    job: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl ProbeProcessContainment {
+    fn attach(child: &Child) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
+            .context("failed to create usability probe Job Object")?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if let Err(error) = configured {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(job);
+            }
+            return Err(error).context("failed to configure usability probe Job Object");
+        }
+        let process = HANDLE(child.as_raw_handle());
+        if let Err(error) = unsafe { AssignProcessToJobObject(job, process) } {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(job);
+            }
+            return Err(error).context("failed to assign usability probe to Job Object");
+        }
+        if let Err(error) = resume_suspended_process_threads(child.id()) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(job);
+            }
+            return Err(error).context("failed to resume contained usability probe");
+        }
+        Ok(Self { job })
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process_threads(process_id: u32) -> Result<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .context("failed to enumerate suspended probe threads")?;
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = false;
+    let mut next = unsafe { Thread32First(snapshot, &raw mut entry) };
+    while next.is_ok() {
+        if entry.th32OwnerProcessID == process_id {
+            found = true;
+            let thread =
+                match unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) } {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        unsafe {
+                            let _ = CloseHandle(snapshot);
+                        }
+                        return Err(error).context("failed to open suspended probe thread");
+                    }
+                };
+            let previous = unsafe { ResumeThread(thread) };
+            unsafe {
+                let _ = CloseHandle(thread);
+            }
+            if previous == u32::MAX {
+                unsafe {
+                    let _ = CloseHandle(snapshot);
+                }
+                anyhow::bail!("failed to resume suspended probe thread");
+            }
+        }
+        next = unsafe { Thread32Next(snapshot, &raw mut entry) };
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    if !found {
+        anyhow::bail!("suspended probe process exposed no resumable thread");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+impl Drop for ProbeProcessContainment {
+    fn drop(&mut self) {
+        unsafe {
+            // KILL_ON_JOB_CLOSE terminates the manifest program and every runtime descendant
+            // assigned through the inherited Job before the TUI can finish shutdown.
+            let _ = windows::Win32::Foundation::CloseHandle(self.job);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_probe_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // A manifest program may launch node-runtime-manager, which in turn owns isolated sing-box
+    // runtimes. A fresh process group gives the TUI one cancellation boundary for that entire
+    // probe tree without ever signalling the live selector's independently owned process.
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_probe_process_tree(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows::Win32::System::Threading::CREATE_SUSPENDED;
+
+        // Suspend before CreateProcess returns so manifest code cannot create a descendant in the
+        // narrow interval before the parent assigns it to the kill-on-close Job Object.
+        command.creation_flags(CREATE_SUSPENDED.0);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_probe_process_tree(child: &mut Child) {
+    let process_group = -(child.id() as libc::pid_t);
+    unsafe {
+        libc::kill(process_group, libc::SIGTERM);
+    }
+    // Do not reap the group leader during the grace period: keeping its PID reserved prevents
+    // PGID reuse, and a leader that exits early says nothing about TERM-ignoring descendants.
+    thread::sleep(PROCESS_TERMINATION_GRACE);
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_probe_process_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn parse_program_output(line: &str) -> std::result::Result<ProgramOutput, String> {
@@ -944,14 +1256,67 @@ fn manifest_from_document(
             document.id
         ),
     };
+    let interval = validated_optional_duration(
+        &document.id,
+        "interval_seconds",
+        document.interval_seconds,
+        MIN_BACKGROUND_INTERVAL,
+        MAX_BACKGROUND_INTERVAL,
+    )?;
+    if interval.is_some() && !document.background {
+        bail!(
+            "manifest '{}' interval_seconds requires background=true",
+            document.id
+        );
+    }
+    let result_ttl = validated_optional_duration(
+        &document.id,
+        "ttl_seconds",
+        document.ttl_seconds,
+        MIN_RESULT_TTL,
+        MAX_RESULT_TTL,
+    )?;
+    let timeout = validated_optional_duration(
+        &document.id,
+        "timeout_seconds",
+        document.timeout_seconds,
+        MIN_PROBE_TIMEOUT,
+        MAX_PROBE_TIMEOUT,
+    )?
+    .unwrap_or(DEFAULT_PROGRAM_TIMEOUT);
     Ok(UsabilityProbeManifest {
         id: NodeViewId::new(document.id)
             .expect("validated manifest IDs are valid node-view identities"),
         label: document.label.trim().to_string(),
         ranking_policy: document.ranking,
         source,
+        background: document.background,
+        interval,
+        result_ttl,
+        timeout,
         source_path: path.to_path_buf(),
     })
+}
+
+fn validated_optional_duration(
+    id: &str,
+    field: &str,
+    seconds: Option<u64>,
+    minimum: Duration,
+    maximum: Duration,
+) -> Result<Option<Duration>> {
+    let Some(seconds) = seconds else {
+        return Ok(None);
+    };
+    let value = Duration::from_secs(seconds);
+    if value < minimum || value > maximum {
+        bail!(
+            "manifest '{id}' {field} must be between {} and {} seconds",
+            minimum.as_secs(),
+            maximum.as_secs()
+        );
+    }
+    Ok(Some(value))
 }
 
 fn validate_manifest_id(id: &str) -> Result<()> {
@@ -1055,6 +1420,10 @@ mod tests {
                 "id":"github-web",
                 "label":"GitHub Web",
                 "ranking":"low-latency",
+                "background":true,
+                "interval_seconds":120,
+                "ttl_seconds":300,
+                "timeout_seconds":30,
                 "url":"https://github.com/404-is-still-http"
             }"#,
         )
@@ -1089,6 +1458,16 @@ mod tests {
             &discovered.manifests[0].source,
             UsabilityProbeSource::Url(url) if url.starts_with("https://github.com/")
         ));
+        assert!(discovered.manifests[0].background);
+        assert_eq!(
+            discovered.manifests[0].interval,
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            discovered.manifests[0].result_ttl,
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(discovered.manifests[0].timeout, Duration::from_secs(30));
         assert!(matches!(
             &discovered.manifests[1].source,
             UsabilityProbeSource::Executable { executable, args }
@@ -1243,6 +1622,10 @@ mod tests {
                     shell_marker.display()
                 )],
             },
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("fixture.json"),
         };
         let client = AsyncClient::builder()
@@ -1293,6 +1676,10 @@ mod tests {
                 executable,
                 args: vec!["--flood".to_string(), ready.display().to_string()],
             },
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("progress-flood.json"),
         };
         let selector_members = (0..128).map(|index| format!("node-{index}")).collect();
@@ -1346,6 +1733,10 @@ mod tests {
                 executable: compile_program_fixture(&directory),
                 args: vec!["--close-stdout".to_string(), ready.display().to_string()],
             },
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("stdout-eof.json"),
         };
         let client = AsyncClient::builder()
@@ -1382,6 +1773,63 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_term_ignoring_descendant_that_holds_protocol_pipes() {
+        let directory = temp_dir("cancel-process-tree");
+        let marker = directory.join("descendant-pid");
+        let manifest = UsabilityProbeManifest {
+            id: NodeViewId::new("process-tree").unwrap(),
+            label: "Process Tree".to_string(),
+            ranking_policy: RankingPolicy::Balanced,
+            source: UsabilityProbeSource::Executable {
+                executable: compile_program_fixture(&directory),
+                args: vec![
+                    "--spawn-descendant".to_string(),
+                    marker.display().to_string(),
+                ],
+            },
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
+            source_path: directory.join("process-tree.json"),
+        };
+        let client = AsyncClient::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let mut job = spawn_usability_probe_job(
+            manifest,
+            vec!["node-a".to_string()],
+            "http://127.0.0.1:1".to_string(),
+            client,
+        )
+        .expect("spawn process-tree fixture");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid: libc::pid_t = fs::read_to_string(&marker)
+            .expect("descendant marker")
+            .parse()
+            .expect("descendant pid");
+        let started = Instant::now();
+        job.cancel();
+        job.join();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let gone_deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < gone_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(descendant_pid, 0) },
+            0,
+            "TERM-ignoring descendant must not survive probe cancellation"
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
     #[test]
     fn executable_output_is_single_line_printable_before_presentation() {
         let directory = temp_dir("program-controls");
@@ -1393,6 +1841,10 @@ mod tests {
                 executable: compile_program_fixture(&directory),
                 args: vec!["--controls".to_string()],
             },
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("fixture-controls.json"),
         };
         let client = AsyncClient::builder()
@@ -1421,6 +1873,59 @@ mod tests {
         assert!(detail.contains("detail   next\u{fffd}[31m"));
         assert!(summary.contains("summary  value\u{fffd}[0m"));
         assert!(diagnostic.contains("\u{fffd}[33m stderr value"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn executable_failure_modes_are_incomplete_and_diagnostics_are_bounded() {
+        let directory = temp_dir("program-failures");
+        let executable = compile_program_fixture(&directory);
+        let client = AsyncClient::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        for (mode, expected) in [
+            ("--invalid-json", "invalid usability probe JSON"),
+            ("--auth-failure", "authentication failed"),
+            ("--unexpected-exit", "exited with"),
+            ("--runtime-failure", "isolated runtime failed"),
+            ("--timeout", "exceeded its 1 second timeout"),
+        ] {
+            let manifest = UsabilityProbeManifest {
+                id: NodeViewId::new(mode.trim_start_matches('-')).unwrap(),
+                label: "Failure Fixture".to_string(),
+                ranking_policy: RankingPolicy::Balanced,
+                source: UsabilityProbeSource::Executable {
+                    executable: executable.clone(),
+                    args: vec![mode.to_string()],
+                },
+                background: false,
+                interval: None,
+                result_ttl: None,
+                timeout: if mode == "--timeout" {
+                    Duration::from_secs(1)
+                } else {
+                    DEFAULT_PROGRAM_TIMEOUT
+                },
+                source_path: directory.join("failure.json"),
+            };
+            let mut job = spawn_usability_probe_job(
+                manifest,
+                vec!["node-a".to_string()],
+                "http://127.0.0.1:1".to_string(),
+                client.clone(),
+            )
+            .expect("spawn failure fixture");
+            let (_, completion) = collect_job(&job);
+            job.join();
+            assert!(!completion.complete, "{mode} must remain incomplete");
+            let diagnostic = completion.diagnostic.expect("failure diagnostic");
+            assert!(
+                diagnostic.contains(expected),
+                "{mode} diagnostic {diagnostic:?} must contain {expected:?}"
+            );
+            assert!(diagnostic.chars().count() <= MAX_DIAGNOSTIC_CHARS);
+        }
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -1461,6 +1966,10 @@ mod tests {
             label: "Web".to_string(),
             ranking_policy: RankingPolicy::LowLatency,
             source: UsabilityProbeSource::Url("https://example.test/any-status".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: PathBuf::from("web.json"),
         };
         let client = AsyncClient::builder()
@@ -1530,6 +2039,10 @@ mod tests {
             label: "Web Failures".to_string(),
             ranking_policy: RankingPolicy::Balanced,
             source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: PathBuf::from("web-failures.json"),
         };
         let client = AsyncClient::builder()
@@ -1685,6 +2198,25 @@ mod tests {
                 fn main() {
                     let args = std::env::args().collect::<Vec<_>>();
                     #[cfg(unix)]
+                    if args.get(1).map(String::as_str) == Some("--descendant") {
+                        unsafe extern "C" {
+                            fn signal(sig: i32, handler: usize) -> usize;
+                        }
+                        unsafe { signal(15, 1); }
+                        std::fs::write(&args[2], std::process::id().to_string()).unwrap();
+                        loop { std::thread::sleep(std::time::Duration::from_secs(30)); }
+                    }
+                    #[cfg(unix)]
+                    if args.get(1).map(String::as_str) == Some("--spawn-descendant") {
+                        let executable = std::env::current_exe().unwrap();
+                        std::process::Command::new(executable)
+                            .arg("--descendant")
+                            .arg(&args[2])
+                            .spawn()
+                            .unwrap();
+                        loop { std::thread::sleep(std::time::Duration::from_secs(30)); }
+                    }
+                    #[cfg(unix)]
                     if args.get(1).map(String::as_str) == Some("--close-stdout") {
                         use std::io::Write;
                         unsafe extern "C" {
@@ -1714,6 +2246,25 @@ mod tests {
                         println!("{}", r#"{"type":"node_result","node":"node-a","usable":true,"detail":"detail\n\t next\u001b[31m"}"#);
                         println!("{}", r#"{"type":"summary","complete":true,"message":"summary\r\nvalue\u001b[0m"}"#);
                         eprint!("\u{1b}[33m\nstderr\tvalue");
+                        return;
+                    }
+                    if args.get(1).map(String::as_str) == Some("--invalid-json") {
+                        println!("not-json");
+                        return;
+                    }
+                    if args.get(1).map(String::as_str) == Some("--auth-failure") {
+                        println!("{}", r#"{"type":"summary","complete":false,"message":"authentication failed"}"#);
+                        return;
+                    }
+                    if args.get(1).map(String::as_str) == Some("--unexpected-exit") {
+                        std::process::exit(17);
+                    }
+                    if args.get(1).map(String::as_str) == Some("--runtime-failure") {
+                        println!("{}", r#"{"type":"summary","complete":false,"message":"isolated runtime failed"}"#);
+                        return;
+                    }
+                    if args.get(1).map(String::as_str) == Some("--timeout") {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
                         return;
                     }
                     if args.len() != 2 {

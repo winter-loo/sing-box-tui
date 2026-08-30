@@ -8,15 +8,24 @@ use crate::auto_pick::{
     AUTO_SELECTION_MODEL_VERSION, AutoPickConfig, BACKGROUND_TASK_KIND, BackgroundLatencySnapshot,
     BackgroundLaunchSpec, BackgroundPollEvent, BackgroundStatusSnapshot, BackgroundWorkerEnsure,
     HeadlessWorkerCommand, HeadlessWorkerControl, HeadlessWorkerMetadata,
+    ScheduledUsabilityProbeConfig,
 };
 use crate::sustained_quality::normalize_sustained_target;
 
 fn background_status_should_publish(status: &str) -> bool {
-    status.starts_with("Auto-pick") || status.starts_with("Testing latency")
+    status.starts_with("Auto-pick")
+        || status.starts_with("Testing latency")
+        || status.starts_with("Running ")
+        || status.contains(" probe complete")
+        || status.contains(" probe incomplete")
+        || status.contains(" probe could not")
 }
 
 fn background_status_requires_selector_refresh(status: &str) -> bool {
-    status.starts_with("Auto-pick switched") || status.starts_with("Auto-pick selected")
+    status.starts_with("Auto-pick switched")
+        || status.starts_with("Auto-pick selected")
+        || status.contains(" probe complete")
+        || status.contains(" probe incomplete")
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -42,14 +51,36 @@ impl App {
     ) -> Result<()> {
         let before = self.auto_pick_runtime_signature();
 
+        let mut enabled = std::collections::BTreeSet::new();
+        let mut selectors = std::collections::BTreeMap::new();
+        for scheduled in &config.scheduled_usability_probes {
+            let manifest = self
+                .usability_probe_manifests
+                .iter()
+                .find(|manifest| manifest.id == scheduled.manifest_id)
+                .context("scheduled usability manifest is unavailable in the worker")?;
+            if !manifest.background
+                || manifest.background_interval().as_secs() != scheduled.interval_secs
+                || manifest.result_ttl.map(|ttl| ttl.as_secs()) != scheduled.ttl_secs
+                || manifest.timeout.as_secs() != scheduled.timeout_secs
+            {
+                anyhow::bail!(
+                    "scheduled usability manifest '{}' changed since foreground authorization",
+                    scheduled.manifest_id
+                );
+            }
+            enabled.insert(scheduled.manifest_id.clone());
+            selectors.insert(scheduled.manifest_id.clone(), scheduled.selector.clone());
+        }
+
         let requested_target = if config.sustained_target_url.trim().is_empty() {
             self.sustained_target_url.as_str()
         } else {
             config.sustained_target_url.as_str()
         };
         let sustained_target_url = normalize_sustained_target(requested_target)?;
-        // Target activation is the only fallible mutation. Do it before committing the selector
-        // settings so one accepted config generation cannot rank a different target partition.
+        // WHY: validate custom schedules before the first mutation so a rejected ApplyConfig
+        // cannot partly enable auto-pick or switch the quality partition in a long-lived worker.
         self.benchmark_workflow
             .activate_sustained_target(&sustained_target_url)?;
 
@@ -59,6 +90,8 @@ impl App {
         self.auto_select_selector = config.selector;
         self.auto_select_node_view = config.active_node_view;
         self.auto_select_ranking_policy = config.ranking_policy;
+        self.background_probe_enabled = enabled;
+        self.background_probe_selectors = selectors;
         if !config.benchmark_url.trim().is_empty() {
             self.benchmark_url = config.benchmark_url;
         }
@@ -111,6 +144,24 @@ impl App {
     }
 
     pub(super) fn auto_pick_config(&self) -> AutoPickConfig {
+        let scheduled_usability_probes = self
+            .background_probe_enabled
+            .iter()
+            .filter_map(|id| {
+                let manifest = self
+                    .usability_probe_manifests
+                    .iter()
+                    .find(|manifest| &manifest.id == id && manifest.background)?;
+                let selector = self.background_probe_selectors.get(id)?.clone();
+                Some(ScheduledUsabilityProbeConfig {
+                    manifest_id: id.clone(),
+                    selector,
+                    interval_secs: manifest.background_interval().as_secs(),
+                    ttl_secs: manifest.result_ttl.map(|ttl| ttl.as_secs()),
+                    timeout_secs: manifest.timeout.as_secs(),
+                })
+            })
+            .collect();
         AutoPickConfig {
             auto_selection_model_version: AUTO_SELECTION_MODEL_VERSION,
             enabled: self.auto_select_enabled,
@@ -125,6 +176,7 @@ impl App {
             max_concurrency: self.benchmark_max_concurrency,
             threshold_ms: self.auto_select_threshold_ms,
             interval_secs: self.auto_select_interval.as_secs(),
+            scheduled_usability_probes,
         }
     }
 
@@ -149,9 +201,10 @@ impl App {
         }
         let config = self.auto_pick_config();
         let launch = self.background_launch_spec()?;
-        let Some(event) =
-            self.background_auto_pick
-                .poll(self.auto_select_enabled, &config, &launch)?
+        let worker_enabled = self.auto_select_enabled || !self.background_probe_enabled.is_empty();
+        let Some(event) = self
+            .background_auto_pick
+            .poll(worker_enabled, &config, &launch)?
         else {
             return Ok(());
         };
@@ -226,7 +279,9 @@ impl App {
     }
 
     pub(super) fn ensure_auto_pick_background_worker_if_enabled(&mut self) -> Result<()> {
-        if !self.auto_select_enabled || !self.background_worker_management_enabled() {
+        if (!self.auto_select_enabled && self.background_probe_enabled.is_empty())
+            || !self.background_worker_management_enabled()
+        {
             return Ok(());
         }
         let worker = self.ensure_auto_pick_background_worker()?;
@@ -239,8 +294,12 @@ impl App {
     }
 
     pub(super) fn ensure_auto_pick_background_worker_after_state_change(&mut self) -> Result<()> {
-        if self.auto_select_enabled && self.background_worker_management_enabled() {
+        if (self.auto_select_enabled || !self.background_probe_enabled.is_empty())
+            && self.background_worker_management_enabled()
+        {
             self.ensure_auto_pick_background_worker()?;
+        } else if self.background_worker_management_enabled() {
+            self.stop_live_background_auto_pick_task()?;
         }
         Ok(())
     }
@@ -292,6 +351,7 @@ impl App {
                 .to_string(),
             auto_selection_explanation: self.last_auto_selection_explanation.clone(),
             latency: self.background_latency_snapshot(),
+            scheduled_usability_probes: self.auto_pick_config().scheduled_usability_probes,
         }
     }
 
@@ -345,6 +405,10 @@ impl App {
                 }
             }
 
+            if self.auto_select_enabled || !self.background_probe_enabled.is_empty() {
+                self.maybe_start_scheduled_usability_probe(std::time::Instant::now());
+                self.poll_usability_probe_updates();
+            }
             if self.auto_select_enabled {
                 self.maybe_refresh_connections();
                 self.poll_benchmark_updates()?;

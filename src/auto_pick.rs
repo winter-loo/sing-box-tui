@@ -22,9 +22,9 @@ use crate::process_inspection::process_is_alive as process_exists;
 use crate::sustained_quality::{normalize_sustained_target, sustained_target_identity};
 
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
-// Model 3 adds stable manifest panel IDs and run-scoped membership. Reusing a model-2 worker would
-// keep every custom panel fail-closed even after the foreground successfully publishes a run.
-pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 3;
+// Model 4 transports explicit per-manifest schedule authorization. Reusing a model-3 worker would
+// silently drop a user's P-toggle or, worse, leave an older authorization running after revocation.
+pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 4;
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -50,6 +50,17 @@ pub(crate) struct AutoPickConfig {
     /// Backward-compatible chart guide transported to older workers; selection no longer uses it.
     pub(crate) threshold_ms: u64,
     pub(crate) interval_secs: u64,
+    #[serde(default)]
+    pub(crate) scheduled_usability_probes: Vec<ScheduledUsabilityProbeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ScheduledUsabilityProbeConfig {
+    pub(crate) manifest_id: NodeViewId,
+    pub(crate) selector: String,
+    pub(crate) interval_secs: u64,
+    pub(crate) ttl_secs: Option<u64>,
+    pub(crate) timeout_secs: u64,
 }
 
 impl AutoPickConfig {
@@ -100,6 +111,8 @@ pub(crate) struct BackgroundStatusSnapshot {
     pub(crate) auto_selection_explanation: Option<AutoSelectionExplanation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latency: Option<BackgroundLatencySnapshot>,
+    #[serde(default)]
+    pub(crate) scheduled_usability_probes: Vec<ScheduledUsabilityProbeConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1256,6 +1269,7 @@ mod tests {
             max_concurrency: 4,
             threshold_ms: 600,
             interval_secs: 30,
+            scheduled_usability_probes: Vec::new(),
         }
     }
 
@@ -1289,6 +1303,7 @@ mod tests {
                 detail: "node-b leads; awaiting confirmation 1/2".to_string(),
             }),
             latency: None,
+            scheduled_usability_probes: Vec::new(),
         }
     }
 

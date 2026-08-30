@@ -22,7 +22,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const BENCHMARK_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BENCHMARK_PRUNE_BATCH_SIZE: usize = 50_000;
-const NODE_QUALITY_SCHEMA_VERSION: i64 = 5;
+const NODE_QUALITY_SCHEMA_VERSION: i64 = 6;
 const MAX_USABILITY_FACTS: usize = 4096;
 const MAX_USABILITY_ID_CHARS: usize = 64;
 const MAX_USABILITY_SELECTOR_CHARS: usize = 256;
@@ -60,12 +60,32 @@ pub(crate) struct UsabilityProbeFactRecord {
     pub(crate) detail: Option<String>,
 }
 
+pub(crate) struct UsabilityProbeRunFinalization<'a> {
+    pub(crate) run_id: i64,
+    pub(crate) generation: u64,
+    pub(crate) complete: bool,
+    pub(crate) summary: Option<&'a str>,
+    pub(crate) diagnostic: Option<&'a str>,
+    pub(crate) facts: &'a [UsabilityProbeFactRecord],
+    pub(crate) result_ttl: Option<Duration>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredUsabilityProbeRun {
     pub(crate) run_id: i64,
     pub(crate) completed_at_ms: u64,
+    pub(crate) expires_at_ms: Option<u64>,
     pub(crate) summary: Option<String>,
     pub(crate) results: Vec<UsabilityProbeFactRecord>,
+    pub(crate) latest_attempt: Option<StoredUsabilityProbeAttempt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUsabilityProbeAttempt {
+    pub(crate) run_id: i64,
+    pub(crate) completed_at_ms: u64,
+    pub(crate) complete: bool,
+    pub(crate) diagnostic: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -139,6 +159,7 @@ enum DatabasePreparation {
     Initialize,
     Current,
     MigrateV4,
+    MigrateV5,
 }
 
 impl NodeQualityReadLease {
@@ -242,6 +263,7 @@ impl BenchmarkStore {
             DatabasePreparation::Initialize => store.initialize()?,
             DatabasePreparation::Current => {}
             DatabasePreparation::MigrateV4 => store.migrate_v4_schema()?,
+            DatabasePreparation::MigrateV5 => store.migrate_v5_schema()?,
         }
         let generation = store.read_quality_generation_unlocked()?;
         store.quality_generation.set(generation as i64);
@@ -343,7 +365,8 @@ impl BenchmarkStore {
                     generation INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     summary TEXT,
-                    diagnostic TEXT
+                    diagnostic TEXT,
+                    expires_at_ms INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_usability_probe_runs_criterion_selector_recent
                     ON usability_probe_runs(
@@ -378,7 +401,7 @@ impl BenchmarkStore {
     fn migrate_v4_schema(&self) -> Result<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Exclusive)
-                .context("failed to begin exclusive node-quality v4-to-v5 migration")?;
+                .context("failed to begin exclusive node-quality v4-to-v6 migration")?;
         // Revalidate after acquiring SQLite's schema-write lock. The outer reconciliation lock
         // serializes cooperating processes, while this second check prevents an untrusted v4 file
         // from being upgraded if it changed between read-only classification and the transaction.
@@ -387,28 +410,49 @@ impl BenchmarkStore {
         }
         transaction
             .execute_batch(USABILITY_PROBE_RUNS_TABLE_SQL)
-            .context("failed to create usability-probe run table during v5 migration")?;
+            .context("failed to create usability-probe run table during v6 migration")?;
         transaction
             .execute_batch(
                 "CREATE INDEX idx_usability_probe_runs_criterion_selector_recent \
                  ON usability_probe_runs(criterion_id, selector, status, generation, completed_at_ms DESC, id DESC)",
             )
-            .context("failed to create usability-probe run index during v5 migration")?;
+            .context("failed to create usability-probe run index during v6 migration")?;
         transaction
             .execute_batch(USABILITY_PROBE_FACTS_TABLE_SQL)
-            .context("failed to create usability-probe fact table during v5 migration")?;
+            .context("failed to create usability-probe fact table during v6 migration")?;
         transaction
             .execute_batch(USABILITY_PROBE_RESULTS_TABLE_SQL)
-            .context("failed to create usability-probe result table during v5 migration")?;
+            .context("failed to create usability-probe result table during v6 migration")?;
         transaction
             .pragma_update(None, "user_version", NODE_QUALITY_SCHEMA_VERSION)
             .context("failed to set node-quality schema version after v4 migration")?;
         if !current_schema_is_recognized(&transaction)? {
-            anyhow::bail!("node-quality v4-to-v5 migration produced an unrecognized schema");
+            anyhow::bail!("node-quality v4-to-v6 migration produced an unrecognized schema");
         }
         transaction
             .commit()
-            .context("failed to commit node-quality v4-to-v5 migration")
+            .context("failed to commit node-quality v4-to-v6 migration")
+    }
+
+    fn migrate_v5_schema(&self) -> Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("failed to begin node-quality v5-to-v6 migration")?;
+        if !v5_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality v5 schema changed before migration");
+        }
+        transaction
+            .execute_batch("ALTER TABLE usability_probe_runs ADD COLUMN expires_at_ms INTEGER")
+            .context("failed to add usability result expiry")?;
+        transaction
+            .pragma_update(None, "user_version", NODE_QUALITY_SCHEMA_VERSION)
+            .context("failed to set node-quality schema version after v5 migration")?;
+        if !current_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality v5-to-v6 migration produced an unrecognized schema");
+        }
+        transaction
+            .commit()
+            .context("failed to commit node-quality v5-to-v6 migration")
     }
 
     pub(crate) fn begin_node_history_reconciliation(
@@ -1319,6 +1363,7 @@ impl BenchmarkStore {
         Ok(Some((run_id, expected_generation)))
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_usability_probe_run(
         &self,
         run_id: i64,
@@ -1328,6 +1373,30 @@ impl BenchmarkStore {
         diagnostic: Option<&str>,
         facts: &[UsabilityProbeFactRecord],
     ) -> Result<bool> {
+        self.finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+            run_id,
+            generation,
+            complete: requested_complete,
+            summary,
+            diagnostic,
+            facts,
+            result_ttl: None,
+        })
+    }
+
+    pub(crate) fn finish_usability_probe_run_with_ttl(
+        &self,
+        finalization: UsabilityProbeRunFinalization<'_>,
+    ) -> Result<bool> {
+        let UsabilityProbeRunFinalization {
+            run_id,
+            generation,
+            complete: requested_complete,
+            summary,
+            diagnostic,
+            facts,
+            result_ttl,
+        } = finalization;
         let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
         let generation_current = generation == self.quality_generation()
             && self.quality_session_current_while_locked()?;
@@ -1429,18 +1498,24 @@ impl BenchmarkStore {
         } else {
             diagnostic
         };
+        let completed_at_ms = current_timestamp_ms()?;
+        let expires_at_ms = result_ttl.map(|ttl| {
+            completed_at_ms.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
+        });
         let updated = transaction
             .execute(
                 r#"
                 UPDATE usability_probe_runs
-                SET completed_at_ms = ?1, status = ?2, summary = ?3, diagnostic = ?4
-                WHERE id = ?5 AND generation = ?6 AND status = 'running'
+                SET completed_at_ms = ?1, status = ?2, summary = ?3, diagnostic = ?4,
+                    expires_at_ms = ?5
+                WHERE id = ?6 AND generation = ?7 AND status = 'running'
                 "#,
                 params![
-                    current_timestamp_ms()?,
+                    completed_at_ms,
                     if complete { "complete" } else { "incomplete" },
                     summary.as_deref(),
                     final_diagnostic,
+                    complete.then_some(expires_at_ms).flatten(),
                     run_id,
                     generation as i64,
                 ],
@@ -1518,7 +1593,7 @@ impl BenchmarkStore {
         let run = connection
             .query_row(
                 r#"
-                SELECT id, completed_at_ms, summary
+                SELECT id, completed_at_ms, expires_at_ms, summary
                 FROM usability_probe_runs
                 WHERE criterion_id = ?1
                   AND selector = ?2
@@ -1531,13 +1606,34 @@ impl BenchmarkStore {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
             .context("failed to query latest complete usability-probe run")?;
-        let Some((run_id, completed_at_ms, summary)) = run else {
+        let latest_attempt = connection
+            .query_row(
+                r#"
+                SELECT id, completed_at_ms, status, diagnostic
+                FROM usability_probe_runs
+                WHERE criterion_id = ?1 AND selector = ?2 AND completed_at_ms IS NOT NULL
+                ORDER BY completed_at_ms DESC, id DESC LIMIT 1
+                "#,
+                params![criterion_id, selector],
+                |row| {
+                    Ok(StoredUsabilityProbeAttempt {
+                        run_id: row.get(0)?,
+                        completed_at_ms: row.get::<_, i64>(1)? as u64,
+                        complete: row.get::<_, String>(2)? == "complete",
+                        diagnostic: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to query latest usability-probe attempt")?;
+        let Some((run_id, completed_at_ms, expires_at_ms, summary)) = run else {
             return Ok(None);
         };
         let allowed = selector_members.iter().collect::<BTreeSet<_>>();
@@ -1568,8 +1664,10 @@ impl BenchmarkStore {
         Ok(Some(StoredUsabilityProbeRun {
             run_id,
             completed_at_ms: completed_at_ms as u64,
+            expires_at_ms: expires_at_ms.map(|value| value as u64),
             summary,
             results,
+            latest_attempt,
         }))
     }
 
@@ -2116,6 +2214,15 @@ fn prepare_node_quality_database(path: &Path) -> Result<DatabasePreparation> {
                 path.display()
             );
         }
+        5 => {
+            if v5_schema_is_recognized(&connection)? {
+                return Ok(DatabasePreparation::MigrateV5);
+            }
+            anyhow::bail!(
+                "refusing to modify unrecognized version {version} database {}",
+                path.display()
+            );
+        }
         legacy_version if legacy_version < 4 => {}
         _ => {
             anyhow::bail!(
@@ -2257,6 +2364,7 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
                 ("status", "TEXT", true, 0),
                 ("summary", "TEXT", false, 0),
                 ("diagnostic", "TEXT", false, 0),
+                ("expires_at_ms", "INTEGER", false, 0),
             ],
         )?
         || !table_has_exact_columns(
@@ -2404,6 +2512,53 @@ fn v4_schema_is_recognized(connection: &Connection) -> Result<bool> {
         )
         .context("failed to validate v4 node-quality state singleton")?;
     Ok(singleton_rows == 1)
+}
+
+fn v5_schema_is_recognized(connection: &Connection) -> Result<bool> {
+    if user_table_names(connection)?
+        != [
+            "benchmark_results",
+            "node_identities",
+            "node_quality_state",
+            "probe_attempts",
+            "reachability_assessments",
+            "sustained_probe_results",
+            "usability_probe_facts",
+            "usability_probe_results",
+            "usability_probe_runs",
+        ]
+        || !published_core_table_schemas_are_recognized(connection, true, true)?
+        || !table_has_exact_columns(
+            connection,
+            "usability_probe_runs",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("started_at_ms", "INTEGER", true, 0),
+                ("completed_at_ms", "INTEGER", false, 0),
+                ("criterion_id", "TEXT", true, 0),
+                ("selector", "TEXT", true, 0),
+                ("generation", "INTEGER", true, 0),
+                ("status", "TEXT", true, 0),
+                ("summary", "TEXT", false, 0),
+                ("diagnostic", "TEXT", false, 0),
+            ],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "usability_probe_runs",
+            &[USABILITY_PROBE_RUNS_V5_TABLE_SQL],
+        )?
+        || !user_behavior_objects(connection)?.is_empty()
+    {
+        return Ok(false);
+    }
+    let singleton_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM node_quality_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(singleton_rows == 1 && usability_probe_foreign_keys_are_recognized(connection)?)
 }
 
 fn published_core_table_schemas_are_recognized(
@@ -2593,6 +2748,21 @@ const SUSTAINED_PROBE_RESULTS_TABLE_SQL: &str = r#"
 "#;
 
 const USABILITY_PROBE_RUNS_TABLE_SQL: &str = r#"
+    CREATE TABLE usability_probe_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at_ms INTEGER NOT NULL,
+        completed_at_ms INTEGER,
+        criterion_id TEXT NOT NULL,
+        selector TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT,
+        diagnostic TEXT,
+        expires_at_ms INTEGER
+    )
+"#;
+
+const USABILITY_PROBE_RUNS_V5_TABLE_SQL: &str = r#"
     CREATE TABLE usability_probe_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at_ms INTEGER NOT NULL,
@@ -2935,7 +3105,8 @@ mod tests {
     use super::{
         BenchmarkRecord, BenchmarkStore, NODE_QUALITY_SCHEMA_VERSION, NodeQualityReadLease,
         QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX, UsabilityProbeFactRecord,
-        current_schema_is_recognized, node_configuration_fingerprint, sync_parent_directory,
+        UsabilityProbeRunFinalization, current_schema_is_recognized,
+        node_configuration_fingerprint, sync_parent_directory,
     };
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
     use crate::node_quality_path::QUALITY_RECONCILIATION_LOCK_SUFFIX;
@@ -3429,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_and_empty_sqlite_header_recover_to_atomic_v5_schema() {
+    fn empty_file_and_empty_sqlite_header_recover_to_atomic_current_schema() {
         for (label, create) in [("zero-bytes", false), ("sqlite-header", true)] {
             let path = test_db_path().with_extension(format!("{label}.sqlite3"));
             if create {
@@ -3456,7 +3627,7 @@ mod tests {
     }
 
     #[test]
-    fn both_published_v2_shapes_are_rebuilt_as_v5_without_old_facts() {
+    fn both_published_v2_shapes_are_rebuilt_as_current_without_old_facts() {
         for complete_column in [false, true] {
             let path = test_db_path().with_extension(if complete_column {
                 "v2b.sqlite3"
@@ -3478,7 +3649,7 @@ mod tests {
                     .recent_benchmarks(10)
                     .expect("read rebuilt benchmark history")
                     .is_empty(),
-                "published v2 facts are discarded before old processes can target the v5 inode"
+                "published v2 facts are discarded before old processes can target the current inode"
             );
             assert!(
                 store
@@ -3489,7 +3660,7 @@ mod tests {
                         [],
                         |row| row.get::<_, bool>(0),
                     )
-                    .expect("verify v5 identity table")
+                    .expect("verify current identity table")
             );
             drop(store);
             remove_test_db(&path);
@@ -3512,7 +3683,8 @@ mod tests {
             NODE_QUALITY_SCHEMA_VERSION
         );
         assert!(
-            current_schema_is_recognized(&store.connection).expect("recognize migrated v5 schema")
+            current_schema_is_recognized(&store.connection)
+                .expect("recognize migrated current schema")
         );
         assert_eq!(
             store
@@ -3571,6 +3743,57 @@ mod tests {
         );
 
         drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn exact_v5_schema_adds_expiry_without_losing_complete_usability_results() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("initialize v6 store");
+        bind_test_identities(&store, &["node-a"]);
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", store.quality_generation())
+            .expect("begin v5 fixture run")
+            .expect("quality generation current");
+        store
+            .finish_usability_probe_run(
+                run_id,
+                generation,
+                true,
+                Some("v5 complete"),
+                None,
+                &[UsabilityProbeFactRecord {
+                    node: "node-a".to_string(),
+                    usable: true,
+                    detail: None,
+                }],
+            )
+            .expect("publish v5 fixture run");
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE usability_probe_runs DROP COLUMN expires_at_ms; PRAGMA user_version = 5;",
+            )
+            .expect("downgrade fixture to exact published v5 shape");
+        drop(store);
+
+        let migrated = BenchmarkStore::open(&path).expect("migrate exact v5 schema");
+        let run = migrated
+            .latest_usability_probe_run("criterion", "select", &["node-a".to_string()])
+            .expect("read migrated result")
+            .expect("complete result retained");
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(run.summary.as_deref(), Some("v5 complete"));
+        assert_eq!(run.expires_at_ms, None);
+        assert_eq!(
+            migrated
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("read migrated version"),
+            NODE_QUALITY_SCHEMA_VERSION
+        );
+
+        drop(migrated);
         remove_test_db(&path);
     }
 
@@ -3634,23 +3857,23 @@ mod tests {
 
     #[test]
     fn malformed_current_schema_is_preserved() {
-        let path = test_db_path().with_extension("v5-trigger.sqlite3");
-        drop(BenchmarkStore::open(&path).expect("create recognized v5 database"));
-        let connection = rusqlite::Connection::open(&path).expect("open v5 fixture");
+        let path = test_db_path().with_extension("v6-trigger.sqlite3");
+        drop(BenchmarkStore::open(&path).expect("create recognized v6 database"));
+        let connection = rusqlite::Connection::open(&path).expect("open v6 fixture");
         connection
             .execute_batch(
-                "CREATE TRIGGER unrelated_v5_trigger AFTER INSERT ON benchmark_results \
+                "CREATE TRIGGER unrelated_v6_trigger AFTER INSERT ON benchmark_results \
                  BEGIN SELECT 1; END;",
             )
-            .expect("add unknown v5 trigger");
+            .expect("add unknown v6 trigger");
         drop(connection);
-        let before = std::fs::read(&path).expect("read v5 candidate");
+        let before = std::fs::read(&path).expect("read v6 candidate");
         let error = BenchmarkStore::open(&path)
             .err()
-            .expect("behavior-changing v5 trigger must be rejected");
-        assert!(format!("{error:#}").contains("unrecognized version 5"));
+            .expect("behavior-changing v6 trigger must be rejected");
+        assert!(format!("{error:#}").contains("unrecognized version 6"));
         assert_eq!(
-            std::fs::read(&path).expect("read preserved v5 candidate"),
+            std::fs::read(&path).expect("read preserved v6 candidate"),
             before
         );
         remove_test_db(&path);
@@ -3699,7 +3922,7 @@ mod tests {
             );
             assert!(
                 !old_runtime_fence.exists(),
-                "a whole-database v5 reset must remove every legacy protocol sidecar"
+                "a whole-database reset must remove every legacy protocol sidecar"
             );
             drop(store);
             remove_test_db(&path);
@@ -4638,6 +4861,69 @@ mod tests {
         assert_eq!(preserved.run_id, first_run);
         assert_eq!(preserved.summary.as_deref(), Some("first complete"));
         assert!(preserved.completed_at_ms > 0);
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn custom_ttl_is_frozen_at_publication_and_latest_failure_is_returned_with_prior_result() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a"]);
+        let (complete_run, generation) = store
+            .begin_usability_probe_run("agy", "select", store.quality_generation())
+            .expect("begin complete run")
+            .expect("quality generation current");
+        assert!(
+            store
+                .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+                    run_id: complete_run,
+                    generation,
+                    complete: true,
+                    summary: Some("accepted"),
+                    diagnostic: None,
+                    facts: &[UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: None,
+                    }],
+                    result_ttl: Some(Duration::from_secs(60)),
+                },)
+                .expect("publish expiring run")
+        );
+        let (failed_run, generation) = store
+            .begin_usability_probe_run("agy", "select", store.quality_generation())
+            .expect("begin failed run")
+            .expect("quality generation current");
+        assert!(
+            !store
+                .finish_usability_probe_run(
+                    failed_run,
+                    generation,
+                    false,
+                    None,
+                    Some("authentication failed"),
+                    &[],
+                )
+                .expect("finalize failed run")
+        );
+        let state = store
+            .latest_usability_probe_run("agy", "select", &["node-a".to_string()])
+            .expect("read usability state")
+            .expect("prior complete run retained");
+        assert_eq!(state.run_id, complete_run);
+        assert!(
+            state
+                .expires_at_ms
+                .is_some_and(|expires| expires > state.completed_at_ms)
+        );
+        let failure = state
+            .latest_attempt
+            .expect("latest failed attempt is visible");
+        assert_eq!(failure.run_id, failed_run);
+        assert!(!failure.complete);
+        assert_eq!(failure.diagnostic.as_deref(), Some("authentication failed"));
 
         drop(store);
         remove_test_db(&path);

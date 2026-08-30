@@ -228,6 +228,10 @@ fn discovered_custom_tab_starts_untested_then_projects_only_current_selector_mem
         label: "GitHub Web".to_string(),
         ranking_policy: RankingPolicy::LowLatency,
         source: UsabilityProbeSource::Url("https://github.com/404-is-still-http".to_string()),
+        background: false,
+        interval: None,
+        result_ttl: None,
+        timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("github-web.json"),
     });
 
@@ -252,7 +256,9 @@ fn discovered_custom_tab_starts_untested_then_projects_only_current_selector_mem
         StoredUsabilityProbeRun {
             run_id: 7,
             completed_at_ms: 42,
+            expires_at_ms: None,
             summary: Some("complete".to_string()),
+            latest_attempt: None,
             results: vec![
                 UsabilityProbeFactRecord {
                     node: "outside-selector".to_string(),
@@ -298,6 +304,10 @@ fn custom_panel_identity_survives_manifest_reordering_and_missing_files() {
         label: label.to_string(),
         ranking_policy: RankingPolicy::Balanced,
         source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+        background: false,
+        interval: None,
+        result_ttl: None,
+        timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from(format!("{id}.json")),
     };
     app.usability_probe_manifests = vec![manifest("alpha", "Alpha"), manifest("beta", "Beta")];
@@ -336,6 +346,10 @@ fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
         label: "Ordered".to_string(),
         ranking_policy: RankingPolicy::Balanced,
         source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+        background: false,
+        interval: None,
+        result_ttl: None,
+        timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("ordered.json"),
     });
     app.usability_probe_projection_cache.insert(
@@ -343,7 +357,9 @@ fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
         StoredUsabilityProbeRun {
             run_id: 8,
             completed_at_ms: 43,
+            expires_at_ms: None,
             summary: None,
+            latest_attempt: None,
             // Persistence order is deliberately lexical and must never control the TUI rows.
             results: ["a-node", "m-node", "z-node"]
                 .into_iter()
@@ -391,6 +407,48 @@ fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
     app.handle_key(KeyCode::Char('k')).expect("move up");
     assert_eq!(app.selected_member_name().as_deref(), Some("z-node"));
     assert_eq!(app.view_snapshot().candidate_selected, Some(0));
+}
+
+#[test]
+fn expired_custom_results_remain_visible_but_cannot_enter_candidates() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    let id = NodeViewId::new("expiring").unwrap();
+    app.usability_probe_manifests.push(UsabilityProbeManifest {
+        id: id.clone(),
+        label: "Expiring".to_string(),
+        ranking_policy: RankingPolicy::Balanced,
+        source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+        background: true,
+        interval: Some(std::time::Duration::from_secs(60)),
+        result_ttl: Some(std::time::Duration::from_secs(1)),
+        timeout: std::time::Duration::from_secs(30),
+        source_path: PathBuf::from("expiring.json"),
+    });
+    app.usability_probe_projection_cache.insert(
+        (id.clone(), "select".to_string()),
+        StoredUsabilityProbeRun {
+            run_id: 12,
+            completed_at_ms: 1,
+            expires_at_ms: Some(2),
+            summary: Some("previously accepted".to_string()),
+            results: vec![UsabilityProbeFactRecord {
+                node: "node-a".to_string(),
+                usable: true,
+                detail: Some("accepted before expiry".to_string()),
+            }],
+            latest_attempt: None,
+        },
+    );
+    app.node_view_panel = super::super::NodeViewPanel::Custom(id.clone());
+
+    let run = app
+        .custom_usability_run(&id, "select", &app.groups[0].members)
+        .expect("expired evidence remains inspectable");
+    assert!(app.custom_usability_run_is_expired(&run));
+    let snapshot = app.view_snapshot();
+    assert!(snapshot.candidate_rows.is_empty());
+    assert!(snapshot.candidate_title.contains("EXPIRED"));
 }
 
 #[test]

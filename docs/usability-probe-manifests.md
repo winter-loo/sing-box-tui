@@ -14,6 +14,10 @@ ASCII identifiers and must be unique. Labels are the tab names shown to users.
   "id": "github-web",
   "label": "GitHub Web",
   "ranking": "low-latency",
+  "background": true,
+  "interval_seconds": 900,
+  "ttl_seconds": 3600,
+  "timeout_seconds": 60,
   "url": "https://github.com/"
 }
 ```
@@ -31,6 +35,18 @@ that individual node is not usable. The client waits longer than the target dead
 produce that response; a stalled/unreachable controller, authentication failure, missing route,
 or other unexpected status leaves the whole run incomplete and preserves the previous complete
 panel. URL probes do not start a child program or create a node runtime.
+
+`background` defaults to `false`. When true, `interval_seconds` may override the safe 900-second
+default schedule. This is only manifest permission: the TUI still will not schedule the criterion
+until the user selects that custom tab and presses `P`. The explicit authorization is stored for
+the stable manifest ID and selected selector. Enabling auto-pick with `a` does not authorize a
+custom probe or consume its application quota. Press `P` again to revoke the authorization.
+
+`ttl_seconds` is optional. Without it, a complete result follows each unchanged node
+configuration's lifetime. With it, the expiry timestamp is frozen when the complete run is
+published, so later manifest edits cannot revive expired evidence. Expired facts remain visible
+in detail but cannot enter custom-panel or automatic-selection candidates. `timeout_seconds`
+bounds the whole program and defaults to 600 seconds.
 
 ## Executable probes
 
@@ -66,6 +82,10 @@ and no node records may follow it. A complete summary is required before results
 panel's prior complete run. An incomplete run and malformed output retain their diagnostic history
 but do not replace the last complete panel.
 
+Invalid JSON Lines, authentication failure, unexpected exit, timeout, cancellation, and runtime
+failure all make the new run incomplete. A prior complete result is retained only while unexpired,
+and the newer failed attempt remains visible in panel/detail state.
+
 Stdout is limited to 64 KiB per line and 4 MiB total. The TUI continuously drains stderr but
 retains only a bounded 16 KiB diagnostic prefix. These bounds keep a faulty probe from growing the
 TUI's memory without limit. Detail, summary, stderr, and manifest diagnostic text is normalized to
@@ -76,6 +96,8 @@ terminal display.
 
 - Use Left and Right while the candidate pane is focused to navigate built-in and custom tabs.
 - Press `U` on a custom tab to start its manual probe.
+- Press `P` on a custom tab to explicitly enable or disable its permitted background schedule for
+  the selected selector. This permission is independent from auto-pick.
 - Progressive results and terminal status appear in the status area.
 - A complete custom tab shows only usable results that are also members of the selector snapshot
   used for the run. Results for other selectors are never published into the tab.

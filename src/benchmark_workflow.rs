@@ -31,7 +31,7 @@ use crate::node_runtime_manager::IsolatedRuntimeSnapshot;
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, NodeQualityReadLease, NodeQuickHistory,
     PersistedNodeQualityProjection, StoredUsabilityProbeRun, SustainedSuccessStats,
-    UsabilityProbeFactRecord, lock_node_quality_reconciliation,
+    UsabilityProbeRunFinalization, lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
     NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
@@ -721,19 +721,14 @@ impl BenchmarkWorkflow {
         Ok((run_id, generation))
     }
 
-    pub(crate) fn finish_usability_probe_run(
+    pub(crate) fn finish_usability_probe_run_with_ttl(
         &self,
-        run_id: i64,
-        generation: u64,
-        complete: bool,
-        summary: Option<&str>,
-        diagnostic: Option<&str>,
-        facts: &[UsabilityProbeFactRecord],
+        finalization: UsabilityProbeRunFinalization<'_>,
     ) -> Result<bool> {
         self.store
             .as_ref()
             .context("node-quality persistence is not active")?
-            .finish_usability_probe_run(run_id, generation, complete, summary, diagnostic, facts)
+            .finish_usability_probe_run_with_ttl(finalization)
     }
 
     pub(crate) fn latest_usability_probe_run(

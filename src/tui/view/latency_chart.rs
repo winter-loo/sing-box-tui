@@ -29,6 +29,8 @@ pub(crate) struct UsabilityCriterionDetail {
     pub(crate) label: String,
     pub(crate) usable: bool,
     pub(crate) detail: Option<String>,
+    pub(crate) expired: bool,
+    pub(crate) latest_failure: Option<String>,
 }
 
 fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
@@ -160,6 +162,19 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
                     .map(|detail| format!(" ({})", truncate_for_width(detail, 56)))
                     .unwrap_or_default()
             )));
+            if criterion.expired {
+                lines.push(Line::from(format!(
+                    "{} criterion result: expired (excluded from candidates)",
+                    criterion.label
+                )));
+            }
+            if let Some(failure) = &criterion.latest_failure {
+                lines.push(Line::from(format!(
+                    "{} criterion latest attempt: {}",
+                    criterion.label,
+                    truncate_for_width(failure, 72)
+                )));
+            }
         }
         frame.render_widget(
             Paragraph::new(lines)
