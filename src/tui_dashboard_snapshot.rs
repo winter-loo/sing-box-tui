@@ -6,6 +6,7 @@ use super::view::{
     SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
     truncate_for_width,
 };
+use crate::benchmark_workflow::{ActiveQuickProbe, BenchmarkWorkflow};
 
 impl App {
     pub(super) fn view_snapshot(&mut self) -> DashboardSnapshot<'_> {
@@ -73,6 +74,15 @@ impl App {
                             let (reachability, _) = split_reachability_evidence(
                                 &projection.assessment.compact_evidence(),
                             );
+                            let active = active_quick_overlay(
+                                &self.benchmark_workflow,
+                                &group.name,
+                                &projection.name,
+                            );
+                            let reachability = active
+                                .as_ref()
+                                .map(|(reachability, _)| reachability.clone())
+                                .unwrap_or(reachability);
                             let p95 = projection
                                 .quick_history
                                 .p95_ms
@@ -99,7 +109,11 @@ impl App {
                                     projection.sustained_stats.attempts,
                                 ),
                                 compact_marker: throughput.replace(" MiB/s", "M/s"),
-                                tone: CandidateTone::Success,
+                                tone: if active.is_some() {
+                                    CandidateTone::Pending
+                                } else {
+                                    CandidateTone::Success
+                                },
                             }
                         })
                         .collect();
@@ -126,6 +140,12 @@ impl App {
                                     split_reachability_evidence(&assessment.compact_evidence()).0
                                 })
                                 .unwrap_or_else(|| "-/3".to_string());
+                            let active =
+                                active_quick_overlay(&self.benchmark_workflow, &group.name, member);
+                            let reachability = active
+                                .as_ref()
+                                .map(|(reachability, _)| reachability.clone())
+                                .unwrap_or(reachability);
                             let marker = result
                                 .detail
                                 .clone()
@@ -136,7 +156,11 @@ impl App {
                                 reachability,
                                 compact_marker: "usable".to_string(),
                                 marker,
-                                tone: CandidateTone::Success,
+                                tone: if active.is_some() {
+                                    CandidateTone::Pending
+                                } else {
+                                    CandidateTone::Success
+                                },
                             })
                         })
                         .collect();
@@ -144,10 +168,22 @@ impl App {
                 displayed_members
                     .iter()
                     .map(|member| {
-                        let assessment = self
+                        let stored_assessment = self
                             .benchmark_workflow
                             .reachability_assessment(&group.name, member);
-                        let (reachability, marker, tone) = if let Some(assessment) = assessment {
+                        // WHY: an active run is the current observation. It must cover stored
+                        // evidence so reruns cannot present an old result as live progress.
+                        let active =
+                            active_quick_overlay(&self.benchmark_workflow, &group.name, member);
+                        let (reachability, marker, tone) = if let Some((reachability, marker)) =
+                            active
+                        {
+                            (
+                                reachability,
+                                marker.unwrap_or_else(|| "...".to_string()),
+                                CandidateTone::Pending,
+                            )
+                        } else if let Some(assessment) = stored_assessment {
                             let tone = match assessment.assessment {
                                 Some(
                                     crate::controller::ReachabilityAssessment::StableReachable,
@@ -164,11 +200,6 @@ impl App {
                             let (reachability, marker) =
                                 split_reachability_evidence(&assessment.compact_evidence());
                             (reachability, marker, tone)
-                        } else if self
-                            .benchmark_workflow
-                            .quick_probe_pending(&group.name, member)
-                        {
-                            ("-/3".into(), "...".to_string(), CandidateTone::Pending)
                         } else {
                             ("-/3".into(), "-".to_string(), CandidateTone::Missing)
                         };
@@ -399,6 +430,23 @@ fn split_reachability_evidence(value: &str) -> (String, String) {
         .unwrap_or_else(|| (value.to_string(), String::new()))
 }
 
+fn active_quick_overlay(
+    workflow: &BenchmarkWorkflow,
+    group: &str,
+    node: &str,
+) -> Option<(String, Option<String>)> {
+    workflow
+        .active_quick_probe(group, node)
+        .map(|progress| match progress {
+            ActiveQuickProbe::Pending => ("-/3".to_string(), None),
+            ActiveQuickProbe::Assessment(assessment) => {
+                let (reachability, marker) =
+                    split_reachability_evidence(&assessment.compact_evidence());
+                (reachability, Some(marker))
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::test_app;
@@ -427,5 +475,74 @@ mod tests {
         assert_eq!(snapshot.candidate_rows[0].marker, "reachable");
         assert_eq!(snapshot.candidate_rows[0].tone, CandidateTone::Success);
         assert_eq!(snapshot.candidate_rows.len(), app.groups[0].members.len());
+    }
+
+    #[test]
+    fn active_reachability_progress_covers_stored_evidence() {
+        let mut app = test_app();
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment {
+                name: "node-a".into(),
+                attempts: vec![
+                    ProbeOutcome::Reachable { delay_ms: 20 },
+                    ProbeOutcome::Reachable { delay_ms: 21 },
+                    ProbeOutcome::Reachable { delay_ms: 22 },
+                ],
+                assessment: Some(ReachabilityAssessment::StableReachable),
+            },
+        );
+        app.benchmark_workflow
+            .add_pending_job_for_test("select", "node-a");
+        app.benchmark_workflow
+            .set_active_reachability_assessment_for_test(
+                "select",
+                NodeReachabilityAssessment {
+                    name: "node-a".into(),
+                    attempts: vec![ProbeOutcome::Timeout],
+                    assessment: Some(ReachabilityAssessment::Degraded),
+                },
+            );
+
+        let snapshot = app.view_snapshot();
+        let row = snapshot
+            .candidate_rows
+            .iter()
+            .find(|row| row.name == "node-a")
+            .expect("active node row");
+
+        assert_eq!(row.reachability, "0/3");
+        assert_eq!(row.marker, "degraded");
+        assert_eq!(row.tone, CandidateTone::Pending);
+    }
+
+    #[test]
+    fn active_probe_without_progress_hides_stored_evidence() {
+        let mut app = test_app();
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment {
+                name: "node-a".into(),
+                attempts: vec![
+                    ProbeOutcome::Reachable { delay_ms: 20 },
+                    ProbeOutcome::Reachable { delay_ms: 21 },
+                    ProbeOutcome::Reachable { delay_ms: 22 },
+                ],
+                assessment: Some(ReachabilityAssessment::StableReachable),
+            },
+        );
+        app.benchmark_workflow
+            .add_pending_job_for_test("select", "node-a");
+
+        let snapshot = app.view_snapshot();
+        let row = snapshot
+            .candidate_rows
+            .iter()
+            .find(|row| row.name == "node-a")
+            .expect("pending node row");
+
+        assert_eq!(row.reachability, "-/3");
+        assert_eq!(row.marker, "...");
+        assert_eq!(row.tone, CandidateTone::Pending);
     }
 }
