@@ -183,7 +183,7 @@ impl App {
                     // in-flight or subsequent probe facts to the new on-disk identity generation.
                     self.benchmark_workflow.pause_quality_persistence();
                     self.usability_probe_projection_cache.clear();
-                    self.latency_chart = None;
+                    self.node_quality_detail = None;
                 }
                 state.schedule_after(state.interval);
                 state.last_error = None;
@@ -225,7 +225,7 @@ mod tests {
     use crossterm::event::KeyCode;
     use std::sync::atomic::Ordering;
 
-    use super::super::LatencyChartState;
+    use super::super::NodeQualityDetailState;
     use super::{SubscriptionRefreshEvent, SubscriptionRefreshJob, SubscriptionRefreshState};
     use crate::controller::{BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome};
     use crate::storage::{BenchmarkStore, StoredUsabilityProbeRun};
@@ -325,12 +325,9 @@ mod tests {
         let cancellation = app
             .benchmark_workflow
             .add_pending_job_for_test("select", "node-old");
-        app.latency_chart = Some(LatencyChartState {
+        app.node_quality_detail = Some(NodeQualityDetailState {
             selector: "select".to_string(),
             node: "node-old".to_string(),
-            samples: Vec::new(),
-            window: std::time::Duration::from_secs(300),
-            threshold_ms: 800,
             last_refresh: std::time::Instant::now(),
             reachability_assessment: None,
             sustained_quality: None,
@@ -352,26 +349,26 @@ mod tests {
                 .reachability_assessment("select", "node-old")
                 .is_none()
         );
-        assert!(app.latency_chart.is_none());
+        assert!(app.node_quality_detail.is_none());
         assert!(app.usability_probe_projection_cache.is_empty());
         assert_eq!(
             app.benchmark_workflow
-                .persist_benchmark_for_test("node-old")
+                .persist_reachability_for_test("node-old")
                 .expect("old result is ignored"),
             None
         );
         assert_eq!(
             app.benchmark_workflow
-                .persist_benchmark_for_test("node-new")
+                .persist_reachability_for_test("node-new")
                 .expect("new result is ignored until runtime reload"),
             None
         );
         assert!(app.status.contains("node-quality persistence paused"));
         assert!(
             BenchmarkStore::open(&path)
-                .expect("reopen benchmark store")
-                .recent_benchmarks(10)
-                .expect("read persisted rows")
+                .expect("reopen node-quality store")
+                .latest_reachability_assessments()
+                .expect("read persisted assessments")
                 .is_empty()
         );
         let _ = std::fs::remove_file(path);
@@ -399,15 +396,15 @@ mod tests {
         assert!(app.benchmark_workflow.quality_persistence_enabled());
         assert_eq!(
             app.benchmark_workflow
-                .persist_benchmark_for_test("node-a")
+                .persist_reachability_for_test("node-a")
                 .expect("persist unchanged-generation result"),
             Some(true)
         );
         assert_eq!(
             BenchmarkStore::open(&path)
-                .expect("reopen benchmark store")
-                .recent_benchmarks(10)
-                .expect("read persisted rows")
+                .expect("reopen node-quality store")
+                .latest_reachability_assessments()
+                .expect("read persisted assessments")
                 .len(),
             1
         );

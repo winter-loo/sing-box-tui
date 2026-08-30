@@ -83,8 +83,6 @@ pub(crate) struct TuiRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) verify_targets: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) auto_select_threshold_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_select_interval_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_proxy_server: Option<String>,

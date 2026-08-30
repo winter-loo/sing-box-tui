@@ -3,10 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use crate::defaults::{
-    DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER,
-    DEFAULT_DELAY_TEST_URL, DEFAULT_SELECTOR_TAG,
-};
+use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER};
 use crate::subscriptions::{
     DEFAULT_SUBSCRIPTION_CACHE_PATH, DEFAULT_SUBSCRIPTION_INTERVAL_DAYS,
     DEFAULT_SUBSCRIPTION_SOURCE_PATH,
@@ -80,18 +77,6 @@ pub(crate) enum CliCommand {
         include_geosite_rules: bool,
         include_tun_mode: bool,
         write: bool,
-    },
-    Benchmark {
-        controller: Option<String>,
-        selector: String,
-        pattern: String,
-        url: String,
-        timeout_ms: u64,
-        request_timeout: f64,
-        max_concurrency: usize,
-        switch: bool,
-        verify: bool,
-        verify_urls: Vec<String>,
     },
     HillstoneProbe {
         server: String,
@@ -182,7 +167,6 @@ impl CliCommand {
             "subscribe" => Self::parse_subscribe(&args[1..]),
             "subscriptions" | "refresh-subscriptions" => Self::parse_subscriptions(&args[1..]),
             "sync" => Self::parse_sync_provider(&args[1..]),
-            "benchmark" => Self::parse_benchmark(&args[1..]),
             "hillstone-probe" => Self::parse_hillstone_probe(&args[1..]),
             "hillstone-route" => Self::parse_hillstone_route(&args[1..]),
             "private-access-service" => Self::parse_private_access_service(&args[1..]),
@@ -721,94 +705,6 @@ impl CliCommand {
         })
     }
 
-    fn parse_benchmark(args: &[String]) -> Result<Self> {
-        let mut controller = None;
-        let mut selector = String::from(DEFAULT_SELECTOR_TAG);
-        let mut pattern = String::new();
-        let mut url = String::from(DEFAULT_DELAY_TEST_URL);
-        let mut timeout_ms = 5000_u64;
-        let mut request_timeout = 12.0_f64;
-        let mut max_concurrency = DEFAULT_BENCHMARK_MAX_CONCURRENCY;
-        let mut switch = false;
-        let mut verify = false;
-        let mut verify_urls = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--controller" => {
-                    i += 1;
-                    let value = args.get(i).context("--controller requires a value")?;
-                    controller = Some(value.clone());
-                }
-                "--selector" => {
-                    i += 1;
-                    selector = args.get(i).context("--selector requires a value")?.clone();
-                }
-                "--match" | "--pattern" => {
-                    i += 1;
-                    pattern = args
-                        .get(i)
-                        .context("--match/--pattern requires a value")?
-                        .clone();
-                }
-                "--url" => {
-                    i += 1;
-                    url = args.get(i).context("--url requires a value")?.clone();
-                }
-                "--timeout-ms" => {
-                    i += 1;
-                    timeout_ms = args
-                        .get(i)
-                        .context("--timeout-ms requires a value")?
-                        .parse()
-                        .context("--timeout-ms must be an integer")?;
-                }
-                "--request-timeout" => {
-                    i += 1;
-                    request_timeout = args
-                        .get(i)
-                        .context("--request-timeout requires a value")?
-                        .parse()
-                        .context("--request-timeout must be a number")?;
-                }
-                "--max-concurrency" => {
-                    i += 1;
-                    max_concurrency = parse_max_concurrency(args.get(i), "--max-concurrency")?;
-                }
-                "--switch" => switch = true,
-                "--verify" => verify = true,
-                "--verify-url" => {
-                    i += 1;
-                    verify_urls.push(
-                        args.get(i)
-                            .context("--verify-url requires a value")?
-                            .clone(),
-                    );
-                }
-                "--help" | "-h" => {
-                    print_benchmark_usage();
-                    std::process::exit(0);
-                }
-                value if value.starts_with('-') => bail!("unknown flag for benchmark: {value}"),
-                value => bail!("unexpected positional argument for benchmark: {value}"),
-            }
-            i += 1;
-        }
-
-        Ok(Self::Benchmark {
-            controller,
-            selector,
-            pattern,
-            url,
-            timeout_ms,
-            request_timeout,
-            max_concurrency,
-            switch,
-            verify,
-            verify_urls,
-        })
-    }
-
     fn parse_hillstone_probe(args: &[String]) -> Result<Self> {
         let mut server = None;
         let mut port = 4433_u16;
@@ -1225,7 +1121,6 @@ fn print_usage() {
     println!(
         "  sync            Log into a provider site, fetch the sing-box subscription, and merge it"
     );
-    println!("  benchmark       Benchmark selector candidates and optionally switch");
     println!("  hillstone-probe Probe Hillstone SSL VPN control-plane compatibility");
     println!("  hillstone-route Add a sing-box route to reach an internal Hillstone HTTP service");
 }
@@ -1246,7 +1141,7 @@ fn print_run_usage() {
         "      --controller <URL>              Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
     );
     println!(
-        "      --max-concurrency <N>           Limit concurrent delay probes in TUI benchmarks (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
+        "      --max-concurrency <N>           Limit concurrent quick assessments in the TUI (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
     );
     println!(
         "      --config <FILE>                 sing-box config path for TUI subscription refresh"
@@ -1408,32 +1303,6 @@ fn print_sync_provider_usage() {
     println!("      --write                       Overwrite the --config file in place");
 }
 
-fn print_benchmark_usage() {
-    println!("Usage: sing-box-tui benchmark [OPTIONS]");
-    println!();
-    println!("Options:");
-    println!(
-        "      --controller <URL>        Clash controller base URL (default: {DEFAULT_CONTROLLER}; env: SING_BOX_CONTROLLER)"
-    );
-    println!(
-        "      --selector <NAME>         Selector group to benchmark (default: {DEFAULT_SELECTOR_TAG})"
-    );
-    println!(
-        "      --match <TEXT>            Comma-separated include/exclude filter for candidate tags; prefix exclusions with ! or -"
-    );
-    println!("      --url <URL>               Delay test URL (default: {DEFAULT_DELAY_TEST_URL})");
-    println!("      --timeout-ms <MS>         Delay probe timeout in ms (default: 5000)");
-    println!("      --request-timeout <SEC>   HTTP request timeout in seconds (default: 12)");
-    println!(
-        "      --max-concurrency <N>     Limit concurrent delay probes (default: {DEFAULT_BENCHMARK_MAX_CONCURRENCY})"
-    );
-    println!("      --switch                  Switch selector to the best successful node");
-    println!("      --verify                  Run post-switch verification targets");
-    println!(
-        "      --verify-url <NAME=URL>   Add a target to the default verification list; repeatable"
-    );
-}
-
 fn print_hillstone_probe_usage() {
     println!("Usage: sing-box-tui hillstone-probe --server <HOST> --username <USER> [OPTIONS]");
     println!();
@@ -1511,32 +1380,8 @@ fn print_private_access_tun_helper_usage() {
 #[cfg(test)]
 mod tests {
     use super::{BackgroundAction, CliCommand};
-    use crate::defaults::{
-        DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER,
-    };
+    use crate::defaults::{DEFAULT_CONFIG_PATH, DEFAULT_CONTROLLER};
     use std::path::PathBuf;
-
-    #[test]
-    fn benchmark_command_defaults_max_concurrency() {
-        let command = CliCommand::parse([
-            "benchmark".to_string(),
-            "--selector".to_string(),
-            "select".to_string(),
-        ])
-        .expect("benchmark command parses");
-
-        match command {
-            CliCommand::Benchmark {
-                max_concurrency,
-                pattern,
-                ..
-            } => {
-                assert_eq!(max_concurrency, DEFAULT_BENCHMARK_MAX_CONCURRENCY);
-                assert!(pattern.is_empty());
-            }
-            _ => panic!("expected benchmark command"),
-        }
-    }
 
     #[test]
     fn run_command_defaults_to_sing_box_on_path() {

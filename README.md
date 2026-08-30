@@ -1,7 +1,7 @@
 # sing-box-tui
 
-Terminal UI for managing sing-box selector nodes, latency tests, subscription
-refresh, bypass rules, and OS system proxy settings.
+Terminal UI for managing sing-box selector nodes, node-quality assessments,
+subscription refresh, bypass rules, and OS system proxy settings.
 
 ![Main screen](docs/assets/main-screen.svg)
 
@@ -326,13 +326,13 @@ Or point it at a different controller:
 cargo run -- run --controller http://127.0.0.1:9992
 ```
 
-Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable auto-pick for the selected selector group and active node-view panel. Prefix a filter term with `!` or `-` to exclude matching nodes, for example `美国,!倍率` keeps US nodes except names containing `倍率`, and `!香港` keeps all nodes except names containing `香港`. Auto-pick always runs in a background worker controlled by the TUI over TCP JSON lines. Every 30 seconds the worker runs a three-attempt reachability assessment, ranks only nodes included by the active panel, and requires the same candidate to win two complete rounds. Within one reachability tier, latency policies require at least a 20% lower warm median and throughput policy requires at least 20% higher sustained throughput. A switch is deferred while current-node connections grow by more than 64 KiB in the preceding 10 seconds. It does not rewrite the sing-box `urltest` outbound; it switches the selector to a concrete node through the controller API.
+Inside the TUI, use `/` to set a node-name filter such as `美国` or `美国,香港`, then press `a` to enable automatic selection for the selected selector group and active node-view panel. Prefix a filter term with `!` or `-` to exclude matching nodes, for example `美国,!倍率` keeps US nodes except names containing `倍率`, and `!香港` keeps all nodes except names containing `香港`. Automatic selection runs in a background worker controlled by the TUI over TCP JSON lines. Every 30 seconds the worker runs a three-attempt reachability assessment, ranks only nodes included by the active panel, and requires the same candidate to win two complete rounds. Within one reachability tier, balanced and low-latency policies require at least a 20% lower warm median, while throughput policy requires at least 20% higher sustained throughput. A switch is deferred while current-node connections grow by more than 64 KiB in the preceding 10 seconds. Candidate probes address concrete outbound tags and never mutate the live selector; only a confirmed automatic-selection decision switches it.
 
 TUI node-quality history is stored next to the canonical active sing-box config. A config named `config.json` keeps the compatible sibling name `singbox.sqlite3`; another config such as `office.json` uses `office.json.sing-box-tui.sqlite3`, so configs in one directory do not share histories accidentally. `SING_BOX_TUI_DB` can override the path: an absolute value is used directly, while a relative value is resolved from the canonical active-config directory (not the process working directory). Empty values and `:memory:` are rejected for active configs. A custom-config database previously created in another working directory is not migrated automatically; use an absolute override if it should remain authoritative.
 
-Schema v3 binds every tagged outbound to a canonical fingerprint of its complete definition. The database stores the tag and hash, not the outbound JSON or credentials. Subscription/import/provider writes reconcile history only after the active config is durably committed: unchanged tag-and-fingerprint pairs keep their facts, while removed outbounds and same-tag changed outbounds lose prior facts. As allowed by the initial node-quality schema policy, the first v3 open replaces any valid legacy SQLite schema older than v3 as a whole, including unrelated legacy tables in that file. A malformed current schema, a future schema, or a non-SQLite file fails closed and is not replaced.
+Schema v7 stores probe attempts, reachability assessments, sustained-quality results, usability-criterion runs, and node fingerprints; it has no legacy single-delay table or compatibility reader. The database stores the tag and hash, not outbound JSON or credentials. Subscription/import/provider writes reconcile history only after the active config is durably committed: unchanged tag-and-fingerprint pairs keep their facts, while removed outbounds and same-tag changed outbounds lose prior facts. The first v7 open replaces every older SQLite schema as a whole. A malformed v7 schema, a future schema, or a non-SQLite file fails closed and is not replaced.
 
-TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last latency filter, whether auto-pick is enabled, its target selector and stable node-view ID, the current selected node for each selector group, and the last explicit TUN mode and China IP routing choices (so a regenerated config that lost the `tun` inbound or the geoip/geosite rule-sets is re-applied on the next startup). On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector. Auto-pick confirmation streaks and traffic windows are intentionally rebuilt after restart, so pre-restart observations cannot complete a switch.
+TUI runtime state is written to `./sing-box-tui.json` by default. Set `SING_BOX_TUI_CONFIG=/path/to/sing-box-tui.json` to use a different file. The state file records the last node-name filter, whether automatic selection is enabled, its target selector and stable node-view ID, explicit background permission for custom usability criteria, the current selected node for each selector group, and the last explicit TUN mode and China IP routing choices. On startup, the TUI re-applies saved selector choices when the saved node still exists in that selector. Confirmation streaks and traffic windows are intentionally rebuilt after restart, so pre-restart observations cannot complete a switch.
 
 When auto-pick is enabled, the worker pid, TCP address, and token are recorded so `sing-box-tui background status` can query it and `sing-box-tui background stop` can stop it. Live TUI-to-worker interaction uses TCP while the registry file is only discovery data, not the live communication channel. Pressing `q` stops the worker together with the managed sing-box process; pressing `B` leaves sing-box, the worker, and active Private Access sessions running with their last applied settings. Starting the TUI again reconnects to the existing TCP-managed worker when auto-pick is enabled. Private Access sessions left by `B` are shown as `BACKGROUND` while the recorded profile pid is still alive.
 
@@ -481,42 +481,38 @@ sudo systemctl restart sing-box
 
 After the config references the local rule-set, press `b` in the TUI to edit bypass entries. The TUI writes `sing-box-tui-bypass.json`; new or retried connections use the updated direct-bypass rules.
 
-## Benchmark Nodes
+## Node quality and node-view panels
 
-The former Python skill script is now built into the Rust app.
+The Current selector panel always shows every selector member in selector order. The Streaming
+panel contains only nodes with an eligible quick assessment and a completed bounded sustained
+probe, ranked by throughput policy. Each valid local usability-probe manifest contributes another
+panel; a node may belong to several panels, and the active panel defines both visible candidates
+and the automatic-selection candidate boundary.
 
-For a manual Internet Route source subscription workflow, including fetching a sing-box subscription JSON, converting legacy config syntax for local testing, benchmarking every node through the Clash API, and verifying real traffic, see [docs/subscription-benchmark.md](docs/subscription-benchmark.md).
+`T` runs three sequential quick probe attempts per node through the live controller, with different
+nodes processed concurrently up to the configured cap. `t` performs that quick assessment and a
+bounded 512 KiB sustained-quality probe for the highlighted node. Sustained transfer and executable
+usability criteria use isolated runtimes and never change the live selector. `i` opens factual probe
+outcomes, reachability assessment, sustained quality, usability-criterion results, expiry, and the
+latest automatic-selection explanation.
+
+See [usability-probe manifests](docs/usability-probe-manifests.md) for registration, direct argument
+execution, background permission, schedules, resource limits, result expiry, and the Agy example.
+See the [release smoke test](docs/release-smoke-test.md) for bounded live validation.
 
 For enterprise intranet access through an external Private Access service process,
 including the Hillstone service, TUI settings, and troubleshooting, see
 [docs/private-access-service.md](docs/private-access-service.md).
 
-CLI examples:
+Run the TUI with a quick-node concurrency cap:
 
 ```bash
-cargo run -- benchmark
-cargo run -- benchmark --max-concurrency 8
-cargo run -- benchmark --selector select --match 美国 --switch
-cargo run -- benchmark --match 美国 --switch --verify
-cargo run -- benchmark --match 美国 --switch --verify --verify-url NAME=URL
 cargo run -- run --max-concurrency 8
 ```
 
-If `--match` is omitted, benchmarking runs without a substring filter. `--match` accepts the same comma-separated include/exclude syntax as the TUI filter, such as `美国,!倍率` or `!香港`. If `--max-concurrency` is omitted, benchmarks use a default cap of 16 concurrent delay probes. The same limit applies to CLI benchmarking and TUI group latency tests started with `T`.
-
-JSON output includes:
-
-- current selector target
-- tested candidates
-- per-node delay values
-- best successful node
-- whether a switch was applied
-- final selected node
-- optional verification summary
-
 ## Clash API Inspection
 
-Two read-only controller commands are available in addition to the TUI latency flow:
+Two read-only controller commands are available in addition to the TUI node-quality flow:
 
 - `selectors`: returns JSON for all selector groups, or one group with `--selector NAME`
 - `status`: returns controller version, current traffic counters, aggregate connection totals, and active connection metadata
@@ -536,21 +532,22 @@ Detached auto-pick worker commands are available separately:
 - `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
 - `\`: toggle the Internet Proxy TUN mode; adds or removes the sing-box `tun` inbound in the configured `config.json` and restarts the managed sing-box process. On macOS/Linux this needs `sudo` (the TUI prompts with `sudo -v`); on Windows it needs an Administrator session.
 - `Enter`: unused for selection
-- `T`: asynchronously test latency for all nodes in the current selector/group using the current filter
-- `t`: asynchronously test latency for only the currently highlighted node (with a light same-node debounce to avoid spammy rapid retests)
-- `s`: toggle node sort order between `SELECTOR ORDER` and `LATENCY ORDER`; latency order hides failed-tested nodes and sorts successful tested nodes by ascending latency
-- `a`: toggle panel-aware auto-pick for the selected selector using the current filter; the background worker requires two complete winning rounds, a same-tier 20% material improvement, and no active current-node transfer before switching
-- `i`: show a SQLite-backed latency line chart for the highlighted node; x-axis is relative time in minutes or hours and y-axis is latency in ms. The chart refreshes from SQLite while open. Failed latency records are treated as gaps, so no point is drawn and the line breaks there.
-- `z` / `Z`: while the latency chart is open, zoom in to the most recent values or zoom out to include less recent values
+- `Left` / `Right` while the candidate pane is focused: move between Current selector, Streaming, and custom usability-criterion panels
+- `T`: run a three-attempt quick reachability assessment for the current panel/selector scope
+- `t`: run a complete quick-plus-sustained assessment for the highlighted node
+- `U`: manually run the active custom usability criterion
+- `P`: grant or revoke independent background permission for the active custom criterion when its manifest permits scheduling
+- `a`: toggle panel-aware automatic selection; the background worker requires two complete winning rounds, a same-tier 20% material improvement, and no active current-node transfer before switching
+- `i`: show node-quality evidence and the latest automatic-selection explanation; use `j` / `k` to scroll
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
 - `v`: immediately start configured background verification checks
-- `o`: open TUI settings for latency, auto-pick, and system proxy values
-- `/`: change the latency substring filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
+- `o`: open TUI settings for quick assessment, sustained quality, automatic selection, and system proxy values
+- `/`: change the node-name filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
 - `r`: refresh groups
 - `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
 - `q`: quit
 
-During async latency tests, node rows show a brighter pending state (`...` plus a spinner marker) while a test is in progress, then show measured latency or `fail` when the test completes.
+During a quick assessment, rows show a brighter probing state and then `3/3`, `2/3`, `1/3`, `0/3`, or `incomplete`. Only timeout and transport failure count against a node; controller failure, invalid measurement, and cancellation leave the assessment incomplete.
 
 ## System Proxy
 

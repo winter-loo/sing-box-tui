@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use urlencoding::encode;
 
-use crate::defaults::{DEFAULT_CONTROLLER, DEFAULT_MIXED_PROXY_SERVER};
+use crate::defaults::DEFAULT_CONTROLLER;
 
 pub(crate) fn run_selectors(options: SelectorsOptions) -> Result<()> {
     let client = build_api_client(options.controller)?;
@@ -48,60 +48,6 @@ pub(crate) fn run_status(options: StatusOptions) -> Result<()> {
     let client = build_api_client(options.controller)?;
     let status = client.fetch_status()?;
     println!("{}", serde_json::to_string_pretty(&status)?);
-    Ok(())
-}
-
-pub(crate) fn run_benchmark(options: BenchmarkOptions) -> Result<()> {
-    let client = build_api_client(options.controller)?;
-    let summary = client.benchmark_selector(&BenchmarkRequest {
-        selector: options.selector,
-        pattern: options.pattern,
-        url: options.url,
-        timeout_ms: options.timeout_ms,
-        request_timeout: options.request_timeout,
-        max_concurrency: options.max_concurrency,
-        nodes: None,
-    })?;
-
-    let mut final_node = summary.current.clone();
-    let mut switched = false;
-    if options.switch
-        && let Some(best) = summary.best_success()
-    {
-        client.switch_proxy(&summary.selector, &best.name)?;
-        final_node = Some(best.name.clone());
-        switched = true;
-    }
-
-    let verification = if options.verify {
-        if options.verification_targets.is_empty() {
-            bail!("verification requires at least one --verify-url <NAME=URL> target");
-        }
-        Some(run_verification(
-            DEFAULT_MIXED_PROXY_SERVER,
-            &options.verification_targets,
-        ))
-    } else {
-        None
-    };
-    let best = summary.best_success().cloned();
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&BenchmarkOutput {
-            selector: summary.selector,
-            current: summary.current,
-            pattern: summary.pattern,
-            test_url: summary.url,
-            timeout_ms: summary.timeout_ms,
-            max_concurrency: summary.max_concurrency,
-            results: summary.results,
-            best,
-            switched,
-            final_node,
-            verification,
-        })?
-    );
     Ok(())
 }
 
@@ -188,90 +134,6 @@ impl ApiClient {
             .json()
             .await
             .context("failed to decode Clash API selector response")
-    }
-
-    pub(crate) fn benchmark_selector(
-        &self,
-        request: &BenchmarkRequest,
-    ) -> Result<BenchmarkSummary> {
-        self.runtime
-            .block_on(self.benchmark_selector_async(request))
-    }
-
-    async fn benchmark_selector_async(
-        &self,
-        request: &BenchmarkRequest,
-    ) -> Result<BenchmarkSummary> {
-        let selector = self.fetch_selector_async(&request.selector).await?;
-        let current = selector.now;
-        let candidates = filter_benchmark_candidates(&selector.all, request);
-
-        if candidates.is_empty() {
-            return Ok(BenchmarkSummary {
-                selector: request.selector.clone(),
-                current,
-                pattern: request.pattern.clone(),
-                url: request.url.clone(),
-                timeout_ms: request.timeout_ms,
-                max_concurrency: request.max_concurrency,
-                results: Vec::new(),
-            });
-        }
-
-        let base_url = self.base_url.clone();
-        let client = self.client.clone();
-        let url = request.url.clone();
-        let timeout_ms = request.timeout_ms;
-        let request_timeout = request.request_timeout;
-
-        let max_concurrency = request.max_concurrency.max(1);
-        let mut results = {
-            let mut tasks = JoinSet::new();
-            let mut pending = candidates.into_iter();
-
-            for _ in 0..max_concurrency {
-                let Some(name) = pending.next() else {
-                    break;
-                };
-                spawn_benchmark_task(
-                    &mut tasks,
-                    client.clone(),
-                    base_url.clone(),
-                    name,
-                    url.clone(),
-                    timeout_ms,
-                    request_timeout,
-                );
-            }
-
-            let mut results = Vec::new();
-            while let Some(result) = tasks.join_next().await {
-                results.push(result.expect("benchmark worker panicked"));
-                if let Some(name) = pending.next() {
-                    spawn_benchmark_task(
-                        &mut tasks,
-                        client.clone(),
-                        base_url.clone(),
-                        name,
-                        url.clone(),
-                        timeout_ms,
-                        request_timeout,
-                    );
-                }
-            }
-            results
-        };
-        results.sort_by_key(|item| (item.delay.is_none(), item.delay.unwrap_or(u64::MAX)));
-
-        Ok(BenchmarkSummary {
-            selector: request.selector.clone(),
-            current,
-            pattern: request.pattern.clone(),
-            url: request.url.clone(),
-            timeout_ms: request.timeout_ms,
-            max_concurrency,
-            results,
-        })
     }
 
     pub(crate) fn switch_proxy(&self, group: &str, proxy: &str) -> Result<()> {
@@ -724,33 +586,6 @@ async fn fetch_selector_for_benchmark(
         .context("failed to decode Clash API selector response")
 }
 
-fn spawn_benchmark_task(
-    tasks: &mut JoinSet<BenchmarkResult>,
-    client: AsyncClient,
-    base_url: String,
-    name: String,
-    url: String,
-    timeout_ms: u64,
-    request_timeout: f64,
-) {
-    tasks.spawn(async move {
-        let delay = measure_delay(
-            client,
-            base_url,
-            name.clone(),
-            url,
-            timeout_ms,
-            request_timeout,
-        )
-        .await;
-        BenchmarkResult {
-            name,
-            delay,
-            completed: true,
-        }
-    });
-}
-
 async fn measure_delay(
     client: AsyncClient,
     base_url: String,
@@ -1024,19 +859,6 @@ pub(crate) struct StatusOptions {
     pub(crate) controller: Option<String>,
 }
 
-pub(crate) struct BenchmarkOptions {
-    pub(crate) controller: Option<String>,
-    pub(crate) selector: String,
-    pub(crate) pattern: String,
-    pub(crate) url: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) request_timeout: f64,
-    pub(crate) max_concurrency: usize,
-    pub(crate) switch: bool,
-    pub(crate) verify: bool,
-    pub(crate) verification_targets: Vec<VerificationTarget>,
-}
-
 #[derive(Clone)]
 pub(crate) struct BenchmarkRequest {
     pub(crate) selector: String,
@@ -1131,33 +953,9 @@ impl BenchmarkSummary {
         }
     }
 
-    pub(crate) fn best_success(&self) -> Option<&BenchmarkResult> {
-        self.results
-            .iter()
-            .filter(|item| item.completed)
-            .filter_map(|item| item.delay.map(|delay| (item, delay)))
-            .min_by_key(|(_, delay)| *delay)
-            .map(|(item, _)| item)
-    }
-
     pub(crate) fn find_result(&self, name: &str) -> Option<&BenchmarkResult> {
         self.results.iter().find(|item| item.name == name)
     }
-}
-
-#[derive(Serialize)]
-pub(crate) struct BenchmarkOutput {
-    pub(crate) selector: String,
-    pub(crate) current: Option<String>,
-    pub(crate) pattern: String,
-    pub(crate) test_url: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) max_concurrency: usize,
-    pub(crate) results: Vec<BenchmarkResult>,
-    pub(crate) best: Option<BenchmarkResult>,
-    pub(crate) switched: bool,
-    pub(crate) final_node: Option<String>,
-    pub(crate) verification: Option<VerificationReport>,
 }
 
 #[derive(Serialize)]
@@ -1385,9 +1183,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BenchmarkEvent, BenchmarkOutput, BenchmarkRequest, BenchmarkResult, BenchmarkSummary,
-        ConnectionsResponse, ProbeOutcome, ProxiesResponse, ShellCheck, TrafficSnapshot,
-        UpdateConfigRequest, filter_benchmark_candidates, matches_filter, selectors_from_payload,
+        BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
+        ProbeOutcome, ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest,
+        filter_benchmark_candidates, matches_filter, selectors_from_payload,
         spawn_reachability_assessment_worker, status_from_parts, verification_check_label,
     };
 
@@ -1604,63 +1402,6 @@ mod tests {
                 .expect("capture delay request");
             assert!(request.contains("/delay?timeout=137&url="));
         }
-    }
-
-    #[test]
-    fn benchmark_summary_picks_lowest_successful_delay() {
-        let summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("node-b".to_string()),
-            pattern: "美国".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 16,
-            results: vec![
-                BenchmarkResult {
-                    name: "node-a".to_string(),
-                    delay: Some(100),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "node-b".to_string(),
-                    delay: Some(80),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "node-c".to_string(),
-                    delay: None,
-                    completed: true,
-                },
-            ],
-        };
-
-        let best = summary.best_success().expect("best result");
-        assert_eq!(best.name, "node-b");
-        assert_eq!(best.delay, Some(80));
-    }
-
-    #[test]
-    fn benchmark_output_serializes_max_concurrency() {
-        let output = BenchmarkOutput {
-            selector: "select".to_string(),
-            current: Some("node-a".to_string()),
-            pattern: "美国".to_string(),
-            test_url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 7,
-            results: vec![BenchmarkResult {
-                name: "node-a".to_string(),
-                delay: Some(42),
-                completed: true,
-            }],
-            best: None,
-            switched: false,
-            final_node: Some("node-a".to_string()),
-            verification: None,
-        };
-
-        let json = serde_json::to_value(output).expect("serialize benchmark output");
-        assert_eq!(json["max_concurrency"], 7);
     }
 
     #[test]

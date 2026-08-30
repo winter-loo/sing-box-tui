@@ -18,14 +18,6 @@ pub(crate) struct StatusSnapshot {
     pub(crate) footer: StatusFooter,
 }
 
-pub(crate) fn node_order_badge(latency_sort_mode: bool) -> &'static str {
-    if latency_sort_mode {
-        "LATENCY ORDER"
-    } else {
-        "SELECTOR ORDER"
-    }
-}
-
 pub(crate) fn pick_mode_badge(auto_select_enabled: bool) -> &'static str {
     if auto_select_enabled {
         "Auto"

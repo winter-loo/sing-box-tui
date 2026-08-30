@@ -68,7 +68,6 @@ pub(super) fn settings_field_value(app: &App, field: SettingsField) -> String {
         SettingsField::RequestTimeoutSec => app.benchmark_request_timeout.to_string(),
         SettingsField::MaxConcurrency => app.benchmark_max_concurrency.to_string(),
         SettingsField::VerifyTargets => app.verify_targets.clone(),
-        SettingsField::AutoPickThresholdMs => app.auto_select_threshold_ms.to_string(),
         SettingsField::AutoPickIntervalSec => app.auto_select_interval.as_secs().to_string(),
         SettingsField::SystemProxyServer => app.system_proxy.server().to_string(),
         SettingsField::ChinaIpRouting => app.china_ip_routing_enabled.to_string(),
@@ -290,7 +289,7 @@ impl App {
         match field {
             SettingsField::BenchmarkUrl => {
                 if value.is_empty() {
-                    bail!("latency URL cannot be empty");
+                    bail!("quick probe target cannot be empty");
                 }
                 self.benchmark_url = value.to_string();
             }
@@ -317,9 +316,6 @@ impl App {
                     parse_verification_targets(value)?;
                 }
                 self.verify_targets = value.to_string();
-            }
-            SettingsField::AutoPickThresholdMs => {
-                self.auto_select_threshold_ms = parse_positive(value)?
             }
             SettingsField::AutoPickIntervalSec => {
                 let seconds: u64 = parse_positive(value)?;

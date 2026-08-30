@@ -3,8 +3,8 @@ use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
     IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab, SettingRow,
-    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, node_order_badge, pick_mode_badge,
-    settings_field_label, truncate_for_width,
+    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
+    truncate_for_width,
 };
 
 impl App {
@@ -196,9 +196,7 @@ impl App {
         let candidate_title = selected_group
             .map(|group| {
                 let order = match &self.node_view_panel {
-                    NodeViewPanel::CurrentSelector => {
-                        node_order_badge(self.benchmark_workflow.latency_order())
-                    }
+                    NodeViewPanel::CurrentSelector => "SELECTOR ORDER",
                     NodeViewPanel::Streaming => "THROUGHPUT",
                     NodeViewPanel::Custom(id) => self
                         .usability_probe_manifests
@@ -238,12 +236,7 @@ impl App {
                 };
                 format!("Candidates for {} [{order}]{progress}", group.name)
             })
-            .unwrap_or_else(|| {
-                format!(
-                    "Candidates [{}]",
-                    node_order_badge(self.benchmark_workflow.latency_order())
-                )
-            });
+            .unwrap_or_else(|| "Candidates [SELECTOR ORDER]".to_string());
         let all_count = selected_group.map_or(0, |group| group.members.len());
         let streaming_count = streaming_projection.len();
         let mut node_view_tabs = vec![
@@ -396,7 +389,7 @@ impl App {
             intranet_detail,
             status,
             flash,
-            latency_chart: self.latency_chart.as_ref(),
+            node_quality_detail: self.node_quality_detail.as_ref(),
             connections,
             help_index: self.show_help.then_some(self.help_index),
             usability_probe_diagnostics: &self.usability_probe_diagnostics,

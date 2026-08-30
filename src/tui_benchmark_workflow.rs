@@ -41,7 +41,9 @@ impl App {
 
     pub(super) fn start_group_benchmark(&mut self) -> Result<()> {
         if self.showing_intranet_details() {
-            self.set_status_only("Latency tests are available for Internet Proxy nodes only");
+            self.set_status_only(
+                "Node-quality assessments are available for Internet Proxy nodes only",
+            );
             return Ok(());
         }
         let Some(group) = self.selected_member_panel_group().cloned() else {
@@ -67,11 +69,11 @@ impl App {
         };
         match self.benchmark_workflow.start_group(request) {
             BenchmarkStart::Started => self.set_status_only(format!(
-                "Testing latency for {} with filter '{}' in background (max {} concurrent)...",
+                "Assessing reachability for {} with filter '{}' in background (max {} concurrent)...",
                 group.name, self.benchmark_filter, self.benchmark_max_concurrency
             )),
             BenchmarkStart::AlreadyRunning => {
-                self.set_status_only(format!("Latency test already running for {}", group.name))
+                self.set_status_only(format!("Reachability assessment already running for {}", group.name))
             }
             BenchmarkStart::NoCandidates => self.set_status_only(format!(
                 "No nodes in {} matched filter '{}'",
@@ -88,7 +90,9 @@ impl App {
 
     pub(super) fn start_member_benchmark(&mut self) -> Result<()> {
         if self.showing_intranet_details() {
-            self.set_status_only("Latency tests are available for Internet Proxy nodes only");
+            self.set_status_only(
+                "Node-quality assessments are available for Internet Proxy nodes only",
+            );
             return Ok(());
         }
         let Some(group) = self.selected_member_panel_group().cloned() else {
@@ -112,11 +116,11 @@ impl App {
             .start_single_node(request, member.clone())
         {
             BenchmarkStart::Started => self.set_status_only(format!(
-                "Testing latency for {} / {} in background...",
+                "Assessing reachability for {} / {} in background...",
                 group.name, member
             )),
             BenchmarkStart::AlreadyRunning => self.set_status_only(format!(
-                "Latency test already running for {} / {}",
+                "Node-quality assessment already running for {} / {}",
                 group.name, member
             )),
             BenchmarkStart::Debounced => self.set_status_only(format!(
@@ -132,16 +136,6 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn toggle_latency_sort_mode(&mut self) {
-        let status = if self.benchmark_workflow.toggle_latency_order() {
-            "Sort order: LATENCY ORDER (sort successful nodes by delay, retain all members)"
-                .to_string()
-        } else {
-            "Sort order: SELECTOR ORDER (complete original selector order)".to_string()
-        };
-        self.set_status_only(status);
-    }
-
     pub(super) fn toggle_auto_select(&mut self) -> Result<()> {
         if self.auto_select_enabled {
             self.auto_select_enabled = false;
@@ -155,7 +149,7 @@ impl App {
             {
                 self.stop_live_background_auto_pick_task()?;
             }
-            self.set_status_only("Auto-pick disabled; background worker stopped");
+            self.set_status_only("Automatic selection disabled; background worker stopped");
             return Ok(());
         }
 
@@ -175,7 +169,7 @@ impl App {
         if self.background_worker_management_enabled() {
             let worker = self.ensure_auto_pick_background_worker()?;
             self.set_status_only(format!(
-                "Auto-pick enabled for {} [{} / {}] via background worker pid {} ({}, 20% material gate, two-round confirmation, every {}s)",
+                "Automatic selection enabled for {} [{} / {}] via background worker pid {} ({}, 20% material gate, two-round confirmation, every {}s)",
                 group_name,
                 self.auto_select_node_view,
                 self.auto_select_ranking_policy.label(),
@@ -185,7 +179,7 @@ impl App {
             ));
         } else {
             self.set_status_only(format!(
-                "Auto-pick enabled for {} [{} / {}] ({}, 20% material gate, two-round confirmation, every {}s)",
+                "Automatic selection enabled for {} [{} / {}] ({}, 20% material gate, two-round confirmation, every {}s)",
                 group_name,
                 self.auto_select_node_view,
                 self.auto_select_ranking_policy.label(),
@@ -223,7 +217,7 @@ impl App {
             BenchmarkStart::Started => {
                 self.last_auto_select_benchmark = Some(now);
                 self.set_status_only(format!(
-                    "Auto-pick testing latency for {} ({})...",
+                    "Automatic selection assessing reachability for {} ({})...",
                     group.name,
                     self.benchmark_scope_label()
                 ));
@@ -231,7 +225,7 @@ impl App {
             BenchmarkStart::NoCandidates => {
                 self.last_auto_select_benchmark = Some(now);
                 self.set_status_only(format!(
-                    "Auto-pick found no nodes in {} for {}",
+                    "Automatic selection found no nodes in {} for {}",
                     group.name,
                     self.benchmark_scope_label()
                 ));
@@ -403,14 +397,14 @@ impl App {
             .cloned()
         else {
             self.set_status_only(format!(
-                "Auto-pick finished for missing group {}",
+                "Automatic selection finished for missing group {}",
                 group_name
             ));
             return Ok(());
         };
         let Some(current_node) = group.current.clone() else {
             self.set_status_only(format!(
-                "Auto-pick deferred for {group_name}: current node unset"
+                "Automatic selection deferred for {group_name}: current node unset"
             ));
             return Ok(());
         };
@@ -493,7 +487,10 @@ impl App {
         let plan = AutoSelectionPlan::new(decision, parent_switch, quality_lease);
         let detail = plan.decision.reason.detail();
         let mut status = if plan.decision.target_node.is_none() && plan.parent_switch.is_none() {
-            format!("Auto-pick {} [{}]: {detail}", group_name, panel.label)
+            format!(
+                "Automatic selection {} [{}]: {detail}",
+                group_name, panel.label
+            )
         } else {
             // Keep `plan` intact until both controller writes return: its read lease is the proof
             // that ranked facts cannot be reconciled between selection and route activation.
@@ -518,15 +515,15 @@ impl App {
             self.save_runtime_state()?;
             match (&plan.decision.target_node, &plan.parent_switch) {
                 (Some(target), Some((_, route_group))) => format!(
-                    "Auto-pick switched {} to {} and selected {}: {}",
+                    "Automatic selection switched {} to {} and selected {}: {}",
                     group_name, target, route_group, detail
                 ),
                 (Some(target), None) => format!(
-                    "Auto-pick switched {} to {}: {}",
+                    "Automatic selection switched {} to {}: {}",
                     group_name, target, detail
                 ),
                 (None, Some((_, route_group))) => format!(
-                    "Auto-pick selected {}; kept {} on {}: {}",
+                    "Automatic selection selected {}; kept {} on {}: {}",
                     route_group,
                     group_name,
                     group.current.as_deref().unwrap_or("unset"),
@@ -571,7 +568,7 @@ impl App {
     fn defer_auto_selection_after_quality_change(&mut self, group: &str, detail: String) {
         let reason = AutoSelectionReason::QualityFactsUnavailable { detail };
         self.set_status_only(format!(
-            "Auto-pick deferred for {group}: {}",
+            "Automatic selection deferred for {group}: {}",
             reason.detail()
         ));
         self.last_auto_selection_explanation = Some(AutoSelectionExplanation::new(
@@ -593,7 +590,8 @@ impl App {
         match update {
             BenchmarkUpdate::Progress { group, best_label } => {
                 self.sync_selection_to_displayed_members();
-                self.status = format!("Testing latency for {group}... best so far: {best_label}");
+                self.status =
+                    format!("Assessing reachability for {group}... best so far: {best_label}");
             }
             BenchmarkUpdate::SustainedProgress { group, result } => {
                 self.sync_selection_to_displayed_members();
@@ -604,7 +602,9 @@ impl App {
                 );
             }
             BenchmarkUpdate::Disconnected { group } => {
-                self.set_status_only(format!("Latency test worker for {group} disconnected"));
+                self.set_status_only(format!(
+                    "Reachability assessment worker for {group} disconnected"
+                ));
             }
             BenchmarkUpdate::Finished(BenchmarkCompletion::Group {
                 group,

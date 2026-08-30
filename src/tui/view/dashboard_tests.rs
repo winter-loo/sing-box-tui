@@ -2,7 +2,7 @@ use super::*;
 use crate::private_access::PrivateAccessRoute;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
@@ -48,7 +48,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             footer: StatusFooter::Status("ready".to_string()),
         },
         flash: None,
-        latency_chart: None,
+        node_quality_detail: None,
         connections: None,
         help_index: None,
         usability_probe_diagnostics: &[],
@@ -185,7 +185,7 @@ fn settings_overlay_uses_typed_rows() {
     let mut snapshot = dashboard_snapshot();
     snapshot.settings = Some(SettingsPanelSnapshot {
         rows: vec![SettingRow {
-            label: "Latency URL",
+            label: "Quick probe HTTPS target",
             value: "https://example.test/ping".to_string(),
         }],
         selected: 0,
@@ -195,19 +195,16 @@ fn settings_overlay_uses_typed_rows() {
 
     let text = rendered_lines(&snapshot).join("\n");
     assert!(text.contains("Settings"));
-    assert!(text.contains("Latency URL"));
+    assert!(text.contains("Quick probe HTTPS target"));
     assert!(text.contains("https://example.test/ping"));
 }
 
 #[test]
 fn reachability_detail_renders_three_attempts_and_assessment() {
     let mut snapshot = dashboard_snapshot();
-    let chart = LatencyChartState {
+    let chart = NodeQualityDetailState {
         selector: "select".into(),
         node: "node-a".into(),
-        samples: Vec::new(),
-        window: Duration::from_secs(3600),
-        threshold_ms: 600,
         last_refresh: Instant::now(),
         reachability_assessment: Some(NodeReachabilityAssessment {
             name: "node-a".into(),
@@ -233,15 +230,15 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
         usability_details: Vec::new(),
         evidence_scroll: 0,
     };
-    snapshot.latency_chart = Some(&chart);
+    snapshot.node_quality_detail = Some(&chart);
 
     let text = rendered_lines(&snapshot).join("\n");
-    assert!(text.contains("Assessment: 2/3 reachable"));
-    assert!(text.contains("Attempt 1: reachable (42ms)"));
-    assert!(text.contains("Attempt 2: timeout"));
-    assert!(text.contains("Attempt 3: reachable (51ms)"));
-    assert!(text.contains("Sustained: 1.0 MiB/s, 524288 bytes"));
-    assert!(text.contains("Auto-selection: candidate leads; awaiting confirmation 1/2"));
+    assert!(text.contains("Reachability assessment: 2/3 reachable"));
+    assert!(text.contains("Probe attempt 1: reachable (42ms)"));
+    assert!(text.contains("Probe attempt 2: timeout"));
+    assert!(text.contains("Probe attempt 3: reachable (51ms)"));
+    assert!(text.contains("Sustained quality: 1.0 MiB/s, 524288 bytes"));
+    assert!(text.contains("Automatic selection: candidate leads; awaiting confirmation 1/2"));
 }
 
 #[test]

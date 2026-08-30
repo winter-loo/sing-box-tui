@@ -13,8 +13,8 @@ use crate::auto_pick::{
 use crate::sustained_quality::normalize_sustained_target;
 
 fn background_status_should_publish(status: &str) -> bool {
-    status.starts_with("Auto-pick")
-        || status.starts_with("Testing latency")
+    status.starts_with("Automatic selection")
+        || status.starts_with("Assessing reachability")
         || status.starts_with("Running ")
         || status.contains(" probe complete")
         || status.contains(" probe incomplete")
@@ -22,8 +22,8 @@ fn background_status_should_publish(status: &str) -> bool {
 }
 
 fn background_status_requires_selector_refresh(status: &str) -> bool {
-    status.starts_with("Auto-pick switched")
-        || status.starts_with("Auto-pick selected")
+    status.starts_with("Automatic selection switched")
+        || status.starts_with("Automatic selection selected")
         || status.contains(" probe complete")
         || status.contains(" probe incomplete")
 }
@@ -50,7 +50,6 @@ struct AutoPickRuntimeSignature {
     sustained_target_identity: String,
     timeout_ms: u64,
     request_timeout_bits: u64,
-    chart_guide_ms: u64,
     interval_secs: u64,
     max_concurrency: usize,
 }
@@ -117,9 +116,6 @@ impl App {
         if config.max_concurrency > 0 {
             self.benchmark_max_concurrency = config.max_concurrency;
         }
-        if config.threshold_ms > 0 {
-            self.auto_select_threshold_ms = config.threshold_ms;
-        }
         if config.interval_secs > 0 {
             self.auto_select_interval = Duration::from_secs(config.interval_secs);
         }
@@ -150,7 +146,6 @@ impl App {
                 .to_string(),
             timeout_ms: self.benchmark_timeout_ms,
             request_timeout_bits: self.benchmark_request_timeout.to_bits(),
-            chart_guide_ms: self.auto_select_threshold_ms,
             interval_secs: self.auto_select_interval.as_secs(),
             max_concurrency: self.benchmark_max_concurrency,
         }
@@ -187,7 +182,6 @@ impl App {
             timeout_ms: self.benchmark_timeout_ms,
             request_timeout: self.benchmark_request_timeout,
             max_concurrency: self.benchmark_max_concurrency,
-            threshold_ms: self.auto_select_threshold_ms,
             interval_secs: self.auto_select_interval.as_secs(),
             scheduled_usability_probes,
         }
@@ -230,27 +224,27 @@ impl App {
                     if background_status_requires_selector_refresh(&status) {
                         self.refresh()?;
                     }
-                    self.set_status_only(format!("Auto-pick worker: {status}"));
+                    self.set_status_only(format!("Automatic selection worker: {status}"));
                 }
                 if let Err(error) = quality_refresh {
                     self.set_status_only(format!(
-                        "Auto-pick worker facts refresh deferred; keeping prior evidence: {error:#}"
+                        "Automatic selection worker facts refresh deferred; keeping prior evidence: {error:#}"
                     ));
                 }
             }
             BackgroundPollEvent::Retry(error) => self.set_status_only(format!(
-                "Auto-pick worker TCP error; process is still alive, retrying: {error}"
+                "Automatic selection worker TCP error; process is still alive, retrying: {error}"
             )),
-            BackgroundPollEvent::Exited(error) => {
-                self.set_status_only(format!("Auto-pick worker exited after TCP error: {error}"))
-            }
+            BackgroundPollEvent::Exited(error) => self.set_status_only(format!(
+                "Automatic selection worker exited after TCP error: {error}"
+            )),
             BackgroundPollEvent::Restarted(worker) => self.set_status_only(format!(
-                "Auto-pick background worker {} pid {} after previous worker exited",
+                "Automatic selection background worker {} pid {} after previous worker exited",
                 worker.label(),
                 worker.pid()
             )),
             BackgroundPollEvent::Ensured(worker) => self.set_status_only(format!(
-                "Auto-pick background worker {} pid {}",
+                "Automatic selection background worker {} pid {}",
                 worker.label(),
                 worker.pid()
             )),
@@ -299,7 +293,7 @@ impl App {
         }
         let worker = self.ensure_auto_pick_background_worker()?;
         self.set_status_only(format!(
-            "Auto-pick background worker {} pid {}",
+            "Automatic selection background worker {} pid {}",
             worker.label(),
             worker.pid()
         ));
