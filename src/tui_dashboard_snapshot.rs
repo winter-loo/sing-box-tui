@@ -49,15 +49,20 @@ impl App {
                     .streaming_projection(&group.name, &group.members)
             })
             .unwrap_or_default();
+        let custom_run = match (&self.node_view_panel, selected_group) {
+            (NodeViewPanel::Custom(id), Some(group)) => {
+                self.custom_usability_run(id, &group.name, &group.members)
+            }
+            _ => None,
+        };
         // Streaming names and row evidence must come from the same leased projection. Re-reading
         // fenced state per row would turn a normal cross-process generation change into a panic.
-        let displayed_members = if self.node_view_panel == NodeViewPanel::Streaming {
-            streaming_projection
+        let displayed_members = match &self.node_view_panel {
+            NodeViewPanel::Streaming => streaming_projection
                 .iter()
                 .map(|projection| projection.name.clone())
-                .collect()
-        } else {
-            self.displayed_members()
+                .collect(),
+            NodeViewPanel::Custom(_) | NodeViewPanel::CurrentSelector => self.displayed_members(),
         };
         let selected_benchmark = self.selected_benchmark();
         let candidate_rows = selected_group
@@ -97,6 +102,43 @@ impl App {
                                 compact_marker: throughput.replace(" MiB/s", "M/s"),
                                 tone: CandidateTone::Success,
                             }
+                        })
+                        .collect();
+                }
+                if let NodeViewPanel::Custom(_) = &self.node_view_panel {
+                    let results = custom_run
+                        .as_ref()
+                        .map(|run| {
+                            run.results
+                                .iter()
+                                .map(|result| (result.node.as_str(), result))
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        })
+                        .unwrap_or_default();
+                    return displayed_members
+                        .iter()
+                        .filter_map(|member| {
+                            let result = results.get(member.as_str())?;
+                            let assessment = self
+                                .benchmark_workflow
+                                .reachability_assessment(&group.name, member);
+                            let reachability = assessment
+                                .map(|assessment| {
+                                    split_reachability_evidence(&assessment.compact_evidence()).0
+                                })
+                                .unwrap_or_else(|| "-/3".to_string());
+                            let marker = result
+                                .detail
+                                .clone()
+                                .unwrap_or_else(|| "criterion accepted".to_string());
+                            Some(CandidateRow {
+                                name: member.clone(),
+                                is_current: group.current.as_deref() == Some(member.as_str()),
+                                reachability,
+                                compact_marker: "usable".to_string(),
+                                marker,
+                                tone: CandidateTone::Success,
+                            })
                         })
                         .collect();
                 }
@@ -153,13 +195,33 @@ impl App {
             .unwrap_or_default();
         let candidate_title = selected_group
             .map(|group| {
-                let order = match self.node_view_panel {
+                let order = match &self.node_view_panel {
                     NodeViewPanel::CurrentSelector => {
                         node_order_badge(self.benchmark_workflow.latency_order())
                     }
                     NodeViewPanel::Streaming => "THROUGHPUT",
+                    NodeViewPanel::Custom(id) => self
+                        .usability_probe_manifests
+                        .iter()
+                        .find(|manifest| &manifest.id == id)
+                        .map(|manifest| manifest.ranking_policy.badge())
+                        .unwrap_or("CUSTOM"),
                 };
-                format!("Candidates for {} [{order}]", group.name)
+                let progress = match &self.node_view_panel {
+                    NodeViewPanel::Custom(id) => {
+                        if let Some((received, total)) =
+                            self.custom_usability_probe_progress(id, &group.name)
+                        {
+                            format!(" · PROBING {received}/{total}")
+                        } else if custom_run.is_none() {
+                            " · UNTESTED".to_string()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    _ => String::new(),
+                };
+                format!("Candidates for {} [{order}]{progress}", group.name)
             })
             .unwrap_or_else(|| {
                 format!(
@@ -169,18 +231,60 @@ impl App {
             });
         let all_count = selected_group.map_or(0, |group| group.members.len());
         let streaming_count = streaming_projection.len();
-        let node_view_tabs = vec![
+        let mut node_view_tabs = vec![
             NodeViewTab {
-                label: "Current selector",
+                label: "Current selector".to_string(),
                 count: all_count,
             },
             NodeViewTab {
-                label: "Streaming",
+                label: "Streaming".to_string(),
                 count: streaming_count,
             },
         ];
+        if let Some(group) = selected_group {
+            node_view_tabs.extend(self.usability_probe_manifests.iter().map(|manifest| {
+                let projection = self.cached_custom_node_view_projection(
+                    &manifest.id,
+                    &group.name,
+                    &group.members,
+                );
+                NodeViewTab {
+                    label: manifest.label.clone(),
+                    count: projection
+                        .members
+                        .values()
+                        .filter(|membership| {
+                            **membership == crate::automatic_selection::PanelMembership::Included
+                        })
+                        .count(),
+                }
+            }));
+        } else {
+            node_view_tabs.extend(self.usability_probe_manifests.iter().map(|manifest| {
+                NodeViewTab {
+                    label: manifest.label.clone(),
+                    count: 0,
+                }
+            }));
+        }
+        let active_node_view_tab = match &self.node_view_panel {
+            NodeViewPanel::CurrentSelector => 0,
+            NodeViewPanel::Streaming => 1,
+            NodeViewPanel::Custom(id) => self
+                .usability_probe_manifests
+                .iter()
+                .position(|manifest| &manifest.id == id)
+                .map(|index| index + 2)
+                .unwrap_or_else(|| {
+                    node_view_tabs.push(NodeViewTab {
+                        label: format!("Unavailable ({id})"),
+                        count: 0,
+                    });
+                    node_view_tabs.len() - 1
+                }),
+        };
 
-        let candidate_selected = if self.node_view_panel == NodeViewPanel::Streaming {
+        let candidate_selected = if self.node_view_panel != NodeViewPanel::CurrentSelector {
             selected_group
                 .and_then(|group| group.members.get(self.member_index))
                 .and_then(|current| {
@@ -271,7 +375,7 @@ impl App {
             intranet_selected: self.private_access.focused_index,
             candidate_title,
             node_view_tabs,
-            active_node_view_tab: self.node_view_panel.index(),
+            active_node_view_tab,
             candidate_rows,
             candidate_selected,
             intranet_detail,
@@ -280,6 +384,7 @@ impl App {
             latency_chart: self.latency_chart.as_ref(),
             connections,
             help_index: self.show_help.then_some(self.help_index),
+            usability_probe_diagnostics: &self.usability_probe_diagnostics,
             settings,
             onboarding: self.onboarding.as_ref(),
             private_access_progress: self.private_access_progress.as_ref(),

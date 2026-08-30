@@ -22,7 +22,14 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const BENCHMARK_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const BENCHMARK_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BENCHMARK_PRUNE_BATCH_SIZE: usize = 50_000;
-const NODE_QUALITY_SCHEMA_VERSION: i64 = 4;
+const NODE_QUALITY_SCHEMA_VERSION: i64 = 5;
+const MAX_USABILITY_FACTS: usize = 4096;
+const MAX_USABILITY_ID_CHARS: usize = 64;
+const MAX_USABILITY_SELECTOR_CHARS: usize = 256;
+const MAX_USABILITY_NODE_CHARS: usize = 256;
+const MAX_USABILITY_DETAIL_CHARS: usize = 512;
+const MAX_USABILITY_SUMMARY_CHARS: usize = 512;
+const MAX_USABILITY_DIAGNOSTIC_CHARS: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NodeIdentity {
@@ -44,6 +51,21 @@ pub(crate) struct BenchmarkRecord<'a> {
 pub(crate) struct NodeLatencySample {
     pub(crate) recorded_at_ms: u64,
     pub(crate) delay_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UsabilityProbeFactRecord {
+    pub(crate) node: String,
+    pub(crate) usable: bool,
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUsabilityProbeRun {
+    pub(crate) run_id: i64,
+    pub(crate) completed_at_ms: u64,
+    pub(crate) summary: Option<String>,
+    pub(crate) results: Vec<UsabilityProbeFactRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -110,6 +132,13 @@ pub(crate) struct NodeQualityReadLease {
     _guard: Option<NodeQualityReconciliationLock>,
     database_path: Option<PathBuf>,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatabasePreparation {
+    Initialize,
+    Current,
+    MigrateV4,
 }
 
 impl NodeQualityReadLease {
@@ -197,7 +226,7 @@ impl BenchmarkStore {
                 database_path.display()
             );
         }
-        reset_legacy_database(&database_path)?;
+        let preparation = prepare_node_quality_database(&database_path)?;
         let connection = Connection::open(&database_path).with_context(|| {
             format!("failed to open SQLite database {}", database_path.display())
         })?;
@@ -209,7 +238,11 @@ impl BenchmarkStore {
             quality_generation: Cell::new(0),
             observed_data_version: Cell::new(0),
         };
-        store.initialize()?;
+        match preparation {
+            DatabasePreparation::Initialize => store.initialize()?,
+            DatabasePreparation::Current => {}
+            DatabasePreparation::MigrateV4 => store.migrate_v4_schema()?,
+        }
         let generation = store.read_quality_generation_unlocked()?;
         store.quality_generation.set(generation as i64);
         store.observed_data_version.set(store.read_data_version()?);
@@ -301,6 +334,36 @@ impl BenchmarkStore {
                     ON sustained_probe_results(
                         selector, node_tag, target_identity, recorded_at_ms DESC, id DESC
                     );
+                CREATE TABLE IF NOT EXISTS usability_probe_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at_ms INTEGER NOT NULL,
+                    completed_at_ms INTEGER,
+                    criterion_id TEXT NOT NULL,
+                    selector TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    summary TEXT,
+                    diagnostic TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_usability_probe_runs_criterion_selector_recent
+                    ON usability_probe_runs(
+                        criterion_id, selector, status, generation, completed_at_ms DESC, id DESC
+                    );
+                CREATE TABLE IF NOT EXISTS usability_probe_facts (
+                    run_id INTEGER NOT NULL REFERENCES usability_probe_runs(id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL,
+                    node_tag TEXT NOT NULL REFERENCES node_identities(tag) ON DELETE CASCADE,
+                    usable INTEGER NOT NULL,
+                    detail TEXT,
+                    PRIMARY KEY (run_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS usability_probe_results (
+                    run_id INTEGER NOT NULL REFERENCES usability_probe_runs(id) ON DELETE CASCADE,
+                    node_tag TEXT NOT NULL REFERENCES node_identities(tag) ON DELETE CASCADE,
+                    usable INTEGER NOT NULL,
+                    detail TEXT,
+                    PRIMARY KEY (run_id, node_tag)
+                );
                 "#,
             )
             .context("failed to initialize benchmark_results SQLite schema")?;
@@ -310,6 +373,42 @@ impl BenchmarkStore {
         transaction
             .commit()
             .context("failed to commit node-quality schema initialization")
+    }
+
+    fn migrate_v4_schema(&self) -> Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Exclusive)
+                .context("failed to begin exclusive node-quality v4-to-v5 migration")?;
+        // Revalidate after acquiring SQLite's schema-write lock. The outer reconciliation lock
+        // serializes cooperating processes, while this second check prevents an untrusted v4 file
+        // from being upgraded if it changed between read-only classification and the transaction.
+        if !v4_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality v4 schema changed before migration");
+        }
+        transaction
+            .execute_batch(USABILITY_PROBE_RUNS_TABLE_SQL)
+            .context("failed to create usability-probe run table during v5 migration")?;
+        transaction
+            .execute_batch(
+                "CREATE INDEX idx_usability_probe_runs_criterion_selector_recent \
+                 ON usability_probe_runs(criterion_id, selector, status, generation, completed_at_ms DESC, id DESC)",
+            )
+            .context("failed to create usability-probe run index during v5 migration")?;
+        transaction
+            .execute_batch(USABILITY_PROBE_FACTS_TABLE_SQL)
+            .context("failed to create usability-probe fact table during v5 migration")?;
+        transaction
+            .execute_batch(USABILITY_PROBE_RESULTS_TABLE_SQL)
+            .context("failed to create usability-probe result table during v5 migration")?;
+        transaction
+            .pragma_update(None, "user_version", NODE_QUALITY_SCHEMA_VERSION)
+            .context("failed to set node-quality schema version after v4 migration")?;
+        if !current_schema_is_recognized(&transaction)? {
+            anyhow::bail!("node-quality v4-to-v5 migration produced an unrecognized schema");
+        }
+        transaction
+            .commit()
+            .context("failed to commit node-quality v4-to-v5 migration")
     }
 
     pub(crate) fn begin_node_history_reconciliation(
@@ -1166,6 +1265,314 @@ impl BenchmarkStore {
         Ok(true)
     }
 
+    pub(crate) fn begin_usability_probe_run(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+        expected_generation: u64,
+    ) -> Result<Option<(i64, u64)>> {
+        if criterion_id.is_empty() || criterion_id.chars().count() > MAX_USABILITY_ID_CHARS {
+            anyhow::bail!("usability criterion id must contain 1 to 64 characters");
+        }
+        if selector.is_empty() || selector.chars().count() > MAX_USABILITY_SELECTOR_CHARS {
+            anyhow::bail!("usability selector must contain 1 to 256 characters");
+        }
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(None);
+        }
+        // The runtime receipt's generation is checked inside the same immediate transaction that
+        // creates the running row. A stale lease therefore produces no row at all, instead of a
+        // dangling run that would require best-effort compensation after the fact.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("failed to begin usability-probe run transaction")?;
+        let inserted = transaction
+            .execute(
+                r#"
+                INSERT INTO usability_probe_runs (
+                    started_at_ms, criterion_id, selector, generation, status
+                )
+                SELECT ?1, ?2, ?3, ?4, 'running'
+                WHERE EXISTS (
+                    SELECT 1 FROM node_quality_state
+                    WHERE singleton = 1
+                      AND generation = ?4
+                      AND identities_initialized = 1
+                )
+                "#,
+                params![
+                    current_timestamp_ms()?,
+                    criterion_id,
+                    selector,
+                    expected_generation as i64,
+                ],
+            )
+            .context("failed to create usability-probe run")?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let run_id = transaction.last_insert_rowid();
+        transaction
+            .commit()
+            .context("failed to commit usability-probe run start")?;
+        Ok(Some((run_id, expected_generation)))
+    }
+
+    pub(crate) fn finish_usability_probe_run(
+        &self,
+        run_id: i64,
+        generation: u64,
+        requested_complete: bool,
+        summary: Option<&str>,
+        diagnostic: Option<&str>,
+        facts: &[UsabilityProbeFactRecord],
+    ) -> Result<bool> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        let generation_current = generation == self.quality_generation()
+            && self.quality_session_current_while_locked()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("failed to begin usability-probe completion transaction")?;
+        let run_exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM usability_probe_runs WHERE id = ?1 AND generation = ?2 AND status = 'running')",
+                params![run_id, generation as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("failed to validate usability-probe run")?;
+        if !run_exists {
+            anyhow::bail!("usability-probe run {run_id} is missing, stale, or already finished");
+        }
+
+        let summary = summary.map(|value| truncate_chars(value, MAX_USABILITY_SUMMARY_CHARS));
+        let diagnostic =
+            diagnostic.map(|value| truncate_chars(value, MAX_USABILITY_DIAGNOSTIC_CHARS));
+        let mut unique_nodes = BTreeSet::new();
+        let mut all_nodes_bound = generation_current;
+        let mut facts_valid = facts.len() <= MAX_USABILITY_FACTS;
+        let mut validation_diagnostic = (facts.len() > MAX_USABILITY_FACTS)
+            .then(|| format!("usability run contains more than {MAX_USABILITY_FACTS} node facts"));
+        if generation_current && facts_valid {
+            for fact in facts {
+                if !unique_nodes.insert(fact.node.as_str()) {
+                    facts_valid = false;
+                    validation_diagnostic = Some(format!(
+                        "usability run contains duplicate fact for {}",
+                        truncate_chars(&fact.node, MAX_USABILITY_NODE_CHARS)
+                    ));
+                    break;
+                }
+                if fact.node.trim().is_empty()
+                    || fact.node.chars().count() > MAX_USABILITY_NODE_CHARS
+                    || fact.node.chars().any(char::is_control)
+                    || fact
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.chars().count() > MAX_USABILITY_DETAIL_CHARS)
+                {
+                    facts_valid = false;
+                    validation_diagnostic =
+                        Some("usability run contains an invalid node fact".to_string());
+                    break;
+                }
+                let bound = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM node_identities WHERE tag = ?1)",
+                        [fact.node.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .with_context(|| {
+                        format!("failed to validate usability fact for {}", fact.node)
+                    })?;
+                all_nodes_bound &= bound;
+            }
+        }
+        let complete = requested_complete && generation_current && all_nodes_bound && facts_valid;
+        if generation_current && all_nodes_bound && facts_valid {
+            for (sequence, fact) in facts.iter().enumerate() {
+                transaction
+                    .execute(
+                        "INSERT INTO usability_probe_facts (run_id, sequence, node_tag, usable, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            run_id,
+                            sequence as i64,
+                            fact.node,
+                            i64::from(fact.usable),
+                            fact.detail,
+                        ],
+                    )
+                    .with_context(|| {
+                        format!("failed to persist usability fact for {}", fact.node)
+                    })?;
+                if complete {
+                    transaction
+                        .execute(
+                            "INSERT INTO usability_probe_results (run_id, node_tag, usable, detail) VALUES (?1, ?2, ?3, ?4)",
+                            params![run_id, fact.node, i64::from(fact.usable), fact.detail],
+                        )
+                        .with_context(|| {
+                            format!("failed to publish usability result for {}", fact.node)
+                        })?;
+                }
+            }
+        }
+        let final_diagnostic = if !generation_current {
+            Some(
+                "node configuration generation changed before usability results could publish"
+                    .to_string(),
+            )
+        } else if !all_nodes_bound {
+            Some("a usability result no longer belongs to the bound node configuration".to_string())
+        } else if !facts_valid {
+            validation_diagnostic
+        } else {
+            diagnostic
+        };
+        let updated = transaction
+            .execute(
+                r#"
+                UPDATE usability_probe_runs
+                SET completed_at_ms = ?1, status = ?2, summary = ?3, diagnostic = ?4
+                WHERE id = ?5 AND generation = ?6 AND status = 'running'
+                "#,
+                params![
+                    current_timestamp_ms()?,
+                    if complete { "complete" } else { "incomplete" },
+                    summary.as_deref(),
+                    final_diagnostic,
+                    run_id,
+                    generation as i64,
+                ],
+            )
+            .context("failed to finalize usability-probe run")?;
+        if updated != 1 {
+            anyhow::bail!("usability-probe run {run_id} changed while it was being finalized");
+        }
+        // Facts, published results, and the terminal complete marker share this one commit. Panel
+        // readers can therefore observe either the prior complete run or this entire run, never a
+        // prefix whose missing node rows would be mistaken for application rejection.
+        transaction
+            .commit()
+            .context("failed to commit usability-probe completion")?;
+        Ok(complete)
+    }
+
+    pub(crate) fn latest_usability_probe_run(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+        selector_members: &[String],
+    ) -> Result<Option<StoredUsabilityProbeRun>> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(None);
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .context("failed to begin usability projection read transaction")?;
+        let run = Self::latest_usability_probe_run_from_connection(
+            &transaction,
+            criterion_id,
+            selector,
+            selector_members,
+        )?;
+        transaction
+            .commit()
+            .context("failed to finish usability projection read transaction")?;
+        Ok(run)
+    }
+
+    pub(crate) fn latest_usability_probe_run_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        criterion_id: &str,
+        selector: &str,
+        selector_members: &[String],
+    ) -> Result<Option<StoredUsabilityProbeRun>> {
+        self.validate_quality_read_lease(lease)?;
+        // The filesystem lease freezes identity/generation through the eventual selector PUT;
+        // this SQLite transaction independently freezes the run row and its result rows so a
+        // concurrent complete publication cannot splice membership from two manifest runs.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .context("failed to begin leased usability projection read transaction")?;
+        let run = Self::latest_usability_probe_run_from_connection(
+            &transaction,
+            criterion_id,
+            selector,
+            selector_members,
+        )?;
+        transaction
+            .commit()
+            .context("failed to finish leased usability projection read transaction")?;
+        Ok(run)
+    }
+
+    fn latest_usability_probe_run_from_connection(
+        connection: &Connection,
+        criterion_id: &str,
+        selector: &str,
+        selector_members: &[String],
+    ) -> Result<Option<StoredUsabilityProbeRun>> {
+        let run = connection
+            .query_row(
+                r#"
+                SELECT id, completed_at_ms, summary
+                FROM usability_probe_runs
+                WHERE criterion_id = ?1
+                  AND selector = ?2
+                  AND status = 'complete'
+                ORDER BY completed_at_ms DESC, id DESC
+                LIMIT 1
+                "#,
+                params![criterion_id, selector],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed to query latest complete usability-probe run")?;
+        let Some((run_id, completed_at_ms, summary)) = run else {
+            return Ok(None);
+        };
+        let allowed = selector_members.iter().collect::<BTreeSet<_>>();
+        let mut statement = connection
+            .prepare(
+                "SELECT node_tag, usable, detail FROM usability_probe_results WHERE run_id = ?1 ORDER BY rowid",
+            )
+            .context("failed to prepare usability result projection")?;
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok(UsabilityProbeFactRecord {
+                    node: row.get(0)?,
+                    usable: row.get::<_, i64>(1)? != 0,
+                    detail: row.get(2)?,
+                })
+            })
+            .context("failed to query usability result projection")?;
+        let mut results = Vec::new();
+        for row in rows {
+            let result = row.context("failed to read usability result")?;
+            // Generation fences only an in-flight publication. Once complete, FK cascade removes
+            // changed identities one node at a time; this selector intersection then prevents the
+            // surviving unchanged facts from leaking out of the current selector membership.
+            if allowed.contains(&result.node) {
+                results.push(result);
+            }
+        }
+        Ok(Some(StoredUsabilityProbeRun {
+            run_id,
+            completed_at_ms: completed_at_ms as u64,
+            summary,
+            results,
+        }))
+    }
+
     pub(crate) fn quality_generation(&self) -> u64 {
         self.quality_generation.get() as u64
     }
@@ -1579,6 +1986,10 @@ fn percentile_95(values: &mut [u64]) -> Option<u64> {
     values.get(rank).copied()
 }
 
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 fn current_timestamp_ms() -> Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1638,15 +2049,15 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reset_legacy_database(path: &Path) -> Result<()> {
+fn prepare_node_quality_database(path: &Path) -> Result<DatabasePreparation> {
     if path == Path::new(":memory:") {
-        return Ok(());
+        return Ok(DatabasePreparation::Initialize);
     }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             ensure_no_orphaned_legacy_sidecars(path)?;
-            return Ok(());
+            return Ok(DatabasePreparation::Initialize);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1662,7 +2073,7 @@ fn reset_legacy_database(path: &Path) -> Result<()> {
     }
     if metadata.len() == 0 {
         ensure_no_orphaned_legacy_sidecars(path)?;
-        return Ok(());
+        return Ok(DatabasePreparation::Initialize);
     }
     // Validate every known sidecar before SQLite opens the main file. A directory, symlink, or
     // other unexpected sidecar must not let a legacy reset delete or mutate the main database.
@@ -1686,14 +2097,26 @@ fn reset_legacy_database(path: &Path) -> Result<()> {
     match version {
         NODE_QUALITY_SCHEMA_VERSION => {
             if current_schema_is_recognized(&connection)? {
-                return Ok(());
+                return Ok(DatabasePreparation::Current);
             }
             anyhow::bail!(
                 "refusing to modify unrecognized version {version} database {}",
                 path.display()
             );
         }
-        legacy_version if legacy_version < NODE_QUALITY_SCHEMA_VERSION => {}
+        4 => {
+            // v4 is the first production append-only node-quality model, so its measurements are
+            // user data rather than disposable legacy cache. Only its exact published shape earns
+            // the additive migration; a spoofed v4 remains untouched and fails closed.
+            if v4_schema_is_recognized(&connection)? {
+                return Ok(DatabasePreparation::MigrateV4);
+            }
+            anyhow::bail!(
+                "refusing to modify unrecognized version {version} database {}",
+                path.display()
+            );
+        }
+        legacy_version if legacy_version < 4 => {}
         _ => {
             anyhow::bail!(
                 "refusing to replace unrecognized node-quality schema version {version} in {}",
@@ -1719,7 +2142,7 @@ fn reset_legacy_database(path: &Path) -> Result<()> {
             path.display()
         )
     })?;
-    Ok(())
+    Ok(DatabasePreparation::Initialize)
 }
 
 fn legacy_reset_sidecar_paths(path: &Path) -> Vec<PathBuf> {
@@ -1786,8 +2209,11 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
             "probe_attempts",
             "reachability_assessments",
             "sustained_probe_results",
+            "usability_probe_facts",
+            "usability_probe_results",
+            "usability_probe_runs",
         ]
-        || !published_core_table_schemas_are_recognized(connection, true)?
+        || !published_core_table_schemas_are_recognized(connection, true, true)?
         || !table_has_exact_columns(
             connection,
             "node_identities",
@@ -1818,7 +2244,135 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
                 ("detail", "TEXT", false, 0),
             ],
         )?
+        || !table_has_exact_columns(
+            connection,
+            "usability_probe_runs",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("started_at_ms", "INTEGER", true, 0),
+                ("completed_at_ms", "INTEGER", false, 0),
+                ("criterion_id", "TEXT", true, 0),
+                ("selector", "TEXT", true, 0),
+                ("generation", "INTEGER", true, 0),
+                ("status", "TEXT", true, 0),
+                ("summary", "TEXT", false, 0),
+                ("diagnostic", "TEXT", false, 0),
+            ],
+        )?
+        || !table_has_exact_columns(
+            connection,
+            "usability_probe_facts",
+            &[
+                ("run_id", "INTEGER", true, 1),
+                ("sequence", "INTEGER", true, 2),
+                ("node_tag", "TEXT", true, 0),
+                ("usable", "INTEGER", true, 0),
+                ("detail", "TEXT", false, 0),
+            ],
+        )?
+        || !table_has_exact_columns(
+            connection,
+            "usability_probe_results",
+            &[
+                ("run_id", "INTEGER", true, 1),
+                ("node_tag", "TEXT", true, 2),
+                ("usable", "INTEGER", true, 0),
+                ("detail", "TEXT", false, 0),
+            ],
+        )?
         || !user_behavior_objects(connection)?.is_empty()
+        || !object_sql_matches(
+            connection,
+            "table",
+            "node_identities",
+            &["CREATE TABLE node_identities (tag TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)"],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "node_quality_state",
+            &[
+                "CREATE TABLE node_quality_state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), generation INTEGER NOT NULL, identities_initialized INTEGER NOT NULL)",
+            ],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "sustained_probe_results",
+            &[SUSTAINED_PROBE_RESULTS_TABLE_SQL],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "usability_probe_runs",
+            &[USABILITY_PROBE_RUNS_TABLE_SQL],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "usability_probe_facts",
+            &[USABILITY_PROBE_FACTS_TABLE_SQL],
+        )?
+        || !object_sql_matches(
+            connection,
+            "table",
+            "usability_probe_results",
+            &[USABILITY_PROBE_RESULTS_TABLE_SQL],
+        )?
+    {
+        return Ok(false);
+    }
+    let singleton_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM node_quality_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to validate node-quality state singleton")?;
+    Ok(singleton_rows == 1)
+}
+
+fn v4_schema_is_recognized(connection: &Connection) -> Result<bool> {
+    if user_table_names(connection)?
+        != [
+            "benchmark_results",
+            "node_identities",
+            "node_quality_state",
+            "probe_attempts",
+            "reachability_assessments",
+            "sustained_probe_results",
+        ]
+        || !published_core_table_schemas_are_recognized(connection, true, false)?
+        || !table_has_exact_columns(
+            connection,
+            "node_identities",
+            &[("tag", "TEXT", false, 1), ("fingerprint", "TEXT", true, 0)],
+        )?
+        || !table_has_exact_columns(
+            connection,
+            "node_quality_state",
+            &[
+                ("singleton", "INTEGER", false, 1),
+                ("generation", "INTEGER", true, 0),
+                ("identities_initialized", "INTEGER", true, 0),
+            ],
+        )?
+        || !table_has_exact_columns(
+            connection,
+            "sustained_probe_results",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("recorded_at_ms", "INTEGER", true, 0),
+                ("selector", "TEXT", true, 0),
+                ("node_tag", "TEXT", true, 0),
+                ("target_identity", "TEXT", true, 0),
+                ("outcome_kind", "TEXT", true, 0),
+                ("first_byte_ms", "INTEGER", false, 0),
+                ("completion_ms", "INTEGER", false, 0),
+                ("bytes_read", "INTEGER", false, 0),
+                ("detail", "TEXT", false, 0),
+            ],
+        )?
         || !object_sql_matches(
             connection,
             "table",
@@ -1848,13 +2402,14 @@ fn current_schema_is_recognized(connection: &Connection) -> Result<bool> {
             [],
             |row| row.get(0),
         )
-        .context("failed to validate node-quality state singleton")?;
+        .context("failed to validate v4 node-quality state singleton")?;
     Ok(singleton_rows == 1)
 }
 
 fn published_core_table_schemas_are_recognized(
     connection: &Connection,
     require_complete: bool,
+    include_usability: bool,
 ) -> Result<bool> {
     let benchmark = table_has_exact_columns(
         connection,
@@ -1902,13 +2457,23 @@ fn published_core_table_schemas_are_recognized(
         ],
     )?;
     let indexes = user_index_names(connection)?;
-    let indexes_recognized = indexes
-        == [
+    let expected_indexes = if include_usability {
+        vec![
+            "idx_benchmark_results_recorded_at",
+            "idx_benchmark_results_selector_node_recent",
+            "idx_reachability_assessments_selector_node_recent",
+            "idx_sustained_probe_selector_node_target_recent",
+            "idx_usability_probe_runs_criterion_selector_recent",
+        ]
+    } else {
+        vec![
             "idx_benchmark_results_recorded_at",
             "idx_benchmark_results_selector_node_recent",
             "idx_reachability_assessments_selector_node_recent",
             "idx_sustained_probe_selector_node_target_recent",
         ]
+    };
+    let indexes_recognized = indexes == expected_indexes
         && index_has_exact_key(
             connection,
             "idx_benchmark_results_recorded_at",
@@ -1945,13 +2510,27 @@ fn published_core_table_schemas_are_recognized(
                 ("id", true),
             ],
         )?
-        && published_core_sql_is_recognized(connection, require_complete)?;
+        && (!include_usability
+            || index_has_exact_key(
+                connection,
+                "idx_usability_probe_runs_criterion_selector_recent",
+                &[
+                    ("criterion_id", false),
+                    ("selector", false),
+                    ("status", false),
+                    ("generation", false),
+                    ("completed_at_ms", true),
+                    ("id", true),
+                ],
+            )?)
+        && published_core_sql_is_recognized(connection, require_complete, include_usability)?;
     Ok(benchmark
         && reachability
         && probes
         && indexes_recognized
         && user_behavior_objects(connection)?.is_empty()
-        && probe_foreign_key_is_recognized(connection)?)
+        && probe_foreign_key_is_recognized(connection)?
+        && (!include_usability || usability_probe_foreign_keys_are_recognized(connection)?))
 }
 
 const BENCHMARK_RESULTS_TABLE_SQL: &str = r#"
@@ -2013,16 +2592,52 @@ const SUSTAINED_PROBE_RESULTS_TABLE_SQL: &str = r#"
     )
 "#;
 
+const USABILITY_PROBE_RUNS_TABLE_SQL: &str = r#"
+    CREATE TABLE usability_probe_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at_ms INTEGER NOT NULL,
+        completed_at_ms INTEGER,
+        criterion_id TEXT NOT NULL,
+        selector TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT,
+        diagnostic TEXT
+    )
+"#;
+
+const USABILITY_PROBE_FACTS_TABLE_SQL: &str = r#"
+    CREATE TABLE usability_probe_facts (
+        run_id INTEGER NOT NULL REFERENCES usability_probe_runs(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        node_tag TEXT NOT NULL REFERENCES node_identities(tag) ON DELETE CASCADE,
+        usable INTEGER NOT NULL,
+        detail TEXT,
+        PRIMARY KEY (run_id, sequence)
+    )
+"#;
+
+const USABILITY_PROBE_RESULTS_TABLE_SQL: &str = r#"
+    CREATE TABLE usability_probe_results (
+        run_id INTEGER NOT NULL REFERENCES usability_probe_runs(id) ON DELETE CASCADE,
+        node_tag TEXT NOT NULL REFERENCES node_identities(tag) ON DELETE CASCADE,
+        usable INTEGER NOT NULL,
+        detail TEXT,
+        PRIMARY KEY (run_id, node_tag)
+    )
+"#;
+
 fn published_core_sql_is_recognized(
     connection: &Connection,
     require_complete: bool,
+    include_usability: bool,
 ) -> Result<bool> {
     let reachability_sql = if require_complete {
         vec![REACHABILITY_V2B_TABLE_SQL]
     } else {
         vec![REACHABILITY_V2A_TABLE_SQL, REACHABILITY_V2B_TABLE_SQL]
     };
-    Ok(object_sql_matches(
+    let core_recognized = object_sql_matches(
         connection,
         "table",
         "benchmark_results",
@@ -2063,7 +2678,17 @@ fn published_core_sql_is_recognized(
         &[
             "CREATE INDEX idx_sustained_probe_selector_node_target_recent ON sustained_probe_results(selector, node_tag, target_identity, recorded_at_ms DESC, id DESC)",
         ],
-    )?)
+    )?;
+    Ok(core_recognized
+        && (!include_usability
+            || object_sql_matches(
+                connection,
+                "index",
+                "idx_usability_probe_runs_criterion_selector_recent",
+                &[
+                    "CREATE INDEX idx_usability_probe_runs_criterion_selector_recent ON usability_probe_runs(criterion_id, selector, status, generation, completed_at_ms DESC, id DESC)",
+                ],
+            )?))
 }
 
 fn user_table_names(connection: &Connection) -> Result<Vec<String>> {
@@ -2235,6 +2860,50 @@ fn probe_foreign_key_is_recognized(connection: &Connection) -> Result<bool> {
         )])
 }
 
+fn usability_probe_foreign_keys_are_recognized(connection: &Connection) -> Result<bool> {
+    fn foreign_keys(
+        connection: &Connection,
+        table: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .with_context(|| format!("failed to inspect {table} foreign keys"))?;
+        let mut keys = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .with_context(|| format!("failed to query {table} foreign keys"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read {table} foreign keys"))?;
+        keys.sort();
+        Ok(keys)
+    }
+
+    let expected = [
+        (
+            "node_identities".to_string(),
+            "node_tag".to_string(),
+            "tag".to_string(),
+            "CASCADE".to_string(),
+        ),
+        (
+            "usability_probe_runs".to_string(),
+            "run_id".to_string(),
+            "id".to_string(),
+            "CASCADE".to_string(),
+        ),
+    ];
+    Ok(
+        foreign_keys(connection, "usability_probe_facts")? == expected
+            && foreign_keys(connection, "usability_probe_results")? == expected,
+    )
+}
+
 fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Result<()> {
     connection
         .busy_timeout(SQLITE_BUSY_TIMEOUT)
@@ -2264,8 +2933,8 @@ fn configure_benchmark_connection(connection: &Connection, path: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkRecord, BenchmarkStore, NODE_QUALITY_SCHEMA_VERSION,
-        QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX,
+        BenchmarkRecord, BenchmarkStore, NODE_QUALITY_SCHEMA_VERSION, NodeQualityReadLease,
+        QUALITY_RUNTIME_RELOAD_FENCE_SUFFIX, QUALITY_WRITE_BLOCK_SUFFIX, UsabilityProbeFactRecord,
         current_schema_is_recognized, node_configuration_fingerprint, sync_parent_directory,
     };
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
@@ -2418,6 +3087,90 @@ mod tests {
                 "#,
             ))
             .expect("seed published v2 schema");
+    }
+
+    fn seed_published_v4_database_with_facts(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("create v4 database");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE benchmark_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node TEXT NOT NULL,
+                    filter TEXT NOT NULL,
+                    delay_ms INTEGER,
+                    completed INTEGER NOT NULL,
+                    job_kind TEXT NOT NULL
+                );
+                CREATE INDEX idx_benchmark_results_recorded_at
+                    ON benchmark_results(recorded_at_ms);
+                CREATE INDEX idx_benchmark_results_selector_node_recent
+                    ON benchmark_results(selector, node, recorded_at_ms DESC, id DESC);
+                CREATE TABLE reachability_assessments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node TEXT NOT NULL,
+                    complete INTEGER NOT NULL
+                );
+                CREATE TABLE probe_attempts (
+                    assessment_id INTEGER NOT NULL REFERENCES reachability_assessments(id) ON DELETE CASCADE,
+                    attempt_index INTEGER NOT NULL,
+                    outcome_kind TEXT NOT NULL,
+                    delay_ms INTEGER,
+                    detail TEXT,
+                    controller_status INTEGER,
+                    PRIMARY KEY (assessment_id, attempt_index)
+                );
+                CREATE INDEX idx_reachability_assessments_selector_node_recent
+                    ON reachability_assessments(selector, node, recorded_at_ms DESC, id DESC);
+                CREATE TABLE node_identities (
+                    tag TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL
+                );
+                CREATE TABLE node_quality_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    generation INTEGER NOT NULL,
+                    identities_initialized INTEGER NOT NULL
+                );
+                CREATE TABLE sustained_probe_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node_tag TEXT NOT NULL,
+                    target_identity TEXT NOT NULL,
+                    outcome_kind TEXT NOT NULL,
+                    first_byte_ms INTEGER,
+                    completion_ms INTEGER,
+                    bytes_read INTEGER,
+                    detail TEXT
+                );
+                CREATE INDEX idx_sustained_probe_selector_node_target_recent
+                    ON sustained_probe_results(
+                        selector, node_tag, target_identity, recorded_at_ms DESC, id DESC
+                    );
+
+                INSERT INTO node_quality_state VALUES (1, 17, 1);
+                INSERT INTO node_identities VALUES ('node-a', 'fingerprint-a');
+                INSERT INTO node_identities VALUES ('select', 'fingerprint-selector');
+                INSERT INTO benchmark_results VALUES (
+                    3, 1000, 'select', 'node-a', 'all', 42, 1, 'manual'
+                );
+                INSERT INTO reachability_assessments VALUES (5, 1100, 'select', 'node-a', 1);
+                INSERT INTO probe_attempts VALUES (5, 0, 'reachable', 42, NULL, NULL);
+                INSERT INTO probe_attempts VALUES (5, 1, 'timeout', NULL, NULL, NULL);
+                INSERT INTO probe_attempts VALUES (5, 2, 'reachable', 44, NULL, NULL);
+                INSERT INTO sustained_probe_results VALUES (
+                    7, 1200, 'select', 'node-a', 'target-v4', 'completed',
+                    80, 500, 524288, NULL
+                );
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .expect("seed published v4 schema and facts");
     }
 
     #[test]
@@ -2676,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_and_empty_sqlite_header_recover_to_atomic_v4_schema() {
+    fn empty_file_and_empty_sqlite_header_recover_to_atomic_v5_schema() {
         for (label, create) in [("zero-bytes", false), ("sqlite-header", true)] {
             let path = test_db_path().with_extension(format!("{label}.sqlite3"));
             if create {
@@ -2703,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn both_published_v2_shapes_are_rebuilt_as_v4_without_old_facts() {
+    fn both_published_v2_shapes_are_rebuilt_as_v5_without_old_facts() {
         for complete_column in [false, true] {
             let path = test_db_path().with_extension(if complete_column {
                 "v2b.sqlite3"
@@ -2725,7 +3478,7 @@ mod tests {
                     .recent_benchmarks(10)
                     .expect("read rebuilt benchmark history")
                     .is_empty(),
-                "published v2 facts are discarded before old processes can target the v4 inode"
+                "published v2 facts are discarded before old processes can target the v5 inode"
             );
             assert!(
                 store
@@ -2736,11 +3489,89 @@ mod tests {
                         [],
                         |row| row.get::<_, bool>(0),
                     )
-                    .expect("verify v4 identity table")
+                    .expect("verify v5 identity table")
             );
             drop(store);
             remove_test_db(&path);
         }
+    }
+
+    #[test]
+    fn exact_v4_schema_migrates_additively_without_losing_quality_facts() {
+        let path = test_db_path().with_extension("v4-facts.sqlite3");
+        seed_published_v4_database_with_facts(&path);
+
+        let store = BenchmarkStore::open(&path).expect("migrate trusted v4 database");
+
+        assert_eq!(store.quality_generation(), 17);
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("read migrated schema version"),
+            NODE_QUALITY_SCHEMA_VERSION
+        );
+        assert!(
+            current_schema_is_recognized(&store.connection).expect("recognize migrated v5 schema")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT fingerprint FROM node_identities WHERE tag = 'node-a'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read preserved identity"),
+            "fingerprint-a"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT delay_ms FROM benchmark_results WHERE id = 3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read preserved quick result"),
+            42
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM probe_attempts WHERE assessment_id = 5",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read preserved reachability attempts"),
+            3
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT bytes_read FROM sustained_probe_results WHERE id = 7",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read preserved sustained result"),
+            524_288
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'usability_probe_%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count additive usability tables"),
+            3
+        );
+
+        drop(store);
+        remove_test_db(&path);
     }
 
     #[test]
@@ -2803,23 +3634,23 @@ mod tests {
 
     #[test]
     fn malformed_current_schema_is_preserved() {
-        let path = test_db_path().with_extension("v4-trigger.sqlite3");
-        drop(BenchmarkStore::open(&path).expect("create recognized v4 database"));
-        let connection = rusqlite::Connection::open(&path).expect("open v4 fixture");
+        let path = test_db_path().with_extension("v5-trigger.sqlite3");
+        drop(BenchmarkStore::open(&path).expect("create recognized v5 database"));
+        let connection = rusqlite::Connection::open(&path).expect("open v5 fixture");
         connection
             .execute_batch(
-                "CREATE TRIGGER unrelated_v4_trigger AFTER INSERT ON benchmark_results \
+                "CREATE TRIGGER unrelated_v5_trigger AFTER INSERT ON benchmark_results \
                  BEGIN SELECT 1; END;",
             )
-            .expect("add unknown v4 trigger");
+            .expect("add unknown v5 trigger");
         drop(connection);
-        let before = std::fs::read(&path).expect("read v4 candidate");
+        let before = std::fs::read(&path).expect("read v5 candidate");
         let error = BenchmarkStore::open(&path)
             .err()
-            .expect("behavior-changing v4 trigger must be rejected");
-        assert!(format!("{error:#}").contains("unrecognized version 4"));
+            .expect("behavior-changing v5 trigger must be rejected");
+        assert!(format!("{error:#}").contains("unrecognized version 5"));
         assert_eq!(
-            std::fs::read(&path).expect("read preserved v4 candidate"),
+            std::fs::read(&path).expect("read preserved v5 candidate"),
             before
         );
         remove_test_db(&path);
@@ -2868,7 +3699,7 @@ mod tests {
             );
             assert!(
                 !old_runtime_fence.exists(),
-                "a whole-database v4 reset must remove every legacy protocol sidecar"
+                "a whole-database v5 reset must remove every legacy protocol sidecar"
             );
             drop(store);
             remove_test_db(&path);
@@ -2895,8 +3726,12 @@ mod tests {
 
         for (label, schema) in [
             (
-                "spoofed-current",
+                "spoofed-v4",
                 "CREATE TABLE unrelated (value TEXT); PRAGMA user_version = 4;",
+            ),
+            (
+                "spoofed-current",
+                "CREATE TABLE unrelated (value TEXT); PRAGMA user_version = 5;",
             ),
             (
                 "future",
@@ -3726,6 +4561,392 @@ mod tests {
         assert!(rows[0].completed);
         assert_eq!(rows[0].job_kind, "auto");
 
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn complete_custom_run_publishes_atomically_and_later_incomplete_preserves_it() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a", "node-b"]);
+        let (first_run, generation) = store
+            .begin_usability_probe_run("agy", "select", store.quality_generation())
+            .expect("begin complete run")
+            .expect("quality session is current");
+        assert!(
+            store
+                .finish_usability_probe_run(
+                    first_run,
+                    generation,
+                    true,
+                    Some("first complete"),
+                    None,
+                    &[
+                        UsabilityProbeFactRecord {
+                            node: "node-a".to_string(),
+                            usable: true,
+                            detail: Some("accepted".to_string()),
+                        },
+                        UsabilityProbeFactRecord {
+                            node: "node-b".to_string(),
+                            usable: false,
+                            detail: Some("rejected".to_string()),
+                        },
+                    ],
+                )
+                .expect("finish complete run")
+        );
+        let first_projection = store
+            .latest_usability_probe_run(
+                "agy",
+                "select",
+                &["node-a".to_string(), "node-b".to_string()],
+            )
+            .expect("read first projection")
+            .expect("complete run is published");
+        assert_eq!(first_projection.run_id, first_run);
+        assert_eq!(first_projection.results.len(), 2);
+
+        let (failed_run, failed_generation) = store
+            .begin_usability_probe_run("agy", "select", store.quality_generation())
+            .expect("begin incomplete run")
+            .expect("quality session is current");
+        assert!(
+            !store
+                .finish_usability_probe_run(
+                    failed_run,
+                    failed_generation,
+                    false,
+                    None,
+                    Some("fixture authentication failed"),
+                    &[UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: false,
+                        detail: None,
+                    }],
+                )
+                .expect("finish incomplete run")
+        );
+        let preserved = store
+            .latest_usability_probe_run(
+                "agy",
+                "select",
+                &["node-a".to_string(), "node-b".to_string()],
+            )
+            .expect("read preserved projection")
+            .expect("prior complete run remains visible");
+        assert_eq!(preserved.run_id, first_run);
+        assert_eq!(preserved.summary.as_deref(), Some("first complete"));
+        assert!(preserved.completed_at_ms > 0);
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn stale_custom_run_receipt_creates_no_dangling_running_row() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a"]);
+
+        let stale_generation = store.quality_generation().saturating_add(1);
+        assert!(
+            store
+                .begin_usability_probe_run("criterion", "select", stale_generation)
+                .expect("reject stale generation without a storage error")
+                .is_none()
+        );
+        let run_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM usability_probe_runs", [], |row| {
+                row.get(0)
+            })
+            .expect("count usability runs");
+        assert_eq!(run_count, 0, "a stale lease must not create a running run");
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn custom_projection_is_intersected_with_current_selector_members() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a", "node-b"]);
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", store.quality_generation())
+            .expect("begin run")
+            .expect("quality session is current");
+        store
+            .finish_usability_probe_run(
+                run_id,
+                generation,
+                true,
+                None,
+                None,
+                &[
+                    UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: None,
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-b".to_string(),
+                        usable: true,
+                        detail: None,
+                    },
+                ],
+            )
+            .expect("finish run");
+        let projection = store
+            .latest_usability_probe_run("criterion", "select", &["node-b".to_string()])
+            .expect("read projection")
+            .expect("run exists");
+        assert_eq!(
+            projection
+                .results
+                .iter()
+                .map(|result| result.node.as_str())
+                .collect::<Vec<_>>(),
+            ["node-b"]
+        );
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn leased_custom_projection_validates_generation_and_preserves_member_intersection() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a", "node-b"]);
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", store.quality_generation())
+            .expect("begin run")
+            .expect("quality session is current");
+        store
+            .finish_usability_probe_run(
+                run_id,
+                generation,
+                true,
+                None,
+                None,
+                &[
+                    UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: None,
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-b".to_string(),
+                        usable: false,
+                        detail: Some("rejected".to_string()),
+                    },
+                ],
+            )
+            .expect("finish run");
+
+        let lease = store
+            .acquire_quality_read_lease()
+            .expect("acquire read lease")
+            .expect("quality session is current");
+        let projection = store
+            .latest_usability_probe_run_with_lease(
+                &lease,
+                "criterion",
+                "select",
+                &["node-b".to_string()],
+            )
+            .expect("read leased projection")
+            .expect("run exists");
+        assert_eq!(projection.run_id, run_id);
+        assert_eq!(projection.results.len(), 1);
+        assert_eq!(projection.results[0].node, "node-b");
+        assert!(!projection.results[0].usable);
+
+        let stale_lease = NodeQualityReadLease::for_test(lease.generation().saturating_add(1));
+        assert!(
+            store
+                .latest_usability_probe_run_with_lease(
+                    &stale_lease,
+                    "criterion",
+                    "select",
+                    &["node-b".to_string()],
+                )
+                .is_err(),
+            "a generation-only fixture must not authorize a production store read"
+        );
+
+        drop(lease);
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn custom_projection_survives_reconciliation_for_each_unchanged_node() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a", "node-b"]);
+        let original_generation = store.quality_generation();
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", original_generation)
+            .expect("begin run")
+            .expect("quality session is current");
+        store
+            .finish_usability_probe_run(
+                run_id,
+                generation,
+                true,
+                None,
+                None,
+                &[
+                    UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: Some("unchanged".to_string()),
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-b".to_string(),
+                        usable: true,
+                        detail: Some("will change".to_string()),
+                    },
+                ],
+            )
+            .expect("finish complete run");
+
+        let changed = node_config(vec![
+            serde_json::json!({
+                "type":"selector", "tag":"select", "outbounds":["node-a", "node-b", "node-c"]
+            }),
+            serde_json::json!({"type":"direct", "tag":"node-a"}),
+            serde_json::json!({
+                "type":"socks", "tag":"node-b", "server":"changed.example", "server_port":1080
+            }),
+            serde_json::json!({"type":"direct", "tag":"node-c"}),
+        ]);
+        store
+            .reconcile_node_history(&changed)
+            .expect("advance generation for changed and added nodes");
+        assert!(store.quality_generation() > original_generation);
+
+        let projection = store
+            .latest_usability_probe_run(
+                "criterion",
+                "select",
+                &[
+                    "node-a".to_string(),
+                    "node-b".to_string(),
+                    "node-c".to_string(),
+                ],
+            )
+            .expect("read reconciled projection")
+            .expect("the complete run survives per-node reconciliation");
+        assert_eq!(projection.run_id, run_id);
+        assert_eq!(
+            projection
+                .results
+                .iter()
+                .map(|result| result.node.as_str())
+                .collect::<Vec<_>>(),
+            ["node-a"]
+        );
+        assert_eq!(projection.results[0].detail.as_deref(), Some("unchanged"));
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn custom_generation_drift_finishes_incomplete_without_publishing() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a"]);
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", store.quality_generation())
+            .expect("begin run")
+            .expect("quality session is current");
+        let changed = serde_json::json!({
+            "outbounds": [
+                {"type":"selector", "tag":"select", "outbounds":["node-a"]},
+                {"type":"socks", "tag":"node-a", "server":"changed.example", "server_port":1080}
+            ]
+        });
+        store
+            .reconcile_node_history(&changed)
+            .expect("advance node generation");
+        assert!(
+            !store
+                .finish_usability_probe_run(
+                    run_id,
+                    generation,
+                    true,
+                    None,
+                    None,
+                    &[UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: None,
+                    }],
+                )
+                .expect("stale run becomes incomplete")
+        );
+        assert!(
+            store
+                .latest_usability_probe_run("criterion", "select", &["node-a".to_string()])
+                .expect("query current generation")
+                .is_none()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM usability_probe_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .expect("read stale run status");
+        assert_eq!(status, "incomplete");
+
+        drop(store);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn malformed_custom_facts_are_terminal_incomplete_not_permanently_running() {
+        let path = test_db_path();
+        let store = BenchmarkStore::open(&path).expect("open sqlite store");
+        bind_test_identities(&store, &["node-a"]);
+        let (run_id, generation) = store
+            .begin_usability_probe_run("criterion", "select", store.quality_generation())
+            .expect("begin run")
+            .expect("quality session is current");
+        let duplicate = UsabilityProbeFactRecord {
+            node: "node-a".to_string(),
+            usable: true,
+            detail: None,
+        };
+        assert!(
+            !store
+                .finish_usability_probe_run(
+                    run_id,
+                    generation,
+                    true,
+                    None,
+                    None,
+                    &[duplicate.clone(), duplicate],
+                )
+                .expect("malformed run is finalized")
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM usability_probe_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .expect("read run status");
+        assert_eq!(status, "incomplete");
+
+        drop(store);
         remove_test_db(&path);
     }
 

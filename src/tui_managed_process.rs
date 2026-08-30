@@ -47,6 +47,10 @@ impl App {
     }
 
     pub(super) fn shutdown_runtime_environment(&mut self) -> Result<()> {
+        // A declared program may own isolated node-runtime-manager descendants. Stop it before
+        // deciding whether the live sing-box stays up; the custom probe never inherits the TUI's
+        // background ownership permission for the user's main proxy runtime.
+        self.cancel_active_usability_probe();
         if self.sing_box.is_leaving_running() {
             return Ok(());
         }

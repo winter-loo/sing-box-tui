@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -28,7 +30,8 @@ use crate::node_quality_path::{
 use crate::node_runtime_manager::IsolatedRuntimeSnapshot;
 use crate::storage::{
     BenchmarkRecord, BenchmarkStore, NodeLatencySample, NodeQualityReadLease, NodeQuickHistory,
-    PersistedNodeQualityProjection, SustainedSuccessStats, lock_node_quality_reconciliation,
+    PersistedNodeQualityProjection, StoredUsabilityProbeRun, SustainedSuccessStats,
+    UsabilityProbeFactRecord, lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
     NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
@@ -135,6 +138,8 @@ pub(crate) struct BenchmarkWorkflow {
     skip_active_environment_check_for_test: bool,
     #[cfg(test)]
     background_projection_reload_count: usize,
+    #[cfg(test)]
+    usability_projection_query_count: Cell<usize>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BenchmarkStart {
@@ -553,6 +558,8 @@ impl BenchmarkWorkflow {
             skip_active_environment_check_for_test: false,
             #[cfg(test)]
             background_projection_reload_count: 0,
+            #[cfg(test)]
+            usability_projection_query_count: Cell::new(0),
         }
     }
 
@@ -642,7 +649,15 @@ impl BenchmarkWorkflow {
             None => anyhow::bail!("node-quality persistence is not active"),
         }
 
-        Ok(members
+        Ok(self.node_quality_facts_from_cache(group, members))
+    }
+
+    pub(crate) fn node_quality_facts_from_cache(
+        &self,
+        group: &str,
+        members: &[String],
+    ) -> Vec<NodeQualityFacts> {
+        members
             .iter()
             .enumerate()
             .map(|(config_order, node)| {
@@ -682,7 +697,81 @@ impl BenchmarkWorkflow {
                     config_order,
                 }
             })
-            .collect())
+            .collect()
+    }
+
+    pub(crate) fn begin_usability_probe_run(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+    ) -> Result<(i64, u64)> {
+        let receipt = self
+            .runtime_receipt()
+            .context("usability probing requires a verified current sing-box runtime")?;
+        let store = self
+            .store
+            .as_ref()
+            .context("node-quality persistence is not active")?;
+        // Do not hold a generation read lease for the duration of an arbitrary user program: it
+        // could block subscription reconciliation indefinitely. Snapshot the receipt now, then
+        // make both the start INSERT and final atomic publication revalidate that generation.
+        let (run_id, generation) = store
+            .begin_usability_probe_run(criterion_id, selector, receipt.quality_generation)?
+            .context("node-quality generation changed before the usability probe started")?;
+        Ok((run_id, generation))
+    }
+
+    pub(crate) fn finish_usability_probe_run(
+        &self,
+        run_id: i64,
+        generation: u64,
+        complete: bool,
+        summary: Option<&str>,
+        diagnostic: Option<&str>,
+        facts: &[UsabilityProbeFactRecord],
+    ) -> Result<bool> {
+        self.store
+            .as_ref()
+            .context("node-quality persistence is not active")?
+            .finish_usability_probe_run(run_id, generation, complete, summary, diagnostic, facts)
+    }
+
+    pub(crate) fn latest_usability_probe_run(
+        &self,
+        criterion_id: &str,
+        selector: &str,
+        selector_members: &[String],
+    ) -> Result<Option<StoredUsabilityProbeRun>> {
+        #[cfg(test)]
+        self.usability_projection_query_count
+            .set(self.usability_projection_query_count.get() + 1);
+        self.store
+            .as_ref()
+            .context("node-quality persistence is not active")?
+            .latest_usability_probe_run(criterion_id, selector, selector_members)
+    }
+
+    pub(crate) fn latest_usability_probe_run_with_lease(
+        &self,
+        lease: &NodeQualityReadLease,
+        criterion_id: &str,
+        selector: &str,
+        selector_members: &[String],
+    ) -> Result<Option<StoredUsabilityProbeRun>> {
+        self.store
+            .as_ref()
+            .context("node-quality persistence is not active")?
+            .latest_usability_probe_run_with_lease(lease, criterion_id, selector, selector_members)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn usability_projection_query_count_for_test(&self) -> usize {
+        self.usability_projection_query_count.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allows_unpersisted_quality_for_test(&self) -> bool {
+        self.allow_unpersisted_quality_for_test && self.store.is_none()
     }
 
     pub(crate) fn activate_sustained_target(&mut self, target_url: &str) -> Result<()> {

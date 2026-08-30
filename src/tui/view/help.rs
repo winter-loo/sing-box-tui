@@ -46,7 +46,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "left/right",
         summary: "Switch node-view tab",
-        detail: "When the candidate pane is focused, move between Current selector and Streaming views without changing the live selector.",
+        detail: "When the candidate pane is focused, move between built-in and discovered custom views without changing the live selector.",
     },
     HelpBinding {
         key: "g",
@@ -82,6 +82,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         key: "t",
         summary: "Fully assess selected node",
         detail: "Run quick eligibility and then one bounded sustained transfer through an isolated node runtime.",
+    },
+    HelpBinding {
+        key: "U",
+        summary: "Run custom usability probe",
+        detail: "Manually run the criterion declared by the active custom node-view tab. Manifest discovery alone never starts a program.",
     },
     HelpBinding {
         key: "/",
@@ -180,8 +185,8 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
 ];
 
-pub(crate) fn help_binding_count() -> usize {
-    HELP_BINDINGS.len()
+pub(crate) fn help_item_count(diagnostic_count: usize) -> usize {
+    HELP_BINDINGS.len().saturating_add(diagnostic_count)
 }
 
 #[cfg(test)]
@@ -191,35 +196,52 @@ pub(crate) fn has_help_binding(key: &str, summary: &str) -> bool {
         .any(|binding| binding.key == key && binding.summary == summary)
 }
 
-pub(crate) fn draw_help_panel(frame: &mut Frame, help_index: usize) {
+pub(crate) fn draw_help_panel(
+    frame: &mut Frame,
+    help_index: usize,
+    diagnostics: &[ManifestDiagnostic],
+) {
     let frame_area = frame.area();
     let width = frame_area.width.saturating_sub(4).min(108);
     let height = frame_area.height.saturating_sub(4).min(34);
     let area = centered_rect(width.max(56), height.max(18), frame_area);
     frame.render_widget(Clear, area);
     let [list_area, detail_area] =
-        Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).areas(area);
-    let selected = help_index.min(HELP_BINDINGS.len().saturating_sub(1));
+        Layout::vertical([Constraint::Min(10), Constraint::Length(7)]).areas(area);
+    let item_count = help_item_count(diagnostics.len());
+    let selected = help_index.min(item_count.saturating_sub(1));
     let visible_rows = list_area.height.saturating_sub(2).max(1) as usize;
     let first = selected.saturating_sub(visible_rows.saturating_sub(1));
 
-    let lines = HELP_BINDINGS
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(visible_rows)
-        .map(|(index, binding)| help_binding(*binding, index == selected))
+    let lines = (first..item_count.min(first.saturating_add(visible_rows)))
+        .map(|index| {
+            if let Some(binding) = HELP_BINDINGS.get(index) {
+                help_binding(*binding, index == selected)
+            } else {
+                let diagnostic_index = index - HELP_BINDINGS.len();
+                help_manifest_diagnostic(
+                    &diagnostics[diagnostic_index],
+                    diagnostic_index,
+                    diagnostics.len(),
+                    index == selected,
+                )
+            }
+        })
         .collect::<Vec<_>>();
 
     let widget = Paragraph::new(lines).block(
         Block::default()
-            .title("Keybindings")
+            .title(if diagnostics.is_empty() {
+                "Keybindings"
+            } else {
+                "Keybindings + invalid usability manifests"
+            })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
     frame.render_widget(widget, list_area);
 
-    let count = format!("{} of {}", selected + 1, HELP_BINDINGS.len());
+    let count = format!("{} of {}", selected + 1, item_count);
     let count_width = unicode_width::UnicodeWidthStr::width(count.as_str()) as u16;
     let count_area = ratatui::layout::Rect {
         x: list_area.x + list_area.width.saturating_sub(count_width + 1),
@@ -232,16 +254,48 @@ pub(crate) fn draw_help_panel(frame: &mut Frame, help_index: usize) {
         count_area,
     );
 
-    let detail = HELP_BINDINGS
-        .get(selected)
-        .map(|binding| binding.detail)
-        .unwrap_or("");
+    let detail = HELP_BINDINGS.get(selected).map_or_else(
+        || {
+            diagnostics
+                .get(selected.saturating_sub(HELP_BINDINGS.len()))
+                .map(|diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message))
+                .unwrap_or_default()
+        },
+        |binding| binding.detail.to_string(),
+    );
     frame.render_widget(
         Paragraph::new(detail)
             .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL)),
         detail_area,
     );
+}
+
+fn help_manifest_diagnostic(
+    diagnostic: &ManifestDiagnostic,
+    index: usize,
+    count: usize,
+    selected: bool,
+) -> Line<'static> {
+    let line_style = if selected {
+        Style::default().bg(Color::Blue)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("! {:>3}/{:<3}", index + 1, count),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{}: {}", diagnostic.path, diagnostic.message),
+            Style::default().fg(Color::Yellow),
+        ),
+    ])
+    .style(line_style)
 }
 
 fn help_binding(binding: HelpBinding, selected: bool) -> Line<'static> {

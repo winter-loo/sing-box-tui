@@ -164,7 +164,7 @@ impl App {
         self.auto_select_enabled = true;
         self.auto_select_selector = Some(group_name.clone());
         self.auto_select_node_view = self.node_view_panel.id();
-        self.auto_select_ranking_policy = self.node_view_panel.ranking_policy();
+        self.auto_select_ranking_policy = self.active_node_view_ranking_policy();
         self.automatic_selection_state = Default::default();
         self.active_node_traffic = Default::default();
         self.last_auto_selection_explanation = None;
@@ -258,6 +258,7 @@ impl App {
         }
         let group = self.auto_select_group()?;
         let current_node = group.current.clone()?;
+        let panel_revision = self.cached_auto_selection_panel_revision(group);
         Some(SelectionScope {
             quality_generation: self
                 .benchmark_workflow
@@ -265,8 +266,23 @@ impl App {
                 .quality_generation(),
             selector: group.name.clone(),
             panel: self.auto_select_node_view.clone(),
+            panel_revision,
             current_node,
         })
+    }
+
+    fn cached_auto_selection_panel_revision(&self, group: &ProxyGroup) -> u64 {
+        if self.auto_select_node_view == crate::automatic_selection::NodeViewId::current_selector()
+            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming()
+        {
+            return 0;
+        }
+        self.cached_custom_node_view_projection(
+            &self.auto_select_node_view,
+            &group.name,
+            &group.members,
+        )
+        .revision
     }
 
     fn auto_selection_evidence_members_for_group(&self, group: &ProxyGroup) -> Vec<String> {
@@ -280,8 +296,21 @@ impl App {
         let mut candidates = if built_in_view {
             self.benchmark_candidates_for_group(group)
         } else {
-            Vec::new()
+            let projection = self.cached_custom_node_view_projection(
+                &self.auto_select_node_view,
+                &group.name,
+                &group.members,
+            );
+            group
+                .members
+                .iter()
+                .filter(|node| projection.membership(node) == PanelMembership::Included)
+                .cloned()
+                .collect()
         };
+        // The current node may sit outside a custom panel. Probe it for failure/traffic comparison,
+        // but the decision projection below remains Included-only and can never select it merely
+        // because evidence acquisition added it here.
         if let Some(current) = group
             .current
             .as_ref()
@@ -293,7 +322,7 @@ impl App {
         candidates
     }
 
-    fn auto_selection_panel_projection(
+    fn built_in_auto_selection_panel_projection(
         &self,
         group: &ProxyGroup,
         facts: &[NodeQualityFacts],
@@ -346,6 +375,7 @@ impl App {
                 id => id.to_string(),
             },
             ranking_policy: self.auto_select_ranking_policy,
+            revision: 0,
             members,
         }
     }
@@ -410,12 +440,37 @@ impl App {
                 .get(facts.node.as_str())
                 .and_then(|assessment| reachability_tier(assessment));
         }
-        let panel = self.auto_selection_panel_projection(&group, &facts);
+        let panel = if self.auto_select_node_view
+            == crate::automatic_selection::NodeViewId::current_selector()
+            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming()
+        {
+            self.built_in_auto_selection_panel_projection(&group, &facts)
+        } else {
+            // The render cache is never authority for a selector write. Re-read custom membership
+            // under the same generation lease that `AutoSelectionPlan` keeps alive through every
+            // controller PUT, so reconciliation cannot invalidate the chosen panel mid-action.
+            match self.leased_custom_node_view_projection(
+                &quality_lease,
+                &self.auto_select_node_view,
+                group_name,
+                &group.members,
+            ) {
+                Ok(panel) => panel,
+                Err(error) => {
+                    self.defer_auto_selection_after_quality_change(
+                        group_name,
+                        format!("custom panel projection unavailable: {error:#}"),
+                    );
+                    return Ok(());
+                }
+            }
+        };
         let parent_switch = self.implicit_root_parent_switch_for_group(group_name);
         let scope = SelectionScope {
             quality_generation: quality_lease.generation(),
             selector: group_name.to_string(),
             panel: panel.id.clone(),
+            panel_revision: panel.revision,
             current_node,
         };
         let transfer = self.active_node_traffic.status(&scope, Instant::now());

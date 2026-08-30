@@ -1,10 +1,14 @@
 use super::super::test_support::{internet_routes_app, test_app};
+use crate::automatic_selection::{NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::BenchmarkUpdate;
 use crate::controller::{
     BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
 };
+use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
+use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
+use std::path::PathBuf;
 
 #[test]
 fn default_panel_keeps_every_selector_member_when_probe_filter_changes() {
@@ -212,6 +216,181 @@ fn arrow_keys_switch_tabs_only_while_candidate_pane_is_focused() {
         app.node_view_panel,
         super::super::NodeViewPanel::CurrentSelector
     );
+}
+
+#[test]
+fn discovered_custom_tab_starts_untested_then_projects_only_current_selector_members() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+    app.usability_probe_manifests.push(UsabilityProbeManifest {
+        id: NodeViewId::new("github-web").unwrap(),
+        label: "GitHub Web".to_string(),
+        ranking_policy: RankingPolicy::LowLatency,
+        source: UsabilityProbeSource::Url("https://github.com/404-is-still-http".to_string()),
+        source_path: PathBuf::from("github-web.json"),
+    });
+
+    app.move_node_view_next();
+    app.move_node_view_next();
+    assert_eq!(
+        app.node_view_panel,
+        super::super::NodeViewPanel::Custom(NodeViewId::new("github-web").unwrap())
+    );
+    assert!(app.displayed_members().is_empty());
+    {
+        let snapshot = app.view_snapshot();
+        assert_eq!(snapshot.active_node_view_tab, 2);
+        assert_eq!(snapshot.node_view_tabs[2].label, "GitHub Web");
+        assert_eq!(snapshot.node_view_tabs[2].count, 0);
+        assert!(snapshot.candidate_rows.is_empty());
+        assert!(snapshot.candidate_title.contains("UNTESTED"));
+    }
+
+    app.usability_probe_projection_cache.insert(
+        (NodeViewId::new("github-web").unwrap(), "select".to_string()),
+        StoredUsabilityProbeRun {
+            run_id: 7,
+            completed_at_ms: 42,
+            summary: Some("complete".to_string()),
+            results: vec![
+                UsabilityProbeFactRecord {
+                    node: "outside-selector".to_string(),
+                    usable: true,
+                    detail: Some("must stay hidden".to_string()),
+                },
+                UsabilityProbeFactRecord {
+                    node: "node-a".to_string(),
+                    usable: false,
+                    detail: Some("application rejected".to_string()),
+                },
+                UsabilityProbeFactRecord {
+                    node: "node-b".to_string(),
+                    usable: true,
+                    detail: Some("valid HTTP response".to_string()),
+                },
+            ],
+        },
+    );
+    assert_eq!(app.displayed_members(), ["node-b"]);
+    {
+        let snapshot = app.view_snapshot();
+        assert_eq!(snapshot.node_view_tabs[2].count, 1);
+        assert_eq!(snapshot.candidate_rows.len(), 1);
+        assert_eq!(snapshot.candidate_rows[0].name, "node-b");
+        assert_eq!(snapshot.candidate_rows[0].marker, "valid HTTP response");
+        assert!(snapshot.candidate_title.contains("LOW LATENCY"));
+    }
+
+    app.handle_key(KeyCode::Char('U'))
+        .expect("manual probe action remains in the TUI");
+    assert!(app.status.contains("Cannot run GitHub Web usability probe"));
+    app.move_node_view_previous();
+    assert_eq!(app.node_view_panel, super::super::NodeViewPanel::Streaming);
+}
+
+#[test]
+fn custom_panel_identity_survives_manifest_reordering_and_missing_files() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    let manifest = |id: &str, label: &str| UsabilityProbeManifest {
+        id: NodeViewId::new(id).unwrap(),
+        label: label.to_string(),
+        ranking_policy: RankingPolicy::Balanced,
+        source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+        source_path: PathBuf::from(format!("{id}.json")),
+    };
+    app.usability_probe_manifests = vec![manifest("alpha", "Alpha"), manifest("beta", "Beta")];
+    let beta = NodeViewId::new("beta").unwrap();
+    app.node_view_panel = super::super::NodeViewPanel::Custom(beta.clone());
+    app.auto_select_node_view = beta.clone();
+
+    app.usability_probe_manifests.swap(0, 1);
+    {
+        let snapshot = app.view_snapshot();
+        assert_eq!(snapshot.active_node_view_tab, 2);
+        assert_eq!(snapshot.node_view_tabs[2].label, "Beta");
+    }
+    assert_eq!(
+        app.runtime_state().active_node_view.as_ref(),
+        Some(&beta),
+        "manifest order is presentation state, never persisted identity"
+    );
+
+    app.usability_probe_manifests.clear();
+    assert!(app.displayed_members().is_empty());
+    let snapshot = app.view_snapshot();
+    assert_eq!(snapshot.active_node_view_tab, 2);
+    assert_eq!(snapshot.node_view_tabs[2].label, "Unavailable (beta)");
+    assert_eq!(snapshot.node_view_tabs[2].count, 0);
+    assert_eq!(app.auto_select_node_view, beta);
+}
+
+#[test]
+fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = vec!["z-node".into(), "a-node".into(), "m-node".into()];
+    app.usability_probe_manifests.push(UsabilityProbeManifest {
+        id: NodeViewId::new("ordered").unwrap(),
+        label: "Ordered".to_string(),
+        ranking_policy: RankingPolicy::Balanced,
+        source: UsabilityProbeSource::Url("https://example.test/".to_string()),
+        source_path: PathBuf::from("ordered.json"),
+    });
+    app.usability_probe_projection_cache.insert(
+        (NodeViewId::new("ordered").unwrap(), "select".to_string()),
+        StoredUsabilityProbeRun {
+            run_id: 8,
+            completed_at_ms: 43,
+            summary: None,
+            // Persistence order is deliberately lexical and must never control the TUI rows.
+            results: ["a-node", "m-node", "z-node"]
+                .into_iter()
+                .map(|node| UsabilityProbeFactRecord {
+                    node: node.to_string(),
+                    usable: true,
+                    detail: None,
+                })
+                .collect(),
+        },
+    );
+    app.move_node_view_next();
+    app.move_node_view_next();
+
+    let queries_before = app
+        .benchmark_workflow
+        .usability_projection_query_count_for_test();
+    for _ in 0..3 {
+        let _ = app.view_snapshot();
+    }
+    assert_eq!(
+        app.benchmark_workflow
+            .usability_projection_query_count_for_test(),
+        queries_before,
+        "repeated dashboard snapshots must remain storage-I/O free"
+    );
+
+    assert_eq!(app.displayed_members(), ["z-node", "a-node", "m-node"]);
+    {
+        let snapshot = app.view_snapshot();
+        assert_eq!(
+            snapshot
+                .candidate_rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["z-node", "a-node", "m-node"]
+        );
+        assert_eq!(snapshot.candidate_selected, Some(0));
+    }
+
+    app.handle_key(KeyCode::Char('j')).expect("move down");
+    assert_eq!(app.selected_member_name().as_deref(), Some("a-node"));
+    assert_eq!(app.view_snapshot().candidate_selected, Some(1));
+    app.handle_key(KeyCode::Char('k')).expect("move up");
+    assert_eq!(app.selected_member_name().as_deref(), Some("z-node"));
+    assert_eq!(app.view_snapshot().candidate_selected, Some(0));
 }
 
 #[test]

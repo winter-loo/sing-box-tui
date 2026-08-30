@@ -74,6 +74,7 @@ impl<'de> Deserialize<'de> for NodeViewId {
 pub(crate) enum RankingPolicy {
     #[default]
     Balanced,
+    #[serde(alias = "low-latency")]
     LowLatency,
     Throughput,
 }
@@ -84,6 +85,14 @@ impl RankingPolicy {
             Self::Balanced => "balanced",
             Self::LowLatency => "low latency",
             Self::Throughput => "throughput",
+        }
+    }
+
+    pub(crate) fn badge(self) -> &'static str {
+        match self {
+            Self::Balanced => "BALANCED",
+            Self::LowLatency => "LOW LATENCY",
+            Self::Throughput => "THROUGHPUT",
         }
     }
 }
@@ -104,6 +113,7 @@ pub(crate) struct NodeViewProjection {
     pub(crate) id: NodeViewId,
     pub(crate) label: String,
     pub(crate) ranking_policy: RankingPolicy,
+    pub(crate) revision: u64,
     pub(crate) members: BTreeMap<String, PanelMembership>,
 }
 
@@ -114,6 +124,7 @@ impl NodeViewProjection {
             id: NodeViewId::current_selector(),
             label: "Current selector".to_string(),
             ranking_policy: RankingPolicy::Balanced,
+            revision: 0,
             members: members
                 .iter()
                 .cloned()
@@ -190,6 +201,9 @@ pub(crate) struct SelectionScope {
     pub(crate) quality_generation: u64,
     pub(crate) selector: String,
     pub(crate) panel: NodeViewId,
+    // A new manifest run is a new decision universe: confirmation and traffic windows must not
+    // combine membership from one run with quality evidence from another.
+    pub(crate) panel_revision: u64,
     pub(crate) current_node: String,
 }
 
@@ -599,7 +613,7 @@ impl AutomaticSelectionState {
             .collect::<Vec<_>>();
         let best = eligible
             .into_iter()
-            .max_by(|left, right| compare_candidates(panel.ranking_policy, left, right));
+            .max_by(|left, right| compare_node_quality(panel.ranking_policy, left, right));
         let Some(best) = best else {
             self.reset_rounds();
             let incomplete = panel.members.values().any(|membership| {
@@ -785,7 +799,7 @@ fn decision(reason: AutoSelectionReason) -> AutoSelectionDecision {
     }
 }
 
-fn compare_candidates(
+pub(crate) fn compare_node_quality(
     policy: RankingPolicy,
     left: &NodeQualityFacts,
     right: &NodeQualityFacts,
@@ -919,6 +933,7 @@ mod tests {
             quality_generation: 7,
             selector: "select".to_string(),
             panel: NodeViewId::current_selector(),
+            panel_revision: 0,
             current_node: current.to_string(),
         }
     }
