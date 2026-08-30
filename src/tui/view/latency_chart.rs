@@ -20,6 +20,15 @@ pub(crate) struct LatencyChartState {
     pub(crate) reachability_assessment: Option<NodeReachabilityAssessment>,
     pub(crate) sustained_quality: Option<NodeSustainedQuality>,
     pub(crate) auto_selection_detail: Option<String>,
+    pub(crate) usability_details: Vec<UsabilityCriterionDetail>,
+    pub(crate) evidence_scroll: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UsabilityCriterionDetail {
+    pub(crate) label: String,
+    pub(crate) usable: bool,
+    pub(crate) detail: Option<String>,
 }
 
 fn latency_chart_time_unit(window: Duration) -> LatencyChartTimeUnit {
@@ -75,6 +84,7 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
     let [quality_area, area] = if chart.reachability_assessment.is_some()
         || chart.sustained_quality.is_some()
         || chart.auto_selection_detail.is_some()
+        || !chart.usability_details.is_empty()
     {
         Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).areas(area)
     } else {
@@ -83,6 +93,7 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
     if chart.reachability_assessment.is_some()
         || chart.sustained_quality.is_some()
         || chart.auto_selection_detail.is_some()
+        || !chart.usability_details.is_empty()
     {
         let mut lines = Vec::new();
         if let Some(detail) = &chart.auto_selection_detail {
@@ -134,12 +145,30 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
                 }
             }
         }
+        for criterion in &chart.usability_details {
+            lines.push(Line::from(format!(
+                "{} criterion: {}{}",
+                criterion.label,
+                if criterion.usable {
+                    "usable"
+                } else {
+                    "rejected"
+                },
+                criterion
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" ({})", truncate_for_width(detail, 56)))
+                    .unwrap_or_default()
+            )));
+        }
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title("Node quality evidence")
-                    .borders(Borders::ALL),
-            ),
+            Paragraph::new(lines)
+                .scroll((chart.evidence_scroll, 0))
+                .block(
+                    Block::default()
+                        .title("Node quality evidence (j/k scroll)")
+                        .borders(Borders::ALL),
+                ),
             quality_area,
         );
     }
@@ -251,6 +280,23 @@ pub(crate) fn draw_latency_chart(frame: &mut Frame, chart: &LatencyChartState) {
                 ]),
         );
     frame.render_widget(chart_widget, area);
+}
+
+pub(crate) fn latency_chart_evidence_line_count(chart: &LatencyChartState) -> usize {
+    let quick = chart
+        .reachability_assessment
+        .as_ref()
+        .map_or(0, |assessment| 1 + assessment.attempts.len());
+    let sustained = chart.sustained_quality.as_ref().map_or(0, |quality| {
+        usize::from(matches!(
+            &quality.outcome,
+            SustainedProbeOutcome::Completed(_)
+        )) + 1
+    });
+    usize::from(chart.auto_selection_detail.is_some())
+        + quick
+        + sustained
+        + chart.usability_details.len()
 }
 
 fn probe_outcome_label(outcome: &ProbeOutcome) -> String {

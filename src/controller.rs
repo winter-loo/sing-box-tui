@@ -613,7 +613,7 @@ fn spawn_reachability_assessment_task(
     });
 }
 
-async fn measure_probe_outcome(
+pub(crate) async fn measure_probe_outcome(
     client: AsyncClient,
     base_url: &str,
     proxy_name: &str,
@@ -623,17 +623,69 @@ async fn measure_probe_outcome(
 ) -> ProbeOutcome {
     // The delay API's cutoff and our HTTP deadline are intentionally independent: the
     // controller still needs time to return a measurement after its own probe expires.
+    measure_probe_outcome_with_deadlines(
+        client,
+        base_url,
+        proxy_name,
+        url,
+        u128::from(controller_timeout_ms),
+        request_timeout,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn measure_usability_probe_outcome(
+    client: AsyncClient,
+    base_url: &str,
+    proxy_name: &str,
+    url: &str,
+    target_timeout: Duration,
+    controller_timeout: Duration,
+) -> ProbeOutcome {
+    // A target deadline is reported by Clash as HTTP 503/504 and belongs to the node. A longer
+    // client deadline expiring means Clash itself failed to answer, so custom panel publication
+    // must treat it as infrastructure failure and preserve the prior complete projection.
+    measure_probe_outcome_with_deadlines(
+        client,
+        base_url,
+        proxy_name,
+        url,
+        target_timeout.as_millis(),
+        controller_timeout,
+        true,
+    )
+    .await
+}
+
+async fn measure_probe_outcome_with_deadlines(
+    client: AsyncClient,
+    base_url: &str,
+    proxy_name: &str,
+    url: &str,
+    target_timeout_ms: u128,
+    controller_timeout: Duration,
+    controller_timeout_is_infrastructure: bool,
+) -> ProbeOutcome {
     let request = client
         .get(format!(
             "{}/proxies/{}/delay?timeout={}&url={}",
             base_url,
             encode(proxy_name),
-            controller_timeout_ms,
+            target_timeout_ms,
             encode(url)
         ))
-        .timeout(request_timeout);
+        .timeout(controller_timeout);
     let response = match request.send().await {
         Ok(response) => response,
+        Err(error) if error.is_timeout() && controller_timeout_is_infrastructure => {
+            return ProbeOutcome::TransportFailure {
+                detail: format!(
+                    "Clash controller did not answer within {}ms",
+                    controller_timeout.as_millis()
+                ),
+            };
+        }
         Err(error) if error.is_timeout() => return ProbeOutcome::Timeout,
         Err(error) => {
             return ProbeOutcome::TransportFailure {

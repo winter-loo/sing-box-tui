@@ -182,6 +182,7 @@ impl App {
                     // The live controller still serves the pre-refresh config. Do not rebind its
                     // in-flight or subsequent probe facts to the new on-disk identity generation.
                     self.benchmark_workflow.pause_quality_persistence();
+                    self.usability_probe_projection_cache.clear();
                     self.latency_chart = None;
                 }
                 state.schedule_after(state.interval);
@@ -227,7 +228,7 @@ mod tests {
     use super::super::LatencyChartState;
     use super::{SubscriptionRefreshEvent, SubscriptionRefreshJob, SubscriptionRefreshState};
     use crate::controller::{BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome};
-    use crate::storage::BenchmarkStore;
+    use crate::storage::{BenchmarkStore, StoredUsabilityProbeRun};
     use crate::subscriptions::{SubscriptionRefreshOutput, SubscriptionRefreshRequest};
 
     use super::super::test_support::{test_app, test_db_path};
@@ -294,6 +295,18 @@ mod tests {
         let store = BenchmarkStore::open(&path).expect("open benchmark store");
         let mut app = test_app();
         app.benchmark_workflow.replace_store(Some(store));
+        app.usability_probe_projection_cache.insert(
+            (
+                crate::automatic_selection::NodeViewId::new("criterion").unwrap(),
+                "select".to_string(),
+            ),
+            StoredUsabilityProbeRun {
+                run_id: 1,
+                completed_at_ms: 1,
+                summary: None,
+                results: Vec::new(),
+            },
+        );
         app.benchmark_workflow
             .set_summary(BenchmarkSummary::empty("select".to_string()));
         app.benchmark_workflow.set_reachability_assessment(
@@ -320,6 +333,8 @@ mod tests {
             reachability_assessment: None,
             sustained_quality: None,
             auto_selection_detail: None,
+            usability_details: Vec::new(),
+            evidence_scroll: 0,
         });
         install_completed_refresh(&mut app, &path, true);
 
@@ -336,6 +351,7 @@ mod tests {
                 .is_none()
         );
         assert!(app.latency_chart.is_none());
+        assert!(app.usability_probe_projection_cache.is_empty());
         assert_eq!(
             app.benchmark_workflow
                 .persist_benchmark_for_test("node-old")

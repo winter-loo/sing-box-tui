@@ -1,11 +1,13 @@
 use super::super::test_support::{internet_routes_app, test_app};
-use crate::automatic_selection::{NodeViewId, SelectionScope};
+use crate::automatic_selection::{NodeViewId, RankingPolicy, SelectionScope};
 use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkUpdate, SustainedKind};
 use crate::controller::{
     ApiClient, BenchmarkRequest, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
     NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
 };
+use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
+use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -146,6 +148,7 @@ fn auto_selection_scope() -> SelectionScope {
         quality_generation: 0,
         selector: "select".to_string(),
         panel: NodeViewId::current_selector(),
+        panel_revision: 0,
         current_node: "node-a".to_string(),
     }
 }
@@ -343,6 +346,149 @@ fn auto_select_requires_two_public_completion_rounds_before_controller_write() {
 }
 
 #[test]
+fn custom_auto_select_uses_included_members_and_resets_confirmation_for_a_new_run() {
+    let controller = FakeController::start("node-b");
+    let mut app = test_app();
+    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
+    app.groups[0].members = vec![
+        "node-a".into(),
+        "node-b".into(),
+        "node-c".into(),
+        "node-d".into(),
+    ];
+    app.benchmark_filter.clear();
+    let panel_id = NodeViewId::new("github-web").unwrap();
+    app.usability_probe_manifests.push(UsabilityProbeManifest {
+        id: panel_id.clone(),
+        label: "GitHub Web".into(),
+        ranking_policy: RankingPolicy::LowLatency,
+        source: UsabilityProbeSource::Url("https://github.com/".into()),
+        source_path: PathBuf::from("github-web.json"),
+    });
+    let install_run = |app: &mut super::App, run_id| {
+        app.usability_probe_projection_cache.insert(
+            (panel_id.clone(), "select".into()),
+            StoredUsabilityProbeRun {
+                run_id,
+                completed_at_ms: run_id as u64,
+                summary: None,
+                results: vec![
+                    UsabilityProbeFactRecord {
+                        node: "node-a".into(),
+                        usable: false,
+                        detail: Some("current is outside this panel".into()),
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-b".into(),
+                        usable: true,
+                        detail: Some("accepted".into()),
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-c".into(),
+                        usable: false,
+                        detail: Some("rejected".into()),
+                    },
+                ],
+            },
+        );
+    };
+    install_run(&mut app, 7);
+    app.node_view_panel = super::super::NodeViewPanel::Custom(panel_id.clone());
+    app.auto_select_enabled = true;
+    app.auto_select_selector = Some("select".into());
+    app.auto_select_node_view = panel_id.clone();
+    app.auto_select_ranking_policy = RankingPolicy::LowLatency;
+
+    let current = reachability("node-a", [100, 100, 100]);
+    let included = reachability("node-b", [70, 70, 70]);
+    let rejected = reachability("node-c", [10, 10, 10]);
+    let untested = reachability("node-d", [5, 5, 5]);
+    for assessment in [&current, &included, &rejected, &untested] {
+        app.benchmark_workflow
+            .set_reachability_assessment("select", assessment.clone());
+    }
+    app.maybe_start_auto_select_benchmark()
+        .expect("custom evidence assessment starts");
+    assert_eq!(
+        app.benchmark_workflow.active_nodes("select"),
+        Some(["node-a".to_string(), "node-b".to_string()].as_slice()),
+        "only Included members plus the out-of-panel current node may be assessed"
+    );
+
+    let seed_idle = |app: &mut super::App, panel_revision| {
+        let scope = SelectionScope {
+            quality_generation: 0,
+            selector: "select".into(),
+            panel: panel_id.clone(),
+            panel_revision,
+            current_node: "node-a".into(),
+        };
+        let now = Instant::now();
+        app.active_node_traffic.observe(
+            scope.clone(),
+            now - Duration::from_secs(10),
+            &ConnectionsSnapshot::default(),
+        );
+        app.active_node_traffic
+            .observe(scope, now, &ConnectionsSnapshot::default());
+    };
+    let assessments = vec![
+        current.clone(),
+        included.clone(),
+        rejected.clone(),
+        untested.clone(),
+    ];
+    seed_idle(&mut app, 7);
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".into(),
+        round_id: 100,
+        assessments: assessments.clone(),
+        quality_current: true,
+    }))
+    .expect("first custom round is retained");
+    assert!(app.status.contains("confirmation 1/2"));
+
+    install_run(&mut app, 8);
+    seed_idle(&mut app, 8);
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".into(),
+        round_id: 101,
+        assessments: assessments.clone(),
+        quality_current: true,
+    }))
+    .expect("new manifest run resets confirmation");
+    assert!(app.status.contains("confirmation 1/2"));
+    assert!(
+        controller
+            .requests
+            .lock()
+            .expect("inspect pre-confirmation requests")
+            .iter()
+            .all(|request| !request.starts_with("PUT /proxies/select "))
+    );
+
+    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+        group: "select".into(),
+        round_id: 102,
+        assessments,
+        quality_current: true,
+    }))
+    .expect("second round on the same manifest run switches");
+    let switches = controller
+        .requests
+        .lock()
+        .expect("inspect custom switch requests")
+        .iter()
+        .filter(|request| request.starts_with("PUT /proxies/select "))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(switches.len(), 1);
+    assert!(switches[0].contains(r#"{"name":"node-b"}"#));
+    assert!(!switches[0].contains("node-c"));
+    assert!(!switches[0].contains("node-d"));
+}
+
+#[test]
 fn streaming_auto_select_discovers_untested_nodes_before_they_become_selectable() {
     let controller = FakeController::start("node-b");
     let mut app = test_app();
@@ -415,6 +561,7 @@ fn streaming_auto_select_discovers_untested_nodes_before_they_become_selectable(
         quality_generation: 0,
         selector: "select".to_string(),
         panel: NodeViewId::streaming(),
+        panel_revision: 0,
         current_node: "node-a".to_string(),
     };
     let now = Instant::now();

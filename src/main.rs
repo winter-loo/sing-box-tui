@@ -35,6 +35,7 @@ mod system_proxy;
 mod tui;
 mod tui_state;
 mod tun;
+mod usability_probe;
 
 use cli::{BackgroundAction, CliCommand};
 use config::{HillstoneRouteOptions, run_hillstone_route_config};

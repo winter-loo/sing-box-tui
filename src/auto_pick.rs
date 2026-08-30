@@ -22,7 +22,9 @@ use crate::process_inspection::process_is_alive as process_exists;
 use crate::sustained_quality::{normalize_sustained_target, sustained_target_identity};
 
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
-pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 2;
+// Model 3 adds stable manifest panel IDs and run-scoped membership. Reusing a model-2 worker would
+// keep every custom panel fail-closed even after the foreground successfully publishes a run.
+pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 3;
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);

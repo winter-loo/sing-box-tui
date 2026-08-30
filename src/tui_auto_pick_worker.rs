@@ -77,6 +77,10 @@ impl App {
         if config.interval_secs > 0 {
             self.auto_select_interval = Duration::from_secs(config.interval_secs);
         }
+        // ApplyConfig is also a fact-notification boundary. A long-lived headless worker must
+        // refresh shared-SQLite manifest membership even when the stable config signature did not
+        // change, otherwise a foreground manual run would never become selectable in that worker.
+        self.refresh_usability_probe_projection_cache();
         if before != self.auto_pick_runtime_signature() {
             self.last_auto_select_benchmark = None;
             self.automatic_selection_state = Default::default();
@@ -199,6 +203,7 @@ impl App {
             .benchmark_workflow
             .apply_background_snapshot(latency, &self.benchmark_filter)?;
         if applied {
+            self.refresh_usability_probe_projection_cache();
             self.sync_selection_to_displayed_members();
         }
         Ok(applied)

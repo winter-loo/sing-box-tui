@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::io;
@@ -65,6 +66,10 @@ use crate::system_proxy::SystemProxy;
 use crate::tui_state::{
     BypassRuleSetStore, TuiStateStore, default_tui_state_path, resolved_tui_bypass_rule_set_path,
 };
+use crate::usability_probe::{
+    ManifestDiagnostic, UsabilityProbeDiscovery, UsabilityProbeManifest,
+    discover_usability_probe_manifests, manifest_diagnostic, usability_probe_manifest_directory,
+};
 
 #[path = "../tui_auto_pick_worker.rs"]
 mod auto_pick_worker;
@@ -99,6 +104,8 @@ mod subscription_workflow;
 #[cfg(test)]
 #[path = "../tui_test_support.rs"]
 mod test_support;
+#[path = "../tui_usability_probe.rs"]
+mod usability_probe_workflow;
 #[path = "../tui_verification.rs"]
 mod verification;
 #[path = "view/mod.rs"]
@@ -112,7 +119,7 @@ use view::private_access_auth_display_value;
 use view::{
     Focus, LatencyChartState, LeftPaneSection, NodeViewPanel, OnboardingState,
     PrivateAccessAuthModal, PrivateAccessProgressEntry, PrivateAccessProgressModal,
-    PrivateAccessProgressTone, SettingsEditState, help_binding_count,
+    PrivateAccessProgressTone, SettingsEditState, help_item_count,
     private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
 };
 
@@ -280,6 +287,7 @@ fn restore_terminal() -> Result<()> {
 fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         app.poll_benchmark_updates()?;
+        app.poll_usability_probe_updates();
         app.poll_subscription_refresh_updates()?;
         app.poll_system_proxy_updates();
         app.poll_tun_toggle_updates();
@@ -389,6 +397,11 @@ struct App {
     benchmark_max_concurrency: usize,
     verify_targets: String,
     benchmark_workflow: BenchmarkWorkflow,
+    usability_probe_manifests: Vec<UsabilityProbeManifest>,
+    usability_probe_diagnostics: Vec<ManifestDiagnostic>,
+    usability_probe_job: Option<usability_probe_workflow::ActiveUsabilityProbe>,
+    usability_probe_projection_cache:
+        BTreeMap<(NodeViewId, String), crate::storage::StoredUsabilityProbeRun>,
     filter_input: Option<String>,
     bypass_input: Option<String>,
     bypass_entries: Vec<String>,
@@ -489,6 +502,16 @@ impl App {
         let system_proxy_config_path = subscription_refresh_options.config_path.clone();
         let node_quality_db_path = default_benchmark_db_path_for_config(&system_proxy_config_path)?;
         let state_path = default_tui_state_path();
+        let usability_manifest_directory =
+            usability_probe_manifest_directory(&system_proxy_config_path);
+        let usability_discovery = discover_usability_probe_manifests(&usability_manifest_directory)
+            .unwrap_or_else(|error| UsabilityProbeDiscovery {
+                manifests: Vec::new(),
+                diagnostics: vec![manifest_diagnostic(
+                    &usability_manifest_directory,
+                    format!("{error:#}"),
+                )],
+            });
         let bypass_rule_set_path = resolved_tui_bypass_rule_set_path(&system_proxy_config_path)?;
         let onboarding_subscription = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
         let background_state = background_task_state_path();
@@ -575,6 +598,10 @@ impl App {
             benchmark_max_concurrency,
             verify_targets: default_verification_targets_setting(),
             benchmark_workflow,
+            usability_probe_manifests: usability_discovery.manifests,
+            usability_probe_diagnostics: usability_discovery.diagnostics,
+            usability_probe_job: None,
+            usability_probe_projection_cache: BTreeMap::new(),
             filter_input: None,
             bypass_input: None,
             bypass_entries: Vec::new(),
@@ -658,6 +685,12 @@ impl App {
             app.restore_persisted_selections(&runtime_state)?;
             app.apply_runtime_state(runtime_state.clone())?;
             app.save_bypass_rule_set()?;
+            if !app.usability_probe_diagnostics.is_empty() {
+                app.set_status_only(format!(
+                    "Loaded with {} invalid usability manifest(s); press ? and select the manifest diagnostics for every path and reason",
+                    app.usability_probe_diagnostics.len()
+                ));
+            }
             Ok(())
         })();
         if let Err(error) = initialization {
@@ -762,7 +795,10 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_help_previous(),
                 KeyCode::Char('g') => self.help_index = 0,
-                KeyCode::Char('G') => self.help_index = help_binding_count().saturating_sub(1),
+                KeyCode::Char('G') => {
+                    self.help_index =
+                        help_item_count(self.usability_probe_diagnostics.len()).saturating_sub(1)
+                }
                 KeyCode::Char('q') => return Ok(false),
                 _ => {}
             }
@@ -790,6 +826,8 @@ impl App {
                     self.latency_chart = None;
                     self.set_status_only("Latency chart closed");
                 }
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_latency_chart_evidence_down(),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_latency_chart_evidence_up(),
                 KeyCode::Char('z') => self.zoom_latency_chart_in(),
                 KeyCode::Char('Z') => self.zoom_latency_chart_out(),
                 KeyCode::Char('q') => return Ok(false),
@@ -819,6 +857,7 @@ impl App {
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
             KeyCode::Char('u') => self.start_manual_subscription_refresh(),
+            KeyCode::Char('U') => self.start_manual_usability_probe(),
             KeyCode::Char('T') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('s') => self.toggle_latency_sort_mode(),
@@ -869,7 +908,8 @@ impl App {
     }
 
     fn move_help_next(&mut self) {
-        self.help_index = (self.help_index + 1).min(help_binding_count().saturating_sub(1));
+        self.help_index = (self.help_index + 1)
+            .min(help_item_count(self.usability_probe_diagnostics.len()).saturating_sub(1));
     }
 
     fn move_help_previous(&mut self) {

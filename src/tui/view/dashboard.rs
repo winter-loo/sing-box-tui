@@ -7,47 +7,43 @@ pub(crate) enum Focus {
     Members,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) enum NodeViewPanel {
     #[default]
     CurrentSelector,
     Streaming,
+    Custom(NodeViewId),
 }
 
 impl NodeViewPanel {
-    pub(crate) fn index(self) -> usize {
-        match self {
-            Self::CurrentSelector => 0,
-            Self::Streaming => 1,
-        }
-    }
-
-    pub(crate) fn id(self) -> NodeViewId {
+    pub(crate) fn id(&self) -> NodeViewId {
         match self {
             Self::CurrentSelector => NodeViewId::current_selector(),
             Self::Streaming => NodeViewId::streaming(),
+            Self::Custom(id) => id.clone(),
         }
     }
 
-    pub(crate) fn ranking_policy(self) -> RankingPolicy {
+    pub(crate) fn builtin_ranking_policy(&self) -> Option<RankingPolicy> {
         match self {
-            Self::CurrentSelector => RankingPolicy::Balanced,
-            Self::Streaming => RankingPolicy::Throughput,
+            Self::CurrentSelector => Some(RankingPolicy::Balanced),
+            Self::Streaming => Some(RankingPolicy::Throughput),
+            Self::Custom(_) => None,
         }
     }
 
     pub(crate) fn from_id(id: &NodeViewId) -> Self {
-        if id == &NodeViewId::streaming() {
-            Self::Streaming
-        } else {
-            Self::CurrentSelector
+        match id.as_str() {
+            crate::automatic_selection::CURRENT_SELECTOR_VIEW_ID => Self::CurrentSelector,
+            crate::automatic_selection::STREAMING_VIEW_ID => Self::Streaming,
+            _ => Self::Custom(id.clone()),
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeViewTab {
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
     pub(crate) count: usize,
 }
 
@@ -107,6 +103,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) latency_chart: Option<&'a LatencyChartState>,
     pub(crate) connections: Option<ConnectionsPanelSnapshot<'a>>,
     pub(crate) help_index: Option<usize>,
+    pub(crate) usability_probe_diagnostics: &'a [ManifestDiagnostic],
     pub(crate) settings: Option<SettingsPanelSnapshot>,
     pub(crate) onboarding: Option<&'a OnboardingState>,
     pub(crate) private_access_progress: Option<&'a PrivateAccessProgressModal>,
@@ -409,7 +406,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         draw_connections_panel(frame, connections);
     }
     if let Some(help_index) = snapshot.help_index {
-        draw_help_panel(frame, help_index);
+        draw_help_panel(frame, help_index, snapshot.usability_probe_diagnostics);
     }
     if let Some(settings) = snapshot.settings.as_ref() {
         draw_settings_panel(frame, settings);

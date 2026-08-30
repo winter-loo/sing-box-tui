@@ -21,6 +21,7 @@ use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRunti
 use crate::storage::NodeLatencySample;
 use crate::subscriptions::SubscriptionRefreshOutput;
 use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
+use crate::usability_probe::ManifestDiagnostic;
 
 mod connections;
 mod dashboard;

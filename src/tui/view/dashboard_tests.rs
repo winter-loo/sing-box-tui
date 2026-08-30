@@ -19,11 +19,11 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         candidate_title: "Candidates [SELECTOR ORDER]".to_string(),
         node_view_tabs: vec![
             NodeViewTab {
-                label: "Current selector",
+                label: "Current selector".to_string(),
                 count: 1,
             },
             NodeViewTab {
-                label: "Streaming",
+                label: "Streaming".to_string(),
                 count: 1,
             },
         ],
@@ -51,6 +51,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         latency_chart: None,
         connections: None,
         help_index: None,
+        usability_probe_diagnostics: &[],
         settings: None,
         onboarding: None,
         private_access_progress: None,
@@ -140,6 +141,32 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
 }
 
 #[test]
+fn help_exposes_every_bounded_invalid_manifest_diagnostic() {
+    let diagnostics = vec![
+        ManifestDiagnostic {
+            path: "usability-probes/bad-one.json".to_string(),
+            message: "manifest id is invalid".to_string(),
+        },
+        ManifestDiagnostic {
+            path: "usability-probes/bad-two.json".to_string(),
+            message: "URL must use https".to_string(),
+        },
+    ];
+    let mut snapshot = dashboard_snapshot();
+    snapshot.help_index = Some(help_item_count(diagnostics.len()).saturating_sub(1));
+    snapshot.usability_probe_diagnostics = &diagnostics;
+
+    let lines = rendered_lines_at(&snapshot, 110, 30);
+    assert!(lines.iter().all(|line| !line.chars().any(char::is_control)));
+    let text = lines.join("\n");
+    assert!(text.contains("invalid usability manifests"));
+    assert!(text.contains("bad-one.json"));
+    assert!(text.contains("manifest id is invalid"));
+    assert!(text.contains("bad-two.json"));
+    assert!(text.contains("URL must use https"));
+}
+
+#[test]
 fn status_footer_is_rendered_below_its_box() {
     let lines = rendered_lines(&dashboard_snapshot());
     let message_row = lines
@@ -203,6 +230,8 @@ fn reachability_detail_renders_three_attempts_and_assessment() {
             ),
         }),
         auto_selection_detail: Some("candidate leads; awaiting confirmation 1/2".into()),
+        usability_details: Vec::new(),
+        evidence_scroll: 0,
     };
     snapshot.latency_chart = Some(&chart);
 

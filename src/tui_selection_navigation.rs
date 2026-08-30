@@ -202,6 +202,7 @@ impl App {
             bail!("no selector group available");
         };
         let group_name = group.name.clone();
+        let group_members = group.members.clone();
         if self.implicit_root_mode() && !self.selected_member_panel_is_manual_selector() {
             self.activate_root_choice()?;
             return Ok(());
@@ -210,7 +211,7 @@ impl App {
             self.set_status_only("No node is available in the active node view");
             return Ok(());
         };
-        let _quality_lease = if self.node_view_panel == NodeViewPanel::Streaming {
+        let _quality_lease = if self.node_view_panel != NodeViewPanel::CurrentSelector {
             Some(self.benchmark_workflow.acquire_quality_read_lease()?)
         } else {
             None
@@ -218,6 +219,28 @@ impl App {
         let _quality_generation = _quality_lease
             .as_ref()
             .map(crate::storage::NodeQualityReadLease::generation);
+        if let (NodeViewPanel::Custom(manifest_id), Some(lease)) =
+            (&self.node_view_panel, _quality_lease.as_ref())
+        {
+            // Manual selection starts from a render cache, but that cache cannot authorize a PUT.
+            // Re-check Included membership under the lease kept alive through both writes so a
+            // new run or reconciliation cannot turn a stale visible row into an invalid switch.
+            let projection = self.leased_custom_node_view_projection(
+                lease,
+                manifest_id,
+                &group_name,
+                &group_members,
+            )?;
+            if projection.membership(&member)
+                != crate::automatic_selection::PanelMembership::Included
+            {
+                self.set_status_only(format!(
+                    "Selection deferred: {member} is no longer included in {}",
+                    projection.label
+                ));
+                return Ok(());
+            }
+        }
         let parent_switch = if self.implicit_root_mode() {
             self.selected_root_choice_name().and_then(|choice| {
                 self.implicit_root_group()
@@ -303,6 +326,7 @@ impl App {
             self.internet_route_index = 0;
         }
         self.sync_member_selection_to_current();
+        self.refresh_usability_probe_projection_cache();
         self.status = format!("Loaded {} selector groups", self.groups.len());
         Ok(())
     }

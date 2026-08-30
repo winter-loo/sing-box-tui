@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::App;
 use super::view::{
@@ -227,10 +228,52 @@ impl App {
             return Vec::new();
         };
         let group = self.selected_member_panel_group().unwrap_or(group);
-        if self.node_view_panel == NodeViewPanel::Streaming {
-            return self
-                .benchmark_workflow
-                .streaming_members(&group.name, &group.members);
+        match &self.node_view_panel {
+            NodeViewPanel::Streaming => {
+                return self
+                    .benchmark_workflow
+                    .streaming_members(&group.name, &group.members);
+            }
+            NodeViewPanel::Custom(manifest_id) => {
+                let projection = self.cached_custom_node_view_projection(
+                    manifest_id,
+                    &group.name,
+                    &group.members,
+                );
+                let mut displayed = group
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        projection.membership(member)
+                            == crate::automatic_selection::PanelMembership::Included
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let facts = self
+                    .benchmark_workflow
+                    .node_quality_facts_from_cache(&group.name, &group.members);
+                let facts = facts
+                    .iter()
+                    .map(|facts| (facts.node.as_str(), facts))
+                    .collect::<BTreeMap<_, _>>();
+                displayed.sort_by(|left, right| {
+                    match (facts.get(left.as_str()), facts.get(right.as_str())) {
+                        (Some(left), Some(right)) => {
+                            crate::automatic_selection::compare_node_quality(
+                                projection.ranking_policy,
+                                left,
+                                right,
+                            )
+                            .reverse()
+                        }
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => Ordering::Equal,
+                    }
+                });
+                return displayed;
+            }
+            NodeViewPanel::CurrentSelector => {}
         }
         let Some(summary) = self.selected_benchmark() else {
             return group.members.clone();
@@ -276,17 +319,32 @@ impl App {
     }
 
     pub(super) fn move_node_view_next(&mut self) {
-        self.node_view_panel = match self.node_view_panel {
-            NodeViewPanel::CurrentSelector => NodeViewPanel::Streaming,
-            NodeViewPanel::Streaming => NodeViewPanel::CurrentSelector,
-        };
+        let ids = self.node_view_ids();
+        let next = ids
+            .iter()
+            .position(|id| id == &self.node_view_panel.id())
+            .map_or(0, |index| (index + 1) % ids.len());
+        self.node_view_panel = self.node_view_panel_from_index(next);
+        self.finish_node_view_change();
+    }
+
+    pub(super) fn move_node_view_previous(&mut self) {
+        let ids = self.node_view_ids();
+        let previous = ids
+            .iter()
+            .position(|id| id == &self.node_view_panel.id())
+            .map_or(ids.len() - 1, |index| (index + ids.len() - 1) % ids.len());
+        self.node_view_panel = self.node_view_panel_from_index(previous);
+        self.finish_node_view_change();
+    }
+
+    fn finish_node_view_change(&mut self) {
         self.sync_selection_to_displayed_members();
-        let status = match self.node_view_panel {
-            NodeViewPanel::CurrentSelector => "Node view: current selector".to_string(),
-            NodeViewPanel::Streaming => "Node view: Streaming".to_string(),
-        };
+        let status = format!("Node view: {}", self.active_node_view_label());
         self.auto_select_node_view = self.node_view_panel.id();
-        self.auto_select_ranking_policy = self.node_view_panel.ranking_policy();
+        self.auto_select_ranking_policy = self.active_node_view_ranking_policy();
+        // A panel is a candidate boundary. Never carry confirmation or traffic evidence across a
+        // boundary change, even when both panels currently happen to show the same nodes.
         self.automatic_selection_state = Default::default();
         self.active_node_traffic = Default::default();
         self.last_auto_selection_explanation = None;
@@ -301,8 +359,59 @@ impl App {
         }
     }
 
-    pub(super) fn move_node_view_previous(&mut self) {
-        self.move_node_view_next();
+    fn node_view_ids(&self) -> Vec<crate::automatic_selection::NodeViewId> {
+        std::iter::once(crate::automatic_selection::NodeViewId::current_selector())
+            .chain(std::iter::once(
+                crate::automatic_selection::NodeViewId::streaming(),
+            ))
+            .chain(
+                self.usability_probe_manifests
+                    .iter()
+                    .map(|manifest| manifest.id.clone()),
+            )
+            .collect()
+    }
+
+    fn node_view_panel_from_index(&self, index: usize) -> NodeViewPanel {
+        match index {
+            0 => NodeViewPanel::CurrentSelector,
+            1 => NodeViewPanel::Streaming,
+            index => self
+                .usability_probe_manifests
+                .get(index - 2)
+                .map(|manifest| NodeViewPanel::Custom(manifest.id.clone()))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(super) fn active_node_view_label(&self) -> String {
+        match &self.node_view_panel {
+            NodeViewPanel::CurrentSelector => "current selector".to_string(),
+            NodeViewPanel::Streaming => "Streaming".to_string(),
+            NodeViewPanel::Custom(id) => self
+                .usability_probe_manifests
+                .iter()
+                .find(|manifest| &manifest.id == id)
+                .map(|manifest| manifest.label.clone())
+                .unwrap_or_else(|| format!("unavailable custom criterion ({id})")),
+        }
+    }
+
+    pub(super) fn active_node_view_ranking_policy(
+        &self,
+    ) -> crate::automatic_selection::RankingPolicy {
+        self.node_view_panel
+            .builtin_ranking_policy()
+            .or_else(|| {
+                let NodeViewPanel::Custom(id) = &self.node_view_panel else {
+                    return None;
+                };
+                self.usability_probe_manifests
+                    .iter()
+                    .find(|manifest| &manifest.id == id)
+                    .map(|manifest| manifest.ranking_policy)
+            })
+            .unwrap_or(crate::automatic_selection::RankingPolicy::Balanced)
     }
 
     pub(super) fn displayed_member_index(&self) -> Option<usize> {
