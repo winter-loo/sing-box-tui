@@ -22,9 +22,9 @@ use crate::process_inspection::process_is_alive as process_exists;
 use crate::sustained_quality::{normalize_sustained_target, sustained_target_identity};
 
 pub(crate) const BACKGROUND_TASK_KIND: &str = "headless-auto-pick";
-// Model 4 transports explicit per-manifest schedule authorization. Reusing a model-3 worker would
-// silently drop a user's P-toggle or, worse, leave an older authorization running after revocation.
-pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 5;
+// Model 6 removes the node-level latency payload from worker status. Reusing a model-5 worker would
+// reintroduce a second fact source instead of waking the foreground to read shared SQLite.
+pub(crate) const AUTO_SELECTION_MODEL_VERSION: u32 = 6;
 const BACKGROUND_TASK_PATH: &str = "sing-box-tui-background.json";
 const BACKGROUND_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -108,29 +108,8 @@ pub(crate) struct BackgroundStatusSnapshot {
     pub(crate) sustained_target_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_selection_explanation: Option<AutoSelectionExplanation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) latency: Option<BackgroundLatencySnapshot>,
     #[serde(default)]
     pub(crate) scheduled_usability_probes: Vec<ScheduledUsabilityProbeConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct BackgroundLatencySnapshot {
-    pub(crate) quality_generation: u64,
-    pub(crate) selector: String,
-    pub(crate) current: Option<String>,
-    pub(crate) pattern: String,
-    pub(crate) url: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) max_concurrency: usize,
-    pub(crate) results: Vec<BackgroundLatencyResult>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct BackgroundLatencyResult {
-    pub(crate) name: String,
-    pub(crate) delay: Option<u64>,
-    pub(crate) completed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -344,7 +323,7 @@ impl BackgroundWorkerEnsure {
 
 #[derive(Clone, Debug)]
 pub(crate) struct BackgroundWorkerUpdate {
-    pub(crate) latency: Option<BackgroundLatencySnapshot>,
+    pub(crate) quality_generation: u64,
     pub(crate) auto_selection_explanation: Option<AutoSelectionExplanation>,
     pub(crate) status: Option<String>,
 }
@@ -536,7 +515,7 @@ impl BackgroundAutoPickManager {
                                     snapshot.worker_status.clone()
                                 });
                             BackgroundPollEvent::Update(Box::new(BackgroundWorkerUpdate {
-                                latency: snapshot.latency,
+                                quality_generation: snapshot.quality_generation,
                                 auto_selection_explanation: snapshot.auto_selection_explanation,
                                 status,
                             }))
@@ -1300,7 +1279,6 @@ mod tests {
                 panel: NodeViewId::current_selector(),
                 detail: "node-b leads; awaiting confirmation 1/2".to_string(),
             }),
-            latency: None,
             scheduled_usability_probes: Vec::new(),
         }
     }

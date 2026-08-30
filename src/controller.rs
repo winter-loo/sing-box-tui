@@ -870,92 +870,9 @@ pub(crate) struct BenchmarkRequest {
     pub(crate) nodes: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct BenchmarkResult {
-    pub(crate) name: String,
-    pub(crate) delay: Option<u64>,
-    #[serde(skip)]
-    pub(crate) completed: bool,
-}
-
-impl BenchmarkResult {
-    pub(crate) fn display_delay(&self) -> String {
-        match (self.delay, self.completed) {
-            (Some(delay), _) => format!("{delay}ms"),
-            (None, false) => "...".to_string(),
-            (None, true) => "fail".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BenchmarkSummary {
-    pub(crate) selector: String,
-    pub(crate) current: Option<String>,
-    pub(crate) pattern: String,
-    pub(crate) url: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) max_concurrency: usize,
-    pub(crate) results: Vec<BenchmarkResult>,
-}
-
 pub(crate) enum BenchmarkEvent {
     ReachabilityProgress(NodeReachabilityAssessment),
     Finished,
-}
-
-impl BenchmarkSummary {
-    pub(crate) fn empty(selector: String) -> Self {
-        Self {
-            selector,
-            current: None,
-            pattern: String::new(),
-            url: String::new(),
-            timeout_ms: 0,
-            max_concurrency: 1,
-            results: Vec::new(),
-        }
-    }
-
-    pub(crate) fn upsert_pending(&mut self, name: String) {
-        if let Some(existing) = self.results.iter_mut().find(|item| item.name == name) {
-            existing.delay = None;
-            existing.completed = false;
-        } else {
-            self.results.push(BenchmarkResult {
-                name,
-                delay: None,
-                completed: false,
-            });
-        }
-    }
-
-    pub(crate) fn reset_pending(&mut self, names: Vec<String>) {
-        self.results = names
-            .into_iter()
-            .map(|name| BenchmarkResult {
-                name,
-                delay: None,
-                completed: false,
-            })
-            .collect();
-    }
-
-    pub(crate) fn update_result(&mut self, result: BenchmarkResult) {
-        if let Some(existing) = self
-            .results
-            .iter_mut()
-            .find(|item| item.name == result.name)
-        {
-            *existing = result;
-        } else {
-            self.results.push(result);
-        }
-    }
-
-    pub(crate) fn find_result(&self, name: &str) -> Option<&BenchmarkResult> {
-        self.results.iter().find(|item| item.name == name)
-    }
 }
 
 #[derive(Serialize)]
@@ -1183,10 +1100,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BenchmarkEvent, BenchmarkRequest, BenchmarkResult, BenchmarkSummary, ConnectionsResponse,
-        ProbeOutcome, ProxiesResponse, ShellCheck, TrafficSnapshot, UpdateConfigRequest,
-        filter_benchmark_candidates, matches_filter, selectors_from_payload,
-        spawn_reachability_assessment_worker, status_from_parts, verification_check_label,
+        BenchmarkEvent, BenchmarkRequest, ConnectionsResponse, ProbeOutcome, ProxiesResponse,
+        ShellCheck, TrafficSnapshot, UpdateConfigRequest, filter_benchmark_candidates,
+        matches_filter, selectors_from_payload, spawn_reachability_assessment_worker,
+        status_from_parts, verification_check_label,
     };
 
     #[test]
@@ -1455,37 +1372,6 @@ mod tests {
             ),
             vec!["us-a".to_string()]
         );
-    }
-
-    #[test]
-    fn benchmark_summary_reset_pending_discards_stale_results() {
-        let mut summary = BenchmarkSummary {
-            selector: "select".to_string(),
-            current: Some("hk-a".to_string()),
-            pattern: "us".to_string(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
-            timeout_ms: 5000,
-            max_concurrency: 3,
-            results: vec![
-                BenchmarkResult {
-                    name: "hk-a".to_string(),
-                    delay: Some(10),
-                    completed: true,
-                },
-                BenchmarkResult {
-                    name: "us-a".to_string(),
-                    delay: Some(80),
-                    completed: true,
-                },
-            ],
-        };
-
-        summary.reset_pending(vec!["us-a".to_string()]);
-
-        assert_eq!(summary.results.len(), 1);
-        assert_eq!(summary.results[0].name, "us-a");
-        assert_eq!(summary.results[0].delay, None);
-        assert!(!summary.results[0].completed);
     }
 
     #[test]

@@ -1,9 +1,7 @@
 use super::super::test_support::{internet_routes_app, test_app};
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::BenchmarkUpdate;
-use crate::controller::{
-    BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
-};
+use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ProxyGroup};
 use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
 use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
@@ -125,31 +123,28 @@ fn implicit_root_parent_switch_targets_non_current_internet_route() {
 }
 
 #[test]
-fn implicit_root_benchmark_summary_is_scoped_to_selected_choice() {
+fn implicit_root_quality_evidence_is_scoped_to_selected_choice() {
     let mut app = internet_routes_app();
-    app.benchmark_workflow.set_summary(BenchmarkSummary {
-        selector: "宝贝云".to_string(),
-        current: Some("bby-2".to_string()),
-        pattern: String::new(),
-        url: "https://www.gstatic.com/generate_204".to_string(),
-        timeout_ms: 5000,
-        max_concurrency: 4,
-        results: vec![BenchmarkResult {
-            name: "bby-1".to_string(),
-            delay: Some(88),
-            completed: true,
-        }],
-    });
+    let assessment = NodeReachabilityAssessment::from_attempts(
+        "bby-1".to_string(),
+        vec![
+            ProbeOutcome::Reachable { delay_ms: 80 },
+            ProbeOutcome::Reachable { delay_ms: 88 },
+            ProbeOutcome::Reachable { delay_ms: 92 },
+        ],
+    );
+    app.benchmark_workflow
+        .set_reachability_assessment("宝贝云", assessment.clone());
 
     assert_eq!(
-        app.selected_benchmark()
-            .map(|summary| summary.selector.as_str()),
-        Some("宝贝云")
+        app.benchmark_workflow
+            .reachability_assessment("宝贝云", "bby-1"),
+        Some(&assessment)
     );
     assert!(
-        app.selected_benchmark()
-            .and_then(|summary| summary.find_result("bby-1"))
-            .is_some()
+        app.benchmark_workflow
+            .reachability_assessment("AirTCP", "bby-1")
+            .is_none()
     );
 }
 

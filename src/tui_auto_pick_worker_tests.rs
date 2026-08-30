@@ -1,10 +1,7 @@
 use super::super::test_support::{test_app, test_db_path};
-use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
 use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::{BenchmarkWorkflow, ManagedRuntimeObservation};
-use crate::controller::{
-    BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome,
-};
+use crate::controller::{NodeReachabilityAssessment, ProbeOutcome};
 use crate::storage::{BenchmarkStore, UsabilityProbeRunFinalization};
 use crate::sustained_quality::{
     DEFAULT_SUSTAINED_TARGET_URL, NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
@@ -187,70 +184,6 @@ fn remove_shared_quality_fixture(config_path: &Path, database_path: &Path) {
 }
 
 #[test]
-fn background_latency_snapshot_updates_visible_benchmark_results() {
-    let mut app = test_app();
-
-    app.apply_background_latency_snapshot(Some(&BackgroundLatencySnapshot {
-        quality_generation: 0,
-        selector: "select".to_string(),
-        current: Some("node-a".to_string()),
-        pattern: "美国".to_string(),
-        url: "https://www.gstatic.com/generate_204".to_string(),
-        timeout_ms: 5000,
-        max_concurrency: 4,
-        results: vec![
-            BackgroundLatencyResult {
-                name: "node-a".to_string(),
-                delay: Some(88),
-                completed: true,
-            },
-            BackgroundLatencyResult {
-                name: "node-b".to_string(),
-                delay: None,
-                completed: true,
-            },
-        ],
-    }))
-    .expect("apply background latency snapshot");
-
-    let summary = app.selected_benchmark().expect("benchmark summary");
-    assert_eq!(
-        summary.find_result("node-a").map(|result| result.delay),
-        Some(Some(88))
-    );
-    assert_eq!(
-        summary
-            .find_result("node-b")
-            .map(|result| result.display_delay()),
-        Some("fail".to_string())
-    );
-}
-
-#[test]
-fn background_latency_snapshot_ignores_stale_filter_results() {
-    let mut app = test_app();
-    app.benchmark_filter = "new".to_string();
-
-    app.apply_background_latency_snapshot(Some(&BackgroundLatencySnapshot {
-        quality_generation: 0,
-        selector: "select".to_string(),
-        current: Some("node-a".to_string()),
-        pattern: "old".to_string(),
-        url: "https://www.gstatic.com/generate_204".to_string(),
-        timeout_ms: 5000,
-        max_concurrency: 4,
-        results: vec![BackgroundLatencyResult {
-            name: "node-a".to_string(),
-            delay: Some(88),
-            completed: true,
-        }],
-    }))
-    .expect("ignore stale-filter background snapshot");
-
-    assert!(app.selected_benchmark().is_none());
-}
-
-#[test]
 fn background_explanation_round_trips_only_for_the_configured_selector_and_panel() {
     let mut app = test_app();
     app.auto_select_enabled = true;
@@ -265,6 +198,13 @@ fn background_explanation_round_trips_only_for_the_configured_selector_and_panel
     let snapshot = app.background_status_snapshot("testing".to_string(), 9);
 
     assert_eq!(snapshot.auto_selection_explanation, Some(explanation));
+    assert!(
+        serde_json::to_value(&snapshot)
+            .expect("encode status snapshot")
+            .get("latency")
+            .is_none(),
+        "worker status must not recreate the removed single-delay fact channel"
+    );
 
     app.apply_background_auto_selection_explanation(Some(AutoSelectionExplanation {
         selector: "select".to_string(),
@@ -448,19 +388,6 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     background_workflow
         .persist_quality_projection_for_test("select", &assessment, &first_sustained)
         .expect("background workflow persists quick and sustained facts");
-    let mut summary = BenchmarkSummary::empty("select".to_string());
-    summary.current = Some("node-a".to_string());
-    summary.pattern = "node".to_string();
-    summary.url = "https://www.gstatic.com/generate_204".to_string();
-    summary.timeout_ms = 5_000;
-    summary.max_concurrency = 4;
-    summary.results.push(BenchmarkResult {
-        name: "node-b".to_string(),
-        delay: Some(75),
-        completed: true,
-    });
-    background_workflow.set_summary(summary);
-
     let mut foreground = test_app();
     foreground.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
     foreground.benchmark_filter = "node".to_string();
@@ -472,14 +399,16 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     background.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
     background.benchmark_filter = "node".to_string();
     background.benchmark_workflow = background_workflow;
-    let snapshot = background
-        .background_latency_snapshot()
-        .expect("background publishes bounded latency notification");
+    let quality_generation = background
+        .benchmark_workflow
+        .runtime_receipt()
+        .expect("background publishes a generation-scoped notification")
+        .quality_generation();
 
     assert!(
         foreground
-            .apply_background_latency_snapshot(Some(&snapshot))
-            .expect("foreground accepts same-generation background snapshot")
+            .apply_background_quality_notification(quality_generation)
+            .expect("foreground accepts same-generation quality notification")
     );
     assert_eq!(foreground.displayed_members(), vec!["node-b"]);
     assert_eq!(
@@ -500,7 +429,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     assert_eq!(detail.sustained_quality.as_ref(), Some(&first_sustained));
 
     foreground
-        .apply_background_latency_snapshot(Some(&snapshot))
+        .apply_background_quality_notification(quality_generation)
         .expect("unchanged poll remains cheap");
     assert_eq!(
         foreground
@@ -516,7 +445,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
         .persist_quality_projection_for_test("select", &assessment, &second_sustained)
         .expect("background commits a second fact revision");
     foreground
-        .apply_background_latency_snapshot(Some(&snapshot))
+        .apply_background_quality_notification(quality_generation)
         .expect("next external commit is reloaded");
     assert_eq!(
         foreground
@@ -536,11 +465,9 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
         .benchmark_workflow
         .persist_quality_projection_for_test("select", &assessment, &third_sustained)
         .expect("background commits after the last accepted revision");
-    let mut stale = snapshot.clone();
-    stale.quality_generation += 1;
     assert!(
         foreground
-            .apply_background_latency_snapshot(Some(&stale))
+            .apply_background_quality_notification(quality_generation + 1)
             .is_err(),
         "generation mismatch must fail closed"
     );
@@ -552,7 +479,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
         "failed refresh retains the prior coherent projection"
     );
     foreground
-        .apply_background_latency_snapshot(Some(&snapshot))
+        .apply_background_quality_notification(quality_generation)
         .expect("failed generation check does not consume the pending data version");
     assert_eq!(
         foreground

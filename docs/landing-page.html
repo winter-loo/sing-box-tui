@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="sing-box-tui is a terminal UI for managing sing-box nodes, latency tests, subscriptions, bypass rules, active connections, and OS system proxy settings.">
+  <meta name="description" content="sing-box-tui is a terminal UI for node-quality assessment, extensible usability panels, subscriptions, active connections, and OS proxy settings.">
   <title>sing-box-tui — Terminal-native sing-box control</title>
   <style>
     :root {
@@ -347,7 +347,7 @@
       font-weight: 800;
     }
 
-    .tui-latency {
+    .tui-quality {
       color: #b513cb;
       min-width: 4.5em;
       margin-left: 1em;
@@ -699,7 +699,7 @@
         <p class="kicker">terminal-native control plane for sing-box</p>
         <h1>Manage <span class="glow">sing-box</span> from the terminal.</h1>
         <p class="lead">
-          A geek-grade terminal UI for sing-box selector nodes, live latency tests,
+          A geek-grade terminal UI for sing-box selector nodes, factual node-quality probes,
           subscription refresh, direct-bypass rules, connection inspection, and one-key
           OS system proxy control.
         </p>
@@ -723,19 +723,13 @@
               <div class="tui-row tui-secondary"><span>白嫖机场</span><span class="tui-route-tag">[马来西亚Troja...]</span></div>
             </div>
             <div class="tui-pane">
-              <div class="tui-title">Candidates for 宝贝云 [LATENCY ORDER]</div>
-              <div class="tui-row"><span></span><span>L1|日本01|直连|流媒体|2x</span><span class="tui-latency">139ms</span></div>
-              <div class="tui-row"><span class="tui-cursor">&gt;</span><span class="tui-node-current">L1|新加坡06|流媒体|3x</span><span class="tui-latency">191ms</span><span>*</span></div>
-              <div class="tui-row"><span></span><span>L1|日本03|直连|流媒体|2x</span><span class="tui-latency">245ms</span></div>
-              <div class="tui-row"><span></span><span>L1|日本05|直连|流媒体|2x</span><span class="tui-latency">301ms</span></div>
-              <div class="tui-row"><span></span><span>L1|新加坡04|直连|流媒体|2x</span><span class="tui-latency">321ms</span></div>
-              <div class="tui-row"><span></span><span>L1|美国02|直连|流媒体|2x</span><span class="tui-latency">351ms</span></div>
-              <div class="tui-row"><span></span><span>L1|新加坡03|直连|流媒体|2x</span><span class="tui-latency">359ms</span></div>
-              <div class="tui-row"><span></span><span>L1|日本04|直连|流媒体|2x</span><span class="tui-latency">373ms</span></div>
-              <div class="tui-row"><span></span><span>L1|美国03|直连|流媒体|2x</span><span class="tui-latency">394ms</span></div>
-              <div class="tui-row"><span></span><span>L1|美国05|直连|流媒体|2x</span><span class="tui-latency">484ms</span></div>
-              <div class="tui-row"><span></span><span>L1|美国04|直连|流媒体|2x</span><span class="tui-latency">575ms</span></div>
-              <div class="tui-row"><span></span><span>L1|美国01|直连|流媒体|2x</span><span class="tui-latency">706ms</span></div>
+              <div class="tui-title">Current 64/64 | Streaming 8/64 | Agy 5/64</div>
+              <div class="tui-row"><span></span><span>L1|日本01|直连|流媒体|2x</span><span class="tui-quality">3/3 stable</span></div>
+              <div class="tui-row"><span class="tui-cursor">&gt;</span><span class="tui-node-current">L1|新加坡06|流媒体|3x</span><span class="tui-quality">3/3 · 4.8M/s</span><span>*</span></div>
+              <div class="tui-row"><span></span><span>L1|日本03|直连|流媒体|2x</span><span class="tui-quality">2/3 reachable</span></div>
+              <div class="tui-row"><span></span><span>L1|日本05|直连|流媒体|2x</span><span class="tui-quality">1/3 degraded</span></div>
+              <div class="tui-row"><span></span><span>L1|新加坡04|直连|流媒体|2x</span><span class="tui-quality">incomplete</span></div>
+              <div class="tui-row"><span></span><span>L1|美国02|直连|流媒体|2x</span><span class="tui-quality">untested</span></div>
             </div>
           </div>
           <div class="tui-status">
@@ -748,11 +742,12 @@
               <span><span class="tui-key">b</span> bypass</span>
               <span><span class="tui-key">B</span> background</span>
               <span><span class="tui-key">p</span> <span class="tui-on">system proxy</span></span>
-              <span><span class="tui-key">T/t</span> latency</span>
-              <span><span class="tui-key">s</span> sort order</span>
+              <span><span class="tui-key">T/t</span> quick / sustained</span>
+              <span><span class="tui-key">←/→</span> node views</span>
+              <span><span class="tui-key">i</span> quality evidence</span>
             </div>
             <div class="tui-status-line"><span class="tui-muted">Controller:</span> http://127.0.0.1:9992</div>
-            <div class="tui-status-line">filter='!香港' tested=64 clash=规则 order=LATENCY ORDER auto=ON best=L1|日本01|直连|流媒体|2x...</div>
+            <div class="tui-status-line">panel=Streaming auto=ON deferred=active current-node transfer · candidate confirmation 2/2</div>
             <div class="tui-status-line">connections active=8 proxy=8 direct=0 up=137.0MiB down=1.1GiB&nbsp;&nbsp; c details</div>
           </div>
         </div>
@@ -761,8 +756,8 @@
 
     <div class="wrap metrics" aria-label="Product highlights">
       <div class="metric"><strong>TUI</strong><span class="metric-label">keyboard-first selector control</span></div>
-      <div class="metric"><strong>30s</strong><span class="metric-label">auto-pick latency loop</span></div>
-      <div class="metric"><strong>SQLite</strong><span class="metric-label">latency history and charts</span></div>
+      <div class="metric"><strong>8 / 2</strong><span class="metric-label">quick / sustained concurrency caps</span></div>
+      <div class="metric"><strong>SQLite</strong><span class="metric-label">factual quality history and expiry</span></div>
       <div class="metric"><strong>Win/mac/Linux</strong><span class="metric-label">system proxy toggles</span></div>
     </div>
 
@@ -786,14 +781,14 @@
             <p>Navigate selector groups, Internet Route groups, and nodes in two- or three-column layouts. Selecting a node can update the child Internet Route selector and point the parent selector at it.</p>
           </article>
           <article class="feature-card" data-index="02">
-            <span class="icon">ms</span>
-            <h3>Async latency testing + sorting</h3>
-            <p>Test an entire selector or a single highlighted node. Sort healthy results by latency, hide failed probes, and keep the TUI responsive while checks run.</p>
+            <span class="icon">3/3</span>
+            <h3>Factual node-quality assessment</h3>
+            <p>Run three bounded quick attempts, keep controller failures incomplete, and inspect reachability, P95, cold-start, and sustained evidence without hiding selector members.</p>
           </article>
           <article class="feature-card" data-index="03">
             <span class="icon">ap</span>
             <h3>Runtime auto-pick</h3>
-            <p>Apply include/exclude filters like <code>美国,!倍率</code>, then let auto-pick test latency every 30 seconds and switch only when the current node is slow, failed, or outside policy.</p>
+            <p>Choose Current selector, Streaming, or a custom usability panel. Auto-pick ranks only that panel, explains confirmation and material-improvement gates, and defers while the current node has active transfer.</p>
           </article>
           <article class="feature-card" data-index="04">
             <span class="icon">sub</span>
@@ -821,7 +816,7 @@
           <h2>From subscription URL to healthy route in a few keystrokes.</h2>
           <p class="section-copy">
             Install the binary, launch the TUI, paste a sing-box subscription URL on first run,
-            then control nodes, filters, latency tests, and proxy state from one cockpit.
+            then control nodes, node-view panels, quality probes, and proxy state from one cockpit.
           </p>
         </div>
         <div class="steps">
@@ -835,7 +830,7 @@
           </article>
           <article class="step">
             <span class="step-num">3</span>
-            <div><h3>Latency</h3><p>Press <code>T</code> for group probes or <code>t</code> for the highlighted node. Results are stored in SQLite for charts and history.</p></div>
+            <div><h3>Assess</h3><p>Press <code>T</code> for a three-attempt quick assessment, <code>t</code> for bounded sustained quality, and <code>i</code> for facts, expiry, criterion results, and switch explanations.</p></div>
           </article>
           <article class="step">
             <span class="step-num">4</span>
@@ -875,7 +870,7 @@
           </article>
           <article class="quote-card">
             <h3>CLI escape hatches</h3>
-            <p>Use <code>selectors</code>, <code>status</code>, <code>benchmark</code>, <code>subscribe</code>, <code>subscriptions</code>, <code>sync</code>, and <code>import</code> when you want JSON output, scripts, or CI-friendly workflows.</p>
+            <p>Use <code>selectors</code>, <code>status</code>, <code>background</code>, <code>subscribe</code>, <code>subscriptions</code>, <code>sync</code>, and <code>import</code> when you want JSON output, scripts, or CI-friendly workflows.</p>
           </article>
         </div>
       </div>
@@ -894,8 +889,8 @@
 <span class="comment"># Start the cockpit</span>
 <span class="cmd">sing-box-tui</span> <span class="flag">run</span>
 
-<span class="comment"># Or use CLI probes directly</span>
-<span class="cmd">sing-box-tui</span> <span class="flag">benchmark --match</span> <span class="str">"美国,!倍率"</span> <span class="flag">--switch --verify</span>
+<span class="comment"># Inspect controller and background-worker state</span>
+<span class="cmd">sing-box-tui</span> <span class="flag">background status</span>
 <span class="cmd">sing-box-tui</span> <span class="flag">status</span>
 <span class="cmd">sing-box-tui</span> <span class="flag">selectors --selector</span> <span class="str">select</span></code></pre>
         </div>
