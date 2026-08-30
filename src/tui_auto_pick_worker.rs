@@ -28,6 +28,17 @@ fn background_status_requires_selector_refresh(status: &str) -> bool {
         || status.contains(" probe incomplete")
 }
 
+fn publish_background_status_change(
+    status: &str,
+    last_published_status: &mut String,
+    status_generation: &mut u64,
+) {
+    if status != last_published_status && background_status_should_publish(status) {
+        *status_generation = status_generation.saturating_add(1);
+        status.clone_into(last_published_status);
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct AutoPickRuntimeSignature {
     enabled: bool,
@@ -421,13 +432,15 @@ impl App {
                 self.maybe_refresh_connections();
                 self.poll_benchmark_updates()?;
                 self.maybe_start_auto_select_benchmark()?;
-                if self.status != last_published_status
-                    && background_status_should_publish(&self.status)
-                {
-                    status_generation = status_generation.saturating_add(1);
-                    last_published_status = self.status.clone();
-                }
             }
+            // WHY: scheduled usability probes have independent consent from auto-pick. Their
+            // completion must advance the worker generation even when selection is disabled so
+            // foreground polling reloads the shared SQLite projection and failure diagnostics.
+            publish_background_status_change(
+                &self.status,
+                &mut last_published_status,
+                &mut status_generation,
+            );
             thread::sleep(Duration::from_millis(100));
         }
     }

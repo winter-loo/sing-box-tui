@@ -1,19 +1,142 @@
 use super::super::test_support::{test_app, test_db_path};
 use crate::auto_pick::{BackgroundLatencyResult, BackgroundLatencySnapshot};
-use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId};
+use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::{BenchmarkWorkflow, ManagedRuntimeObservation};
 use crate::controller::{
     BenchmarkResult, BenchmarkSummary, NodeReachabilityAssessment, ProbeOutcome,
 };
-use crate::storage::BenchmarkStore;
+use crate::storage::{BenchmarkStore, UsabilityProbeRunFinalization};
 use crate::sustained_quality::{
     DEFAULT_SUSTAINED_TARGET_URL, NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
     sustained_target_identity,
 };
+use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
 use reqwest::Client as AsyncClient;
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+#[test]
+fn scheduled_probe_status_advances_generation_without_auto_pick() {
+    let mut last = "configuration applied".to_string();
+    let mut generation = 4;
+
+    super::publish_background_status_change(
+        "Agy probe complete: 2/2 reported nodes usable",
+        &mut last,
+        &mut generation,
+    );
+
+    assert_eq!(generation, 5);
+    assert_eq!(last, "Agy probe complete: 2/2 reported nodes usable");
+}
+
+#[test]
+fn persisted_probe_start_restores_remaining_interval_after_worker_restart() {
+    let now = Instant::now();
+    let restored = super::super::usability_probe_workflow::restored_probe_start(
+        now,
+        1_000_000,
+        970_000,
+        Duration::from_secs(60),
+    )
+    .expect("recent persisted attempt has a monotonic anchor");
+
+    assert_eq!(
+        now.duration_since(restored),
+        std::time::Duration::from_secs(30)
+    );
+    assert!(
+        now.duration_since(restored) < std::time::Duration::from_secs(60),
+        "a restarted worker must not immediately repeat a paid probe"
+    );
+    assert!(
+        super::super::usability_probe_workflow::restored_probe_start(
+            now,
+            1_000_000,
+            900_000,
+            Duration::from_secs(60),
+        )
+        .is_none(),
+        "an attempt older than the interval is immediately due"
+    );
+}
+
+#[test]
+fn restarted_worker_defers_recent_incomplete_probe_from_shared_sqlite() {
+    let database_path = test_db_path();
+    let config_path = database_path.with_extension("scheduled-probe-config.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+            "outbounds": [
+                {"type":"selector","tag":"select","outbounds":["node-a","node-b"]},
+                {"type":"direct","tag":"node-a"},
+                {"type":"direct","tag":"node-b"}
+            ]
+        }"#,
+    )
+    .expect("write scheduled-probe config");
+    let mut workflow = open_persisted_workflow(&config_path, &database_path);
+    workflow
+        .confirm_managed_runtime_reload(&config_path, &database_path, || {
+            Ok(ManagedRuntimeObservation::new(
+                (),
+                &config_path,
+                "http://127.0.0.1:9992",
+                Some(std::process::id()),
+            ))
+        })
+        .expect("confirm scheduled-probe runtime");
+    let (run_id, generation, process_lease) = workflow
+        .begin_usability_probe_run("agy", "select")
+        .expect("start prior scheduled attempt");
+    workflow
+        .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+            run_id,
+            generation,
+            process_lease: &process_lease,
+            complete: false,
+            summary: None,
+            diagnostic: Some("provider was temporarily unavailable"),
+            facts: &[],
+            result_ttl: Some(Duration::from_secs(300)),
+        })
+        .expect("persist prior incomplete attempt");
+
+    let manifest_id = NodeViewId::new("agy").expect("manifest id");
+    let mut app = test_app();
+    app.benchmark_workflow = workflow;
+    app.usability_probe_manifests.push(UsabilityProbeManifest {
+        id: manifest_id.clone(),
+        label: "Agy".to_string(),
+        ranking_policy: RankingPolicy::Balanced,
+        source: UsabilityProbeSource::Executable {
+            executable: PathBuf::from("must-not-run"),
+            args: Vec::new(),
+        },
+        background: true,
+        interval: Some(Duration::from_secs(60)),
+        result_ttl: Some(Duration::from_secs(300)),
+        timeout: Duration::from_secs(60),
+        source_path: PathBuf::from("agy.json"),
+    });
+    app.background_probe_enabled.insert(manifest_id.clone());
+    app.background_probe_selectors
+        .insert(manifest_id.clone(), "select".to_string());
+
+    app.maybe_start_scheduled_usability_probe(Instant::now());
+
+    assert!(app.usability_probe_job.is_none());
+    assert!(
+        app.last_background_probe_started
+            .contains_key(&(manifest_id, "select".to_string())),
+        "the restarted worker must restore the recent failed attempt into its monotonic schedule"
+    );
+
+    drop(app);
+    remove_shared_quality_fixture(&config_path, &database_path);
+}
 
 fn open_persisted_workflow(config_path: &Path, database_path: &Path) -> BenchmarkWorkflow {
     BenchmarkWorkflow::open(
