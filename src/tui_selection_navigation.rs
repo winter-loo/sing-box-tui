@@ -52,6 +52,7 @@ impl App {
                 }
             },
             Focus::Members => {
+                self.manual_candidate_navigation = true;
                 if self.showing_intranet_details() {
                     let max_scroll = self.intranet_detail_line_count().saturating_sub(1) as u16;
                     self.intranet_detail_scroll = self
@@ -106,6 +107,7 @@ impl App {
                 }
             },
             Focus::Members => {
+                self.manual_candidate_navigation = true;
                 if self.showing_intranet_details() {
                     self.intranet_detail_scroll = self.intranet_detail_scroll.saturating_sub(1);
                     return;
@@ -137,6 +139,7 @@ impl App {
                 self.sync_member_selection_to_current();
             }
             Focus::Members => {
+                self.manual_candidate_navigation = true;
                 if self.showing_intranet_details() {
                     self.intranet_detail_scroll = 0;
                     return;
@@ -168,6 +171,7 @@ impl App {
                 }
             }
             Focus::Members => {
+                self.manual_candidate_navigation = true;
                 if self.showing_intranet_details() {
                     self.intranet_detail_scroll =
                         self.intranet_detail_line_count().saturating_sub(1) as u16;

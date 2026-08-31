@@ -115,6 +115,7 @@ pub(super) fn test_app() -> App {
         auto_select_selector: None,
         auto_select_node_view: crate::automatic_selection::NodeViewId::current_selector(),
         auto_select_ranking_policy: crate::automatic_selection::RankingPolicy::Balanced,
+        manual_candidate_navigation: false,
         auto_select_interval: Duration::from_secs(30),
         last_auto_select_benchmark: None,
         automatic_selection_state: Default::default(),

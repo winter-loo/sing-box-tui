@@ -345,6 +345,7 @@ impl App {
     }
 
     fn finish_node_view_change(&mut self) {
+        self.manual_candidate_navigation = false;
         self.sync_selection_to_displayed_members();
         let status = format!("Node view: {}", self.active_node_view_label());
         self.auto_select_node_view = self.node_view_panel.id();

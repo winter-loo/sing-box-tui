@@ -396,7 +396,15 @@ impl App {
             }
         };
 
-        let candidate_selected = if self.node_view_panel != NodeViewPanel::CurrentSelector {
+        let is_active_probing = usability_manifest_id.as_ref().is_some_and(|id| {
+            selected_group.as_ref().is_some_and(|g| {
+                self.is_usability_probe_active_for(id, Some(&g.name))
+            })
+        });
+
+        let candidate_selected = if is_active_probing && !self.manual_candidate_navigation {
+            None
+        } else if self.node_view_panel != NodeViewPanel::CurrentSelector {
             selected_group
                 .and_then(|group| group.members.get(self.member_index))
                 .and_then(|current| {

@@ -109,6 +109,7 @@ impl App {
         let (run_id, generation, process_lease) = self
             .benchmark_workflow
             .begin_usability_probe_run(manifest.id.as_str(), &group.name)?;
+        self.manual_candidate_navigation = false;
         let job = spawn_usability_probe_job_with_context(
             manifest.clone(),
             group.members.clone(),
@@ -376,6 +377,7 @@ impl App {
                     self.set_status_only(message);
                 }
                 UsabilityProbeJobEvent::Finished(mut completion) => {
+                    self.manual_candidate_navigation = true;
                     let Some(mut active) = self.usability_probe_job.take() else {
                         continue;
                     };
