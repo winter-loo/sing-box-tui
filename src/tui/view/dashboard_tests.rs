@@ -1,4 +1,24 @@
 #[test]
+fn pending_candidate_renders_working_shimmer_animation() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows = vec![CandidateRow {
+        name: "test-node".to_string(),
+        is_current: false,
+        reachability: String::new(),
+        compact_marker: "Working (2s)".to_string(),
+        marker: "• Working (2s)".to_string(),
+        tone: CandidateTone::Pending,
+    }];
+    snapshot.pending_animation_tick = 3;
+
+    let lines = rendered_lines(&snapshot);
+    let text = lines.join("
+");
+    assert!(text.contains("test-node"));
+    assert!(text.contains("Working (2s)"));
+}
+
+#[test]
 fn active_usability_probe_renders_braille_spinner_instead_of_tab_count() {
     let mut snapshot = dashboard_snapshot();
     snapshot.node_view_tabs[1].spinner = Some("⠋".to_string());
@@ -61,6 +81,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             tone: CandidateTone::Success,
         }],
         candidate_selected: Some(0),
+        pending_animation_tick: 0,
         pending_animation_bright: true,
         intranet_detail: None,
         status: StatusSnapshot {

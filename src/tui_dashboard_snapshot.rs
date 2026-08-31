@@ -115,13 +115,9 @@ impl App {
                                     return None;
                                 }
                                 let (marker, compact_marker) = if is_pending {
-                                    let m = pending_candidate_marker(
-                                        pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0),
-                                    );
-                                    let c = format!(
-                                        "⏳ checking ({}s)",
-                                        pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0)
-                                    );
+                                    let elapsed = pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0);
+                                    let m = pending_candidate_marker(elapsed);
+                                    let c = format!("Working ({elapsed}s)");
                                     (m, c)
                                 } else {
                                     let sustained = result
@@ -488,6 +484,7 @@ impl App {
             active_node_view_tab,
             candidate_rows,
             candidate_selected,
+            pending_animation_tick: (self.animation_started.elapsed().as_millis() / 80) as usize,
             pending_animation_bright: (self.animation_started.elapsed().as_millis() / 500) % 2 == 0,
             intranet_detail,
             status,
@@ -559,7 +556,7 @@ fn format_custom_probe_progress(
 }
 
 fn pending_candidate_marker(elapsed_seconds: u64) -> String {
-    format!("• checking TCP 22 ({elapsed_seconds}s)")
+    format!("• Working ({elapsed_seconds}s)")
 }
 
 #[cfg(test)]
@@ -589,7 +586,7 @@ mod tests {
 
     #[test]
     fn pending_tcp_candidate_marker_matches_working_animation_copy() {
-        assert_eq!(pending_candidate_marker(3), "• checking TCP 22 (3s)");
+        assert_eq!(pending_candidate_marker(3), "• Working (3s)");
     }
 
     #[test]

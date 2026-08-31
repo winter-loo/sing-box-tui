@@ -106,6 +106,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) active_node_view_tab: usize,
     pub(crate) candidate_rows: Vec<CandidateRow>,
     pub(crate) candidate_selected: Option<usize>,
+    pub(crate) pending_animation_tick: usize,
     pub(crate) pending_animation_bright: bool,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
     pub(crate) status: StatusSnapshot,
@@ -338,7 +339,14 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             let mut spans = vec![Span::styled(visible_name, style)];
             if !marker.is_empty() {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(marker.to_string(), marker_style));
+                if row.tone == CandidateTone::Pending {
+                    spans.extend(render_pending_working_marker(
+                        marker,
+                        snapshot.pending_animation_tick,
+                    ));
+                } else {
+                    spans.push(Span::styled(marker.to_string(), marker_style));
+                }
             }
             if !row.reachability.is_empty() {
                 spans.push(Span::raw("  "));
@@ -496,6 +504,46 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         let cursor_y = status_area.y.saturating_add(status_line_count);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>> {
+    let (prefix, suffix) = if let Some(idx) = marker.find(" (") {
+        (&marker[..idx], &marker[idx..])
+    } else {
+        (marker, "")
+    };
+
+    let chars: Vec<char> = prefix.chars().collect();
+    let char_count = chars.len();
+    if char_count == 0 {
+        return vec![Span::styled(marker.to_string(), Style::default().fg(Color::DarkGray))];
+    }
+
+    let period = char_count + 4;
+    let wave_pos = (tick % period) as isize;
+
+    let mut spans = Vec::with_capacity(char_count + 1);
+    for (i, &ch) in chars.iter().enumerate() {
+        let dist = (i as isize - wave_pos).abs();
+        let style = match dist {
+            0 => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            1 => Style::default()
+                .fg(Color::Rgb(200, 200, 200))
+                .add_modifier(Modifier::BOLD),
+            2 => Style::default().fg(Color::Rgb(150, 150, 150)),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::styled(
+            suffix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
 }
 
 fn pending_candidate_style(bright: bool) -> Style {
