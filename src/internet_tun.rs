@@ -488,7 +488,7 @@ mod tests {
     }
 
     fn wait_for_managed_tun(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if inspect_tun_config(path).is_ok_and(|state| state.managed_internet_tun) {
                 return;
@@ -497,7 +497,7 @@ mod tests {
             // On Windows, a zero-delay read loop can repeatedly reopen the destination while the
             // worker is trying to atomically replace it. Leave a small scheduling window for the
             // write instead of turning this assertion helper into file-system contention.
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

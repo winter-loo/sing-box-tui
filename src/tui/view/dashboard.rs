@@ -292,10 +292,13 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             };
             let current_suffix = if row.is_current { "  *" } else { "" };
             let available = candidate_area.width.saturating_sub(4) as usize;
-            let suffix_width = unicode_width::UnicodeWidthStr::width(row.reachability.as_str())
-                + unicode_width::UnicodeWidthStr::width(loading_suffix)
-                + unicode_width::UnicodeWidthStr::width(current_suffix)
-                + 2;
+            let reachability_width = unicode_width::UnicodeWidthStr::width(row.reachability.as_str());
+            let suffix_width = if reachability_width > 0 {
+                reachability_width + 2
+            } else {
+                0
+            } + unicode_width::UnicodeWidthStr::width(loading_suffix)
+                + unicode_width::UnicodeWidthStr::width(current_suffix);
             let name_width = unicode_width::UnicodeWidthStr::width(row.name.as_str());
             let marker = if !row.marker.is_empty()
                 && name_width
@@ -330,8 +333,10 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(marker.to_string(), marker_style));
             }
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(row.reachability.clone(), evidence_style));
+            if !row.reachability.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(row.reachability.clone(), evidence_style));
+            }
             spans.push(Span::raw(loading_suffix));
             spans.push(Span::raw(current_suffix));
             ListItem::new(Line::from(spans))

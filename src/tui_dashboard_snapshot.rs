@@ -66,15 +66,7 @@ impl App {
                                 if !is_pending && !result.is_some_and(|result| result.usable) {
                                     return None;
                                 }
-                                let assessment = self
-                                    .benchmark_workflow
-                                    .reachability_assessment(&group.name, member);
-                                let reachability = assessment
-                                    .map(|assessment| {
-                                        split_reachability_evidence(&assessment.compact_evidence())
-                                            .0
-                                    })
-                                    .unwrap_or_else(|| "-/3".to_string());
+                                let reachability = String::new();
                                 let marker = if is_pending {
                                     pending_candidate_marker(
                                         pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0),
@@ -122,23 +114,12 @@ impl App {
                         .iter()
                         .filter_map(|member| {
                             let result = results.get(member.as_str())?;
-                            let assessment = self
-                                .benchmark_workflow
-                                .reachability_assessment(&group.name, member);
-                            let reachability = assessment
-                                .map(|assessment| {
-                                    split_reachability_evidence(&assessment.compact_evidence()).0
-                                })
-                                .unwrap_or_else(|| "-/3".to_string());
                             let active =
                                 active_quick_overlay(&self.benchmark_workflow, &group.name, member);
                             let quick_probe_pending = active
                                 .as_ref()
                                 .is_some_and(|(_, _, assessment)| assessment.is_none());
-                            let reachability = active
-                                .as_ref()
-                                .map(|(reachability, _, _)| reachability.clone())
-                                .unwrap_or(reachability);
+                            let reachability = String::new();
                             let marker = result
                                 .detail
                                 .clone()
