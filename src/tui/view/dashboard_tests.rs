@@ -151,15 +151,12 @@ fn streaming_rows_adapt_without_losing_node_identity_or_reachability() {
     snapshot.active_node_view_tab = 1;
     snapshot.candidate_rows[0].is_current = false;
     snapshot.candidate_rows[0].reachability = String::new();
-    snapshot.candidate_rows[0].marker = "1.0 MiB/s · 2/2 sustained · p95 80ms · cold 40ms".into();
+    snapshot.candidate_rows[0].marker = "1.0 MiB/s".into();
     snapshot.candidate_rows[0].compact_marker = "1.0M/s".into();
 
     let wide = rendered_lines_at(&snapshot, 130, 30).join("
 ");
     assert!(wide.contains("1.0 MiB/s"));
-    assert!(wide.contains("2/2 sustained"));
-    assert!(wide.contains("p95 80ms"));
-    assert!(wide.contains("cold 40ms"));
 
     snapshot.candidate_rows[0].name = "这是一个很长的中文流媒体节点名称".into();
     for width in [64, 52] {

@@ -6,7 +6,53 @@ use super::view::{
     SettingRow, SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge,
     settings_field_label,
 };
+use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::{ActiveQuickProbe, BenchmarkWorkflow};
+use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
+
+fn extract_candidate_brief_marker(
+    manifest_id: Option<&NodeViewId>,
+    sustained: Option<&NodeSustainedQuality>,
+    detail: Option<&str>,
+) -> (String, String) {
+    if let Some(sustained) = sustained {
+        if let SustainedProbeOutcome::Completed(completion) = &sustained.outcome {
+            let speed = completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
+            let marker = format!("{:.1} MiB/s", speed);
+            let compact = format!("{:.1}M/s", speed);
+            return (marker, compact);
+        }
+    }
+    if manifest_id == Some(&NodeViewId::streaming()) {
+        if let Some(detail_str) = detail {
+            if let Some(idx) = detail_str.find("MiB/s") {
+                let prefix = &detail_str[..idx + 5];
+                if let Some(start) = prefix.rfind(' ') {
+                    let speed = &prefix[start + 1..];
+                    return (speed.to_string(), speed.to_string());
+                }
+            }
+        }
+    }
+    if let Some(detail_str) = detail {
+        if let Some(idx) = detail_str.find("succeeded in ") {
+            let rest = &detail_str[idx + "succeeded in ".len()..];
+            return (rest.to_string(), rest.to_string());
+        }
+        if let Some(idx) = detail_str.find("response in ") {
+            let rest = &detail_str[idx + "response in ".len()..];
+            return (rest.to_string(), rest.to_string());
+        }
+        if let Some(idx) = detail_str.find("banner in ") {
+            let rest = &detail_str[idx + "banner in ".len()..];
+            return (rest.to_string(), rest.to_string());
+        }
+        if unicode_width::UnicodeWidthStr::width(detail_str) <= 24 {
+            return (detail_str.to_string(), detail_str.to_string());
+        }
+    }
+    ("usable".to_string(), "usable".to_string())
+}
 
 impl App {
     pub(super) fn view_snapshot(&mut self) -> DashboardSnapshot<'_> {
@@ -66,31 +112,33 @@ impl App {
                                 if !is_pending && !result.is_some_and(|result| result.usable) {
                                     return None;
                                 }
-                                let reachability = String::new();
-                                let marker = if is_pending {
-                                    pending_candidate_marker(
+                                let (marker, compact_marker) = if is_pending {
+                                    let m = pending_candidate_marker(
                                         pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0),
-                                    )
+                                    );
+                                    let c = format!(
+                                        "⏳ checking ({}s)",
+                                        pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0)
+                                    );
+                                    (m, c)
                                 } else {
-                                    result
-                                        .and_then(|result| result.detail.clone())
-                                        .unwrap_or_else(|| "criterion accepted".to_string())
+                                    let sustained = result
+                                        .and_then(|r| r.sustained_quality.as_ref())
+                                        .or_else(|| {
+                                            self.benchmark_workflow
+                                                .sustained_quality(&group.name, member)
+                                        });
+                                    extract_candidate_brief_marker(
+                                        usability_manifest_id.as_ref(),
+                                        sustained,
+                                        result.and_then(|r| r.detail.as_deref()),
+                                    )
                                 };
                                 Some(CandidateRow {
                                     name: member.clone(),
                                     is_current: group.current.as_deref() == Some(member.as_str()),
-                                    reachability,
-                                    compact_marker: if is_pending {
-                                        format!(
-                                            "• checking ({}s)",
-                                            pending
-                                                .as_ref()
-                                                .map(|(_, elapsed)| *elapsed)
-                                                .unwrap_or(0)
-                                        )
-                                    } else {
-                                        "usable".to_string()
-                                    },
+                                    reachability: String::new(),
+                                    compact_marker,
                                     marker,
                                     tone: if is_pending {
                                         CandidateTone::Pending
@@ -119,16 +167,19 @@ impl App {
                             let quick_probe_pending = active
                                 .as_ref()
                                 .is_some_and(|(_, _, assessment)| assessment.is_none());
-                            let reachability = String::new();
-                            let marker = result
-                                .detail
-                                .clone()
-                                .unwrap_or_else(|| "criterion accepted".to_string());
+                            let sustained = self
+                                .benchmark_workflow
+                                .sustained_quality(&group.name, member);
+                            let (marker, compact_marker) = extract_candidate_brief_marker(
+                                usability_manifest_id.as_ref(),
+                                sustained,
+                                result.detail.as_deref(),
+                            );
                             Some(CandidateRow {
                                 name: member.clone(),
                                 is_current: group.current.as_deref() == Some(member.as_str()),
-                                reachability,
-                                compact_marker: "usable".to_string(),
+                                reachability: String::new(),
+                                compact_marker,
                                 marker,
                                 tone: if quick_probe_pending {
                                     CandidateTone::Pending
