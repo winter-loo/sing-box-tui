@@ -45,6 +45,7 @@ impl NodeViewPanel {
 pub(crate) struct NodeViewTab {
     pub(crate) label: String,
     pub(crate) count: usize,
+    pub(crate) spinner: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,7 +238,13 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     let tab_titles = snapshot
         .node_view_tabs
         .iter()
-        .map(|tab| Line::from(format!("{} {}", tab.label, tab.count)))
+        .map(|tab| {
+            if let Some(spinner) = &tab.spinner {
+                Line::from(format!("{} {}", tab.label, spinner))
+            } else {
+                Line::from(format!("{} {}", tab.label, tab.count))
+            }
+        })
         .collect::<Vec<_>>();
     frame.render_widget(
         Tabs::new(tab_titles)

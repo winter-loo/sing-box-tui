@@ -1,3 +1,14 @@
+#[test]
+fn active_usability_probe_renders_braille_spinner_instead_of_tab_count() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.node_view_tabs[1].spinner = Some("⠋".to_string());
+
+    let rendered = rendered_lines(&snapshot).join("
+");
+    assert!(rendered.contains("Streaming ⠋"));
+    assert!(!rendered.contains("Streaming 1"));
+}
+
 use super::*;
 use crate::private_access::PrivateAccessRoute;
 use ratatui::Terminal;
@@ -32,10 +43,12 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             NodeViewTab {
                 label: "Current selector".to_string(),
                 count: 1,
+                spinner: None,
             },
             NodeViewTab {
                 label: "Streaming".to_string(),
                 count: 1,
+                spinner: None,
             },
         ],
         active_node_view_tab: 0,

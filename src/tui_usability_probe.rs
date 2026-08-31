@@ -772,6 +772,17 @@ impl App {
         }
     }
 
+    pub(super) fn is_usability_probe_active_for(
+        &self,
+        manifest_id: &NodeViewId,
+        selector: Option<&str>,
+    ) -> bool {
+        self.usability_probe_job.as_ref().is_some_and(|active| {
+            &active.manifest_id == manifest_id
+                && selector.is_none_or(|sel| active.selector == sel)
+        })
+    }
+
     pub(super) fn custom_usability_probe_progress(
         &self,
         manifest_id: &NodeViewId,

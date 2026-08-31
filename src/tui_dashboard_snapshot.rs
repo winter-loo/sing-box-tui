@@ -1,3 +1,5 @@
+const BRAILLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
@@ -331,13 +333,18 @@ impl App {
             }
             _ => None,
         };
+        let spinner_frame = BRAILLE_SPINNER_FRAMES[
+            (self.animation_started.elapsed().as_millis() / 80) as usize % BRAILLE_SPINNER_FRAMES.len()
+        ];
         let all_count = selected_group.map_or(0, |group| group.members.len());
         let mut node_view_tabs = vec![NodeViewTab {
             label: "Current selector".to_string(),
             count: all_count,
+            spinner: None,
         }];
         if let Some(group) = selected_group {
             node_view_tabs.extend(self.visible_usability_manifests().map(|manifest| {
+                let is_probing = self.is_usability_probe_active_for(&manifest.id, Some(&group.name));
                 let projection = self.cached_custom_node_view_projection(
                     &manifest.id,
                     &group.name,
@@ -352,14 +359,19 @@ impl App {
                             **membership == crate::automatic_selection::PanelMembership::Included
                         })
                         .count(),
+                    spinner: is_probing.then(|| spinner_frame.to_string()),
                 }
             }));
         } else {
             node_view_tabs.extend(
                 self.visible_usability_manifests()
-                    .map(|manifest| NodeViewTab {
-                        label: manifest.label.clone(),
-                        count: 0,
+                    .map(|manifest| {
+                        let is_probing = self.is_usability_probe_active_for(&manifest.id, None);
+                        NodeViewTab {
+                            label: manifest.label.clone(),
+                            count: 0,
+                            spinner: is_probing.then(|| spinner_frame.to_string()),
+                        }
                     }),
             );
         }
@@ -374,6 +386,7 @@ impl App {
                         node_view_tabs.push(NodeViewTab {
                             label: format!("Unavailable ({id})"),
                             count: 0,
+                            spinner: None,
                         });
                         node_view_tabs.len() - 1
                     })
