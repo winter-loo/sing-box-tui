@@ -319,7 +319,7 @@ impl App {
                         })
                         .unwrap_or_else(|| "Probe running".to_string());
                     Some(CandidateNotice {
-                        title: "Probe progress".to_string(),
+                        title: "Probe progress (Esc 取消)".to_string(),
                         message: format!("{progress}\n{message}"),
                         error: false,
                     })
