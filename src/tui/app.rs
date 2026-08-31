@@ -844,6 +844,9 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc if self.network_transition_is_running() => {
                 self.set_status_only("Wait for the network mode update before exiting");
             }
+            KeyCode::Esc if self.is_any_probe_running() => {
+                self.pause_active_probes();
+            }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -894,7 +897,30 @@ impl App {
         displayed.get(index).cloned()
     }
 
-    fn open_help_panel(&mut self) {
+        pub(super) fn is_any_probe_running(&self) -> bool {
+        self.usability_probe_job.is_some() || self.benchmark_workflow.is_running()
+    }
+
+    pub(super) fn pause_active_probes(&mut self) {
+        let mut stopped = false;
+        if self.usability_probe_job.is_some() {
+            if let Err(error) = self.cancel_active_usability_probe_with_reason("User paused probe") {
+                self.set_status_only(format!("Cannot pause usability probe: {error:#}"));
+            } else {
+                stopped = true;
+            }
+        }
+        if self.benchmark_workflow.is_running() {
+            self.benchmark_workflow.cancel_running_probes();
+            stopped = true;
+        }
+        if stopped {
+            self.manual_candidate_navigation = true;
+            self.set_status_only("Probe paused");
+        }
+    }
+
+fn open_help_panel(&mut self) {
         self.show_help = true;
         self.flash = None;
         self.set_status_only("Showing help");

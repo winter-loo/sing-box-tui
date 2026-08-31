@@ -231,6 +231,22 @@ struct SustainedJob {
 }
 
 impl BenchmarkWorkflow {
+    pub(crate) fn is_running(&self) -> bool {
+        !self.jobs.is_empty() || !self.sustained_jobs.is_empty()
+    }
+
+    pub(crate) fn cancel_running_probes(&mut self) {
+        for job in &self.jobs {
+            if let Some(cancellation) = &job.cancellation {
+                cancellation.store(true, Ordering::Relaxed);
+            }
+        }
+        for job in &self.sustained_jobs {
+            job.cancellation.store(true, Ordering::Relaxed);
+        }
+    }
+
+
     pub(crate) fn open(
         base_url: String,
         client: AsyncClient,
