@@ -460,16 +460,21 @@ pub(super) fn live_usability_members(
     current_node: Option<&str>,
     results: &BTreeMap<String, crate::usability_probe::UsabilityProbeNodeResult>,
 ) -> Vec<String> {
-    selector_members
-        .iter()
-        .filter(|member| {
-            current_node == Some(member.as_str())
-                || results
-                    .get(member.as_str())
-                    .is_some_and(|result| result.usable)
-        })
-        .cloned()
-        .collect()
+    let mut members = Vec::new();
+    if let Some(current) = current_node {
+        if selector_members.iter().any(|member| member == current) {
+            members.push(current.to_string());
+        }
+    }
+    for member in selector_members {
+        if Some(member.as_str()) == current_node {
+            continue;
+        }
+        if results.get(member.as_str()).is_some_and(|result| result.usable) {
+            members.push(member.clone());
+        }
+    }
+    members
 }
 
 #[cfg(test)]

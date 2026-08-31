@@ -280,7 +280,7 @@ fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
 
     assert_eq!(
         live_usability_members(&members, Some("checking"), &results),
-        ["accepted", "checking"]
+        ["checking", "accepted"]
     );
     assert_eq!(
         live_usability_members(&members, None, &results),
