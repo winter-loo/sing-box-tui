@@ -813,17 +813,22 @@ impl App {
         manifest_id: &NodeViewId,
         selector: &str,
     ) -> Option<(
-        Option<(String, u64)>,
+        Option<(String, u64, String)>,
         BTreeMap<String, UsabilityProbeNodeResult>,
     )> {
         self.usability_probe_job.as_ref().and_then(|active| {
             (&active.manifest_id == manifest_id && active.selector == selector).then(|| {
+                let stage_label = active
+                    .progress
+                    .as_ref()
+                    .map(|p| p.stage_two_label.clone())
+                    .unwrap_or_default();
                 let pending = active.current_node.clone().map(|node| {
                     let elapsed = active
                         .current_node_started_at
                         .map(|started| started.elapsed().as_secs())
                         .unwrap_or_default();
-                    (node, elapsed)
+                    (node, elapsed, stage_label)
                 });
                 (pending, active.received.clone())
             })

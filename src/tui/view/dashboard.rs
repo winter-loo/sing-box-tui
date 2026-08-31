@@ -507,7 +507,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
 }
 
 fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>> {
-    let (prefix, suffix) = if let Some(idx) = marker.find(" (") {
+    let (prefix, suffix) = if let Some(idx) = marker.rfind(" (") {
         (&marker[..idx], &marker[idx..])
     } else {
         (marker, "")

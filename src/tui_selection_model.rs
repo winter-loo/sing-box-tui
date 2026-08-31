@@ -229,7 +229,7 @@ impl App {
             {
                 return live_usability_members(
                     &group.members,
-                    pending.as_ref().map(|(node, _)| node.as_str()),
+                    pending.as_ref().map(|(node, _, _)| node.as_str()),
                     &results,
                 );
             }

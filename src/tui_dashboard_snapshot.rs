@@ -109,15 +109,22 @@ impl App {
                             .iter()
                             .filter_map(|member| {
                                 let is_pending =
-                                    pending.as_ref().is_some_and(|(node, _)| node == member);
+                                    pending.as_ref().is_some_and(|(node, _, _)| node == member);
                                 let result = live_results.get(member);
                                 if !is_pending && !result.is_some_and(|result| result.usable) {
                                     return None;
                                 }
                                 let (marker, compact_marker) = if is_pending {
-                                    let elapsed = pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0);
-                                    let m = pending_candidate_marker(elapsed);
-                                    let c = format!("Working ({elapsed}s)");
+                                    let (elapsed, stage) = pending
+                                        .as_ref()
+                                        .map(|(_, elapsed, stage)| (*elapsed, stage.as_str()))
+                                        .unwrap_or((0, ""));
+                                    let m = pending_candidate_marker(stage, elapsed);
+                                    let c = if stage.is_empty() {
+                                        format!("checking ({elapsed}s)")
+                                    } else {
+                                        format!("checking {stage} ({elapsed}s)")
+                                    };
                                     (m, c)
                                 } else {
                                     let sustained = result
@@ -555,8 +562,12 @@ fn format_custom_probe_progress(
     )
 }
 
-fn pending_candidate_marker(elapsed_seconds: u64) -> String {
-    format!("• Working ({elapsed_seconds}s)")
+fn pending_candidate_marker(stage: &str, elapsed_seconds: u64) -> String {
+    if stage.is_empty() {
+        format!("• checking ({elapsed_seconds}s)")
+    } else {
+        format!("• checking {stage} ({elapsed_seconds}s)")
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +597,7 @@ mod tests {
 
     #[test]
     fn pending_tcp_candidate_marker_matches_working_animation_copy() {
-        assert_eq!(pending_candidate_marker(3), "• Working (3s)");
+        assert_eq!(pending_candidate_marker("TCP 22", 3), "• checking TCP 22 (3s)");
     }
 
     #[test]

@@ -5,8 +5,8 @@ fn pending_candidate_renders_working_shimmer_animation() {
         name: "test-node".to_string(),
         is_current: false,
         reachability: String::new(),
-        compact_marker: "Working (2s)".to_string(),
-        marker: "• Working (2s)".to_string(),
+        compact_marker: "checking TCP 22 (2s)".to_string(),
+        marker: "• checking TCP 22 (2s)".to_string(),
         tone: CandidateTone::Pending,
     }];
     snapshot.pending_animation_tick = 3;
@@ -15,7 +15,7 @@ fn pending_candidate_renders_working_shimmer_animation() {
     let text = lines.join("
 ");
     assert!(text.contains("test-node"));
-    assert!(text.contains("Working (2s)"));
+    assert!(text.contains("checking TCP 22 (2s)"));
 }
 
 #[test]
