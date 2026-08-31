@@ -32,7 +32,7 @@ fn backslash_starts_the_internet_tun_transition() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::fs::read_to_string(&path).is_ok_and(|text| text.contains("\"tun\"")) {
         assert!(Instant::now() < deadline, "config mutation timed out");
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
     }
     let _ = std::fs::remove_file(path);
 }

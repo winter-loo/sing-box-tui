@@ -558,9 +558,6 @@ impl BenchmarkWorkflow {
         group: &str,
         node: &str,
     ) -> Option<&NodeSustainedQuality> {
-        if !self.quality_session_current() {
-            return None;
-        }
         self.sustained_quality
             .get(&(group.to_string(), node.to_string()))
     }

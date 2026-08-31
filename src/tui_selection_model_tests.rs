@@ -33,7 +33,7 @@ fn spawn_selection_controller() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind selection controller");
     let address = listener.local_addr().expect("selection controller address");
     let worker = thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..6 {
             let (mut stream, _) = listener.accept().expect("accept selection request");
             let mut request = [0_u8; 4096];
             let count = stream.read(&mut request).unwrap_or_default();
@@ -160,11 +160,62 @@ fn candidate_space_selection_child() {
         app.handle_key(KeyCode::Char(' '))
             .expect("Space selection should complete")
     );
+    drop(process_lease);
+
+    // Also verify that Space selection on the Streaming candidate panel does not deadlock.
+    let (stream_run_id, stream_gen, stream_lease) = app
+        .benchmark_workflow
+        .begin_usability_probe_run("streaming", "select")
+        .expect("begin streaming probe run");
+    assert!(
+        app.benchmark_workflow
+            .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+                run_id: stream_run_id,
+                generation: stream_gen,
+                process_lease: &stream_lease,
+                complete: true,
+                summary: Some("accepted"),
+                diagnostic: None,
+                facts: &facts,
+                result_ttl: None,
+            })
+            .expect("finish streaming probe run")
+    );
+    let sustained = NodeSustainedQuality {
+        name: "node-a".to_string(),
+        outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+            first_byte_ms: 50,
+            completion_ms: 200,
+            bytes_read: 512 * 1024,
+            throughput_bytes_per_second: 2_000_000,
+        }),
+    };
+    app.benchmark_workflow
+        .record_custom_sustained_quality("select", stream_gen, &sustained)
+        .expect("record sustained quality");
+    app.node_view_panel = super::super::NodeViewPanel::Streaming;
+    app.usability_probe_projection_cache.insert(
+        (NodeViewId::streaming(), "select".to_string()),
+        StoredUsabilityProbeRun {
+            run_id: stream_run_id,
+            completed_at_ms: 2,
+            expires_at_ms: None,
+            summary: Some("accepted".to_string()),
+            latest_attempt: None,
+            results: facts.to_vec(),
+        },
+    );
+    assert_eq!(app.displayed_members(), ["node-a"]);
+    assert!(
+        app.handle_key(KeyCode::Char(' '))
+            .expect("Space selection on Streaming panel should complete")
+    );
+    drop(stream_lease);
+
     controller_worker
         .join()
         .expect("selection controller exits");
     drop(app);
-    drop(process_lease);
     remove_space_selection_files(&database_path, &config_path);
 }
 
@@ -180,8 +231,8 @@ fn space_on_candidate_panel_does_not_deadlock_the_ui() {
             "--test-threads=1",
         ])
         .env(SPACE_SELECTION_CHILD_ENV, &database_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn Space selection child");
     let deadline = Instant::now() + Duration::from_secs(5);
