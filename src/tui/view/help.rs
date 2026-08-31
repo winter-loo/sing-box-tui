@@ -80,13 +80,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         key: "U",
-        summary: "Run custom usability probe",
-        detail: "Manually run the criterion declared by the active custom node-view tab. Manifest discovery alone never starts a program.",
+        summary: "Run active usability probe",
+        detail: "Manually run the criterion declared by the active usability tab, including the built-in Streaming probe. Discovery alone never starts a probe.",
     },
     HelpBinding {
         key: "P",
-        summary: "Toggle custom probe schedule",
-        detail: "Explicitly allow or deny scheduled background execution for the active custom tab and selected selector. The manifest must also permit background execution.",
+        summary: "Toggle probe schedule",
+        detail: "Explicitly allow or deny scheduled background execution for the active usability tab and selected selector. Its manifest must also permit background execution.",
     },
     HelpBinding {
         key: "/",

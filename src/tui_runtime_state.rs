@@ -90,7 +90,10 @@ impl App {
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.auto_select_selector = state.auto_pick_selector;
-        let active_node_view = state.active_node_view.unwrap_or_default();
+        let mut active_node_view = state.active_node_view.unwrap_or_default();
+        if !self.node_view_id_is_visible(&active_node_view) {
+            active_node_view = crate::automatic_selection::NodeViewId::current_selector();
+        }
         self.node_view_panel = NodeViewPanel::from_id(&active_node_view);
         // Preserve the stable ID even when its manifest is temporarily missing. Manifest ordering
         // is presentation only; falling back by index could silently authorize another panel.

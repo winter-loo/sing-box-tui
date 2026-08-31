@@ -211,23 +211,20 @@ impl App {
             self.set_status_only("No node is available in the active node view");
             return Ok(());
         };
-        let _quality_lease = if self.node_view_panel != NodeViewPanel::CurrentSelector {
+        let quality_lease = if self.node_view_panel != NodeViewPanel::CurrentSelector {
             Some(self.benchmark_workflow.acquire_quality_read_lease()?)
         } else {
             None
         };
-        let _quality_generation = _quality_lease
-            .as_ref()
-            .map(crate::storage::NodeQualityReadLease::generation);
-        if let (NodeViewPanel::Custom(manifest_id), Some(lease)) =
-            (&self.node_view_panel, _quality_lease.as_ref())
+        if let (Some(manifest_id), Some(lease)) =
+            (self.active_usability_manifest_id(), quality_lease.as_ref())
         {
             // Manual selection starts from a render cache, but that cache cannot authorize a PUT.
             // Re-check Included membership under the lease kept alive through both writes so a
             // new run or reconciliation cannot turn a stale visible row into an invalid switch.
             let projection = self.leased_custom_node_view_projection(
                 lease,
-                manifest_id,
+                &manifest_id,
                 &group_name,
                 &group_members,
             )?;
@@ -257,6 +254,11 @@ impl App {
                 .switch_proxy(&parent, &route_group)
                 .with_context(|| format!("failed to switch {} to {}", parent, route_group))?;
         }
+        // The lease must cover membership validation and every selector write, but refresh uses
+        // unleased projection reads that acquire the same cross-process lock. Release it before
+        // refresh so a custom candidate-panel selection cannot deadlock itself re-entering that
+        // lock on the UI thread.
+        drop(quality_lease);
         if REFRESH_DEBOUNCE > Duration::ZERO {
             std::thread::sleep(REFRESH_DEBOUNCE);
         }

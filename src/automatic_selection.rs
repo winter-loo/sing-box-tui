@@ -102,7 +102,6 @@ pub(crate) enum PanelMembership {
     Included,
     Rejected,
     Untested,
-    Incomplete,
     // Dynamic manifests in #18 can project an expired fact without widening this decision API.
     #[allow(dead_code)]
     Expired,
@@ -156,15 +155,6 @@ impl ReachabilityTier {
             2 => Self::Reachable,
             1 => Self::Degraded,
             _ => Self::Unreachable,
-        }
-    }
-
-    pub(crate) fn successes(self) -> u8 {
-        match self {
-            Self::StableReachable => 3,
-            Self::Reachable => 2,
-            Self::Degraded => 1,
-            Self::Unreachable => 0,
         }
     }
 
@@ -619,9 +609,7 @@ impl AutomaticSelectionState {
             let incomplete = panel.members.values().any(|membership| {
                 matches!(
                     membership,
-                    PanelMembership::Untested
-                        | PanelMembership::Incomplete
-                        | PanelMembership::Expired
+                    PanelMembership::Untested | PanelMembership::Expired
                 )
             });
             return decision(if incomplete {

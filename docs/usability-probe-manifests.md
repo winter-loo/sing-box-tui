@@ -7,6 +7,68 @@ By default, place JSON manifests in `usability-probes` beside the active sing-bo
 Set `SING_BOX_TUI_USABILITY_PROBE_DIR` to use a different directory. IDs are stable, lowercase
 ASCII identifiers and must be unique. Labels are the tab names shown to users.
 
+## Bundled probes and visibility
+
+The executable always includes two custom probes; neither needs Python or a separately installed
+adapter:
+
+- `streaming` is visible by default and uses throughput ranking. It runs an HTTPS prefilter and
+  then a bounded 512 KiB transfer through each surviving node's isolated runtime.
+- `github-ssh` is hidden by default and uses low-latency ranking. It first checks GitHub HTTPS,
+  then sends `CONNECT github.com:22` through the isolated runtime and requires a real `SSH-`
+  protocol banner.
+- `agy-gemini` is hidden by default and uses balanced ranking. It applies a hard two-second
+  ordinary-connectivity prefilter through the isolated runtime, then runs a real
+  `agy --agent gemini` request only for nodes that pass. Ordinary reachability is never treated as
+  Agy Gemini usability.
+
+A user manifest with one of those stable IDs replaces the bundled manifest. Use `builtin` to keep
+the in-process implementation while changing presentation or scheduling. For example, this makes
+the GitHub SSH tab visible:
+
+```json
+{
+  "id": "github-ssh",
+  "label": "GitHub SSH",
+  "ranking": "low-latency",
+  "builtin": "github-ssh",
+  "visible": true
+}
+```
+
+This hides Streaming while keeping it registered and configurable:
+
+```json
+{
+  "id": "streaming",
+  "label": "Streaming",
+  "ranking": "throughput",
+  "builtin": "streaming",
+  "visible": false
+}
+```
+
+This shows the bundled Agy Gemini tab:
+
+```json
+{
+  "id": "agy-gemini",
+  "label": "Agy Gemini",
+  "ranking": "balanced",
+  "builtin": "agy-gemini",
+  "visible": true
+}
+```
+
+The built-in Agy probe resolves the `agy` executable from `PATH`. Set
+`SING_BOX_TUI_AGY_EXECUTABLE` to an absolute executable path when it is installed elsewhere. Its
+authenticated CLI state remains owned by Agy; the TUI does not collect credentials.
+
+`visible` defaults to `true` for user manifests. A manifest must declare exactly one source:
+`url`, `executable`, or `builtin`. The supported `builtin` values are `streaming` and
+`github-ssh`, and `agy-gemini`. Replacing a bundled ID with `url` or `executable` replaces its
+implementation too.
+
 ## URL probes
 
 ```json
@@ -95,9 +157,9 @@ terminal display.
 
 ## TUI behavior
 
-- Use Left and Right while the candidate pane is focused to navigate built-in and custom tabs.
-- Press `U` on a custom tab to start its manual probe.
-- Press `P` on a custom tab to explicitly enable or disable its permitted background schedule for
+- Use Left and Right while the candidate pane is focused to navigate visible usability tabs.
+- Press `U` on an active usability tab, including Streaming, to start its manual probe.
+- Press `P` on an active usability tab to explicitly enable or disable its permitted background schedule for
   the selected selector. This permission is independent from auto-pick.
 - Progressive results and terminal status appear in the status area.
 - A complete custom tab shows only usable results that are also members of the selector snapshot
@@ -110,13 +172,19 @@ Invalid manifests are skipped and reported with bounded, actionable diagnostics 
 Press `?`, then select each invalid-manifest row to inspect every reported path and reason. Fix the
 reported files and restart the TUI to rediscover them.
 
-## Agy Gemini example panel
+## Agy Gemini built-in probe and legacy adapter
+
+The Agy Gemini implementation is bundled in the executable and hidden by default; the `builtin`
+manifest above is the shortest way to show it. It uses
+`http://www.gstatic.com/generate_204` only for the hard two-second ordinary-connectivity screen.
+Every node admitted to the panel must subsequently complete the real authenticated Agy Gemini
+command through that node's isolated proxy.
 
 The [Unix manifest](../examples/usability-probes/unix/agy-gemini.json) and
-[Windows manifest](../examples/usability-probes/windows/agy-gemini.json) wire the existing Agy
-adapter into a custom **Agy Gemini** panel. Both use `balanced` network ranking and declare no
-background schedule, so they run only when the user presses `U`. Copy only the manifest for the
-current platform into the active `usability-probes` directory.
+[Windows manifest](../examples/usability-probes/windows/agy-gemini.json) remain as examples of
+replacing the built-in ID with the external Python adapter. Both explicitly make the tab visible,
+use `balanced` network ranking, and declare no background schedule. Copy one only when that
+external-program override is intentional.
 
 On Unix, keep the manifest's executable path relative to `scripts/agy-gemini-node-probe.py` or
 update it for the installed layout, and make the adapter executable if the checkout did not
@@ -124,14 +192,18 @@ preserve its executable bit. Windows does not interpret Python shebangs, so its 
 `python.exe` directly without a shell; replace both `C:\\Path\\To` placeholders with absolute
 paths to the interpreter and checkout before registration.
 
-The adapter's `--tui-jsonl` mode keeps stdout reserved for the progressive protocol. It publishes
+The legacy adapter's `--tui-jsonl` mode keeps stdout reserved for the progressive protocol. It publishes
 only the node tag, a successful result, and bounded timing; it never publishes the Agy response,
 account, project, prompt, environment, proxy URL, configuration path, or manager diagnostic text.
-Only a zero-exit real `agy --agent gemini --print ...` invocation emits `usable:true`. Authentication
-requirements, non-zero process exits, timeouts, spawn failures, and isolated-runtime failures stop
-the assessment with `complete:false`; they do not manufacture `usable:false` facts. Consequently,
-the TUI preserves the previous complete panel instead of blaming a node for an infrastructure or
-account failure.
+Both implementations emit `usable:true` only after a zero-exit real
+`agy --agent gemini --print ...` invocation. In the built-in probe, Agy's explicit
+`User location is not supported for the API use` response rejects only the current node and the
+scan continues. Authentication requirements, timeouts, spawn failures, isolated-runtime failures,
+and unclassified non-zero exits still stop the assessment with `complete:false`; the Probe error
+panel includes the bounded underlying Agy error, and the TUI preserves the previous complete panel.
+The transient Agy startup message `not authenticated, trying silent auth` is not an authentication
+failure by itself; the final process outcome and terminal API error decide the result.
+The legacy external adapter conservatively treats every non-zero Agy exit as an incomplete run.
 
 Automated coverage uses local fixture manager and Agy executables and redirects all proxy variables
 to an unbound loopback port. It needs no account, quota, or public network access:
@@ -147,19 +219,25 @@ and are not published as node facts. When `node` is present and belongs to the s
 the active panel shows that node as pending. A later usable node result keeps it in the panel; a
 rejected result removes it. Set `candidate` to `false` when a named preliminary check should update
 the progress box without putting that node into the candidate panel; the field defaults to `true`.
-Programs with multiple stages may also attach a `progress` object containing `https_scanned`,
-`https_total`, `tcp_completed`, `tcp_total`, and `accepted`. The active panel renders those explicit
-counters instead of deriving a misleading denominator from the selected selector's member count.
+Programs with multiple stages may also attach a `progress` object containing
+`stage_one_completed`, `stage_one_total`, `stage_two_completed`, `stage_two_total`, `accepted`, and
+optional `stage_one_label` / `stage_two_label` strings. The older GitHub-specific field names
+`https_scanned`, `https_total`, `tcp_completed`, and `tcp_total` remain accepted as aliases. The
+active panel renders those explicit counters instead of deriving a misleading denominator from the
+selected selector's member count.
 Executable probes receive the active selector's ordered node tags as a JSON array in
 `SING_BOX_TUI_USABILITY_CANDIDATES`. Bundled probes use this scope so progress totals, pending rows,
 accepted rows, and the selector backing the candidate panel always describe the same node set.
 
-## GitHub SSH example panel
+## GitHub SSH built-in probe and legacy adapter
 
-The [Unix manifest](../examples/usability-probes/unix/github-ssh.json) and
-[Windows manifest](../examples/usability-probes/windows/github-ssh.json) register the bundled
-`github-ssh-node-probe.py` adapter as a manual **GitHub SSH** panel. Copy the platform manifest
-beside the active configuration and replace the Windows path placeholders when applicable.
+The GitHub SSH implementation is now bundled in the executable and hidden by default; the
+`builtin` manifest above is the shortest way to show it. The older
+[Unix manifest](../examples/usability-probes/unix/github-ssh.json) and
+[Windows manifest](../examples/usability-probes/windows/github-ssh.json) remain as examples of
+replacing the built-in ID with the external `github-ssh-node-probe.py` adapter. Copy one only when
+that external-program override is intentional, and replace the Windows path placeholders when
+applicable.
 
 For every node that passes the existing `https://github.com/` reachability prefilter, the adapter
 starts from the isolated runtime's local HTTP proxy, sends `CONNECT github.com:22`, and waits for a

@@ -67,6 +67,7 @@ use crate::tui_state::{
 use crate::usability_probe::{
     ManifestDiagnostic, UsabilityProbeDiscovery, UsabilityProbeManifest,
     discover_usability_probe_manifests, manifest_diagnostic, usability_probe_manifest_directory,
+    with_default_usability_probe_manifests,
 };
 
 #[path = "../tui_auto_pick_worker.rs"]
@@ -501,14 +502,17 @@ impl App {
         let state_path = default_tui_state_path();
         let usability_manifest_directory =
             usability_probe_manifest_directory(&system_proxy_config_path);
-        let usability_discovery = discover_usability_probe_manifests(&usability_manifest_directory)
-            .unwrap_or_else(|error| UsabilityProbeDiscovery {
-                manifests: Vec::new(),
-                diagnostics: vec![manifest_diagnostic(
-                    &usability_manifest_directory,
-                    format!("{error:#}"),
-                )],
-            });
+        let usability_discovery = with_default_usability_probe_manifests(
+            discover_usability_probe_manifests(&usability_manifest_directory).unwrap_or_else(
+                |error| UsabilityProbeDiscovery {
+                    manifests: Vec::new(),
+                    diagnostics: vec![manifest_diagnostic(
+                        &usability_manifest_directory,
+                        format!("{error:#}"),
+                    )],
+                },
+            ),
+        );
         let bypass_rule_set_path = resolved_tui_bypass_rule_set_path(&system_proxy_config_path)?;
         let onboarding_subscription = PathBuf::from(DEFAULT_SUBSCRIPTION_SOURCE_PATH);
         let background_state = background_task_state_path();

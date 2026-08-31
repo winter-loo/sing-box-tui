@@ -194,7 +194,7 @@ fn app_applies_persisted_auto_pick_without_filter() {
 #[test]
 fn unknown_stable_panel_id_survives_restart_for_future_manifest_ownership() {
     let mut app = test_app();
-    let dynamic = NodeViewId::new("agy-gemini").expect("valid dynamic view id");
+    let dynamic = NodeViewId::new("future-custom-probe").expect("valid dynamic view id");
 
     app.apply_runtime_state(TuiRuntimeState {
         auto_pick_enabled: true,

@@ -1,4 +1,4 @@
-use super::super::test_support::{internet_routes_app, test_app};
+use super::super::test_support::{install_streaming_probe_run, internet_routes_app, test_app};
 use crate::automatic_selection::{NodeViewId, RankingPolicy, SelectionScope};
 use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkUpdate, SustainedKind};
 use crate::controller::{
@@ -356,6 +356,7 @@ fn custom_auto_select_uses_included_members_and_resets_confirmation_for_a_new_ru
         result_ttl: None,
         timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("github-web.json"),
+        visible: true,
     });
     let install_run = |app: &mut super::App, run_id| {
         app.usability_probe_projection_cache.insert(
@@ -483,22 +484,27 @@ fn custom_auto_select_uses_included_members_and_resets_confirmation_for_a_new_ru
 }
 
 #[test]
-fn streaming_auto_select_discovers_untested_nodes_before_they_become_selectable() {
-    let controller = FakeController::start("node-b");
+fn streaming_auto_select_uses_only_custom_probe_members_plus_the_current_node() {
     let mut app = test_app();
-    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
     app.groups[0].members = vec![
         "node-a".to_string(),
         "node-b".to_string(),
         "node-c".to_string(),
     ];
     app.benchmark_filter = "node-b".to_string();
-    app.move_node_view_next();
-    app.auto_select_enabled = true;
-    app.sustained_runtime_environment = Some((
-        PathBuf::from("missing-test-config.json"),
-        PathBuf::from("/usr/bin/false"),
-    ));
+    app.benchmark_workflow.set_sustained_quality(
+        "select",
+        NodeSustainedQuality {
+            name: "node-b".to_string(),
+            outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                first_byte_ms: 100,
+                completion_ms: 600,
+                bytes_read: 512 * 1024,
+                throughput_bytes_per_second: 1024 * 1024,
+            }),
+        },
+    );
+    install_streaming_probe_run(&mut app, 70, &[("node-b", true), ("node-c", false)]);
     let current = reachability("node-a", [100, 100, 100]);
     let candidate = reachability("node-b", [70, 70, 70]);
     let panel_rejected = reachability("node-c", [10, 10, 10]);
@@ -506,88 +512,17 @@ fn streaming_auto_select_discovers_untested_nodes_before_they_become_selectable(
         app.benchmark_workflow
             .set_reachability_assessment("select", assessment.clone());
     }
+    app.move_node_view_next();
+    assert_eq!(app.displayed_members(), ["node-b"]);
+    app.auto_select_enabled = true;
 
     app.maybe_start_auto_select_benchmark()
         .expect("streaming evidence assessment starts");
     assert_eq!(
         app.benchmark_workflow.active_nodes("select"),
         Some(["node-a".to_string(), "node-b".to_string()].as_slice()),
-        "untested filter-matching nodes need quick evidence, while rejected nodes stay excluded"
+        "the current node remains comparable, but rejected and untested nodes stay outside the custom panel"
     );
-
-    app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
-        group: "select".to_string(),
-        round_id: 70,
-        assessments: vec![current.clone(), candidate.clone(), panel_rejected.clone()],
-        quality_current: true,
-    }))
-    .expect("fresh streaming panel schedules missing sustained evidence");
-    assert_eq!(
-        app.benchmark_workflow.active_sustained_nodes("select"),
-        Some(vec!["node-a".to_string(), "node-b".to_string()]),
-        "bounded sustained discovery must include the untested panel candidate"
-    );
-    assert!(
-        controller
-            .requests
-            .lock()
-            .expect("inspect pre-evidence requests")
-            .iter()
-            .all(|request| !request.starts_with("PUT /proxies/select ")),
-        "a discovery candidate is not selectable until its panel facts are complete"
-    );
-
-    for (node, throughput) in [("node-b", 1024 * 1024), ("node-c", 8 * 1024 * 1024)] {
-        app.benchmark_workflow.set_sustained_quality(
-            "select",
-            NodeSustainedQuality {
-                name: node.to_string(),
-                outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
-                    first_byte_ms: 100,
-                    completion_ms: 600,
-                    bytes_read: 512 * 1024,
-                    throughput_bytes_per_second: throughput,
-                }),
-            },
-        );
-    }
-    let scope = SelectionScope {
-        quality_generation: 0,
-        selector: "select".to_string(),
-        panel: NodeViewId::streaming(),
-        panel_revision: 0,
-        current_node: "node-a".to_string(),
-    };
-    let now = Instant::now();
-    app.active_node_traffic.observe(
-        scope.clone(),
-        now - Duration::from_secs(10),
-        &ConnectionsSnapshot::default(),
-    );
-    app.active_node_traffic
-        .observe(scope, now, &ConnectionsSnapshot::default());
-
-    for round_id in [71, 72] {
-        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
-            group: "select".to_string(),
-            round_id,
-            assessments: vec![current.clone(), candidate.clone(), panel_rejected.clone()],
-            quality_current: true,
-        }))
-        .expect("completed streaming evidence is evaluated");
-    }
-
-    let switch_requests = controller
-        .requests
-        .lock()
-        .expect("inspect streaming switch requests")
-        .iter()
-        .filter(|request| request.starts_with("PUT /proxies/select "))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(switch_requests.len(), 1);
-    assert!(switch_requests[0].contains(r#"{"name":"node-b"}"#));
-    assert!(!switch_requests[0].contains("node-c"));
 }
 
 #[test]

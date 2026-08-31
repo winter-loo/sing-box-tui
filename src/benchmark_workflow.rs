@@ -33,8 +33,8 @@ use crate::storage::{
     lock_node_quality_reconciliation,
 };
 use crate::sustained_quality::{
-    NodeSustainedQuality, SustainedCompletion, SustainedProbeEvent, SustainedProbeRequest,
-    spawn_sustained_probe_worker, sustained_target_identity, validate_sustained_target,
+    NodeSustainedQuality, SustainedProbeEvent, SustainedProbeRequest, spawn_sustained_probe_worker,
+    sustained_target_identity, validate_sustained_target,
 };
 
 type NodeMetricKey = (String, String);
@@ -42,18 +42,10 @@ type QuickHistoryCache = BTreeMap<NodeMetricKey, NodeQuickHistory>;
 type SustainedStatsCache = BTreeMap<NodeMetricKey, SustainedSuccessStats>;
 type MetricCaches = (QuickHistoryCache, SustainedStatsCache);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StreamingNodeProjection {
-    pub(crate) name: String,
-    pub(crate) assessment: NodeReachabilityAssessment,
-    pub(crate) completion: SustainedCompletion,
-    pub(crate) sustained_stats: SustainedSuccessStats,
-    pub(crate) quick_history: NodeQuickHistory,
-}
-
 pub(crate) enum ActiveQuickProbe<'a> {
     Pending,
-    Assessment(&'a NodeReachabilityAssessment),
+    IncompleteAssessment(&'a NodeReachabilityAssessment),
+    CompleteAssessment(&'a NodeReachabilityAssessment),
 }
 
 pub(crate) const QUALITY_RUNTIME_RECEIPT_ENV: &str = "SING_BOX_TUI_QUALITY_RUNTIME_RECEIPT";
@@ -573,9 +565,68 @@ impl BenchmarkWorkflow {
             .get(&(group.to_string(), node.to_string()))
     }
 
+    /// Commits an attributable transfer produced by the built-in Streaming custom adapter.
+    /// The adapter owns panel membership, while this method keeps throughput/history behind the
+    /// existing generation-fenced node-quality seam used by ranking and automatic selection.
+    pub(crate) fn record_custom_sustained_quality(
+        &mut self,
+        group: &str,
+        expected_generation: u64,
+        result: &NodeSustainedQuality,
+    ) -> Result<bool> {
+        if !result.outcome.is_node_attributable() {
+            return Ok(false);
+        }
+        let lease = self.acquire_quality_read_lease()?;
+        anyhow::ensure!(
+            lease.generation() == expected_generation,
+            "Streaming custom probe generation changed before result publication"
+        );
+        let persisted = match self.store.as_ref() {
+            Some(store) => {
+                store.record_sustained_quality(group, &self.sustained_target_identity, result)?
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    self.allow_unpersisted_quality_for_test
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            }
+        };
+        drop(lease);
+        if !persisted {
+            return Ok(false);
+        }
+        let projection_lease = self.acquire_quality_read_lease()?;
+        anyhow::ensure!(
+            projection_lease.generation() == expected_generation,
+            "Streaming custom probe generation changed after result publication"
+        );
+        let key = (group.to_string(), result.name.clone());
+        self.sustained_quality.insert(key.clone(), result.clone());
+        if let Some(store) = self.store.as_ref() {
+            let stats = store.sustained_success_stats_with_lease(
+                &projection_lease,
+                group,
+                &result.name,
+                &self.sustained_target_identity,
+                10,
+            )?;
+            self.sustained_stats_cache.insert(key, stats);
+        }
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn quick_probe_pending(&self, group: &str, node: &str) -> bool {
-        self.active_quick_probe(group, node).is_some()
+        matches!(
+            self.active_quick_probe(group, node),
+            Some(ActiveQuickProbe::Pending | ActiveQuickProbe::IncompleteAssessment(_))
+        )
     }
 
     pub(crate) fn active_quick_probe(
@@ -589,7 +640,13 @@ impl BenchmarkWorkflow {
             .map(|job| {
                 job.current_assessments
                     .get(node)
-                    .map(ActiveQuickProbe::Assessment)
+                    .map(|assessment| {
+                        if assessment.attempts.len() == 3 && assessment.assessment.is_some() {
+                            ActiveQuickProbe::CompleteAssessment(assessment)
+                        } else {
+                            ActiveQuickProbe::IncompleteAssessment(assessment)
+                        }
+                    })
                     .unwrap_or(ActiveQuickProbe::Pending)
             })
     }
@@ -987,80 +1044,6 @@ impl BenchmarkWorkflow {
         Ok(BenchmarkStart::Started)
     }
 
-    pub(crate) fn streaming_members(&self, group: &str, members: &[String]) -> Vec<String> {
-        self.streaming_projection(group, members)
-            .into_iter()
-            .map(|projection| projection.name)
-            .collect()
-    }
-
-    pub(crate) fn streaming_projection(
-        &self,
-        group: &str,
-        members: &[String],
-    ) -> Vec<StreamingNodeProjection> {
-        // Copy every field for the rendered rows while one cross-process lease blocks node
-        // reconciliation. The owned projection remains coherent even if its generation changes
-        // immediately after this method returns and the TUI has not rendered it yet.
-        let Ok(_quality_lease) = self.acquire_quality_read_lease() else {
-            return Vec::new();
-        };
-        let mut ranked = members
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let key = (group.to_string(), node.to_string());
-                let assessment = self.reachability_assessments.get(&key)?;
-                if !assessment_is_quick_eligible(assessment) {
-                    return None;
-                }
-                let sustained_quality = self.sustained_quality.get(&key)?;
-                let completion = sustained_quality.completed()?;
-                let sustained = self.sustained_stats_current(group, node, sustained_quality);
-                let quick = self.quick_history(group, node);
-                Some((
-                    StreamingNodeProjection {
-                        name: node.clone(),
-                        assessment: assessment.clone(),
-                        completion: completion.clone(),
-                        sustained_stats: sustained,
-                        quick_history: quick,
-                    },
-                    index,
-                ))
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| {
-            right
-                .0
-                .completion
-                .throughput_bytes_per_second
-                .cmp(&left.0.completion.throughput_bytes_per_second)
-                .then_with(|| {
-                    compare_ratio_desc(
-                        left.0.sustained_stats.successes,
-                        left.0.sustained_stats.attempts,
-                        right.0.sustained_stats.successes,
-                        right.0.sustained_stats.attempts,
-                    )
-                })
-                .then_with(|| {
-                    compare_optional_ascending(
-                        left.0.quick_history.p95_ms,
-                        right.0.quick_history.p95_ms,
-                    )
-                })
-                .then_with(|| {
-                    compare_optional_ascending(
-                        left.0.quick_history.cold_start_ms,
-                        right.0.quick_history.cold_start_ms,
-                    )
-                })
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        ranked.into_iter().map(|entry| entry.0).collect()
-    }
-
     pub(crate) fn automatic_sustained_candidates(
         &self,
         group: &str,
@@ -1125,23 +1108,6 @@ impl BenchmarkWorkflow {
                 .take(5),
         );
         out
-    }
-
-    fn sustained_stats_current(
-        &self,
-        group: &str,
-        node: &str,
-        sustained_quality: &NodeSustainedQuality,
-    ) -> SustainedSuccessStats {
-        self.sustained_stats_cache
-            .get(&(group.to_string(), node.to_string()))
-            .copied()
-            // The caller already read this value under its quality lease. Falling back through
-            // `sustained_quality()` would try to acquire the same reconciliation lock again.
-            .unwrap_or_else(|| SustainedSuccessStats {
-                successes: usize::from(sustained_quality.completed().is_some()),
-                attempts: 1,
-            })
     }
 
     pub(crate) fn quick_history(&self, group: &str, node: &str) -> NodeQuickHistory {
@@ -3012,17 +2978,9 @@ mod tests {
             target_a_identity,
         );
 
-        assert_eq!(
-            workflow.streaming_members("select", &["node-a".into()]),
-            ["node-a"]
-        );
+        assert!(workflow.sustained_quality("select", "node-a").is_some());
         workflow.activate_sustained_target(target_b).unwrap();
         assert!(workflow.sustained_quality("select", "node-a").is_none());
-        assert!(
-            workflow
-                .streaming_members("select", &["node-a".into()])
-                .is_empty()
-        );
 
         let (sender, receiver) = mpsc::channel();
         sender
@@ -3046,10 +3004,7 @@ mod tests {
         });
         workflow.poll();
 
-        assert_eq!(
-            workflow.streaming_members("select", &["node-a".into()]),
-            ["node-a"]
-        );
+        assert!(workflow.sustained_quality("select", "node-a").is_some());
         drop(workflow);
         let store = BenchmarkStore::open(&path).unwrap();
         assert_eq!(
@@ -3277,128 +3232,6 @@ mod tests {
         assert!(workflow.quick_history_cache.is_empty());
         assert!(workflow.sustained_stats_cache.is_empty());
         assert!(workflow.last_single_node.is_none());
-    }
-
-    #[test]
-    fn streaming_view_requires_both_gates_and_uses_lexicographic_ranking() {
-        let mut workflow = workflow(None);
-        for (node, p95, cold) in [
-            ("throughput", 200, 80),
-            ("success", 200, 80),
-            ("p95", 100, 80),
-            ("cold", 100, 40),
-            ("degraded", 10, 10),
-        ] {
-            workflow.set_reachability_assessment("select", reachable(node, [cold, p95, p95]));
-            workflow.set_sustained_quality(
-                "select",
-                sustained(node, if node == "throughput" { 2_000 } else { 1_000 }),
-            );
-        }
-        workflow.set_reachability_assessment(
-            "select",
-            NodeReachabilityAssessment::from_attempts(
-                "degraded".into(),
-                vec![
-                    ProbeOutcome::Reachable { delay_ms: 10 },
-                    ProbeOutcome::Timeout,
-                    ProbeOutcome::Timeout,
-                ],
-            ),
-        );
-        workflow.sustained_stats_cache.insert(
-            ("select".into(), "success".into()),
-            SustainedSuccessStats {
-                successes: 2,
-                attempts: 2,
-            },
-        );
-        for node in ["p95", "cold"] {
-            workflow.sustained_stats_cache.insert(
-                ("select".into(), node.into()),
-                SustainedSuccessStats {
-                    successes: 1,
-                    attempts: 2,
-                },
-            );
-        }
-
-        let members = ["cold", "degraded", "p95", "success", "throughput"].map(str::to_string);
-        assert_eq!(
-            workflow.streaming_members("select", &members),
-            vec!["throughput", "success", "cold", "p95"]
-        );
-    }
-
-    #[test]
-    fn streaming_projection_remains_coherent_after_generation_change() {
-        let path = test_db_path();
-        let store = BenchmarkStore::open(&path).unwrap();
-        store
-            .reconcile_node_history(&serde_json::json!({
-                "outbounds": [{"type":"direct", "tag":"node-a"}]
-            }))
-            .unwrap();
-        let assessment = reachable("node-a", [20, 30, 40]);
-        store
-            .record_reachability_assessment("select", &assessment)
-            .unwrap();
-        store
-            .record_sustained_quality(
-                "select",
-                &default_target_identity(),
-                &sustained("node-a", 2_000),
-            )
-            .unwrap();
-        let mut workflow = workflow(Some(store));
-        workflow.sustained_stats_cache.clear();
-
-        let sustained_quality = workflow
-            .sustained_quality
-            .get(&("select".into(), "node-a".into()))
-            .unwrap();
-        assert_eq!(
-            workflow.sustained_stats_current("select", "node-a", sustained_quality),
-            SustainedSuccessStats {
-                successes: 1,
-                attempts: 1,
-            }
-        );
-
-        let projection = workflow.streaming_projection("select", &["node-a".into()]);
-        assert_eq!(projection.len(), 1);
-
-        let reconciler = BenchmarkStore::open(&path).unwrap();
-        reconciler
-            .reconcile_node_history(&serde_json::json!({
-                "outbounds": [{"type":"direct", "tag":"node-b"}]
-            }))
-            .unwrap();
-
-        // The old frame owns one internally consistent copy, while a fresh frame observes the
-        // generation fence and fails closed instead of mixing old membership with missing facts.
-        assert_eq!(projection[0].name, "node-a");
-        assert_eq!(projection[0].assessment, assessment);
-        assert_eq!(
-            projection[0].completion.throughput_bytes_per_second,
-            512 * 1024 * 1_000 / 500
-        );
-        assert_eq!(
-            projection[0].sustained_stats,
-            SustainedSuccessStats {
-                successes: 1,
-                attempts: 1,
-            }
-        );
-        assert!(
-            workflow
-                .streaming_projection("select", &["node-a".into()])
-                .is_empty()
-        );
-
-        drop(reconciler);
-        drop(workflow);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

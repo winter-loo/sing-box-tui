@@ -2,6 +2,7 @@
   "id": "agy-gemini",
   "label": "Agy Gemini",
   "ranking": "balanced",
+  "visible": true,
   "executable": "../../../scripts/agy-gemini-node-probe.py",
   "args": ["--tui-jsonl"]
 }

@@ -2,6 +2,7 @@
   "id": "agy-gemini",
   "label": "Agy Gemini",
   "ranking": "balanced",
+  "visible": true,
   "executable": "C:\\Path\\To\\python.exe",
   "args": ["C:\\Path\\To\\sing-box-tui\\scripts\\agy-gemini-node-probe.py", "--tui-jsonl"]
 }

@@ -483,18 +483,24 @@ After the config references the local rule-set, press `b` in the TUI to edit byp
 
 ## Node quality and node-view panels
 
-The Current selector panel always shows every selector member in selector order. The Streaming
-panel contains only nodes with an eligible quick assessment and a completed bounded sustained
-probe, ranked by throughput policy. Each valid local usability-probe manifest contributes another
+The Current selector panel always shows every selector member in selector order. Streaming is a
+bundled custom usability probe and is visible by default. Press `U` on its tab to run an HTTPS
+prefilter followed by a bounded 512 KiB transfer through an isolated runtime for each surviving
+node. Nodes enter the panel only after that custom probe accepts them, and are ranked by throughput.
+GitHub SSH and Agy Gemini are also bundled, but their tabs are hidden by default. A local manifest
+can show either one without an external adapter, or hide/replace any bundled criterion by using the
+same stable ID. The Agy probe resolves `agy` from `PATH`, or from
+`SING_BOX_TUI_AGY_EXECUTABLE`. Each additional local usability-probe manifest contributes another
 panel; a node may belong to several panels, and the active panel defines both visible candidates
-and the automatic-selection candidate boundary.
+and the automatic-selection boundary.
 
 `T` runs three sequential quick probe attempts per node through the live controller, with different
 nodes processed concurrently up to the configured cap. `t` performs that quick assessment and a
-bounded 512 KiB sustained-quality probe for the highlighted node. Sustained transfer and executable
-usability criteria use isolated runtimes and never change the live selector. `i` opens factual probe
-outcomes, reachability assessment, sustained quality, usability-criterion results, expiry, and the
-latest automatic-selection explanation.
+bounded 512 KiB sustained-quality probe for the highlighted node. `U` runs the active usability
+criterion, including Streaming and any visible configured criterion. Sustained transfer and
+executable or bundled usability criteria use isolated runtimes and never change the live selector.
+`i` opens factual probe outcomes, reachability assessment, sustained quality, usability-criterion
+results, expiry, and the latest automatic-selection explanation.
 
 See [usability-probe manifests](docs/usability-probe-manifests.md) for registration, direct argument
 execution, background permission, schedules, resource limits, result expiry, and the Agy example.
@@ -535,8 +541,8 @@ Detached auto-pick worker commands are available separately:
 - `Left` / `Right` while the candidate pane is focused: move between Current selector, Streaming, and custom usability-criterion panels
 - `T`: run a three-attempt quick reachability assessment for the current panel/selector scope
 - `t`: run a complete quick-plus-sustained assessment for the highlighted node
-- `U`: manually run the active custom usability criterion
-- `P`: grant or revoke independent background permission for the active custom criterion when its manifest permits scheduling
+- `U`: manually run the active usability criterion, including the default Streaming probe
+- `P`: grant or revoke independent background permission for the active usability criterion when its manifest permits scheduling
 - `a`: toggle panel-aware automatic selection; the background worker requires two complete winning rounds, a same-tier 20% material improvement, and no active current-node transfer before switching
 - `i`: show node-quality evidence and the latest automatic-selection explanation; use `j` / `k` to scroll
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately

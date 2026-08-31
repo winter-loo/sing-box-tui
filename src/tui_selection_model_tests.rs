@@ -1,13 +1,205 @@
-use super::super::test_support::{internet_routes_app, test_app};
+use super::super::test_support::{install_streaming_probe_run, internet_routes_app, test_app};
 use super::live_usability_members;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
-use crate::benchmark_workflow::BenchmarkUpdate;
-use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ProxyGroup};
-use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
+use crate::benchmark_workflow::{BenchmarkUpdate, BenchmarkWorkflow, ManagedRuntimeObservation};
+use crate::controller::{ApiClient, NodeReachabilityAssessment, ProbeOutcome, ProxyGroup};
+use crate::storage::{
+    StoredUsabilityProbeRun, UsabilityProbeFactRecord, UsabilityProbeRunFinalization,
+};
 use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
 use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const SPACE_SELECTION_CHILD_ENV: &str = "SING_BOX_TUI_SPACE_SELECTION_CHILD";
+
+fn space_selection_test_path(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sing-box-tui-space-selection-{label}-{nanos}-{}.sqlite3",
+        rand::random::<u64>()
+    ))
+}
+
+fn spawn_selection_controller() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind selection controller");
+    let address = listener.local_addr().expect("selection controller address");
+    let worker = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept selection request");
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap_or_default();
+            let request = String::from_utf8_lossy(&request[..count]);
+            let (status, body) = if request.starts_with("PUT ") {
+                ("204 No Content", "")
+            } else if request.contains(" /configs ") {
+                ("200 OK", r#"{"mode":"rule","mode-list":["rule"]}"#)
+            } else {
+                (
+                    "200 OK",
+                    r#"{"proxies":{"select":{"name":"select","type":"Selector","now":"node-a","all":["node-a"]},"node-a":{"name":"node-a","type":"Direct"}}}"#,
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write selection response");
+        }
+    });
+    (format!("http://{address}"), worker)
+}
+
+fn remove_space_selection_files(database_path: &Path, config_path: &Path) {
+    let mut paths =
+        crate::node_quality_path::node_quality_reserved_paths(database_path).unwrap_or_default();
+    paths.push(config_path.to_path_buf());
+    if let Ok(config_lock) = crate::node_quality_path::config_mutation_lock_path(config_path) {
+        paths.push(config_lock);
+    }
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn candidate_space_selection_child() {
+    let Ok(database_path) = std::env::var(SPACE_SELECTION_CHILD_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let config_path = database_path.with_extension("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"outbounds":[{"type":"selector","tag":"select","outbounds":["node-a"]},{"type":"direct","tag":"node-a"}]}"#,
+    )
+    .expect("write selection config");
+    let (controller, controller_worker) = spawn_selection_controller();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("selection HTTP client");
+    let mut workflow = BenchmarkWorkflow::open(
+        controller.clone(),
+        http.clone(),
+        &config_path,
+        &database_path,
+        crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL,
+    )
+    .expect("open persisted selection workflow");
+    workflow
+        .confirm_managed_runtime_reload(&config_path, &database_path, || {
+            Ok(ManagedRuntimeObservation::new(
+                (),
+                config_path.clone(),
+                controller.clone(),
+                Some(std::process::id()),
+            ))
+        })
+        .expect("confirm selection runtime");
+    let (run_id, generation, process_lease) = workflow
+        .begin_usability_probe_run("agy-gemini", "select")
+        .expect("begin selection probe run");
+    let facts = [UsabilityProbeFactRecord {
+        node: "node-a".to_string(),
+        usable: true,
+        detail: Some("accepted".to_string()),
+    }];
+    assert!(
+        workflow
+            .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+                run_id,
+                generation,
+                process_lease: &process_lease,
+                complete: true,
+                summary: Some("accepted"),
+                diagnostic: None,
+                facts: &facts,
+                result_ttl: None,
+            })
+            .expect("finish selection probe run")
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("selection API runtime");
+    let mut app = test_app();
+    app.client = ApiClient {
+        base_url: controller,
+        runtime,
+        client: http,
+    };
+    app.benchmark_workflow = workflow;
+    let criterion = NodeViewId::new("agy-gemini").expect("Agy criterion ID");
+    app.node_view_panel = super::super::NodeViewPanel::Custom(criterion.clone());
+    app.benchmark_filter.clear();
+    app.usability_probe_projection_cache.insert(
+        (criterion, "select".to_string()),
+        StoredUsabilityProbeRun {
+            run_id,
+            completed_at_ms: 1,
+            expires_at_ms: None,
+            summary: Some("accepted".to_string()),
+            latest_attempt: None,
+            results: facts.to_vec(),
+        },
+    );
+    assert_eq!(app.displayed_members(), ["node-a"]);
+
+    assert!(
+        app.handle_key(KeyCode::Char(' '))
+            .expect("Space selection should complete")
+    );
+    controller_worker
+        .join()
+        .expect("selection controller exits");
+    drop(app);
+    drop(process_lease);
+    remove_space_selection_files(&database_path, &config_path);
+}
+
+#[test]
+fn space_on_candidate_panel_does_not_deadlock_the_ui() {
+    let database_path = space_selection_test_path("parent");
+    let config_path = database_path.with_extension("config.json");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "tui::app::selection_model::tests::candidate_space_selection_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SPACE_SELECTION_CHILD_ENV, &database_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn Space selection child");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll Space selection child") {
+            remove_space_selection_files(&database_path, &config_path);
+            assert!(status.success(), "Space selection child failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            remove_space_selection_files(&database_path, &config_path);
+            panic!("Space selection deadlocked while refreshing a candidate panel");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[test]
 fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
@@ -19,6 +211,7 @@ fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
                 node: "accepted".to_string(),
                 usable: true,
                 detail: None,
+                sustained_quality: None,
             },
         ),
         (
@@ -27,6 +220,7 @@ fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
                 node: "rejected".to_string(),
                 usable: false,
                 detail: None,
+                sustained_quality: None,
             },
         ),
     ]
@@ -213,6 +407,7 @@ fn streaming_panel_filters_ranks_and_preserves_selector_members() {
             },
         );
     }
+    install_streaming_probe_run(&mut app, 1, &[("node-a", true), ("node-b", true)]);
 
     assert_eq!(app.node_view_counts(), (3, 2));
     assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
@@ -249,6 +444,62 @@ fn arrow_keys_switch_tabs_only_while_candidate_pane_is_focused() {
 }
 
 #[test]
+fn bundled_streaming_tab_is_visible_while_specialized_probes_start_hidden() {
+    let mut app = test_app();
+
+    let snapshot = app.view_snapshot();
+    assert_eq!(
+        snapshot
+            .node_view_tabs
+            .iter()
+            .map(|tab| tab.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Current selector", "Streaming"]
+    );
+
+    let github = app
+        .usability_probe_manifests
+        .iter_mut()
+        .find(|manifest| manifest.id.as_str() == "github-ssh")
+        .expect("bundled GitHub SSH manifest");
+    github.visible = true;
+    app.usability_probe_manifests
+        .iter_mut()
+        .find(|manifest| manifest.id.as_str() == "agy-gemini")
+        .expect("bundled Agy Gemini manifest")
+        .visible = true;
+    let snapshot = app.view_snapshot();
+    assert_eq!(
+        snapshot
+            .node_view_tabs
+            .iter()
+            .map(|tab| tab.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Current selector", "Streaming", "GitHub SSH", "Agy Gemini"]
+    );
+
+    app.usability_probe_manifests
+        .iter_mut()
+        .find(|manifest| manifest.id == NodeViewId::streaming())
+        .expect("bundled Streaming manifest")
+        .visible = false;
+    let snapshot = app.view_snapshot();
+    assert_eq!(
+        snapshot
+            .node_view_tabs
+            .iter()
+            .map(|tab| tab.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Current selector", "GitHub SSH", "Agy Gemini"]
+    );
+    app.move_node_view_next();
+    assert_eq!(
+        app.node_view_panel,
+        super::super::NodeViewPanel::Custom(NodeViewId::new("github-ssh").unwrap())
+    );
+}
+
+#[test]
 fn discovered_custom_tab_starts_untested_then_projects_only_current_selector_members() {
     let mut app = test_app();
     app.benchmark_filter.clear();
@@ -263,6 +514,7 @@ fn discovered_custom_tab_starts_untested_then_projects_only_current_selector_mem
         result_ttl: None,
         timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("github-web.json"),
+        visible: true,
     });
 
     app.move_node_view_next();
@@ -339,6 +591,7 @@ fn custom_panel_identity_survives_manifest_reordering_and_missing_files() {
         result_ttl: None,
         timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from(format!("{id}.json")),
+        visible: true,
     };
     app.usability_probe_manifests = vec![manifest("alpha", "Alpha"), manifest("beta", "Beta")];
     let beta = NodeViewId::new("beta").unwrap();
@@ -348,8 +601,8 @@ fn custom_panel_identity_survives_manifest_reordering_and_missing_files() {
     app.usability_probe_manifests.swap(0, 1);
     {
         let snapshot = app.view_snapshot();
-        assert_eq!(snapshot.active_node_view_tab, 2);
-        assert_eq!(snapshot.node_view_tabs[2].label, "Beta");
+        assert_eq!(snapshot.active_node_view_tab, 1);
+        assert_eq!(snapshot.node_view_tabs[1].label, "Beta");
     }
     assert_eq!(
         app.runtime_state().active_node_view.as_ref(),
@@ -360,9 +613,9 @@ fn custom_panel_identity_survives_manifest_reordering_and_missing_files() {
     app.usability_probe_manifests.clear();
     assert!(app.displayed_members().is_empty());
     let snapshot = app.view_snapshot();
-    assert_eq!(snapshot.active_node_view_tab, 2);
-    assert_eq!(snapshot.node_view_tabs[2].label, "Unavailable (beta)");
-    assert_eq!(snapshot.node_view_tabs[2].count, 0);
+    assert_eq!(snapshot.active_node_view_tab, 1);
+    assert_eq!(snapshot.node_view_tabs[1].label, "Unavailable (beta)");
+    assert_eq!(snapshot.node_view_tabs[1].count, 0);
     assert_eq!(app.auto_select_node_view, beta);
 }
 
@@ -381,6 +634,7 @@ fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
         result_ttl: None,
         timeout: std::time::Duration::from_secs(600),
         source_path: PathBuf::from("ordered.json"),
+        visible: true,
     });
     app.usability_probe_projection_cache.insert(
         (NodeViewId::new("ordered").unwrap(), "select".to_string()),
@@ -454,6 +708,7 @@ fn expired_custom_results_remain_visible_but_cannot_enter_candidates() {
         result_ttl: Some(std::time::Duration::from_secs(1)),
         timeout: std::time::Duration::from_secs(30),
         source_path: PathBuf::from("expiring.json"),
+        visible: true,
     });
     app.usability_probe_projection_cache.insert(
         (id.clone(), "select".to_string()),
@@ -503,6 +758,7 @@ fn empty_streaming_panel_makes_member_actions_safe_no_ops() {
 #[test]
 fn projection_update_resynchronizes_a_streaming_selection_that_disappears() {
     let mut app = test_app();
+    app.benchmark_filter.clear();
     app.groups[0].members = vec!["node-a".into(), "node-b".into()];
     for node in ["node-a", "node-b"] {
         app.benchmark_workflow.set_reachability_assessment(
@@ -529,6 +785,7 @@ fn projection_update_resynchronizes_a_streaming_selection_that_disappears() {
             },
         );
     }
+    install_streaming_probe_run(&mut app, 1, &[("node-a", true), ("node-b", true)]);
     app.move_node_view_next();
     assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
 

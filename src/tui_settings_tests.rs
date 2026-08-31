@@ -1,4 +1,4 @@
-use super::super::test_support::test_app;
+use super::super::test_support::{install_streaming_probe_run, test_app};
 use crossterm::event::KeyCode;
 
 use super::{
@@ -179,6 +179,7 @@ fn sustained_target_setting_requires_account_free_https() {
 #[test]
 fn changing_sustained_target_resynchronizes_streaming_selection() {
     let mut app = test_app();
+    app.benchmark_filter.clear();
     let target_a = "https://a.example.test/payload?bytes=524288";
     let target_b = "https://b.example.test/payload?bytes=524288";
     let nanos = std::time::SystemTime::now()
@@ -231,6 +232,7 @@ fn changing_sustained_target_resynchronizes_streaming_selection() {
             ),
         );
     }
+    install_streaming_probe_run(&mut app, 1, &[("node-a", true), ("node-b", true)]);
     app.move_node_view_next();
     assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
 

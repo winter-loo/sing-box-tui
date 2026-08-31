@@ -658,6 +658,140 @@ impl NodeRuntimeManager {
     }
 }
 
+/// In-process adapter for application-specific usability probes. It exposes only ordered
+/// candidate traversal and the currently bound loopback proxy; JSON-RPC and runtime lifecycle
+/// remain private implementation details of this module.
+pub(crate) struct NodeRuntimeTraversal {
+    manager: NodeRuntimeManager,
+    runtime_id: Option<String>,
+    proxy_url: String,
+    candidates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TraversalCandidate {
+    pub(crate) node: String,
+    pub(crate) reachable: bool,
+    pub(crate) scanned: usize,
+}
+
+impl NodeRuntimeTraversal {
+    pub(crate) fn start(
+        config_path: &Path,
+        sing_box_executable: &Path,
+        candidates: &[String],
+        prefilter_url: &str,
+        connectivity_timeout_ms: u64,
+    ) -> Result<Self> {
+        let manager = NodeRuntimeManager::default();
+        manager
+            .initialize(&json!({
+                "config_path": config_path,
+                "sing_box_executable": sing_box_executable,
+            }))
+            .map_err(manager_error)?;
+        let response = manager
+            .create_runtime(&json!({
+                "url": prefilter_url,
+                "connectivity_timeout_ms": connectivity_timeout_ms,
+                "candidates": candidates,
+            }))
+            .map_err(manager_error)?;
+        let runtime_id = response
+            .get("runtime_id")
+            .and_then(Value::as_str)
+            .context("node runtime creation omitted runtime_id")?
+            .to_string();
+        let proxy_url = response
+            .get("proxy")
+            .and_then(|proxy| proxy.get("http"))
+            .and_then(Value::as_str)
+            .context("node runtime creation omitted HTTP proxy")?
+            .to_string();
+        let returned_candidates = response
+            .get("candidates")
+            .and_then(Value::as_array)
+            .context("node runtime creation omitted candidates")?
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .as_str()
+                    .map(str::to_string)
+                    .context("node runtime returned a non-string candidate")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if returned_candidates != candidates {
+            bail!("node runtime candidate scope changed during creation");
+        }
+        Ok(Self {
+            manager,
+            runtime_id: Some(runtime_id),
+            proxy_url,
+            candidates: returned_candidates,
+        })
+    }
+
+    pub(crate) fn proxy_url(&self) -> &str {
+        &self.proxy_url
+    }
+
+    pub(crate) fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<TraversalCandidate>> {
+        let runtime_id = self
+            .runtime_id
+            .as_deref()
+            .context("node runtime traversal is already complete")?;
+        let response = self
+            .manager
+            .next_step(&json!({"runtime_id": runtime_id}))
+            .map_err(manager_error);
+        self.manager.complete_next(runtime_id);
+        let response = response?;
+        if response.get("end").and_then(Value::as_bool) == Some(true) {
+            self.runtime_id = None;
+            return Ok(None);
+        }
+        let node = response
+            .get("node")
+            .and_then(|node| node.get("tag"))
+            .and_then(Value::as_str)
+            .context("node runtime traversal omitted candidate tag")?
+            .to_string();
+        let reachable = response
+            .get("reachable")
+            .and_then(Value::as_bool)
+            .context("node runtime traversal omitted reachability")?;
+        let scanned = response
+            .get("scanned")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .context("node runtime traversal omitted scanned count")?;
+        Ok(Some(TraversalCandidate {
+            node,
+            reachable,
+            scanned,
+        }))
+    }
+}
+
+impl Drop for NodeRuntimeTraversal {
+    fn drop(&mut self) {
+        if let Some(runtime_id) = self.runtime_id.take() {
+            let _ = self
+                .manager
+                .close_runtime(&json!({"runtime_id": runtime_id}));
+        }
+        self.manager.close_all();
+    }
+}
+
+fn manager_error(error: ManagerError) -> anyhow::Error {
+    anyhow!("{}: {}", error.code, error.message)
+}
+
 struct NodeRuntime {
     id: String,
     url: String,

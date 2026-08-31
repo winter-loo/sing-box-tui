@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 
 use super::App;
 use crate::automatic_selection::{
-    AutoSelectionExplanation, AutoSelectionPlan, AutoSelectionReason, NodeQualityFacts,
-    NodeViewProjection, PanelMembership, ReachabilityTier, SelectionScope,
+    AutoSelectionExplanation, AutoSelectionPlan, AutoSelectionReason, NodeViewProjection,
+    PanelMembership, ReachabilityTier, SelectionScope,
 };
 use crate::benchmark_workflow::{
     BenchmarkCompletion, BenchmarkStart, BenchmarkUpdate, SustainedKind,
@@ -269,7 +269,6 @@ impl App {
 
     fn cached_auto_selection_panel_revision(&self, group: &ProxyGroup) -> u64 {
         if self.auto_select_node_view == crate::automatic_selection::NodeViewId::current_selector()
-            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming()
         {
             return 0;
         }
@@ -282,14 +281,11 @@ impl App {
     }
 
     fn auto_selection_evidence_members_for_group(&self, group: &ProxyGroup) -> Vec<String> {
-        let built_in_view = self.auto_select_node_view
+        // Current selector owns every member. Usability panels, including Streaming, own a strict
+        // Included-only boundary established by their latest complete custom run.
+        let mut candidates = if self.auto_select_node_view
             == crate::automatic_selection::NodeViewId::current_selector()
-            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming();
-        // Decision projection stays Included-only, but evidence acquisition is intentionally
-        // wider: an Untested Streaming node must be probed before it can ever earn membership.
-        // Future manifest views can provide their own discovery projection instead of inheriting
-        // this built-in selector-wide behavior.
-        let mut candidates = if built_in_view {
+        {
             self.benchmark_candidates_for_group(group)
         } else {
             let projection = self.cached_custom_node_view_projection(
@@ -318,10 +314,9 @@ impl App {
         candidates
     }
 
-    fn built_in_auto_selection_panel_projection(
+    fn current_selector_auto_selection_panel_projection(
         &self,
         group: &ProxyGroup,
-        facts: &[NodeQualityFacts],
     ) -> NodeViewProjection {
         let members = group
             .members
@@ -333,26 +328,6 @@ impl App {
                     == crate::automatic_selection::NodeViewId::current_selector()
                 {
                     PanelMembership::Included
-                } else if self.auto_select_node_view
-                    == crate::automatic_selection::NodeViewId::streaming()
-                {
-                    match facts.iter().find(|facts| facts.node == *node) {
-                        Some(facts)
-                            if facts.reachability.is_some_and(|tier| tier.successes() >= 2)
-                                && facts.throughput_bytes_per_second.is_some() =>
-                        {
-                            PanelMembership::Included
-                        }
-                        Some(facts) if facts.reachability.is_none() => {
-                            if facts.recent_quick_rounds == 0 {
-                                PanelMembership::Untested
-                            } else {
-                                PanelMembership::Incomplete
-                            }
-                        }
-                        Some(_) => PanelMembership::Rejected,
-                        None => PanelMembership::Untested,
-                    }
                 } else {
                     // Unknown IDs belong to future manifest panels. Until their projection is
                     // registered, fail closed instead of silently expanding to every selector node.
@@ -367,7 +342,6 @@ impl App {
                 crate::automatic_selection::CURRENT_SELECTOR_VIEW_ID => {
                     "Current selector".to_string()
                 }
-                crate::automatic_selection::STREAMING_VIEW_ID => "Streaming".to_string(),
                 id => id.to_string(),
             },
             ranking_policy: self.auto_select_ranking_policy,
@@ -438,9 +412,8 @@ impl App {
         }
         let panel = if self.auto_select_node_view
             == crate::automatic_selection::NodeViewId::current_selector()
-            || self.auto_select_node_view == crate::automatic_selection::NodeViewId::streaming()
         {
-            self.built_in_auto_selection_panel_projection(&group, &facts)
+            self.current_selector_auto_selection_panel_projection(&group)
         } else {
             // The render cache is never authority for a selector write. Re-read custom membership
             // under the same generation lease that `AutoSelectionPlan` keeps alive through every

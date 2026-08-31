@@ -2,6 +2,7 @@
   "id": "github-ssh",
   "label": "GitHub SSH",
   "ranking": "low-latency",
+  "visible": true,
   "timeout_seconds": 600,
   "executable": "C:\\Path\\To\\python.exe",
   "args": ["C:\\Path\\To\\sing-box-tui\\scripts\\github-ssh-node-probe.py"]

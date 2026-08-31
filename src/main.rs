@@ -7,6 +7,7 @@ mod atomic_file;
 mod auto_pick;
 mod automatic_selection;
 mod benchmark_workflow;
+mod builtin_usability_probe;
 mod clash;
 mod cli;
 mod config;

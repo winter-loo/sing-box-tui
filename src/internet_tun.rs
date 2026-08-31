@@ -494,7 +494,10 @@ mod tests {
                 return;
             }
             assert!(Instant::now() < deadline, "config mutation timed out");
-            std::thread::yield_now();
+            // On Windows, a zero-delay read loop can repeatedly reopen the destination while the
+            // worker is trying to atomically replace it. Leave a small scheduling window for the
+            // write instead of turning this assertion helper into file-system contention.
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 

@@ -279,6 +279,39 @@ fn probe_one_node(
             };
         }
     };
+    probe_sustained_via_proxy(name, isolated.http_proxy_url(), target, cancelled)
+}
+
+/// Runs the same bounded transfer through a traversal runtime that has already selected a node.
+/// This is the adapter used by the built-in Streaming custom criterion; target validation,
+/// headers, redirects, byte count, timeouts, and cancellation remain identical to ordinary
+/// sustained-quality measurements.
+pub(crate) fn probe_sustained_over_proxy(
+    name: String,
+    proxy_url: &str,
+    target_url: &str,
+    cancelled: &AtomicBool,
+) -> NodeSustainedQuality {
+    let target = match ValidatedSustainedTarget::parse(target_url) {
+        Ok(target) => target,
+        Err(_) => {
+            return NodeSustainedQuality {
+                name,
+                outcome: SustainedProbeOutcome::RuntimeFailed {
+                    detail: "invalid sustained target".to_string(),
+                },
+            };
+        }
+    };
+    probe_sustained_via_proxy(name, proxy_url.to_string(), &target, cancelled)
+}
+
+fn probe_sustained_via_proxy(
+    name: String,
+    proxy_url: String,
+    target: &ValidatedSustainedTarget,
+    cancelled: &AtomicBool,
+) -> NodeSustainedQuality {
     // Runtime construction and direct node binding have their own startup bound. Sustained
     // timing begins only once the candidate-bound data channel is ready to carry the transfer.
     let started = Instant::now();
@@ -302,7 +335,6 @@ fn probe_one_node(
             };
         }
     };
-    let proxy_url = isolated.http_proxy_url();
     let outcome = runtime
         .block_on(async {
             tokio::select! {

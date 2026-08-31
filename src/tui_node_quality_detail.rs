@@ -185,6 +185,7 @@ mod tests {
             result_ttl: None,
             timeout: std::time::Duration::from_secs(60),
             source_path: std::path::PathBuf::from("agy.json"),
+            visible: true,
         });
         app.usability_probe_projection_cache.insert(
             (NodeViewId::new("agy").unwrap(), "select".to_string()),

@@ -16,7 +16,9 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::task::JoinSet;
 
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
+use crate::builtin_usability_probe::{BuiltinProbeContext, BuiltinProbeKind, run_builtin_probe};
 use crate::controller::{ProbeOutcome, measure_usability_probe_outcome};
+use crate::sustained_quality::NodeSustainedQuality;
 
 pub(crate) const USABILITY_PROBE_DIRECTORY_ENV: &str = "SING_BOX_TUI_USABILITY_PROBE_DIR";
 const PROBE_CANDIDATES_ENV: &str = "SING_BOX_TUI_USABILITY_CANDIDATES";
@@ -57,6 +59,7 @@ pub(crate) enum UsabilityProbeSource {
         executable: PathBuf,
         args: Vec<String>,
     },
+    Builtin(BuiltinProbeKind),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +73,7 @@ pub(crate) struct UsabilityProbeManifest {
     pub(crate) result_ttl: Option<Duration>,
     pub(crate) timeout: Duration,
     pub(crate) source_path: PathBuf,
+    pub(crate) visible: bool,
 }
 
 impl UsabilityProbeManifest {
@@ -95,16 +99,36 @@ pub(crate) struct UsabilityProbeNodeResult {
     pub(crate) node: String,
     pub(crate) usable: bool,
     pub(crate) detail: Option<String>,
+    /// Built-in Streaming attaches its attributable transfer result so the ordinary node-quality
+    /// store remains the single source of throughput facts. External programs cannot inject this
+    /// trusted measurement.
+    pub(crate) sustained_quality: Option<NodeSustainedQuality>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UsabilityProbeProgress {
-    pub(crate) https_scanned: usize,
-    pub(crate) https_total: usize,
-    pub(crate) tcp_completed: usize,
-    pub(crate) tcp_total: usize,
+    #[serde(alias = "https_scanned")]
+    pub(crate) stage_one_completed: usize,
+    #[serde(alias = "https_total")]
+    pub(crate) stage_one_total: usize,
+    #[serde(alias = "tcp_completed")]
+    pub(crate) stage_two_completed: usize,
+    #[serde(alias = "tcp_total")]
+    pub(crate) stage_two_total: usize,
+    #[serde(default = "default_stage_one_label")]
+    pub(crate) stage_one_label: String,
+    #[serde(default = "default_stage_two_label")]
+    pub(crate) stage_two_label: String,
     pub(crate) accepted: usize,
+}
+
+fn default_stage_one_label() -> String {
+    "HTTPS".to_string()
+}
+
+fn default_stage_two_label() -> String {
+    "TCP 22".to_string()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +155,21 @@ pub(crate) struct UsabilityProbeJob {
     receiver: Receiver<UsabilityProbeJobEvent>,
     worker: Option<JoinHandle<()>>,
     cancellation: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundedProbeProcessExit {
+    Completed(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedProbeProcessOutput {
+    pub(crate) exit: BoundedProbeProcessExit,
+    pub(crate) elapsed: Duration,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 struct SpawnedProgramGuard {
@@ -242,6 +281,8 @@ struct ManifestDocument {
     #[serde(default)]
     args: Option<Vec<String>>,
     #[serde(default)]
+    builtin: Option<BuiltinProbeKind>,
+    #[serde(default)]
     background: bool,
     #[serde(default)]
     interval_seconds: Option<u64>,
@@ -249,6 +290,13 @@ struct ManifestDocument {
     ttl_seconds: Option<u64>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    #[serde(default = "default_true")]
+    visible: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct UsabilityProbeExecutionContext {
+    pub(crate) builtin: BuiltinProbeContext,
 }
 
 pub(crate) fn usability_probe_manifest_directory(config_path: &Path) -> PathBuf {
@@ -344,6 +392,68 @@ pub(crate) fn discover_usability_probe_manifests(
     Ok(discovery)
 }
 
+/// Prepends the probes shipped in the executable and lets a user manifest with the same stable
+/// ID replace either default. This keeps release packaging self-contained while preserving the
+/// manifest directory as the user-configuration seam.
+pub(crate) fn with_default_usability_probe_manifests(
+    mut discovery: UsabilityProbeDiscovery,
+) -> UsabilityProbeDiscovery {
+    let mut manifests = default_usability_probe_manifests();
+    for configured in discovery.manifests.drain(..) {
+        if let Some(index) = manifests
+            .iter()
+            .position(|manifest| manifest.id == configured.id)
+        {
+            manifests[index] = configured;
+        } else {
+            manifests.push(configured);
+        }
+    }
+    discovery.manifests = manifests;
+    discovery
+}
+
+fn default_usability_probe_manifests() -> Vec<UsabilityProbeManifest> {
+    vec![
+        UsabilityProbeManifest {
+            id: NodeViewId::streaming(),
+            label: "Streaming".to_string(),
+            ranking_policy: RankingPolicy::Throughput,
+            source: UsabilityProbeSource::Builtin(BuiltinProbeKind::Streaming),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
+            source_path: PathBuf::from("<builtin:streaming>"),
+            visible: true,
+        },
+        UsabilityProbeManifest {
+            id: NodeViewId::new("github-ssh").expect("built-in ID is valid"),
+            label: "GitHub SSH".to_string(),
+            ranking_policy: RankingPolicy::LowLatency,
+            source: UsabilityProbeSource::Builtin(BuiltinProbeKind::GithubSsh),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
+            source_path: PathBuf::from("<builtin:github-ssh>"),
+            visible: false,
+        },
+        UsabilityProbeManifest {
+            id: NodeViewId::new("agy-gemini").expect("built-in ID is valid"),
+            label: "Agy Gemini".to_string(),
+            ranking_policy: RankingPolicy::Balanced,
+            source: UsabilityProbeSource::Builtin(BuiltinProbeKind::AgyGemini),
+            background: false,
+            interval: None,
+            result_ttl: None,
+            timeout: DEFAULT_PROGRAM_TIMEOUT,
+            source_path: PathBuf::from("<builtin:agy-gemini>"),
+            visible: false,
+        },
+    ]
+}
+
 pub(crate) fn load_usability_probe_manifest(path: &Path) -> Result<UsabilityProbeManifest> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect manifest {}", path.display()))?;
@@ -373,11 +483,28 @@ pub(crate) fn load_usability_probe_manifest(path: &Path) -> Result<UsabilityProb
     manifest_from_document(document, path)
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_usability_probe_job(
+    manifest: UsabilityProbeManifest,
+    selector_members: Vec<String>,
+    controller_base_url: String,
+    client: AsyncClient,
+) -> Result<UsabilityProbeJob> {
+    spawn_usability_probe_job_with_context(
+        manifest,
+        selector_members,
+        controller_base_url,
+        client,
+        None,
+    )
+}
+
+pub(crate) fn spawn_usability_probe_job_with_context(
     manifest: UsabilityProbeManifest,
     mut selector_members: Vec<String>,
     controller_base_url: String,
     client: AsyncClient,
+    execution: Option<UsabilityProbeExecutionContext>,
 ) -> Result<UsabilityProbeJob> {
     if selector_members.is_empty() {
         bail!(
@@ -460,6 +587,21 @@ pub(crate) fn spawn_usability_probe_job(
                     );
                 })
                 .context("failed to start executable usability probe worker")?
+        }
+        UsabilityProbeSource::Builtin(kind) => {
+            let execution = execution.context("built-in usability probe context is unavailable")?;
+            thread::Builder::new()
+                .name(format!("usability-builtin-{}", manifest.id))
+                .spawn(move || {
+                    run_builtin_probe(
+                        kind,
+                        selector_members,
+                        execution.builtin,
+                        sender,
+                        worker_cancellation,
+                    );
+                })
+                .context("failed to start built-in usability probe worker")?
         }
     };
     Ok(UsabilityProbeJob {
@@ -635,11 +777,13 @@ fn url_result_from_outcome(
             node,
             usable: true,
             detail: Some(format!("live HTTP response in {delay_ms}ms")),
+            sustained_quality: None,
         }),
         ProbeOutcome::Timeout => Ok(UsabilityProbeNodeResult {
             node,
             usable: false,
             detail: Some("live HTTP response timed out".to_string()),
+            sustained_quality: None,
         }),
         ProbeOutcome::TransportFailure { detail } => Err(format!(
             "failed to reach the Clash controller while probing {node}: {}",
@@ -649,6 +793,7 @@ fn url_result_from_outcome(
             node,
             usable: false,
             detail: Some("target did not return a valid HTTP response".to_string()),
+            sustained_quality: None,
         }),
         ProbeOutcome::ControllerFailure { status } => Err(format!(
             "controller returned HTTP {status} while probing {node}"
@@ -817,6 +962,7 @@ fn run_program_probe(
                             node: node.clone(),
                             usable,
                             detail: detail.map(bounded_result_detail),
+                            sustained_quality: None,
                         };
                         results.insert(node, result.clone());
                         let _ = sender.send(UsabilityProbeJobEvent::Progress(result));
@@ -1150,10 +1296,10 @@ fn parse_program_output(line: &str) -> std::result::Result<ProgramOutput, String
                 validate_program_node_name(node)?;
             }
             if let Some(progress) = progress
-                && (progress.https_scanned > progress.https_total
-                    || progress.tcp_total > progress.https_scanned
-                    || progress.tcp_completed > progress.tcp_total
-                    || progress.accepted > progress.tcp_completed)
+                && (progress.stage_one_completed > progress.stage_one_total
+                    || progress.stage_two_total > progress.stage_one_completed
+                    || progress.stage_two_completed > progress.stage_two_total
+                    || progress.accepted > progress.stage_two_completed)
             {
                 return Err("usability probe progress counters are inconsistent".to_string());
             }
@@ -1183,6 +1329,129 @@ fn validate_program_node_name(node: &str) -> std::result::Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Runs one child behind the same process-tree containment used by executable manifests while
+/// retaining only bounded output. Built-in adapters use this seam for third-party CLIs without
+/// learning the platform-specific Job Object/process-group lifecycle.
+pub(crate) fn run_bounded_probe_process(
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: &AtomicBool,
+) -> Result<BoundedProbeProcessOutput> {
+    #[derive(Clone, Copy)]
+    enum StopReason {
+        Completed,
+        TimedOut,
+        Cancelled,
+    }
+
+    configure_probe_process_tree(command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let process_started = Instant::now();
+    let mut child = command.spawn().context("failed to start probe process")?;
+    let containment = match ProbeProcessContainment::attach(&child) {
+        Ok(containment) => containment,
+        Err(error) => {
+            kill_and_wait(&mut child);
+            return Err(error);
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_wait(&mut child);
+            drop(containment);
+            bail!("probe process stdout was not piped");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_and_wait(&mut child);
+            drop(containment);
+            bail!("probe process stderr was not piped");
+        }
+    };
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let stdout_worker = thread::Builder::new()
+        .name("bounded-probe-stdout".to_string())
+        .spawn(move || {
+            let _ = stdout_sender.send(read_bounded_stderr(stdout));
+        });
+    if let Err(error) = stdout_worker {
+        kill_and_wait(&mut child);
+        drop(containment);
+        bail!("failed to start bounded probe stdout reader: {error}");
+    }
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    let stderr_worker = thread::Builder::new()
+        .name("bounded-probe-stderr".to_string())
+        .spawn(move || {
+            let _ = stderr_sender.send(read_bounded_stderr(stderr));
+        });
+    if let Err(error) = stderr_worker {
+        terminate_probe_process_tree(&mut child);
+        drop(containment);
+        let _ = child.wait();
+        let _ = stdout_receiver.recv_timeout(Duration::from_secs(1));
+        bail!("failed to start bounded probe stderr reader: {error}");
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut observation_error = None;
+    let stop_reason = loop {
+        if cancellation.load(Ordering::Relaxed) {
+            terminate_probe_process_tree(&mut child);
+            break StopReason::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            terminate_probe_process_tree(&mut child);
+            break StopReason::TimedOut;
+        }
+        match probe_process_running_without_reaping(&mut child) {
+            Ok(false) => break StopReason::Completed,
+            Ok(true) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                observation_error = Some(error);
+                terminate_probe_process_tree(&mut child);
+                break StopReason::Cancelled;
+            }
+        }
+    };
+    let elapsed = process_started.elapsed();
+    // A successful group leader can leave descendants holding inherited pipes. Close the
+    // containment before collecting output so those descendants cannot make reader completion
+    // unbounded. On Unix the leader PID remains reserved until wait below.
+    if matches!(stop_reason, StopReason::Completed) {
+        terminate_probe_process_tree(&mut child);
+    }
+    drop(containment);
+    let waited = child.wait().context("failed to wait for probe process")?;
+    let exit = match stop_reason {
+        StopReason::Completed => BoundedProbeProcessExit::Completed(waited),
+        StopReason::TimedOut => BoundedProbeProcessExit::TimedOut,
+        StopReason::Cancelled => BoundedProbeProcessExit::Cancelled,
+    };
+    let reader_timeout = Duration::from_secs(1);
+    let stdout = stdout_receiver
+        .recv_timeout(reader_timeout)
+        .context("probe process stdout reader did not finish after cleanup")?;
+    let stderr = stderr_receiver
+        .recv_timeout(reader_timeout)
+        .context("probe process stderr reader did not finish after cleanup")?;
+    if let Some(error) = observation_error {
+        return Err(error).context("failed to observe probe process");
+    }
+    Ok(BoundedProbeProcessOutput {
+        exit,
+        elapsed,
+        stdout,
+        stderr,
+    })
 }
 
 fn read_protocol_lines(
@@ -1344,8 +1613,13 @@ fn manifest_from_document(
 ) -> Result<UsabilityProbeManifest> {
     validate_manifest_id(&document.id)?;
     validate_manifest_label(&document.label)?;
-    let source = match (document.url, document.executable, document.args) {
-        (Some(url), None, None) => {
+    let source = match (
+        document.url,
+        document.executable,
+        document.args,
+        document.builtin,
+    ) {
+        (Some(url), None, None, None) => {
             let parsed = reqwest::Url::parse(url.trim())
                 .with_context(|| format!("manifest '{}' has an invalid URL", document.id))?;
             if parsed.scheme() != "https" {
@@ -1362,7 +1636,7 @@ fn manifest_from_document(
             }
             UsabilityProbeSource::Url(parsed.to_string())
         }
-        (None, Some(executable), Some(args)) => {
+        (None, Some(executable), Some(args), None) => {
             validate_executable(&document.id, &executable, &args)?;
             let executable = PathBuf::from(executable.trim());
             let executable = if executable.is_absolute() {
@@ -1375,19 +1649,21 @@ fn manifest_from_document(
             };
             UsabilityProbeSource::Executable { executable, args }
         }
-        (Some(_), Some(_), _) => bail!(
-            "manifest '{}' must declare exactly one of url or executable",
+        (None, None, None, Some(builtin)) => UsabilityProbeSource::Builtin(builtin),
+        (Some(_), Some(_), _, _) | (Some(_), _, _, Some(_)) | (_, Some(_), _, Some(_)) => bail!(
+            "manifest '{}' must declare exactly one of url, executable, or builtin",
             document.id
         ),
-        (Some(_), None, Some(_)) => {
+        (Some(_), None, Some(_), None) => {
             bail!("manifest '{}' URL form must not declare args", document.id)
         }
-        (None, Some(_), None) => bail!(
+        (None, Some(_), None, None) => bail!(
             "manifest '{}' executable form requires an args array",
             document.id
         ),
-        (None, None, _) => bail!(
-            "manifest '{}' must declare exactly one of url or executable",
+        (None, None, Some(_), _) => bail!("manifest '{}' args require executable", document.id),
+        (None, None, None, None) => bail!(
+            "manifest '{}' must declare exactly one of url, executable, or builtin",
             document.id
         ),
     };
@@ -1430,6 +1706,7 @@ fn manifest_from_document(
         result_ttl,
         timeout,
         source_path: path.to_path_buf(),
+        visible: document.visible,
     })
 }
 
@@ -1467,7 +1744,7 @@ fn validate_manifest_id(id: &str) -> Result<()> {
     {
         bail!("manifest id may contain only lowercase ASCII letters, digits, '.', '_' and '-'");
     }
-    if matches!(id, "current-selector" | "streaming") {
+    if id == "current-selector" {
         bail!("manifest id '{id}' is reserved for a built-in node view");
     }
     Ok(())
@@ -1525,7 +1802,7 @@ mod tests {
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::TcpListener;
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1543,6 +1820,107 @@ mod tests {
             std::env::temp_dir().join(format!("sing-box-tui-usability-{label}-{nanos}-{counter}"));
         fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    #[test]
+    fn built_in_custom_catalog_defaults_streaming_visible_and_specialized_probes_hidden() {
+        let discovery = with_default_usability_probe_manifests(UsabilityProbeDiscovery::default());
+        let streaming = discovery
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id == NodeViewId::streaming())
+            .expect("Streaming is bundled");
+        assert!(streaming.visible);
+        assert_eq!(
+            streaming.source,
+            UsabilityProbeSource::Builtin(BuiltinProbeKind::Streaming)
+        );
+        let github = discovery
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id.as_str() == "github-ssh")
+            .expect("GitHub SSH is bundled");
+        assert!(!github.visible);
+        assert_eq!(
+            github.source,
+            UsabilityProbeSource::Builtin(BuiltinProbeKind::GithubSsh)
+        );
+        let agy = discovery
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id.as_str() == "agy-gemini")
+            .expect("Agy Gemini is bundled");
+        assert!(!agy.visible);
+        assert_eq!(
+            agy.source,
+            UsabilityProbeSource::Builtin(BuiltinProbeKind::AgyGemini)
+        );
+    }
+
+    #[test]
+    fn user_manifests_override_built_in_probe_visibility_by_stable_id() {
+        let directory = temp_dir("builtin-overrides");
+        fs::write(
+            directory.join("github-ssh.json"),
+            r#"{
+                "id":"github-ssh",
+                "label":"GitHub SSH",
+                "ranking":"low-latency",
+                "builtin":"github-ssh",
+                "visible":true
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("streaming.json"),
+            r#"{
+                "id":"streaming",
+                "label":"Streaming",
+                "ranking":"throughput",
+                "builtin":"streaming",
+                "visible":false
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("agy-gemini.json"),
+            r#"{
+                "id":"agy-gemini",
+                "label":"Agy Gemini",
+                "ranking":"balanced",
+                "builtin":"agy-gemini",
+                "visible":true
+            }"#,
+        )
+        .unwrap();
+
+        let discovery = discover_usability_probe_manifests(&directory).unwrap();
+        let discovery = with_default_usability_probe_manifests(discovery);
+        assert!(
+            discovery
+                .manifests
+                .iter()
+                .find(|manifest| manifest.id.as_str() == "github-ssh")
+                .unwrap()
+                .visible
+        );
+        assert!(
+            !discovery
+                .manifests
+                .iter()
+                .find(|manifest| manifest.id == NodeViewId::streaming())
+                .unwrap()
+                .visible
+        );
+        assert!(
+            discovery
+                .manifests
+                .iter()
+                .find(|manifest| manifest.id.as_str() == "agy-gemini")
+                .unwrap()
+                .visible
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1575,11 +1953,12 @@ mod tests {
             measured_progress,
             ProgramOutput::Progress {
                 progress: Some(UsabilityProbeProgress {
-                    https_scanned: 44,
-                    https_total: 108,
-                    tcp_completed: 3,
-                    tcp_total: 17,
+                    stage_one_completed: 44,
+                    stage_one_total: 108,
+                    stage_two_completed: 3,
+                    stage_two_total: 17,
                     accepted: 2,
+                    ..
                 }),
                 ..
             }
@@ -1619,16 +1998,20 @@ mod tests {
                     "label":"Agy Gemini",
                     "ranking":"balanced",
                     "executable":"fixture-probe",
-                    "args":["--marker","{}"]
+                    "args":["--marker",{}]
                 }}"#,
-                marker.display()
+                serde_json::to_string(&marker.display().to_string()).unwrap()
             ),
         )
         .expect("write executable manifest");
 
         let discovered =
             discover_usability_probe_manifests(&directory).expect("discover manifests");
-        assert!(discovered.diagnostics.is_empty());
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            discovered.diagnostics
+        );
         assert_eq!(
             discovered
                 .manifests
@@ -1810,6 +2193,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("fixture.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -1847,6 +2231,36 @@ mod tests {
     }
 
     #[test]
+    fn bounded_probe_process_captures_output_and_enforces_timeout() {
+        let directory = temp_dir("bounded-process");
+        let executable = compile_program_fixture(&directory);
+        let cancellation = AtomicBool::new(false);
+
+        let mut completed = Command::new(&executable);
+        completed.arg("--controls");
+        let output =
+            run_bounded_probe_process(&mut completed, Duration::from_secs(5), &cancellation)
+                .expect("bounded fixture completes");
+        assert!(matches!(
+            output.exit,
+            BoundedProbeProcessExit::Completed(status) if status.success()
+        ));
+        assert!(output.stdout.contains("node-a"));
+        assert!(output.stderr.contains("stderr value"));
+
+        let mut stalled = Command::new(&executable);
+        stalled.arg("--timeout");
+        let started = Instant::now();
+        let output =
+            run_bounded_probe_process(&mut stalled, Duration::from_millis(100), &cancellation)
+                .expect("bounded fixture times out cleanly");
+        assert_eq!(output.exit, BoundedProbeProcessExit::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        fs::remove_dir_all(directory).expect("remove bounded process fixture");
+    }
+
+    #[test]
     fn cancellation_joins_after_more_than_sixty_four_unconsumed_progress_events() {
         let directory = temp_dir("cancel-progress-flood");
         let executable = compile_program_fixture(&directory);
@@ -1864,6 +2278,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("progress-flood.json"),
+            visible: true,
         };
         let selector_members = (0..128).map(|index| format!("node-{index}")).collect();
         let client = AsyncClient::builder()
@@ -1921,6 +2336,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("stdout-eof.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -1977,6 +2393,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("process-tree.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -2029,6 +2446,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: directory.join("fixture-controls.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -2091,6 +2509,7 @@ mod tests {
                     DEFAULT_PROGRAM_TIMEOUT
                 },
                 source_path: directory.join("failure.json"),
+                visible: true,
             };
             let mut job = spawn_usability_probe_job(
                 manifest,
@@ -2154,6 +2573,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: PathBuf::from("web.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -2227,6 +2647,7 @@ mod tests {
             result_ttl: None,
             timeout: DEFAULT_PROGRAM_TIMEOUT,
             source_path: PathBuf::from("web-failures.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()
@@ -2385,6 +2806,7 @@ mod tests {
             result_ttl: None,
             timeout: Duration::from_secs(60),
             source_path: PathBuf::from("cancel-url.json"),
+            visible: true,
         };
         let client = AsyncClient::builder()
             .no_proxy()

@@ -223,63 +223,84 @@ impl App {
             return Vec::new();
         };
         let group = self.selected_member_panel_group().unwrap_or(group);
-        match &self.node_view_panel {
-            NodeViewPanel::Streaming => {
-                return self
-                    .benchmark_workflow
-                    .streaming_members(&group.name, &group.members);
-            }
-            NodeViewPanel::Custom(manifest_id) => {
-                if let Some((pending, results)) =
-                    self.custom_usability_live_projection(manifest_id, &group.name)
-                {
-                    return live_usability_members(
-                        &group.members,
-                        pending.as_ref().map(|(node, _)| node.as_str()),
-                        &results,
-                    );
-                }
-                let projection = self.cached_custom_node_view_projection(
-                    manifest_id,
-                    &group.name,
+        if let Some(manifest_id) = self.active_usability_manifest_id() {
+            if let Some((pending, results)) =
+                self.custom_usability_live_projection(&manifest_id, &group.name)
+            {
+                return live_usability_members(
                     &group.members,
+                    pending.as_ref().map(|(node, _)| node.as_str()),
+                    &results,
                 );
-                let mut displayed = group
-                    .members
-                    .iter()
-                    .filter(|member| {
-                        projection.membership(member)
-                            == crate::automatic_selection::PanelMembership::Included
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let facts = self
-                    .benchmark_workflow
-                    .node_quality_facts_from_cache(&group.name, &group.members);
-                let facts = facts
-                    .iter()
-                    .map(|facts| (facts.node.as_str(), facts))
-                    .collect::<BTreeMap<_, _>>();
-                displayed.sort_by(|left, right| {
-                    match (facts.get(left.as_str()), facts.get(right.as_str())) {
-                        (Some(left), Some(right)) => {
-                            crate::automatic_selection::compare_node_quality(
-                                projection.ranking_policy,
-                                left,
-                                right,
-                            )
-                            .reverse()
-                        }
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => Ordering::Equal,
-                    }
-                });
-                return displayed;
             }
-            NodeViewPanel::CurrentSelector => {}
+            let projection =
+                self.cached_custom_node_view_projection(&manifest_id, &group.name, &group.members);
+            let mut displayed = group
+                .members
+                .iter()
+                .filter(|member| {
+                    projection.membership(member)
+                        == crate::automatic_selection::PanelMembership::Included
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let facts = self
+                .benchmark_workflow
+                .node_quality_facts_from_cache(&group.name, &group.members);
+            let facts = facts
+                .iter()
+                .map(|facts| (facts.node.as_str(), facts))
+                .collect::<BTreeMap<_, _>>();
+            displayed.sort_by(|left, right| {
+                match (facts.get(left.as_str()), facts.get(right.as_str())) {
+                    (Some(left), Some(right)) => crate::automatic_selection::compare_node_quality(
+                        projection.ranking_policy,
+                        left,
+                        right,
+                    )
+                    .reverse(),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                }
+            });
+            return displayed;
         }
         group.members.clone()
+    }
+
+    pub(super) fn active_usability_manifest_id(
+        &self,
+    ) -> Option<crate::automatic_selection::NodeViewId> {
+        match &self.node_view_panel {
+            NodeViewPanel::Streaming => Some(crate::automatic_selection::NodeViewId::streaming()),
+            NodeViewPanel::Custom(id) => Some(id.clone()),
+            NodeViewPanel::CurrentSelector => None,
+        }
+    }
+
+    pub(super) fn visible_usability_manifests(
+        &self,
+    ) -> impl Iterator<Item = &crate::usability_probe::UsabilityProbeManifest> {
+        self.usability_probe_manifests
+            .iter()
+            .filter(|manifest| manifest.visible)
+    }
+
+    pub(super) fn node_view_id_is_visible(
+        &self,
+        id: &crate::automatic_selection::NodeViewId,
+    ) -> bool {
+        if id == &crate::automatic_selection::NodeViewId::current_selector() {
+            return true;
+        }
+        self.usability_probe_manifests
+            .iter()
+            .find(|manifest| &manifest.id == id)
+            .map(|manifest| manifest.visible)
+            // A missing plug-in can be installed again later. Preserve its stable persisted ID;
+            // only a manifest that is present and explicitly hidden should be suppressed.
+            .unwrap_or(true)
     }
 
     #[cfg(test)]
@@ -289,9 +310,17 @@ impl App {
         };
         (
             group.members.len(),
-            self.benchmark_workflow
-                .streaming_projection(&group.name, &group.members)
-                .len(),
+            self.cached_custom_node_view_projection(
+                &crate::automatic_selection::NodeViewId::streaming(),
+                &group.name,
+                &group.members,
+            )
+            .members
+            .values()
+            .filter(|membership| {
+                **membership == crate::automatic_selection::PanelMembership::Included
+            })
+            .count(),
         )
     }
 
@@ -338,33 +367,29 @@ impl App {
 
     fn node_view_ids(&self) -> Vec<crate::automatic_selection::NodeViewId> {
         std::iter::once(crate::automatic_selection::NodeViewId::current_selector())
-            .chain(std::iter::once(
-                crate::automatic_selection::NodeViewId::streaming(),
-            ))
             .chain(
-                self.usability_probe_manifests
-                    .iter()
+                self.visible_usability_manifests()
                     .map(|manifest| manifest.id.clone()),
             )
             .collect()
     }
 
     fn node_view_panel_from_index(&self, index: usize) -> NodeViewPanel {
-        match index {
-            0 => NodeViewPanel::CurrentSelector,
-            1 => NodeViewPanel::Streaming,
-            index => self
-                .usability_probe_manifests
-                .get(index - 2)
-                .map(|manifest| NodeViewPanel::Custom(manifest.id.clone()))
-                .unwrap_or_default(),
-        }
+        self.node_view_ids()
+            .get(index)
+            .map(NodeViewPanel::from_id)
+            .unwrap_or_default()
     }
 
     pub(super) fn active_node_view_label(&self) -> String {
         match &self.node_view_panel {
             NodeViewPanel::CurrentSelector => "current selector".to_string(),
-            NodeViewPanel::Streaming => "Streaming".to_string(),
+            NodeViewPanel::Streaming => self
+                .usability_probe_manifests
+                .iter()
+                .find(|manifest| manifest.id == crate::automatic_selection::NodeViewId::streaming())
+                .map(|manifest| manifest.label.clone())
+                .unwrap_or_else(|| "Streaming".to_string()),
             NodeViewPanel::Custom(id) => self
                 .usability_probe_manifests
                 .iter()
@@ -377,17 +402,14 @@ impl App {
     pub(super) fn active_node_view_ranking_policy(
         &self,
     ) -> crate::automatic_selection::RankingPolicy {
-        self.node_view_panel
-            .builtin_ranking_policy()
-            .or_else(|| {
-                let NodeViewPanel::Custom(id) = &self.node_view_panel else {
-                    return None;
-                };
+        self.active_usability_manifest_id()
+            .and_then(|id| {
                 self.usability_probe_manifests
                     .iter()
-                    .find(|manifest| &manifest.id == id)
+                    .find(|manifest| manifest.id == id)
                     .map(|manifest| manifest.ranking_policy)
             })
+            .or_else(|| self.node_view_panel.builtin_ranking_policy())
             .unwrap_or(crate::automatic_selection::RankingPolicy::Balanced)
     }
 

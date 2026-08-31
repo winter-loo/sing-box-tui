@@ -5,13 +5,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::automatic_selection::{NodeViewId, NodeViewProjection, PanelMembership, RankingPolicy};
+use crate::builtin_usability_probe::{AGY_EXECUTABLE_ENV, BuiltinProbeContext};
 use crate::storage::{
     NodeQualityReadLease, StoredUsabilityProbeRun, UsabilityProbeFactRecord,
     UsabilityProbeRunFinalization,
 };
 use crate::usability_probe::{
-    UsabilityProbeJob, UsabilityProbeJobEvent, UsabilityProbeNodeResult, UsabilityProbeProgress,
-    spawn_usability_probe_job, usability_presentation_text,
+    UsabilityProbeExecutionContext, UsabilityProbeJob, UsabilityProbeJobEvent,
+    UsabilityProbeNodeResult, UsabilityProbeProgress, spawn_usability_probe_job_with_context,
+    usability_presentation_text,
 };
 
 use super::App;
@@ -33,19 +35,21 @@ pub(super) struct ActiveUsabilityProbe {
     progress: Option<UsabilityProbeProgress>,
     result_ttl: Option<Duration>,
     background: bool,
+    quality_persistence_error: Option<String>,
     job: UsabilityProbeJob,
 }
 
 impl App {
     pub(super) fn start_manual_usability_probe(&mut self) {
         if self.usability_probe_job.is_some() {
-            self.set_status_only("A custom usability probe is already running");
+            self.set_status_only("A usability probe is already running");
             return;
         }
         let manifest_id = match &self.node_view_panel {
+            NodeViewPanel::Streaming => NodeViewId::streaming(),
             NodeViewPanel::Custom(id) => id.clone(),
             _ => {
-                self.set_status_only("Select a custom node-view tab before pressing U");
+                self.set_status_only("Select a usability node-view tab before pressing U");
                 return;
             }
         };
@@ -77,16 +81,40 @@ impl App {
         background: bool,
     ) -> Result<()> {
         if self.usability_probe_job.is_some() {
-            bail!("a custom usability probe is already running");
+            bail!("a usability probe is already running");
         }
+        let execution = match &manifest.source {
+            crate::usability_probe::UsabilityProbeSource::Builtin(_) => {
+                let (config_path, sing_box_executable) = self
+                    .sustained_runtime_environment
+                    .clone()
+                    .context("managed runtime environment is unavailable")?;
+                Some(UsabilityProbeExecutionContext {
+                    builtin: BuiltinProbeContext {
+                        config_path,
+                        sing_box_executable,
+                        streaming_prefilter_url: self.benchmark_url.clone(),
+                        streaming_target_url: self.sustained_target_url.clone(),
+                        connectivity_timeout_ms: self.benchmark_timeout_ms,
+                        agy_executable: std::env::var_os(AGY_EXECUTABLE_ENV)
+                            .filter(|value| !value.is_empty())
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("agy")),
+                    },
+                })
+            }
+            crate::usability_probe::UsabilityProbeSource::Url(_)
+            | crate::usability_probe::UsabilityProbeSource::Executable { .. } => None,
+        };
         let (run_id, generation, process_lease) = self
             .benchmark_workflow
             .begin_usability_probe_run(manifest.id.as_str(), &group.name)?;
-        let job = spawn_usability_probe_job(
+        let job = spawn_usability_probe_job_with_context(
             manifest.clone(),
             group.members.clone(),
             self.client.base_url.clone(),
             self.client.client.clone(),
+            execution,
         )
         .map_err(|error| {
             let diagnostic = format!("failed to launch usability probe: {error:#}");
@@ -112,12 +140,13 @@ impl App {
             process_lease,
             selector_member_count: group.members.len(),
             received: BTreeMap::new(),
-            stage: "Starting probe program and isolated runtime...".to_string(),
+            stage: "Starting usability probe...".to_string(),
             current_node: None,
             current_node_started_at: None,
             progress: None,
             result_ttl: manifest.result_ttl,
             background,
+            quality_persistence_error: None,
             job,
         });
         self.set_status_only(format!(
@@ -129,11 +158,10 @@ impl App {
     }
 
     pub(super) fn toggle_background_usability_probe(&mut self) -> Result<()> {
-        let NodeViewPanel::Custom(manifest_id) = &self.node_view_panel else {
-            self.set_status_only("Select a custom node-view tab before pressing P");
+        let Some(manifest_id) = self.active_usability_manifest_id() else {
+            self.set_status_only("Select a usability node-view tab before pressing P");
             return Ok(());
         };
-        let manifest_id = manifest_id.clone();
         let Some(manifest) = self
             .usability_probe_manifests
             .iter()
@@ -272,6 +300,31 @@ impl App {
             match event {
                 UsabilityProbeJobEvent::Progress(result) => {
                     let latest_result = result.clone();
+                    let quality_persistence = result.sustained_quality.as_ref().map(|quality| {
+                        let active = self
+                            .usability_probe_job
+                            .as_ref()
+                            .expect("progress requires an active usability probe");
+                        self.benchmark_workflow.record_custom_sustained_quality(
+                            &active.selector,
+                            active.generation,
+                            quality,
+                        )
+                    });
+                    let persistence_diagnostic = match quality_persistence {
+                        Some(Err(error)) => Some(format!(
+                            "failed to persist Streaming throughput evidence: {error:#}"
+                        )),
+                        Some(Ok(false)) => {
+                            Some("Streaming throughput evidence became stale".to_string())
+                        }
+                        Some(Ok(true)) | None => None,
+                    };
+                    if let Some(diagnostic) = persistence_diagnostic {
+                        if let Some(active) = self.usability_probe_job.as_mut() {
+                            active.quality_persistence_error = Some(diagnostic);
+                        }
+                    }
                     let (manifest_id, received_count, selector_member_count) = {
                         let Some(active) = self.usability_probe_job.as_mut() else {
                             continue;
@@ -322,11 +375,15 @@ impl App {
                     self.sync_selection_to_displayed_members();
                     self.set_status_only(message);
                 }
-                UsabilityProbeJobEvent::Finished(completion) => {
+                UsabilityProbeJobEvent::Finished(mut completion) => {
                     let Some(mut active) = self.usability_probe_job.take() else {
                         continue;
                     };
                     active.job.join();
+                    if let Some(diagnostic) = active.quality_persistence_error.take() {
+                        completion.complete = false;
+                        completion.diagnostic = Some(diagnostic);
+                    }
                     let facts = completion
                         .results
                         .iter()
@@ -508,7 +565,12 @@ impl App {
         selector_members: &[String],
     ) -> NodeViewProjection {
         let run = self.custom_usability_run(manifest_id, selector, selector_members);
-        self.custom_node_view_projection_from_run(manifest_id, selector_members, run.as_ref())
+        self.custom_node_view_projection_from_run(
+            manifest_id,
+            selector,
+            selector_members,
+            run.as_ref(),
+        )
     }
 
     pub(super) fn leased_custom_node_view_projection(
@@ -545,12 +607,18 @@ impl App {
         } else {
             None
         };
-        Ok(self.custom_node_view_projection_from_run(manifest_id, selector_members, run.as_ref()))
+        Ok(self.custom_node_view_projection_from_run(
+            manifest_id,
+            selector,
+            selector_members,
+            run.as_ref(),
+        ))
     }
 
     fn custom_node_view_projection_from_run(
         &self,
         manifest_id: &NodeViewId,
+        selector: &str,
         selector_members: &[String],
         run: Option<&StoredUsabilityProbeRun>,
     ) -> NodeViewProjection {
@@ -579,6 +647,16 @@ impl App {
                     PanelMembership::Rejected
                 } else {
                     match results.get(node.as_str()) {
+                        Some(true)
+                            if manifest_id == &NodeViewId::streaming()
+                                && self
+                                    .benchmark_workflow
+                                    .sustained_quality(selector, node)
+                                    .and_then(|quality| quality.completed())
+                                    .is_none() =>
+                        {
+                            PanelMembership::Untested
+                        }
                         Some(true) => PanelMembership::Included,
                         Some(false) => PanelMembership::Rejected,
                         None => PanelMembership::Untested,
@@ -799,6 +877,7 @@ mod tests {
                 node: "node-a".to_string(),
                 usable: false,
                 detail: Some("login\nfailed\t\u{1b}[31m".to_string()),
+                sustained_quality: None,
             },
         );
 
@@ -830,6 +909,7 @@ mod tests {
             result_ttl: None,
             timeout: Duration::from_secs(30),
             source_path: std::path::PathBuf::from("fixture.json"),
+            visible: true,
         };
         app.usability_probe_manifests = vec![
             manifest(permitted.clone(), true),

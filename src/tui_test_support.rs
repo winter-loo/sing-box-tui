@@ -15,6 +15,8 @@ use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
 use crate::internet_tun::{InternetTunTransaction, PersistedInternetTun};
 use crate::managed_sing_box::ManagedSingBox;
 use crate::node_quality_path::default_benchmark_db_path_for_config;
+use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
+use crate::usability_probe::{UsabilityProbeDiscovery, with_default_usability_probe_manifests};
 
 static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -69,6 +71,8 @@ pub(super) fn test_app() -> App {
         unique_test_suffix()
     ));
 
+    let probe_discovery =
+        with_default_usability_probe_manifests(UsabilityProbeDiscovery::default());
     App {
         client: api_client,
         groups: vec![ProxyGroup {
@@ -97,8 +101,8 @@ pub(super) fn test_app() -> App {
         benchmark_max_concurrency: DEFAULT_BENCHMARK_MAX_CONCURRENCY,
         verify_targets: super::default_verification_targets_setting(),
         benchmark_workflow,
-        usability_probe_manifests: Vec::new(),
-        usability_probe_diagnostics: Vec::new(),
+        usability_probe_manifests: probe_discovery.manifests,
+        usability_probe_diagnostics: probe_discovery.diagnostics,
         usability_probe_job: None,
         usability_probe_projection_cache: std::collections::BTreeMap::new(),
         background_probe_enabled: std::collections::BTreeSet::new(),
@@ -162,6 +166,30 @@ pub(super) fn test_app() -> App {
         private_access_progress: None,
         private_access_auth: None,
     }
+}
+
+pub(super) fn install_streaming_probe_run(app: &mut App, run_id: i64, results: &[(&str, bool)]) {
+    app.usability_probe_projection_cache.insert(
+        (
+            crate::automatic_selection::NodeViewId::streaming(),
+            "select".to_string(),
+        ),
+        StoredUsabilityProbeRun {
+            run_id,
+            completed_at_ms: u64::try_from(run_id).unwrap_or_default(),
+            expires_at_ms: None,
+            summary: Some("built-in Streaming probe completed".to_string()),
+            latest_attempt: None,
+            results: results
+                .iter()
+                .map(|(node, usable)| UsabilityProbeFactRecord {
+                    node: (*node).to_string(),
+                    usable: *usable,
+                    detail: None,
+                })
+                .collect(),
+        },
+    );
 }
 
 pub(super) fn private_access_progress_text(app: &App) -> String {

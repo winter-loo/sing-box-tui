@@ -2,7 +2,7 @@ use super::super::test_support::{test_app, test_db_path};
 use crate::automatic_selection::{AutoSelectionExplanation, NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::{BenchmarkWorkflow, ManagedRuntimeObservation};
 use crate::controller::{NodeReachabilityAssessment, ProbeOutcome};
-use crate::storage::{BenchmarkStore, UsabilityProbeRunFinalization};
+use crate::storage::{BenchmarkStore, UsabilityProbeFactRecord, UsabilityProbeRunFinalization};
 use crate::sustained_quality::{
     DEFAULT_SUSTAINED_TARGET_URL, NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
     sustained_target_identity,
@@ -117,6 +117,7 @@ fn restarted_worker_defers_recent_incomplete_probe_from_shared_sqlite() {
         result_ttl: Some(Duration::from_secs(300)),
         timeout: Duration::from_secs(60),
         source_path: PathBuf::from("agy.json"),
+        visible: true,
     });
     app.background_probe_enabled.insert(manifest_id.clone());
     app.background_probe_selectors
@@ -161,6 +162,61 @@ fn completed_sustained(node: &str, throughput: u64) -> NodeSustainedQuality {
             throughput_bytes_per_second: throughput,
         }),
     }
+}
+
+fn persist_streaming_probe_run(workflow: &mut BenchmarkWorkflow, results: &[(&str, bool)]) {
+    let facts = results
+        .iter()
+        .map(|(node, usable)| UsabilityProbeFactRecord {
+            node: (*node).to_string(),
+            usable: *usable,
+            detail: None,
+        })
+        .collect::<Vec<_>>();
+    let (run_id, generation, process_lease) = workflow
+        .begin_usability_probe_run(NodeViewId::streaming().as_str(), "select")
+        .expect("begin persisted Streaming probe run");
+    workflow
+        .finish_usability_probe_run_with_ttl(UsabilityProbeRunFinalization {
+            run_id,
+            generation,
+            process_lease: &process_lease,
+            complete: true,
+            summary: Some("built-in Streaming probe completed"),
+            diagnostic: None,
+            facts: &facts,
+            result_ttl: None,
+        })
+        .expect("finish persisted Streaming probe run");
+}
+
+fn persist_streaming_probe_run_in_store(store: &BenchmarkStore, results: &[(&str, bool)]) {
+    let facts = results
+        .iter()
+        .map(|(node, usable)| UsabilityProbeFactRecord {
+            node: (*node).to_string(),
+            usable: *usable,
+            detail: None,
+        })
+        .collect::<Vec<_>>();
+    let generation = store.quality_generation();
+    let (run_id, run_generation) = store
+        .begin_usability_probe_run(NodeViewId::streaming().as_str(), "select", generation)
+        .expect("begin persisted Streaming probe run")
+        .expect("quality generation remains current");
+    assert_eq!(run_generation, generation);
+    assert!(
+        store
+            .finish_usability_probe_run(
+                run_id,
+                generation,
+                true,
+                Some("built-in Streaming probe completed"),
+                None,
+                &facts,
+            )
+            .expect("finish persisted Streaming probe run")
+    );
 }
 
 fn remove_shared_quality_fixture(config_path: &Path, database_path: &Path) {
@@ -248,6 +304,7 @@ fn live_background_config_moves_selector_and_streaming_facts_to_one_target_parti
             )
             .expect("persist target B quality")
     );
+    persist_streaming_probe_run_in_store(&store, &[("node-b", true), ("node-c", true)]);
 
     let mut app = test_app();
     app.groups[0].members = vec![
@@ -274,6 +331,7 @@ fn live_background_config_moves_selector_and_streaming_facts_to_one_target_parti
             ),
         );
     }
+    app.refresh_usability_probe_projection_cache();
     app.move_node_view_next();
     assert_eq!(app.displayed_members(), ["node-b"]);
     app.last_auto_select_benchmark = Some(Instant::now());
@@ -388,6 +446,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     background_workflow
         .persist_quality_projection_for_test("select", &assessment, &first_sustained)
         .expect("background workflow persists quick and sustained facts");
+    persist_streaming_probe_run(&mut background_workflow, &[("node-b", true)]);
     let mut foreground = test_app();
     foreground.groups[0].members = vec!["node-a".to_string(), "node-b".to_string()];
     foreground.benchmark_filter = "node".to_string();
