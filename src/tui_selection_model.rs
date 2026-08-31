@@ -230,6 +230,15 @@ impl App {
                     .streaming_members(&group.name, &group.members);
             }
             NodeViewPanel::Custom(manifest_id) => {
+                if let Some((pending, results)) =
+                    self.custom_usability_live_projection(manifest_id, &group.name)
+                {
+                    return live_usability_members(
+                        &group.members,
+                        pending.as_ref().map(|(node, _)| node.as_str()),
+                        &results,
+                    );
+                }
                 let projection = self.cached_custom_node_view_projection(
                     manifest_id,
                     &group.name,
@@ -421,6 +430,23 @@ impl App {
             self.sync_selection_to_member_name(&next);
         }
     }
+}
+
+pub(super) fn live_usability_members(
+    selector_members: &[String],
+    current_node: Option<&str>,
+    results: &BTreeMap<String, crate::usability_probe::UsabilityProbeNodeResult>,
+) -> Vec<String> {
+    selector_members
+        .iter()
+        .filter(|member| {
+            current_node == Some(member.as_str())
+                || results
+                    .get(member.as_str())
+                    .is_some_and(|result| result.usable)
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

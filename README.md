@@ -544,7 +544,9 @@ Detached auto-pick worker commands are available separately:
 - `o`: open TUI settings for quick assessment, sustained quality, automatic selection, and system proxy values
 - `/`: change the node-name filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
 - `r`: refresh groups
-- `?`: show the help modal; use `Up` / `Down`, `j` / `k`, or mouse wheel to browse it
+- `?`: show the help modal; use `Up` / `Down` or `j` / `k` to browse it
+
+The TUI deliberately leaves terminal mouse capture disabled. Drag with the mouse to select text using your terminal's native selection and copy behavior.
 - `q`: quit
 
 During a quick assessment, rows show a brighter probing state and then `3/3`, `2/3`, `1/3`, `0/3`, or `incomplete`. Only timeout and transport failure count against a node; controller failure, invalid measurement, and cancellation leave the assessment incomplete.

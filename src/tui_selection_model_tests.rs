@@ -1,4 +1,5 @@
 use super::super::test_support::{internet_routes_app, test_app};
+use super::live_usability_members;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
 use crate::benchmark_workflow::BenchmarkUpdate;
 use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ProxyGroup};
@@ -7,6 +8,40 @@ use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, Sustai
 use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
 use std::path::PathBuf;
+
+#[test]
+fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
+    let members = ["accepted", "rejected", "checking", "untested"].map(str::to_string);
+    let results = [
+        (
+            "accepted".to_string(),
+            crate::usability_probe::UsabilityProbeNodeResult {
+                node: "accepted".to_string(),
+                usable: true,
+                detail: None,
+            },
+        ),
+        (
+            "rejected".to_string(),
+            crate::usability_probe::UsabilityProbeNodeResult {
+                node: "rejected".to_string(),
+                usable: false,
+                detail: None,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        live_usability_members(&members, Some("checking"), &results),
+        ["accepted", "checking"]
+    );
+    assert_eq!(
+        live_usability_members(&members, None, &results),
+        ["accepted"]
+    );
+}
 
 #[test]
 fn default_panel_keeps_every_selector_member_when_probe_filter_changes() {

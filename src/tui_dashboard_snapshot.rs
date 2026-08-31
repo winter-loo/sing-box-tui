@@ -1,10 +1,10 @@
 use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
-    CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
-    IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab, SettingRow,
-    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
-    truncate_for_width,
+    CandidateNotice, CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot,
+    Focus, InternetRow, IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab,
+    SettingRow, SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge,
+    settings_field_label,
 };
 use crate::benchmark_workflow::{ActiveQuickProbe, BenchmarkWorkflow};
 
@@ -53,6 +53,12 @@ impl App {
         let custom_run = match (&self.node_view_panel, selected_group) {
             (NodeViewPanel::Custom(id), Some(group)) => {
                 self.custom_usability_run(id, &group.name, &group.members)
+            }
+            _ => None,
+        };
+        let custom_live = match (&self.node_view_panel, selected_group) {
+            (NodeViewPanel::Custom(id), Some(group)) => {
+                self.custom_usability_live_projection(id, &group.name)
             }
             _ => None,
         };
@@ -119,6 +125,59 @@ impl App {
                         .collect();
                 }
                 if let NodeViewPanel::Custom(_) = &self.node_view_panel {
+                    if let Some((pending, live_results)) = custom_live.as_ref() {
+                        return displayed_members
+                            .iter()
+                            .filter_map(|member| {
+                                let is_pending =
+                                    pending.as_ref().is_some_and(|(node, _)| node == member);
+                                let result = live_results.get(member);
+                                if !is_pending && !result.is_some_and(|result| result.usable) {
+                                    return None;
+                                }
+                                let assessment = self
+                                    .benchmark_workflow
+                                    .reachability_assessment(&group.name, member);
+                                let reachability = assessment
+                                    .map(|assessment| {
+                                        split_reachability_evidence(&assessment.compact_evidence())
+                                            .0
+                                    })
+                                    .unwrap_or_else(|| "-/3".to_string());
+                                let marker = if is_pending {
+                                    pending_candidate_marker(
+                                        pending.as_ref().map(|(_, elapsed)| *elapsed).unwrap_or(0),
+                                    )
+                                } else {
+                                    result
+                                        .and_then(|result| result.detail.clone())
+                                        .unwrap_or_else(|| "criterion accepted".to_string())
+                                };
+                                Some(CandidateRow {
+                                    name: member.clone(),
+                                    is_current: group.current.as_deref() == Some(member.as_str()),
+                                    reachability,
+                                    compact_marker: if is_pending {
+                                        format!(
+                                            "• checking ({}s)",
+                                            pending
+                                                .as_ref()
+                                                .map(|(_, elapsed)| *elapsed)
+                                                .unwrap_or(0)
+                                        )
+                                    } else {
+                                        "usable".to_string()
+                                    },
+                                    marker,
+                                    tone: if is_pending {
+                                        CandidateTone::Pending
+                                    } else {
+                                        CandidateTone::Success
+                                    },
+                                })
+                            })
+                            .collect();
+                    }
                     let results = custom_run
                         .as_ref()
                         .map(|run| {
@@ -229,10 +288,11 @@ impl App {
                 };
                 let progress = match &self.node_view_panel {
                     NodeViewPanel::Custom(id) => {
-                        if let Some((received, total)) =
-                            self.custom_usability_probe_progress(id, &group.name)
+                        if self
+                            .custom_usability_probe_progress(id, &group.name)
+                            .is_some()
                         {
-                            format!(" · PROBING {received}/{total}")
+                            String::new()
                         } else {
                             let Some(run) = custom_run.as_ref() else {
                                 return format!(
@@ -245,7 +305,8 @@ impl App {
                                 state.push("EXPIRED".to_string());
                             }
                             if let Some(failure) = self.custom_usability_latest_failure(run) {
-                                state.push(format!("FAILED {}", truncate_for_width(&failure, 48)));
+                                let _ = failure;
+                                state.push("FAILED".to_string());
                             }
                             if state.is_empty() {
                                 String::new()
@@ -259,6 +320,33 @@ impl App {
                 format!("Candidates for {} [{order}]{progress}", group.name)
             })
             .unwrap_or_else(|| "Candidates [SELECTOR ORDER]".to_string());
+        let candidate_notice = match (&self.node_view_panel, selected_group) {
+            (NodeViewPanel::Custom(id), Some(group)) => {
+                if let Some(message) = self.custom_usability_probe_stage(id, &group.name) {
+                    let progress = self
+                        .custom_usability_probe_progress(id, &group.name)
+                        .map(|(received, _total, metrics)| {
+                            format_custom_probe_progress(metrics.as_ref(), received)
+                        })
+                        .unwrap_or_else(|| "Probe running".to_string());
+                    Some(CandidateNotice {
+                        title: "Probe progress".to_string(),
+                        message: format!("{progress}\n{message}"),
+                        error: false,
+                    })
+                } else {
+                    custom_run.as_ref().and_then(|run| {
+                        self.custom_usability_latest_failure(run)
+                            .map(|message| CandidateNotice {
+                                title: "Probe error".to_string(),
+                                message,
+                                error: true,
+                            })
+                    })
+                }
+            }
+            _ => None,
+        };
         let all_count = selected_group.map_or(0, |group| group.members.len());
         let streaming_count = streaming_projection.len();
         let mut node_view_tabs = vec![
@@ -404,10 +492,12 @@ impl App {
             intranet_rows,
             intranet_selected: self.private_access.focused_index,
             candidate_title,
+            candidate_notice,
             node_view_tabs,
             active_node_view_tab,
             candidate_rows,
             candidate_selected,
+            pending_animation_bright: (self.animation_started.elapsed().as_millis() / 500) % 2 == 0,
             intranet_detail,
             status,
             flash,
@@ -447,11 +537,56 @@ fn active_quick_overlay(
         })
 }
 
+fn format_custom_probe_progress(
+    metrics: Option<&crate::usability_probe::UsabilityProbeProgress>,
+    received: usize,
+) -> String {
+    metrics.map_or_else(
+        || format!("Results received {received}"),
+        |metrics| {
+            format!(
+                "HTTPS {}/{} · TCP 22 {}/{} · accepted {}",
+                metrics.https_scanned,
+                metrics.https_total,
+                metrics.tcp_completed,
+                metrics.tcp_total,
+                metrics.accepted
+            )
+        },
+    )
+}
+
+fn pending_candidate_marker(elapsed_seconds: u64) -> String {
+    format!("• checking TCP 22 ({elapsed_seconds}s)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::test_app;
     use super::super::view::CandidateTone;
+    use super::{format_custom_probe_progress, pending_candidate_marker};
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
+
+    #[test]
+    fn custom_probe_title_uses_explicit_stage_metrics() {
+        let metrics = crate::usability_probe::UsabilityProbeProgress {
+            https_scanned: 44,
+            https_total: 108,
+            tcp_completed: 3,
+            tcp_total: 17,
+            accepted: 2,
+        };
+
+        assert_eq!(
+            format_custom_probe_progress(Some(&metrics), 0),
+            "HTTPS 44/108 · TCP 22 3/17 · accepted 2"
+        );
+    }
+
+    #[test]
+    fn pending_tcp_candidate_marker_matches_working_animation_copy() {
+        assert_eq!(pending_candidate_marker(3), "• checking TCP 22 (3s)");
+    }
 
     #[test]
     fn application_snapshot_exposes_compact_reachability_evidence() {

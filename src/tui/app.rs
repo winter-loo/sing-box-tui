@@ -8,9 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -268,8 +266,9 @@ fn print_json(value: Value) -> Result<()> {
 
 fn setup_terminal() -> Result<DefaultTerminal> {
     enable_raw_mode().context("failed to enable raw mode")?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
+    // Keep mouse reporting disabled so the host terminal retains native text
+    // selection and copy behavior while the TUI is running.
+    execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
     Ok(ratatui::DefaultTerminal::new(
         ratatui::backend::CrosstermBackend::new(io::stdout()),
     )?)
@@ -277,8 +276,7 @@ fn setup_terminal() -> Result<DefaultTerminal> {
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
+    execute!(io::stdout(), LeaveAlternateScreen).context("failed to leave alternate screen")?;
     Ok(())
 }
 
@@ -314,7 +312,6 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     return Ok(());
                 }
             }
-            Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -333,8 +330,7 @@ fn suspend_terminal_for_prompt(terminal: &mut DefaultTerminal, message: &str) ->
 
 fn resume_terminal_after_prompt(terminal: &mut DefaultTerminal) -> Result<()> {
     enable_raw_mode().context("failed to re-enable raw mode")?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to re-enter alternate screen")?;
+    execute!(io::stdout(), EnterAlternateScreen).context("failed to re-enter alternate screen")?;
     terminal.clear()?;
     Ok(())
 }
@@ -386,6 +382,7 @@ struct App {
     expanded_intranet_sections: BTreeSet<String>,
     status: String,
     flash: Option<(String, Instant)>,
+    animation_started: Instant,
     benchmark_filter: String,
     benchmark_url: String,
     sustained_target_url: String,
@@ -589,6 +586,7 @@ impl App {
             expanded_intranet_sections: BTreeSet::new(),
             status: String::from("Loading proxy groups..."),
             flash: None,
+            animation_started: Instant::now(),
             benchmark_filter: String::new(),
             benchmark_url: String::from(DEFAULT_DELAY_TEST_URL),
             sustained_target_url: String::from(DEFAULT_SUSTAINED_TARGET_URL),
@@ -882,17 +880,6 @@ impl App {
             _ => {}
         }
         Ok(true)
-    }
-
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
-        if !self.show_help {
-            return;
-        }
-        match kind {
-            MouseEventKind::ScrollDown => self.move_help_next(),
-            MouseEventKind::ScrollUp => self.move_help_previous(),
-            _ => {}
-        }
     }
 
     fn selected_member_name(&self) -> Option<String> {

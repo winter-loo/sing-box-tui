@@ -19,6 +19,7 @@ use crate::automatic_selection::{NodeViewId, RankingPolicy};
 use crate::controller::{ProbeOutcome, measure_usability_probe_outcome};
 
 pub(crate) const USABILITY_PROBE_DIRECTORY_ENV: &str = "SING_BOX_TUI_USABILITY_PROBE_DIR";
+const PROBE_CANDIDATES_ENV: &str = "SING_BOX_TUI_USABILITY_CANDIDATES";
 const DEFAULT_MANIFEST_DIRECTORY: &str = "usability-probes";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_DISCOVERED_MANIFESTS: usize = 64;
@@ -96,6 +97,16 @@ pub(crate) struct UsabilityProbeNodeResult {
     pub(crate) detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UsabilityProbeProgress {
+    pub(crate) https_scanned: usize,
+    pub(crate) https_total: usize,
+    pub(crate) tcp_completed: usize,
+    pub(crate) tcp_total: usize,
+    pub(crate) accepted: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UsabilityProbeRunCompletion {
     pub(crate) complete: bool,
@@ -107,6 +118,12 @@ pub(crate) struct UsabilityProbeRunCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UsabilityProbeJobEvent {
     Progress(UsabilityProbeNodeResult),
+    Status {
+        message: String,
+        node: Option<String>,
+        candidate: bool,
+        progress: Option<UsabilityProbeProgress>,
+    },
     Finished(UsabilityProbeRunCompletion),
 }
 
@@ -185,6 +202,15 @@ impl Drop for UsabilityProbeJob {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ProgramOutput {
+    Progress {
+        message: String,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default = "default_true")]
+        candidate: bool,
+        #[serde(default)]
+        progress: Option<UsabilityProbeProgress>,
+    },
     NodeResult {
         node: String,
         usable: bool,
@@ -196,6 +222,10 @@ enum ProgramOutput {
         #[serde(default)]
         message: Option<String>,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,8 +429,11 @@ pub(crate) fn spawn_usability_probe_job(
             // manifest format, not merely an escaping convention.
             let mut command = Command::new(&executable);
             configure_probe_process_tree(&mut command);
+            let encoded_candidates = serde_json::to_string(&selector_members)
+                .context("failed to encode usability probe candidate scope")?;
             command
                 .args(&args)
+                .env(PROBE_CANDIDATES_ENV, encoded_candidates)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -727,6 +760,29 @@ fn run_program_probe(
                     continue;
                 }
                 match parse_program_output(&line) {
+                    Ok(ProgramOutput::Progress {
+                        message,
+                        node,
+                        candidate,
+                        progress,
+                    }) => {
+                        if terminal_summary.is_some() {
+                            fatal_error =
+                                Some("progress appeared after the terminal summary".to_string());
+                            if !tree_terminated {
+                                terminate_probe_process_tree(&mut child);
+                                tree_terminated = true;
+                            }
+                        } else {
+                            let node = node.filter(|node| allowed_nodes.contains(node));
+                            let _ = sender.send(UsabilityProbeJobEvent::Status {
+                                message: bounded_result_detail(message),
+                                node,
+                                candidate,
+                                progress,
+                            });
+                        }
+                    }
                     Ok(ProgramOutput::NodeResult {
                         node,
                         usable,
@@ -1078,16 +1134,32 @@ fn parse_program_output(line: &str) -> std::result::Result<ProgramOutput, String
     let output = serde_json::from_str::<ProgramOutput>(line)
         .map_err(|error| format!("invalid usability probe JSON Lines output: {error}"))?;
     match &output {
-        ProgramOutput::NodeResult { node, detail, .. } => {
-            if node.trim().is_empty()
-                || node.chars().count() > 256
-                || node.chars().any(char::is_control)
-            {
+        ProgramOutput::Progress {
+            message,
+            node,
+            progress,
+            ..
+        } => {
+            if message.trim().is_empty() || message.contains('\0') {
                 return Err(
-                    "usability probe node names must contain 1 to 256 printable characters"
+                    "usability probe progress must be non-empty and contain no NUL bytes"
                         .to_string(),
                 );
             }
+            if let Some(node) = node {
+                validate_program_node_name(node)?;
+            }
+            if let Some(progress) = progress
+                && (progress.https_scanned > progress.https_total
+                    || progress.tcp_total > progress.https_scanned
+                    || progress.tcp_completed > progress.tcp_total
+                    || progress.accepted > progress.tcp_completed)
+            {
+                return Err("usability probe progress counters are inconsistent".to_string());
+            }
+        }
+        ProgramOutput::NodeResult { node, detail, .. } => {
+            validate_program_node_name(node)?;
             if detail.as_ref().is_some_and(|detail| detail.contains('\0')) {
                 return Err("usability probe detail must not contain NUL bytes".to_string());
             }
@@ -1102,6 +1174,15 @@ fn parse_program_output(line: &str) -> std::result::Result<ProgramOutput, String
         }
     }
     Ok(output)
+}
+
+fn validate_program_node_name(node: &str) -> std::result::Result<(), String> {
+    if node.trim().is_empty() || node.chars().count() > 256 || node.chars().any(char::is_control) {
+        return Err(
+            "usability probe node names must contain 1 to 256 printable characters".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn read_protocol_lines(
@@ -1462,6 +1543,54 @@ mod tests {
             std::env::temp_dir().join(format!("sing-box-tui-usability-{label}-{nanos}-{counter}"));
         fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    #[test]
+    fn executable_progress_record_is_protocol_safe_and_bounded_for_presentation() {
+        let output =
+            parse_program_output(r#"{"type":"progress","message":"Scanning 12/108 candidates"}"#)
+                .expect("parse progress record");
+        assert!(matches!(
+            output,
+            ProgramOutput::Progress {
+                message,
+                node: None,
+                candidate: true,
+                progress: None,
+            } if message == "Scanning 12/108 candidates"
+        ));
+        let node_progress = parse_program_output(
+            r#"{"type":"progress","message":"checking HTTPS","node":"美国HY1轻量","candidate":false}"#,
+        )
+        .expect("parse node progress record");
+        assert!(matches!(
+            node_progress,
+            ProgramOutput::Progress { node: Some(node), candidate: false, .. } if node == "美国HY1轻量"
+        ));
+        let measured_progress = parse_program_output(
+            r#"{"type":"progress","message":"TCP","progress":{"https_scanned":44,"https_total":108,"tcp_completed":3,"tcp_total":17,"accepted":2}}"#,
+        )
+        .expect("parse explicit progress counters");
+        assert!(matches!(
+            measured_progress,
+            ProgramOutput::Progress {
+                progress: Some(UsabilityProbeProgress {
+                    https_scanned: 44,
+                    https_total: 108,
+                    tcp_completed: 3,
+                    tcp_total: 17,
+                    accepted: 2,
+                }),
+                ..
+            }
+        ));
+        assert!(
+            parse_program_output(
+                r#"{"type":"progress","message":"invalid","progress":{"https_scanned":4,"https_total":3,"tcp_completed":0,"tcp_total":0,"accepted":0}}"#
+            )
+            .is_err()
+        );
+        assert!(parse_program_output(r#"{"type":"progress","message":""}"#).is_err());
     }
 
     #[test]
@@ -2154,6 +2283,7 @@ mod tests {
                 .expect("stalled controller probe must terminate")
             {
                 UsabilityProbeJobEvent::Progress(result) => progress.push(result),
+                UsabilityProbeJobEvent::Status { .. } => {}
                 UsabilityProbeJobEvent::Finished(completion) => break completion,
             }
         };
@@ -2324,6 +2454,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match job.try_recv() {
                 Some(UsabilityProbeJobEvent::Progress(result)) => progress.push(result),
+                Some(UsabilityProbeJobEvent::Status { .. }) => {}
                 Some(UsabilityProbeJobEvent::Finished(completion)) => {
                     return (progress, completion);
                 }
@@ -2412,6 +2543,11 @@ mod tests {
                     }
                     if args.len() != 2 {
                         std::process::exit(9);
+                    }
+                    if std::env::var("SING_BOX_TUI_USABILITY_CANDIDATES").as_deref()
+                        != Ok(r#"["node-a","node-b"]"#)
+                    {
+                        std::process::exit(10);
                     }
                     println!("{}", r#"{"type":"node_result","node":"node-a","usable":true,"detail":"first"}"#);
                     println!("{}", r#"{"type":"node_result","node":"outside-selector","usable":true}"#);

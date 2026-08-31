@@ -72,6 +72,7 @@ itself. The TUI does not create that runtime on the program's behalf.
 The program writes progressive JSON Lines records to stdout:
 
 ```json
+{"type":"progress","message":"checking TCP 22","node":"Hong Kong 01"}
 {"type":"node_result","node":"Hong Kong 01","usable":true,"detail":"request accepted"}
 {"type":"node_result","node":"US 02","usable":false,"detail":"application rejected"}
 {"type":"summary","complete":true,"message":"all candidates assessed"}
@@ -137,6 +138,39 @@ to an unbound loopback port. It needs no account, quota, or public network acces
 
 ```sh
 python3 -m unittest scripts.tests.test_agy_gemini_node_probe
+```
+
+`progress` records are optional, may appear before or between node results, and update the active
+panel's progress box immediately. Programs should emit one before any potentially slow startup or
+prefilter operation so a zero-result run remains visibly active. Progress messages are transient
+and are not published as node facts. When `node` is present and belongs to the selector snapshot,
+the active panel shows that node as pending. A later usable node result keeps it in the panel; a
+rejected result removes it. Set `candidate` to `false` when a named preliminary check should update
+the progress box without putting that node into the candidate panel; the field defaults to `true`.
+Programs with multiple stages may also attach a `progress` object containing `https_scanned`,
+`https_total`, `tcp_completed`, `tcp_total`, and `accepted`. The active panel renders those explicit
+counters instead of deriving a misleading denominator from the selected selector's member count.
+Executable probes receive the active selector's ordered node tags as a JSON array in
+`SING_BOX_TUI_USABILITY_CANDIDATES`. Bundled probes use this scope so progress totals, pending rows,
+accepted rows, and the selector backing the candidate panel always describe the same node set.
+
+## GitHub SSH example panel
+
+The [Unix manifest](../examples/usability-probes/unix/github-ssh.json) and
+[Windows manifest](../examples/usability-probes/windows/github-ssh.json) register the bundled
+`github-ssh-node-probe.py` adapter as a manual **GitHub SSH** panel. Copy the platform manifest
+beside the active configuration and replace the Windows path placeholders when applicable.
+
+For every node that passes the existing `https://github.com/` reachability prefilter, the adapter
+starts from the isolated runtime's local HTTP proxy, sends `CONNECT github.com:22`, and waits for a
+real `SSH-` protocol banner. It does not change the live selector and does not read or set proxy
+environment variables. A timeout, rejected CONNECT, early close, or non-SSH response excludes only
+that node. Manager and runtime infrastructure failures leave the run incomplete.
+
+The offline contract test uses a local CONNECT fixture and needs no GitHub access:
+
+```sh
+python3 -m unittest scripts.tests.test_github_ssh_node_probe
 ```
 
 ### Optional authenticated manual smoke

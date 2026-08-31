@@ -6,7 +6,7 @@ use super::{
 use crate::private_access::PrivateAccessAuthField;
 use crate::private_access_session::PrivateAccessRuntime;
 use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState};
-use crossterm::event::{KeyCode, MouseEventKind};
+use crossterm::event::KeyCode;
 
 #[test]
 fn tun_toggle_is_documented_in_help_and_status_bar() {
@@ -92,18 +92,6 @@ fn help_panel_moves_selection_with_keyboard() {
     assert_eq!(app.help_index, 1);
 
     app.handle_key(KeyCode::Char('k')).expect("move up");
-    assert_eq!(app.help_index, 0);
-}
-
-#[test]
-fn help_panel_moves_selection_with_mouse_wheel() {
-    let mut app = test_app();
-    app.handle_key(KeyCode::Char('?')).expect("open help");
-
-    app.handle_mouse(MouseEventKind::ScrollDown);
-    assert_eq!(app.help_index, 1);
-
-    app.handle_mouse(MouseEventKind::ScrollUp);
     assert_eq!(app.help_index, 0);
 }
 

@@ -159,15 +159,16 @@ pub(crate) fn run_stdio() -> Result<()> {
                     let (response, completed_next) = match serde_json::from_str::<RpcRequest>(&line)
                     {
                         Ok(request) => {
-                            let completed_next = (request.method == "next")
-                                .then(|| {
-                                    request
-                                        .params
-                                        .get("runtime_id")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string)
-                                })
-                                .flatten();
+                            let completed_next =
+                                matches!(request.method.as_str(), "next" | "next_step")
+                                    .then(|| {
+                                        request
+                                            .params
+                                            .get("runtime_id")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string)
+                                    })
+                                    .flatten();
                             (manager.handle(request), completed_next)
                         }
                         Err(error) => (
@@ -317,6 +318,7 @@ impl NodeRuntimeManager {
             "initialize" => self.initialize(&request.params),
             "create_runtime" => self.create_runtime(&request.params),
             "next" => self.next(&request.params),
+            "next_step" => self.next_step(&request.params),
             "close_runtime" => self.close_runtime(&request.params),
             method => Err(ManagerError::new(
                 "method_not_found",
@@ -445,8 +447,9 @@ impl NodeRuntimeManager {
                 ),
             ));
         }
+        let candidate_tags = optional_string_array(params, "candidates")?;
 
-        let environment = {
+        let mut environment = {
             let state = self.state.lock().expect("manager mutex poisoned");
             let environment = state.environment.clone().ok_or_else(|| {
                 ManagerError::new("not_initialized", "initialize must be called first")
@@ -462,6 +465,37 @@ impl NodeRuntimeManager {
             }
             environment
         };
+        if let Some(candidate_tags) = candidate_tags {
+            if candidate_tags.is_empty() {
+                return Err(ManagerError::new(
+                    "invalid_params",
+                    "candidates must contain at least one node tag",
+                ));
+            }
+            let mut seen = HashSet::new();
+            let mut selected = Vec::with_capacity(candidate_tags.len());
+            for tag in candidate_tags {
+                if !seen.insert(tag.clone()) {
+                    return Err(ManagerError::new(
+                        "invalid_params",
+                        format!("duplicate candidate node {tag}"),
+                    ));
+                }
+                let node = environment
+                    .nodes
+                    .iter()
+                    .find(|node| node.tag == tag)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ManagerError::new(
+                            "invalid_params",
+                            format!("candidate {tag} is not a concrete node"),
+                        )
+                    })?;
+                selected.push(node);
+            }
+            environment.nodes = selected;
+        }
 
         let runtime_id = random_id();
         // Public runtimes must retain the documented full traversal and `next` prefilter contract.
@@ -501,6 +535,14 @@ impl NodeRuntimeManager {
     }
 
     fn next(&self, params: &Value) -> ManagerResult<Value> {
+        self.traverse(params, false)
+    }
+
+    fn next_step(&self, params: &Value) -> ManagerResult<Value> {
+        self.traverse(params, true)
+    }
+
+    fn traverse(&self, params: &Value, single_step: bool) -> ManagerResult<Value> {
         let runtime_id = required_string(object_params(params)?, "runtime_id")?;
         let handle = {
             let state = self.state.lock().expect("manager mutex poisoned");
@@ -518,12 +560,15 @@ impl NodeRuntimeManager {
                 format!("runtime {runtime_id} already has an outstanding next request"),
             ));
         }
-        let response = handle
-            .runtime
-            .lock()
-            .expect("runtime mutex poisoned")
-            .next(&handle.cancelled)
-            .map_err(|error| ManagerError::new("runtime_failed", format!("{error:#}")))?;
+        let response = {
+            let mut runtime = handle.runtime.lock().expect("runtime mutex poisoned");
+            if single_step {
+                runtime.next_step(&handle.cancelled)
+            } else {
+                runtime.next(&handle.cancelled)
+            }
+        }
+        .map_err(|error| ManagerError::new("runtime_failed", format!("{error:#}")))?;
         if response.get("end").and_then(Value::as_bool) == Some(true) {
             self.state
                 .lock()
@@ -781,7 +826,83 @@ impl NodeRuntime {
     }
 
     fn creation_response(&self) -> Value {
-        runtime_creation_response(&self.id, self.proxy_value(), self.nodes.len())
+        runtime_creation_response(&self.id, self.proxy_value(), &self.nodes)
+    }
+
+    fn next_step(&mut self, cancelled: &AtomicBool) -> Result<Value> {
+        if self.bound_node.is_some() {
+            bail!("target-bound node runtimes do not support traversal");
+        }
+        if self.poisoned {
+            bail!("node runtime is poisoned after an infrastructure failure");
+        }
+        self.ensure_child_alive()?;
+        if let Err(error) = self
+            .controller
+            .switch_proxy(&self.selector_tag, &self.block_tag)
+        {
+            self.poisoned = true;
+            return Err(error).context("failed to disconnect the previous node");
+        }
+        if self.cursor >= self.nodes.len() {
+            let response = json!({
+                "end": true,
+                "scanned": self.cursor,
+                "reachable": self.reachable,
+            });
+            self.shutdown();
+            return Ok(response);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            bail!("node runtime was closed");
+        }
+        self.ensure_child_alive()?;
+        let ordinal = self.cursor + 1;
+        let node = self.nodes[self.cursor].clone();
+        self.cursor += 1;
+        let https_reachable = self
+            .controller
+            .measure_proxy_delay(&node.tag, &self.url, self.timeout_ms)
+            .is_some();
+        if !https_reachable {
+            if let Err(error) = self.controller.fetch_config() {
+                self.poisoned = true;
+                return Err(error).context("isolated sing-box controller became unavailable");
+            }
+        } else if let Err(error) = self.controller.switch_proxy(&self.selector_tag, &node.tag) {
+            if self.controller.fetch_config().is_err() {
+                self.poisoned = true;
+                return Err(error).context("isolated sing-box controller became unavailable");
+            }
+            eprintln!(
+                "node runtime {} skipped node at ordinal {} after switch failure: {error:#}",
+                self.id, ordinal
+            );
+        } else {
+            self.reachable += 1;
+            return Ok(json!({
+                "end": false,
+                "node": {
+                    "tag": node.tag,
+                    "selectors": node.selectors,
+                    "ordinal": ordinal,
+                },
+                "proxy": self.proxy_value(),
+                "scanned": self.cursor,
+                "reachable": true,
+            }));
+        }
+        Ok(json!({
+            "end": false,
+            "node": {
+                "tag": node.tag,
+                "selectors": node.selectors,
+                "ordinal": ordinal,
+            },
+            "proxy": self.proxy_value(),
+            "scanned": self.cursor,
+            "reachable": false,
+        }))
     }
 
     fn next(&mut self, cancelled: &AtomicBool) -> Result<Value> {
@@ -901,11 +1022,12 @@ impl NodeRuntime {
     }
 }
 
-fn runtime_creation_response(runtime_id: &str, proxy: Value, total_candidates: usize) -> Value {
+fn runtime_creation_response(runtime_id: &str, proxy: Value, nodes: &[NodeDescriptor]) -> Value {
     json!({
         "runtime_id": runtime_id,
         "proxy": proxy,
-        "total_candidates": total_candidates,
+        "total_candidates": nodes.len(),
+        "candidates": nodes.iter().map(|node| node.tag.as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -1872,6 +1994,34 @@ fn optional_u64(params: &Map<String, Value>, name: &str) -> ManagerResult<Option
         .transpose()
 }
 
+fn optional_string_array(
+    params: &Map<String, Value>,
+    name: &str,
+) -> ManagerResult<Option<Vec<String>>> {
+    params
+        .get(name)
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                ManagerError::new(
+                    "invalid_params",
+                    format!("{name} must be an array of strings"),
+                )
+            })?;
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        ManagerError::new(
+                            "invalid_params",
+                            format!("{name} must be an array of strings"),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2001,6 +2151,17 @@ mod tests {
         assert!(response.error.is_none());
         assert_eq!(response.id, json!(41));
         assert_eq!(response.result.unwrap()["total_candidates"], json!(1));
+        let scoped = manager.handle(RpcRequest {
+            id: json!(42),
+            method: "create_runtime".to_string(),
+            params: json!({
+                "url": "https://example.test/ping",
+                "candidates": ["outside-selector"]
+            }),
+        });
+        let error = scoped.error.expect("unknown scoped candidate is rejected");
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("not a concrete node"));
         fs::remove_dir_all(directory).unwrap();
     }
 

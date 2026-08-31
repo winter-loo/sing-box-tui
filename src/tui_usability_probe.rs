@@ -10,8 +10,8 @@ use crate::storage::{
     UsabilityProbeRunFinalization,
 };
 use crate::usability_probe::{
-    UsabilityProbeJob, UsabilityProbeJobEvent, UsabilityProbeNodeResult, spawn_usability_probe_job,
-    usability_presentation_text,
+    UsabilityProbeJob, UsabilityProbeJobEvent, UsabilityProbeNodeResult, UsabilityProbeProgress,
+    spawn_usability_probe_job, usability_presentation_text,
 };
 
 use super::App;
@@ -27,6 +27,10 @@ pub(super) struct ActiveUsabilityProbe {
     process_lease: crate::storage::UsabilityProbeLockLease,
     selector_member_count: usize,
     received: BTreeMap<String, UsabilityProbeNodeResult>,
+    stage: String,
+    current_node: Option<String>,
+    current_node_started_at: Option<Instant>,
+    progress: Option<UsabilityProbeProgress>,
     result_ttl: Option<Duration>,
     background: bool,
     job: UsabilityProbeJob,
@@ -108,6 +112,10 @@ impl App {
             process_lease,
             selector_member_count: group.members.len(),
             received: BTreeMap::new(),
+            stage: "Starting probe program and isolated runtime...".to_string(),
+            current_node: None,
+            current_node_started_at: None,
+            progress: None,
             result_ttl: manifest.result_ttl,
             background,
             job,
@@ -269,6 +277,10 @@ impl App {
                             continue;
                         };
                         active.received.insert(result.node.clone(), result);
+                        if active.current_node.as_deref() == Some(latest_result.node.as_str()) {
+                            active.current_node = None;
+                            active.current_node_started_at = None;
+                        }
                         (
                             active.manifest_id.clone(),
                             active.received.len(),
@@ -279,14 +291,36 @@ impl App {
                         .usability_probe_manifests
                         .iter()
                         .find(|manifest| manifest.id == manifest_id)
-                        .map(|manifest| manifest.label.as_str())
-                        .unwrap_or("Custom");
+                        .map(|manifest| manifest.label.clone())
+                        .unwrap_or_else(|| "Custom".to_string());
+                    self.sync_selection_to_displayed_members();
                     self.set_status_only(usability_probe_progress_status(
-                        label,
+                        &label,
                         received_count,
                         selector_member_count,
                         &latest_result,
                     ));
+                }
+                UsabilityProbeJobEvent::Status {
+                    message,
+                    node,
+                    candidate,
+                    progress,
+                } => {
+                    let Some(active) = self.usability_probe_job.as_mut() else {
+                        continue;
+                    };
+                    active.stage = message.clone();
+                    let next_node = candidate.then_some(node).flatten();
+                    if next_node != active.current_node {
+                        active.current_node_started_at = next_node.as_ref().map(|_| Instant::now());
+                    }
+                    active.current_node = next_node;
+                    if progress.is_some() {
+                        active.progress = progress;
+                    }
+                    self.sync_selection_to_displayed_members();
+                    self.set_status_only(message);
                 }
                 UsabilityProbeJobEvent::Finished(completion) => {
                     let Some(mut active) = self.usability_probe_job.take() else {
@@ -664,10 +698,46 @@ impl App {
         &self,
         manifest_id: &NodeViewId,
         selector: &str,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(usize, usize, Option<UsabilityProbeProgress>)> {
+        self.usability_probe_job.as_ref().and_then(|active| {
+            (&active.manifest_id == manifest_id && active.selector == selector).then_some((
+                active.received.len(),
+                active.selector_member_count,
+                active.progress.clone(),
+            ))
+        })
+    }
+
+    pub(super) fn custom_usability_probe_stage(
+        &self,
+        manifest_id: &NodeViewId,
+        selector: &str,
+    ) -> Option<String> {
         self.usability_probe_job.as_ref().and_then(|active| {
             (&active.manifest_id == manifest_id && active.selector == selector)
-                .then_some((active.received.len(), active.selector_member_count))
+                .then(|| active.stage.clone())
+        })
+    }
+
+    pub(super) fn custom_usability_live_projection(
+        &self,
+        manifest_id: &NodeViewId,
+        selector: &str,
+    ) -> Option<(
+        Option<(String, u64)>,
+        BTreeMap<String, UsabilityProbeNodeResult>,
+    )> {
+        self.usability_probe_job.as_ref().and_then(|active| {
+            (&active.manifest_id == manifest_id && active.selector == selector).then(|| {
+                let pending = active.current_node.clone().map(|node| {
+                    let elapsed = active
+                        .current_node_started_at
+                        .map(|started| started.elapsed().as_secs())
+                        .unwrap_or_default();
+                    (node, elapsed)
+                });
+                (pending, active.received.clone())
+            })
         })
     }
 }

@@ -85,6 +85,13 @@ pub(crate) struct CandidateRow {
     pub(crate) tone: CandidateTone,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateNotice {
+    pub(crate) title: String,
+    pub(crate) message: String,
+    pub(crate) error: bool,
+}
+
 pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) focus: Focus,
     pub(crate) left_pane_section: LeftPaneSection,
@@ -93,10 +100,12 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) intranet_rows: Vec<IntranetRow>,
     pub(crate) intranet_selected: usize,
     pub(crate) candidate_title: String,
+    pub(crate) candidate_notice: Option<CandidateNotice>,
     pub(crate) node_view_tabs: Vec<NodeViewTab>,
     pub(crate) active_node_view_tab: usize,
     pub(crate) candidate_rows: Vec<CandidateRow>,
     pub(crate) candidate_selected: Option<usize>,
+    pub(crate) pending_animation_bright: bool,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
     pub(crate) status: StatusSnapshot,
     pub(crate) flash: Option<String>,
@@ -259,19 +268,27 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             } else {
                 Style::default()
             };
-            let (marker_style, loading_suffix) = match row.tone {
+            let (marker_style, evidence_style, loading_suffix) = match row.tone {
                 CandidateTone::Pending => (
-                    Style::default()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                    "  ⟳",
+                    pending_candidate_style(snapshot.pending_animation_bright),
+                    Style::default().fg(Color::DarkGray),
+                    "",
                 ),
-                CandidateTone::Success => (Style::default().fg(Color::Magenta), ""),
+                CandidateTone::Success => (
+                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(Color::Magenta),
+                    "",
+                ),
                 CandidateTone::Error => (
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     "",
                 ),
-                CandidateTone::Missing => (Style::default().fg(Color::DarkGray), ""),
+                CandidateTone::Missing => (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::DarkGray),
+                    "",
+                ),
             };
             let current_suffix = if row.is_current { "  *" } else { "" };
             let available = candidate_area.width.saturating_sub(4) as usize;
@@ -314,12 +331,50 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
                 spans.push(Span::styled(marker.to_string(), marker_style));
             }
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(row.reachability.clone(), marker_style));
+            spans.push(Span::styled(row.reachability.clone(), evidence_style));
             spans.push(Span::raw(loading_suffix));
             spans.push(Span::raw(current_suffix));
             ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
+
+    let (candidate_notice_area, candidate_list_area) =
+        if let Some(notice) = &snapshot.candidate_notice {
+            let inner_width = candidate_area.width.saturating_sub(2).max(1) as usize;
+            let wrapped_lines = notice
+                .message
+                .lines()
+                .map(|line| {
+                    unicode_width::UnicodeWidthStr::width(line)
+                        .div_ceil(inner_width)
+                        .max(1)
+                })
+                .sum::<usize>() as u16;
+            let notice_height = wrapped_lines.saturating_add(2).min(candidate_area.height);
+            let [notice_area, list_area] =
+                Layout::vertical([Constraint::Length(notice_height), Constraint::Min(0)])
+                    .areas(candidate_area);
+            (Some(notice_area), list_area)
+        } else {
+            (None, candidate_area)
+        };
+    if let (Some(notice), Some(notice_area)) = (&snapshot.candidate_notice, candidate_notice_area) {
+        frame.render_widget(
+            Paragraph::new(notice.message.as_str())
+                .style(Style::default().fg(if notice.error {
+                    Color::LightRed
+                } else {
+                    Color::LightYellow
+                }))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(notice.title.as_str())
+                        .borders(Borders::ALL),
+                ),
+            notice_area,
+        );
+    }
 
     let members_title = snapshot.candidate_title.clone();
     let members_block = Block::default()
@@ -331,7 +386,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         .highlight_style(selected_style(snapshot.focus == Focus::Members))
         .highlight_symbol("> ");
     let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
-    frame.render_stateful_widget(members_widget, candidate_area, &mut members_state);
+    frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
 
     if let Some(detail) = snapshot.intranet_detail.as_ref() {
         let profile = detail.profile;
@@ -428,5 +483,15 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             .saturating_add(unicode_width::UnicodeWidthStr::width(input.as_str()) as u16);
         let cursor_y = status_area.y.saturating_add(status_line_count);
         frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn pending_candidate_style(bright: bool) -> Style {
+    if bright {
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
     }
 }

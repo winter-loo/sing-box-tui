@@ -87,6 +87,7 @@ pub(super) fn test_app() -> App {
         expanded_intranet_sections: BTreeSet::new(),
         status: String::new(),
         flash: None,
+        animation_started: Instant::now(),
         benchmark_filter: "美国".to_string(),
         benchmark_url: "https://www.gstatic.com/generate_204".to_string(),
         sustained_target_url: crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL.to_string(),

@@ -4,6 +4,16 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::time::Instant;
 
+#[test]
+fn pending_candidate_animation_has_distinct_bright_and_dim_frames() {
+    let bright = pending_candidate_style(true);
+    let dim = pending_candidate_style(false);
+
+    assert_eq!(bright.fg, Some(Color::LightYellow));
+    assert_eq!(dim.fg, Some(Color::DarkGray));
+    assert_ne!(bright, dim);
+}
+
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
         focus: Focus::Groups,
@@ -17,6 +27,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         intranet_rows: Vec::new(),
         intranet_selected: 0,
         candidate_title: "Candidates [SELECTOR ORDER]".to_string(),
+        candidate_notice: None,
         node_view_tabs: vec![
             NodeViewTab {
                 label: "Current selector".to_string(),
@@ -37,6 +48,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             tone: CandidateTone::Success,
         }],
         candidate_selected: Some(0),
+        pending_animation_bright: true,
         intranet_detail: None,
         status: StatusSnapshot {
             system_proxy_enabled: false,
@@ -57,6 +69,44 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         private_access_progress: None,
         private_access_auth: None,
     }
+}
+
+#[test]
+fn custom_probe_error_is_fully_visible_inside_the_candidate_panel() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_title = "Candidates for select [LOW LATENCY] · FAILED".into();
+    snapshot.candidate_notice = Some(CandidateNotice {
+        title: "Probe error".into(),
+        message: "run #7 failed: the beginning explains the failure and the complete diagnostic ends with UTF8_SENTINEL".into(),
+        error: true,
+    });
+
+    let rendered = rendered_lines_at(&snapshot, 72, 24).join("\n");
+    assert!(rendered.contains("Probe error"));
+    assert!(rendered.contains("the beginning explains"));
+    assert!(rendered.contains("UTF8_SENTINEL"));
+}
+
+#[test]
+fn custom_probe_progress_is_visible_before_any_node_result() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows.clear();
+    snapshot.candidate_title = "Candidates for select [LOW LATENCY]".into();
+    snapshot.candidate_notice = Some(CandidateNotice {
+        title: "Probe progress".into(),
+        message: "HTTPS 44/108 · TCP 22 3/17 · accepted 2\nScanning node US 01...".into(),
+        error: false,
+    });
+
+    let rendered = rendered_lines_at(&snapshot, 72, 24).join("\n");
+    assert!(rendered.contains("Probe progress"));
+    assert!(rendered.contains("HTTPS 44/108 · TCP 22 3/17 · accepted 2"));
+    assert!(rendered.contains("Scanning node US 01"));
+    let title_line = rendered
+        .lines()
+        .find(|line| line.contains("Candidates for select"))
+        .expect("candidate title");
+    assert!(!title_line.contains("HTTPS"));
 }
 
 fn rendered_lines(snapshot: &DashboardSnapshot<'_>) -> Vec<String> {
