@@ -411,6 +411,7 @@ pub(crate) fn spawn_reachability_assessment_worker(
                     base_url.clone(),
                     name,
                     probe.clone(),
+                    tx.clone(),
                     cancelled.clone(),
                 );
             }
@@ -425,6 +426,7 @@ pub(crate) fn spawn_reachability_assessment_worker(
                         base_url.clone(),
                         name,
                         probe.clone(),
+                        tx.clone(),
                         cancelled.clone(),
                     );
                 }
@@ -447,6 +449,7 @@ fn spawn_reachability_assessment_task(
     base_url: String,
     name: String,
     probe: ReachabilityProbeConfig,
+    progress_tx: Sender<BenchmarkEvent>,
     cancelled: Arc<AtomicBool>,
 ) {
     tasks.spawn(async move {
@@ -468,6 +471,9 @@ fn spawn_reachability_assessment_task(
                 .await,
             );
             if attempt_index < 2 {
+                let _ = progress_tx.send(BenchmarkEvent::AttemptProgress(
+                    NodeReachabilityAssessment::from_attempts(name.clone(), attempts.clone()),
+                ));
                 sleep(Duration::from_millis(300)).await;
             }
         }
@@ -871,6 +877,7 @@ pub(crate) struct BenchmarkRequest {
 }
 
 pub(crate) enum BenchmarkEvent {
+    AttemptProgress(NodeReachabilityAssessment),
     ReachabilityProgress(NodeReachabilityAssessment),
     Finished,
 }
@@ -1299,11 +1306,28 @@ mod tests {
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
+        for completed in 1..=2 {
+            let progress = match event_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("receive attempt progress")
+            {
+                BenchmarkEvent::AttemptProgress(assessment) => assessment,
+                BenchmarkEvent::ReachabilityProgress(_) => {
+                    panic!("worker completed before publishing attempt {completed}")
+                }
+                BenchmarkEvent::Finished => panic!("worker finished without attempt progress"),
+            };
+            assert_eq!(progress.attempts, vec![ProbeOutcome::Timeout; completed]);
+            assert_eq!(progress.assessment, None);
+        }
         let assessment = match event_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("receive reachability progress")
+            .expect("receive completed reachability assessment")
         {
             BenchmarkEvent::ReachabilityProgress(assessment) => assessment,
+            BenchmarkEvent::AttemptProgress(_) => {
+                panic!("worker published unexpected extra attempt progress")
+            }
             BenchmarkEvent::Finished => panic!("worker finished without an assessment"),
         };
         assert_eq!(assessment.attempts, vec![ProbeOutcome::Timeout; 3]);

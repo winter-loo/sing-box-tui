@@ -4,6 +4,7 @@ fn pending_candidate_renders_working_shimmer_animation() {
     snapshot.candidate_rows = vec![CandidateRow {
         name: "test-node".to_string(),
         is_current: false,
+        latency_signal: None,
         reachability: String::new(),
         compact_marker: "checking TCP 22 (2s)".to_string(),
         marker: "• checking TCP 22 (2s)".to_string(),
@@ -45,6 +46,50 @@ fn pending_candidate_animation_has_distinct_bright_and_dim_frames() {
     assert_ne!(bright, dim);
 }
 
+#[test]
+fn latency_signal_uses_the_requested_color_thresholds() {
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Untested).fg,
+        Some(Color::DarkGray)
+    );
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 199 }).fg,
+        Some(Color::Green)
+    );
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 200 }).fg,
+        Some(Color::Yellow)
+    );
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 400 }).fg,
+        Some(Color::Rgb(184, 134, 11))
+    );
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 600 }).fg,
+        Some(Color::Rgb(205, 92, 92))
+    );
+    let unreachable = latency_signal_style(LatencySignalState::Unreachable);
+    assert_eq!(unreachable.fg, Some(Color::Rgb(139, 0, 0)));
+    assert!(unreachable.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn braille_signal_uses_thin_half_cell_bars_with_fixed_spacing() {
+    let levels = [2, 5, 8]
+        .map(latency_signal_glyph)
+        .into_iter()
+        .collect::<String>();
+    assert_eq!(levels, "⡀⡄⡆");
+    assert_eq!(unicode_width::UnicodeWidthStr::width(levels.as_str()), 3);
+
+    let three_bars = [8, 4, 2]
+        .map(latency_signal_glyph)
+        .into_iter()
+        .collect::<String>();
+    assert_eq!(three_bars, "⡆⡄⡀");
+    assert_eq!(unicode_width::UnicodeWidthStr::width(three_bars.as_str()), 3);
+}
+
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
         focus: Focus::Groups,
@@ -75,8 +120,25 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         candidate_rows: vec![CandidateRow {
             name: "node-a".to_string(),
             is_current: true,
-            reachability: "3/3".to_string(),
-            marker: "stable reachable".to_string(),
+            latency_signal: Some(LatencySignal {
+                bars: [
+                    LatencySignalBar {
+                        height: 8,
+                        state: LatencySignalState::Reachable { delay_ms: 100 },
+                    },
+                    LatencySignalBar {
+                        height: 4,
+                        state: LatencySignalState::Reachable { delay_ms: 200 },
+                    },
+                    LatencySignalBar {
+                        height: 2,
+                        state: LatencySignalState::Reachable { delay_ms: 400 },
+                    },
+                ],
+                average_ms: Some(233),
+            }),
+            reachability: String::new(),
+            marker: String::new(),
             compact_marker: String::new(),
             tone: CandidateTone::Success,
         }],
@@ -169,13 +231,17 @@ fn node_view_tabs_and_candidates_remain_usable_at_normal_and_narrow_widths() {
     assert!(normal.contains("Current selector 1"));
     assert!(normal.contains("Streaming 1"));
     assert!(normal.contains("node-a"));
-    assert!(normal.contains("3/3"));
+    assert!(normal.contains("⡆⡄⡀"));
+    assert!(normal.contains("233ms"));
+    assert!(!normal.contains("avg"));
 
     let narrow = rendered_lines_at(&snapshot, 64, 24).join("\n");
     assert!(narrow.contains("Current selector"));
     assert!(narrow.contains("Streaming"));
     assert!(narrow.contains("node-a"));
-    assert!(narrow.contains("3/3"));
+    assert!(narrow.contains("⡆⡄⡀"));
+    assert!(narrow.contains("233ms"));
+    assert!(!narrow.contains("avg"));
     assert!(!narrow.contains("Node details"));
 }
 
@@ -184,6 +250,7 @@ fn streaming_rows_adapt_without_losing_node_identity_or_reachability() {
     let mut snapshot = dashboard_snapshot();
     snapshot.active_node_view_tab = 1;
     snapshot.candidate_rows[0].is_current = false;
+    snapshot.candidate_rows[0].latency_signal = None;
     snapshot.candidate_rows[0].reachability = String::new();
     snapshot.candidate_rows[0].marker = "1.0 MiB/s".into();
     snapshot.candidate_rows[0].compact_marker = "1.0M/s".into();
@@ -211,8 +278,11 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(text.contains("Internet Proxy"));
     assert!(text.contains("select"));
     assert!(text.contains("node-a"));
-    assert!(text.contains("stable reachable"));
-    assert!(text.contains("3/3"));
+    assert!(text.contains("⡆⡄⡀"));
+    assert!(text.contains("233ms"));
+    assert!(!text.contains("avg"));
+    assert!(!text.contains("stable reachable"));
+    assert!(!text.contains("3/3"));
     assert!(text.contains("System Proxy: disabled"));
     assert!(text.contains("Tun Mode: enabled"));
     assert!(!text.contains("Intranet Proxy"));

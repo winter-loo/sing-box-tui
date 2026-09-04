@@ -4,12 +4,13 @@ use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     CandidateNotice, CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot,
-    Focus, InternetRow, IntranetDetailSnapshot, IntranetRow, NodeViewPanel, NodeViewTab,
-    SettingRow, SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge,
-    settings_field_label,
+    Focus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
+    LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow, SettingsPanelSnapshot,
+    StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
 };
 use crate::automatic_selection::NodeViewId;
-use crate::benchmark_workflow::{ActiveQuickProbe, BenchmarkWorkflow};
+use crate::benchmark_workflow::ActiveQuickProbe;
+use crate::controller::ProbeOutcome;
 use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
 
 fn extract_candidate_brief_marker(
@@ -54,6 +55,67 @@ fn extract_candidate_brief_marker(
         }
     }
     ("usable".to_string(), "usable".to_string())
+}
+
+fn latency_signal_for_attempts(attempts: &[ProbeOutcome]) -> LatencySignal {
+    const UNTESTED_HEIGHT: u8 = 2;
+    const SINGLE_SAMPLE_HEIGHT: u8 = 5;
+    const MIN_MEASURED_HEIGHT: u8 = 2;
+    const MAX_MEASURED_HEIGHT: u8 = 8;
+
+    let reachable_delays = attempts
+        .iter()
+        .filter_map(|attempt| match attempt {
+            ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let minimum_delay = reachable_delays.iter().copied().min();
+    let compare_relative_heights = reachable_delays.len() >= 2;
+    let average_ms = (!reachable_delays.is_empty()).then(|| {
+        let count = reachable_delays.len() as u128;
+        let sum = reachable_delays
+            .iter()
+            .map(|delay| u128::from(*delay))
+            .sum::<u128>();
+        ((sum + count / 2) / count).min(u128::from(u64::MAX)) as u64
+    });
+
+    let bars = std::array::from_fn(|index| match attempts.get(index) {
+        Some(ProbeOutcome::Reachable { delay_ms }) => {
+            let height = if compare_relative_heights {
+                let minimum = u128::from(minimum_delay.unwrap_or(*delay_ms).max(1));
+                let delay = u128::from((*delay_ms).max(1));
+                ((u128::from(MAX_MEASURED_HEIGHT) * minimum + delay / 2) / delay).clamp(
+                    u128::from(MIN_MEASURED_HEIGHT),
+                    u128::from(MAX_MEASURED_HEIGHT),
+                ) as u8
+            } else {
+                SINGLE_SAMPLE_HEIGHT
+            };
+            LatencySignalBar {
+                height,
+                state: LatencySignalState::Reachable {
+                    delay_ms: *delay_ms,
+                },
+            }
+        }
+        Some(ProbeOutcome::Timeout | ProbeOutcome::TransportFailure { .. }) => LatencySignalBar {
+            height: MAX_MEASURED_HEIGHT,
+            state: LatencySignalState::Unreachable,
+        },
+        Some(
+            ProbeOutcome::ControllerFailure { .. }
+            | ProbeOutcome::InvalidMeasurement
+            | ProbeOutcome::Cancelled,
+        )
+        | None => LatencySignalBar {
+            height: UNTESTED_HEIGHT,
+            state: LatencySignalState::Untested,
+        },
+    });
+
+    LatencySignal { bars, average_ms }
 }
 
 impl App {
@@ -142,6 +204,7 @@ impl App {
                                 Some(CandidateRow {
                                     name: member.clone(),
                                     is_current: group.current.as_deref() == Some(member.as_str()),
+                                    latency_signal: None,
                                     reachability: String::new(),
                                     compact_marker,
                                     marker,
@@ -167,11 +230,14 @@ impl App {
                         .iter()
                         .filter_map(|member| {
                             let result = results.get(member.as_str())?;
-                            let active =
-                                active_quick_overlay(&self.benchmark_workflow, &group.name, member);
-                            let quick_probe_pending = active
-                                .as_ref()
-                                .is_some_and(|(_, _, assessment)| assessment.is_none());
+                            let quick_probe_pending = matches!(
+                                self.benchmark_workflow
+                                    .active_quick_probe(&group.name, member),
+                                Some(
+                                    ActiveQuickProbe::Pending
+                                        | ActiveQuickProbe::IncompleteAssessment(_)
+                                )
+                            );
                             let sustained = self
                                 .benchmark_workflow
                                 .sustained_quality(&group.name, member);
@@ -183,6 +249,7 @@ impl App {
                             Some(CandidateRow {
                                 name: member.clone(),
                                 is_current: group.current.as_deref() == Some(member.as_str()),
+                                latency_signal: None,
                                 reachability: String::new(),
                                 compact_marker,
                                 marker,
@@ -198,39 +265,40 @@ impl App {
                 displayed_members
                     .iter()
                     .map(|member| {
-                        let stored_assessment = self
-                            .benchmark_workflow
-                            .reachability_assessment(&group.name, member);
                         // WHY: an active run is the current observation. It must cover stored
                         // evidence so reruns cannot present an old result as live progress.
-                        let active =
-                            active_quick_overlay(&self.benchmark_workflow, &group.name, member);
-                        let (reachability, marker, tone) = if let Some((
-                            reachability,
-                            marker,
-                            assessment,
-                        )) = active
+                        let (latency_signal, tone) = match self
+                            .benchmark_workflow
+                            .active_quick_probe(&group.name, member)
                         {
-                            let tone = match assessment {
-                                Some(
-                                    crate::controller::ReachabilityAssessment::StableReachable,
-                                )
-                                | Some(crate::controller::ReachabilityAssessment::Reachable) => {
-                                    CandidateTone::Success
-                                }
-                                Some(crate::controller::ReachabilityAssessment::Degraded)
-                                | Some(crate::controller::ReachabilityAssessment::Unreachable) => {
-                                    CandidateTone::Error
-                                }
-                                None => CandidateTone::Pending,
-                            };
-                            (
-                                reachability,
-                                marker.unwrap_or_else(|| "...".to_string()),
-                                tone,
-                            )
-                        } else if let Some(assessment) = stored_assessment {
-                            let tone = match assessment.assessment {
+                            Some(ActiveQuickProbe::Pending) => {
+                                (latency_signal_for_attempts(&[]), CandidateTone::Pending)
+                            }
+                            Some(ActiveQuickProbe::IncompleteAssessment(assessment)) => (
+                                latency_signal_for_attempts(&assessment.attempts),
+                                CandidateTone::Pending,
+                            ),
+                            Some(ActiveQuickProbe::CompleteAssessment(assessment)) => {
+                                let tone = match assessment.assessment {
+                                    Some(
+                                        crate::controller::ReachabilityAssessment::StableReachable,
+                                    )
+                                    | Some(crate::controller::ReachabilityAssessment::Reachable) => {
+                                        CandidateTone::Success
+                                    }
+                                    Some(crate::controller::ReachabilityAssessment::Degraded)
+                                    | Some(
+                                        crate::controller::ReachabilityAssessment::Unreachable,
+                                    ) => CandidateTone::Error,
+                                    None => CandidateTone::Missing,
+                                };
+                                (latency_signal_for_attempts(&assessment.attempts), tone)
+                            }
+                            None => {
+                                let stored_assessment = self
+                                    .benchmark_workflow
+                                    .reachability_assessment(&group.name, member);
+                                let tone = match stored_assessment.and_then(|value| value.assessment) {
                                 Some(
                                     crate::controller::ReachabilityAssessment::StableReachable,
                                 )
@@ -242,18 +310,23 @@ impl App {
                                     CandidateTone::Error
                                 }
                                 None => CandidateTone::Missing,
-                            };
-                            let (reachability, marker) =
-                                split_reachability_evidence(&assessment.compact_evidence());
-                            (reachability, marker, tone)
-                        } else {
-                            ("-/3".into(), "-".to_string(), CandidateTone::Missing)
+                                };
+                                (
+                                    latency_signal_for_attempts(
+                                        stored_assessment
+                                            .map(|assessment| assessment.attempts.as_slice())
+                                            .unwrap_or(&[]),
+                                    ),
+                                    tone,
+                                )
+                            }
                         };
                         CandidateRow {
                             name: member.clone(),
                             is_current: group.current.as_deref() == Some(member.as_str()),
-                            reachability,
-                            marker,
+                            latency_signal: Some(latency_signal),
+                            reachability: String::new(),
+                            marker: String::new(),
                             compact_marker: String::new(),
                             tone,
                         }
@@ -516,39 +589,6 @@ impl App {
     }
 }
 
-fn split_reachability_evidence(value: &str) -> (String, String) {
-    value
-        .split_once(' ')
-        .map(|(ratio, detail)| (ratio.to_string(), detail.to_string()))
-        .unwrap_or_else(|| (value.to_string(), String::new()))
-}
-
-fn active_quick_overlay(
-    workflow: &BenchmarkWorkflow,
-    group: &str,
-    node: &str,
-) -> Option<(
-    String,
-    Option<String>,
-    Option<crate::controller::ReachabilityAssessment>,
-)> {
-    workflow
-        .active_quick_probe(group, node)
-        .map(|progress| match progress {
-            ActiveQuickProbe::Pending => ("-/3".to_string(), None, None),
-            ActiveQuickProbe::IncompleteAssessment(assessment) => {
-                let (reachability, marker) =
-                    split_reachability_evidence(&assessment.compact_evidence());
-                (reachability, Some(marker), None)
-            }
-            ActiveQuickProbe::CompleteAssessment(assessment) => {
-                let (reachability, marker) =
-                    split_reachability_evidence(&assessment.compact_evidence());
-                (reachability, Some(marker), assessment.assessment)
-            }
-        })
-}
-
 fn format_custom_probe_progress(
     metrics: Option<&crate::usability_probe::UsabilityProbeProgress>,
     received: usize,
@@ -581,7 +621,7 @@ fn pending_candidate_marker(stage: &str, elapsed_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::test_app;
-    use super::super::view::CandidateTone;
+    use super::super::view::{CandidateTone, LatencySignalState};
     use super::{format_custom_probe_progress, pending_candidate_marker};
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
 
@@ -609,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn application_snapshot_exposes_compact_reachability_evidence() {
+    fn application_snapshot_exposes_latency_signal_and_reachable_average() {
         let mut app = test_app();
         app.benchmark_filter.clear();
         app.benchmark_workflow.set_reachability_assessment(
@@ -626,10 +666,76 @@ mod tests {
         );
 
         let snapshot = app.view_snapshot();
-        assert_eq!(snapshot.candidate_rows[0].reachability, "2/3");
-        assert_eq!(snapshot.candidate_rows[0].marker, "reachable");
+        let signal = snapshot.candidate_rows[0]
+            .latency_signal
+            .as_ref()
+            .expect("current-selector row has a latency signal");
+        assert_eq!(signal.average_ms, Some(45));
+        assert_eq!(signal.bars[0].height, 8);
+        assert_eq!(signal.bars[1].height, 6);
+        assert_eq!(signal.bars[2].height, 8);
+        assert_eq!(signal.bars[2].state, LatencySignalState::Unreachable);
+        assert!(snapshot.candidate_rows[0].reachability.is_empty());
+        assert!(snapshot.candidate_rows[0].marker.is_empty());
         assert_eq!(snapshot.candidate_rows[0].tone, CandidateTone::Success);
         assert_eq!(snapshot.candidate_rows.len(), app.groups[0].members.len());
+    }
+
+    #[test]
+    fn latency_signal_rebalances_after_each_reachable_attempt() {
+        let mut app = test_app();
+        app.benchmark_workflow
+            .add_pending_job_for_test("select", "node-a");
+
+        app.benchmark_workflow
+            .set_active_reachability_assessment_for_test(
+                "select",
+                NodeReachabilityAssessment::from_attempts(
+                    "node-a".into(),
+                    vec![ProbeOutcome::Reachable { delay_ms: 100 }],
+                ),
+            );
+        {
+            let snapshot = app.view_snapshot();
+            let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
+            assert_eq!(signal.bars.map(|bar| bar.height), [5, 2, 2]);
+            assert_eq!(signal.average_ms, Some(100));
+        }
+
+        app.benchmark_workflow
+            .set_active_reachability_assessment_for_test(
+                "select",
+                NodeReachabilityAssessment::from_attempts(
+                    "node-a".into(),
+                    vec![
+                        ProbeOutcome::Reachable { delay_ms: 100 },
+                        ProbeOutcome::Reachable { delay_ms: 200 },
+                    ],
+                ),
+            );
+        {
+            let snapshot = app.view_snapshot();
+            let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
+            assert_eq!(signal.bars.map(|bar| bar.height), [8, 4, 2]);
+            assert_eq!(signal.average_ms, Some(150));
+        }
+
+        app.benchmark_workflow
+            .set_active_reachability_assessment_for_test(
+                "select",
+                NodeReachabilityAssessment::from_attempts(
+                    "node-a".into(),
+                    vec![
+                        ProbeOutcome::Reachable { delay_ms: 100 },
+                        ProbeOutcome::Reachable { delay_ms: 200 },
+                        ProbeOutcome::Reachable { delay_ms: 400 },
+                    ],
+                ),
+            );
+        let snapshot = app.view_snapshot();
+        let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
+        assert_eq!(signal.bars.map(|bar| bar.height), [8, 4, 2]);
+        assert_eq!(signal.average_ms, Some(233));
     }
 
     #[test]
@@ -666,8 +772,10 @@ mod tests {
             .find(|row| row.name == "node-a")
             .expect("active node row");
 
-        assert_eq!(row.reachability, "0/3");
-        assert_eq!(row.marker, "degraded");
+        let signal = row.latency_signal.as_ref().unwrap();
+        assert_eq!(signal.bars[0].state, LatencySignalState::Unreachable);
+        assert_eq!(signal.bars[1].state, LatencySignalState::Untested);
+        assert_eq!(signal.average_ms, None);
         assert_eq!(row.tone, CandidateTone::Pending);
     }
 
@@ -696,8 +804,9 @@ mod tests {
             .find(|row| row.name == "node-a")
             .expect("completed node row");
 
-        assert_eq!(row.reachability, "3/3");
-        assert_eq!(row.marker, "stable reachable");
+        let signal = row.latency_signal.as_ref().unwrap();
+        assert_eq!(signal.bars.map(|bar| bar.height), [8, 8, 7]);
+        assert_eq!(signal.average_ms, Some(21));
         assert_eq!(row.tone, CandidateTone::Success);
     }
 
@@ -726,8 +835,13 @@ mod tests {
             .find(|row| row.name == "node-a")
             .expect("pending node row");
 
-        assert_eq!(row.reachability, "-/3");
-        assert_eq!(row.marker, "...");
+        let signal = row.latency_signal.as_ref().unwrap();
+        assert_eq!(signal.bars.map(|bar| bar.height), [2, 2, 2]);
+        assert!(signal
+            .bars
+            .iter()
+            .all(|bar| bar.state == LatencySignalState::Untested));
+        assert_eq!(signal.average_ms, None);
         assert_eq!(row.tone, CandidateTone::Pending);
     }
 }

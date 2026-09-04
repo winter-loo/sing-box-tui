@@ -76,10 +76,30 @@ pub(crate) enum CandidateTone {
     Missing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LatencySignalState {
+    Untested,
+    Reachable { delay_ms: u64 },
+    Unreachable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LatencySignalBar {
+    pub(crate) height: u8,
+    pub(crate) state: LatencySignalState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LatencySignal {
+    pub(crate) bars: [LatencySignalBar; 3],
+    pub(crate) average_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateRow {
     pub(crate) name: String,
     pub(crate) is_current: bool,
+    pub(crate) latency_signal: Option<LatencySignal>,
     pub(crate) reachability: String,
     pub(crate) marker: String,
     pub(crate) compact_marker: String,
@@ -119,6 +139,60 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) onboarding: Option<&'a OnboardingState>,
     pub(crate) private_access_progress: Option<&'a PrivateAccessProgressModal>,
     pub(crate) private_access_auth: Option<&'a PrivateAccessAuthModal>,
+}
+
+fn latency_signal_glyph(height: u8) -> char {
+    // One Braille cell has two dot columns. These glyphs use only the left column, so every
+    // signal bar is half a cell wide and the unused right column is a consistent half-cell gap.
+    // The circular dots also give the closest portable terminal approximation to rounded ends.
+    // Never use the top Braille dot: keeping the upper quarter of every cell empty prevents bars
+    // in adjacent node rows from visually joining into one continuous vertical line.
+    match height.clamp(1, 8) {
+        1..=3 => '⡀',
+        4..=5 => '⡄',
+        _ => '⡆',
+    }
+}
+
+fn latency_signal_style(state: LatencySignalState) -> Style {
+    match state {
+        LatencySignalState::Untested => Style::default().fg(Color::DarkGray),
+        LatencySignalState::Reachable { delay_ms } if delay_ms < 200 => {
+            Style::default().fg(Color::Green)
+        }
+        LatencySignalState::Reachable { delay_ms } if delay_ms < 400 => {
+            Style::default().fg(Color::Yellow)
+        }
+        LatencySignalState::Reachable { delay_ms } if delay_ms < 600 => {
+            Style::default().fg(Color::Rgb(184, 134, 11))
+        }
+        LatencySignalState::Reachable { .. } => {
+            Style::default().fg(Color::Rgb(205, 92, 92))
+        }
+        LatencySignalState::Unreachable => Style::default()
+            .fg(Color::Rgb(139, 0, 0))
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn latency_average_label(signal: &LatencySignal) -> String {
+    signal.average_ms.map_or_else(
+        || "--".to_string(),
+        |average| format!("{average}ms"),
+    )
+}
+
+fn render_latency_signal(signal: &LatencySignal) -> Vec<Span<'static>> {
+    signal
+        .bars
+        .iter()
+        .map(|bar| {
+            Span::styled(
+                latency_signal_glyph(bar.height).to_string(),
+                latency_signal_style(bar.state),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -300,6 +374,29 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             };
             let current_suffix = if row.is_current { "  *" } else { "" };
             let available = candidate_area.width.saturating_sub(4) as usize;
+            if let Some(signal) = &row.latency_signal {
+                let average = latency_average_label(signal);
+                let suffix_width = 2
+                    + signal.bars.len()
+                    + 2
+                    + unicode_width::UnicodeWidthStr::width(average.as_str())
+                    + unicode_width::UnicodeWidthStr::width(current_suffix);
+                let visible_name =
+                    truncate_for_width(&row.name, available.saturating_sub(suffix_width));
+                let mut spans = vec![Span::styled(visible_name, style), Span::raw("  ")];
+                spans.extend(render_latency_signal(signal));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    average,
+                    Style::default().fg(if signal.average_ms.is_some() {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    }),
+                ));
+                spans.push(Span::raw(current_suffix));
+                return ListItem::new(Line::from(spans));
+            }
             let reachability_width = unicode_width::UnicodeWidthStr::width(row.reachability.as_str());
             let suffix_width = if reachability_width > 0 {
                 reachability_width + 2
