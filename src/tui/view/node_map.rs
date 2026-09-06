@@ -23,34 +23,56 @@ pub(crate) fn draw_node_map_panel(frame: &mut Frame, state: &NodeMapState) {
         "Filter: All Nodes (f)"
     };
 
-    let resolving_text = if state.is_resolving {
-        " [Resolving GeoIP...]"
-    } else {
-        ""
-    };
+    let is_disconnected = !state.is_resolving && stats.plotted_nodes == 0;
 
-    let title = Line::from(vec![
-        Span::styled(
-            " 🌍 Node Physical Location World Map ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "(Nodes: {} | Plotted: {} | Reachable: {} | Countries: {}{}) ",
-                stats.total_nodes,
-                stats.plotted_nodes,
-                stats.reachable_nodes,
-                stats.unique_countries,
-                resolving_text
+    let title = if is_disconnected {
+        Line::from(vec![
+            Span::styled(
+                " 🌍 Node Physical Location World Map ",
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
             ),
-            Style::default().fg(Color::Gray),
-        ),
-    ]);
+            Span::styled(
+                "[⚡ Disconnected from the world] ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("(Nodes: {} | Plotted: 0) ", stats.total_nodes),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        let resolving_text = if state.is_resolving {
+            " [Resolving GeoIP...]"
+        } else {
+            ""
+        };
+        Line::from(vec![
+            Span::styled(
+                " 🌍 Node Physical Location World Map ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "(Nodes: {} | Plotted: {} | Reachable: {} | Countries: {}{}) ",
+                    stats.total_nodes,
+                    stats.plotted_nodes,
+                    stats.reachable_nodes,
+                    stats.unique_countries,
+                    resolving_text
+                ),
+                Style::default().fg(Color::Gray),
+            ),
+        ])
+    };
 
     let outer_block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(if is_disconnected {
+            Style::default().fg(Color::LightRed)
+        } else {
+            Style::default().fg(Color::Cyan)
+        });
 
     let inner = outer_block.inner(area);
     frame.render_widget(outer_block, area);
@@ -85,8 +107,10 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
     let [map_rect, legend_rect] =
         Layout::vertical([Constraint::Min(12), Constraint::Length(1)]).areas(area);
 
+    let stats = state.stats();
+
     let map_block = Block::default()
-        .title(" World Map (Equirectangular Projection) ")
+        .title(" World Map ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -99,12 +123,118 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
         return;
     }
 
+    // When no nodes can be plotted on the world map (offline or pending resolution)
+    if stats.plotted_nodes == 0 {
+        if state.is_resolving {
+            let msg = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "🌐 Connecting to the world...",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Resolving node IP physical locations...",
+                    Style::default().fg(Color::Gray),
+                )),
+            ];
+            let p = Paragraph::new(msg).alignment(ratatui::layout::Alignment::Center);
+            let v_offset = (height.saturating_sub(4)) / 2;
+            let centered_area = Rect {
+                x: canvas_area.x,
+                y: canvas_area.y + v_offset as u16,
+                width: canvas_area.width,
+                height: 4.min(canvas_area.height),
+            };
+            frame.render_widget(p, centered_area);
+        } else {
+            let msg = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("⚡ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "You are disconnected from the world.",
+                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "The world map is unavailable while offline.",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(Span::styled(
+                    "No physical node locations could be resolved.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("r", Style::default().fg(Color::Cyan)),
+                    Span::styled(" to retry once connection is restored.", Style::default().fg(Color::DarkGray)),
+                ]),
+            ];
+            let p = Paragraph::new(msg).alignment(ratatui::layout::Alignment::Center);
+            let v_offset = (height.saturating_sub(7)) / 2;
+            let centered_area = Rect {
+                x: canvas_area.x,
+                y: canvas_area.y + v_offset as u16,
+                width: canvas_area.width,
+                height: 7.min(canvas_area.height),
+            };
+            frame.render_widget(p, centered_area);
+        }
+
+        let legend = Line::from(vec![
+            Span::styled("● ", Style::default().fg(if state.is_resolving { Color::Yellow } else { Color::DarkGray })),
+            Span::raw(if state.is_resolving { "Connecting..." } else { "Offline / Disconnected from the world" }),
+        ]);
+        frame.render_widget(Paragraph::new(legend), legend_rect);
+        return;
+    }
+
+    let filtered_indices = state.filtered_indices();
+    if filtered_indices.is_empty() {
+        let msg = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No reachable nodes to display.",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "All plotted nodes are currently unreachable.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled("f", Style::default().fg(Color::Cyan)),
+                Span::styled(" to show all nodes on the map.", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+        let p = Paragraph::new(msg).alignment(ratatui::layout::Alignment::Center);
+        let v_offset = (height.saturating_sub(6)) / 2;
+        let centered_area = Rect {
+            x: canvas_area.x,
+            y: canvas_area.y + v_offset as u16,
+            width: canvas_area.width,
+            height: 6.min(canvas_area.height),
+        };
+        frame.render_widget(p, centered_area);
+
+        let legend = Line::from(vec![
+            Span::styled("Filter active: ", Style::default().fg(Color::Yellow)),
+            Span::raw("Press 'f' to view all nodes"),
+        ]);
+        frame.render_widget(Paragraph::new(legend), legend_rect);
+        return;
+    }
+
     // Equator and Prime Meridian rows/cols
     let eq_y = height / 2;
     let pm_x = width / 2;
 
     // Cluster nodes by projected (x, y)
-    let filtered_indices = state.filtered_indices();
     let selected_filtered_pos = state
         .selected_index
         .min(filtered_indices.len().saturating_sub(1));
@@ -256,7 +386,7 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
             Line::from(vec![
                 Span::styled("IP:       ", Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    node.ip.as_deref().unwrap_or("Resolving..."),
+                    node.ip.as_deref().unwrap_or("Unresolved (Offline)"),
                     Style::default().fg(Color::LightYellow),
                 ),
             ]),
@@ -264,7 +394,11 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                 Span::styled("Location: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     truncate_for_width(&node.display_location(), available_w),
-                    Style::default().fg(Color::LightCyan),
+                    if node.location.is_some() {
+                        Style::default().fg(Color::LightCyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
             ]),
             Line::from(vec![
@@ -290,6 +424,7 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
     frame.render_widget(Paragraph::new(detail_lines), detail_inner);
 
     // List of nodes
+    let stats = state.stats();
     let filtered_indices = state.filtered_indices();
     let selected_pos = state
         .selected_index
@@ -306,11 +441,10 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                 NodeTone::Missing => ("●", Color::DarkGray),
             };
 
-            let country_badge = node
-                .location
-                .as_ref()
-                .map(|l| format!("[{}]", l.country_code))
-                .unwrap_or_else(|| "[--]".to_string());
+            let (country_badge, badge_color) = match &node.location {
+                Some(l) => (format!("[{}]", l.country_code), Color::Cyan),
+                None => ("[--]".to_string(), Color::DarkGray),
+            };
 
             let current_indicator = if node.is_current { " *" } else { "" };
             let max_name_len = list_area.width.saturating_sub(16) as usize;
@@ -320,7 +454,7 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                 Span::styled(format!("{status_dot} "), Style::default().fg(dot_color)),
                 Span::styled(
                     format!("{country_badge:<5} "),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(badge_color),
                 ),
                 Span::raw(display_name),
                 Span::styled(current_indicator, Style::default().fg(Color::Green)),
@@ -329,7 +463,11 @@ fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
         .collect();
 
     let list_block = Block::default()
-        .title(format!(" Nodes ({}/{}) ", filtered_indices.len(), state.nodes.len()))
+        .title(format!(
+            " Nodes ({} Plotted / {}) ",
+            stats.plotted_nodes,
+            state.nodes.len()
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -416,6 +554,41 @@ mod tests {
         assert!(rendered_text.contains("US-LA-01"));
         assert!(rendered_text.contains("1.2.3.4"));
         assert!(rendered_text.contains("Los Angeles"));
+    }
+
+    #[test]
+    fn node_map_panel_renders_disconnected_when_no_nodes_plotted() {
+        let nodes = vec![NodeLocation {
+            tag: "US-LA-01".to_string(),
+            outbound_type: "vless".to_string(),
+            server_host: "us.example.com".to_string(),
+            server_port: Some(443),
+            ip: None,
+            location: None,
+            is_current: true,
+            latency_ms: None,
+            reachability: "--".to_string(),
+            tone: NodeTone::Missing,
+        }];
+
+        let mut state = NodeMapState::new(nodes);
+        state.is_resolving = false;
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal initializes");
+        terminal
+            .draw(|frame| draw_node_map_panel(frame, &state))
+            .expect("draws node map panel");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered_text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered_text.contains("You are disconnected from the world."));
+        assert!(rendered_text.contains("The world map is unavailable while offline."));
+        assert!(rendered_text.contains("Disconnected from the world"));
     }
 }
 

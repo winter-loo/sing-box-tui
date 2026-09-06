@@ -7,8 +7,7 @@ use serde_json::Value;
 use super::App;
 use crate::controller::ProbeOutcome;
 use crate::node_map::{
-    GeoLocation, NodeLocation, NodeMapState, NodeTone, infer_location_from_name,
-    spawn_ip_geolocation_worker,
+    GeoLocation, NodeLocation, NodeMapState, NodeTone, spawn_ip_geolocation_worker,
 };
 
 pub(super) struct NodeMapJob {
@@ -101,7 +100,6 @@ impl App {
             });
 
             let is_current = current_member.as_deref() == Some(member.as_str());
-            let initial_location = infer_location_from_name(member);
 
             node_locations.push(NodeLocation {
                 tag: member.clone(),
@@ -109,7 +107,7 @@ impl App {
                 server_host: server.clone(),
                 server_port: port,
                 ip: None,
-                location: initial_location,
+                location: None,
                 is_current,
                 latency_ms,
                 reachability: reachability_label,
@@ -153,7 +151,15 @@ impl App {
                     if let Some(state) = &mut self.node_map {
                         state.apply_resolved_locations(&updates);
                         state.is_resolving = false;
-                        self.set_status_only("Node IP physical locations updated");
+                        let stats = state.stats();
+                        if stats.plotted_nodes > 0 {
+                            self.set_status_only(format!(
+                                "Node physical locations updated ({} plotted across {} countries)",
+                                stats.plotted_nodes, stats.unique_countries
+                            ));
+                        } else {
+                            self.set_status_only("You are disconnected from the world (0 nodes plotted)");
+                        }
                     }
                     self.node_map_job = None;
                 }
@@ -161,6 +167,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if let Some(state) = &mut self.node_map {
                         state.is_resolving = false;
+                        self.set_status_only("You are disconnected from the world (geolocation failed)");
                     }
                     self.node_map_job = None;
                 }

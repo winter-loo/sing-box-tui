@@ -120,7 +120,7 @@ impl NodeLocation {
                     lon_dir
                 )
             }
-            None => "--, --".to_string(),
+            None => "Disconnected / Unresolved".to_string(),
         }
     }
 }
@@ -139,68 +139,6 @@ pub fn country_code_to_flag(code: &str) -> String {
     } else {
         String::new()
     }
-}
-
-/// Fast offline heuristic mapping for node tags when offline or waiting for API resolution.
-pub fn infer_location_from_name(name: &str) -> Option<GeoLocation> {
-    let upper = name.to_uppercase();
-
-    // Map common regions: (keywords, country, code, region, city, lat, lon)
-    const PRESETS: &[(&[&str], &str, &str, &str, &str, f64, f64)] = &[
-        (&["香港", "HK", "HONG KONG", "HONGKONG", "🇭🇰"], "Hong Kong", "HK", "Hong Kong", "Hong Kong", 22.3193, 114.1694),
-        (&["台湾", "臺灣", "TW", "TAIWAN", "TAIPEI", "台北", "臺北", "🇹🇼"], "Taiwan", "TW", "Taipei", "Taipei", 25.0330, 121.5654),
-        (&["日本", "JP", "JAPAN", "TOKYO", "东京", "東京", "OSAKA", "大阪", "🇯🇵"], "Japan", "JP", "Kanto", "Tokyo", 35.6762, 139.6503),
-        (&["新加坡", "SG", "SINGAPORE", "LION", "狮城", "🇸🇬"], "Singapore", "SG", "Singapore", "Singapore", 1.3521, 103.8198),
-        (&["美国", "美國", "US", "USA", "UNITED STATES", "AMERICA", "LOS ANGELES", "洛杉矶", "SAN JOSE", "圣何塞", "SILICON", "硅谷", "NEW YORK", "纽约", "SEATTLE", "西雅图", "CHICAGO", "芝加哥", "🇺🇸"], "United States", "US", "California", "Los Angeles", 34.0522, -118.2437),
-        (&["韩国", "韓國", "KR", "KOREA", "SEOUL", "首尔", "首爾", "🇰🇷"], "South Korea", "KR", "Seoul", "Seoul", 37.5665, 126.9780),
-        (&["英国", "英國", "UK", "GB", "UNITED KINGDOM", "BRITAIN", "LONDON", "伦敦", "倫敦", "🇬🇧"], "United Kingdom", "GB", "England", "London", 51.5074, -0.1278),
-        (&["德国", "德國", "DE", "GERMANY", "FRANKFURT", "法兰克福", "BERLIN", "柏林", "🇩🇪"], "Germany", "DE", "Hesse", "Frankfurt", 50.1109, 8.6821),
-        (&["法国", "法國", "FR", "FRANCE", "PARIS", "巴黎", "🇫🇷"], "France", "FR", "Ile-de-France", "Paris", 48.8566, 2.3522),
-        (&["荷兰", "荷蘭", "NL", "NETHERLANDS", "AMSTERDAM", "阿姆斯特丹", "🇳🇱"], "Netherlands", "NL", "North Holland", "Amsterdam", 52.3676, 4.9041),
-        (&["澳大利亚", "澳洲", "AU", "AUSTRALIA", "SYDNEY", "悉尼", "MELBOURNE", "墨尔本", "🇦🇺"], "Australia", "AU", "New South Wales", "Sydney", -33.8688, 151.2093),
-        (&["加拿大", "CA", "CANADA", "TORONTO", "多伦多", "VANCOUVER", "温哥华", "🇨🇦"], "Canada", "CA", "Ontario", "Toronto", 43.6532, -79.3832),
-        (&["俄罗斯", "俄羅斯", "RU", "RUSSIA", "MOSCOW", "莫斯科", "🇷🇺"], "Russia", "RU", "Moscow", "Moscow", 55.7558, 37.6173),
-        (&["印度", "IN", "INDIA", "MUMBAI", "孟买", "DELHI", "德里", "🇮🇳"], "India", "IN", "Maharashtra", "Mumbai", 19.0760, 72.8777),
-        (&["马来西亚", "MY", "MALAYSIA", "KUALA LUMPUR", "吉隆坡", "🇲🇾"], "Malaysia", "MY", "Federal Territory", "Kuala Lumpur", 3.1390, 101.6869),
-        (&["泰国", "TH", "THAILAND", "BANGKOK", "曼谷", "🇹🇭"], "Thailand", "TH", "Bangkok", "Bangkok", 13.7563, 100.5018),
-        (&["越南", "VN", "VIETNAM", "HANOI", "河内", "HO CHI MINH", "胡志明", "🇻🇳"], "Vietnam", "VN", "Hanoi", "Hanoi", 21.0285, 105.8542),
-        (&["菲律宾", "PH", "PHILIPPINES", "MANILA", "马尼拉", "🇵🇭"], "Philippines", "PH", "Metro Manila", "Manila", 14.5995, 120.9842),
-        (&["印尼", "ID", "INDONESIA", "JAKARTA", "雅加达", "🇮🇩"], "Indonesia", "ID", "Jakarta", "Jakarta", -6.2088, 106.8456),
-        (&["土耳其", "TR", "TURKEY", "ISTANBUL", "伊斯坦布尔", "🇹🇷"], "Turkey", "TR", "Istanbul", "Istanbul", 41.0082, 28.9784),
-        (&["阿联酋", "迪拜", "AE", "UAE", "DUBAI", "🇦🇪"], "United Arab Emirates", "AE", "Dubai", "Dubai", 25.2048, 55.2708),
-        (&["巴西", "BR", "BRAZIL", "SAO PAULO", "圣保罗", "🇧🇷"], "Brazil", "BR", "Sao Paulo", "Sao Paulo", -23.5505, -46.6333),
-        (&["阿根廷", "AR", "ARGENTINA", "BUENOS AIRES", "布宜诺斯艾利斯", "🇦🇷"], "Argentina", "AR", "Buenos Aires", "Buenos Aires", -34.6037, -58.3816),
-        (&["南非", "ZA", "SOUTH AFRICA", "JOHANNESBURG", "约翰内斯堡", "🇿🇦"], "South Africa", "ZA", "Gauteng", "Johannesburg", -26.2041, 28.0473),
-        (&["瑞士", "CH", "SWITZERLAND", "ZURICH", "苏黎世", "🇨🇭"], "Switzerland", "CH", "Zurich", "Zurich", 47.3769, 8.5417),
-        (&["瑞典", "SE", "SWEDEN", "STOCKHOLM", "斯德哥尔摩", "🇸🇪"], "Sweden", "SE", "Stockholm", "Stockholm", 59.3293, 18.0686),
-        (&["意大利", "IT", "ITALY", "ROME", "罗马", "MILAN", "米兰", "🇮🇹"], "Italy", "IT", "Lazio", "Rome", 41.9028, 12.4964),
-        (&["西班牙", "ES", "SPAIN", "MADRID", "马德里", "BARCELONA", "巴塞罗那", "🇪🇸"], "Spain", "ES", "Madrid", "Madrid", 40.4168, -3.7038),
-        (&["波兰", "PL", "POLAND", "WARSAW", "华沙", "🇵🇱"], "Poland", "PL", "Mazovia", "Warsaw", 52.2297, 21.0122),
-        (&["爱尔兰", "IE", "IRELAND", "DUBLIN", "都柏林", "🇮🇪"], "Ireland", "IE", "Leinster", "Dublin", 53.3498, -6.2603),
-        (&["芬兰", "FI", "FINLAND", "HELSINKI", "赫尔辛基", "🇫🇮"], "Finland", "FI", "Uusimaa", "Helsinki", 60.1699, 24.9384),
-        (&["挪威", "NO", "NORWAY", "OSLO", "奥斯陆", "🇳🇴"], "Norway", "NO", "Oslo", "Oslo", 59.9139, 10.7522),
-        (&["丹麦", "DK", "DENMARK", "COPENHAGEN", "哥本哈根", "🇩🇰"], "Denmark", "DK", "Capital Region", "Copenhagen", 55.6761, 12.5683),
-        (&["奥地利", "AT", "AUSTRIA", "VIENNA", "维也纳", "🇦🇹"], "Austria", "AT", "Vienna", "Vienna", 48.2082, 16.3738),
-        (&["以色列", "IL", "ISRAEL", "TEL AVIV", "特拉维夫", "🇮🇱"], "Israel", "IL", "Tel Aviv", "Tel Aviv", 32.0853, 34.7818),
-        (&["新西兰", "NZ", "NEW ZEALAND", "AUCKLAND", "奥克兰", "🇳🇿"], "New Zealand", "NZ", "Auckland", "Auckland", -36.8485, 174.7633),
-        (&["中国", "国内", "CN", "CHINA", "BEIJING", "北京", "SHANGHAI", "上海", "GUANGZHOU", "广州", "SHENZHEN", "深圳", "🇨🇳"], "China", "CN", "Beijing", "Beijing", 39.9042, 116.4074),
-    ];
-
-    for (keywords, country, code, region, city, lat, lon) in PRESETS {
-        for kw in *keywords {
-            if upper.contains(kw) {
-                return Some(GeoLocation {
-                    country: country.to_string(),
-                    country_code: code.to_string(),
-                    region: region.to_string(),
-                    city: city.to_string(),
-                    latitude: *lat,
-                    longitude: *lon,
-                });
-            }
-        }
-    }
-    None
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -363,9 +301,14 @@ pub fn spawn_ip_geolocation_worker<F>(
                 let ip_str = if let Ok(ip) = host.parse::<IpAddr>() {
                     Some(ip.to_string())
                 } else {
-                    match tokio::net::lookup_host(format!("{host}:443")).await {
-                        Ok(mut addrs) => addrs.next().map(|a| a.ip().to_string()),
-                        Err(_) => None,
+                    let lookup = tokio::time::timeout(
+                        Duration::from_millis(1500),
+                        tokio::net::lookup_host(format!("{host}:443")),
+                    )
+                    .await;
+                    match lookup {
+                        Ok(Ok(mut addrs)) => addrs.next().map(|a| a.ip().to_string()),
+                        _ => None,
                     }
                 };
 
@@ -381,7 +324,7 @@ pub fn spawn_ip_geolocation_worker<F>(
             let unique_ips: Vec<String> = ip_to_tags.keys().cloned().collect();
             if !unique_ips.is_empty() {
                 // Build client with local proxy if available
-                let mut client_builder = AsyncClient::builder().timeout(Duration::from_secs(8));
+                let mut client_builder = AsyncClient::builder().timeout(Duration::from_secs(3));
                 if let Some(port) = local_proxy_port {
                     if let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")) {
                         client_builder = client_builder.proxy(proxy);
@@ -462,18 +405,6 @@ mod tests {
         let (x_max, y_max) = project_coords(-90.0, 180.0, 80, 24);
         assert_eq!(x_max, 79);
         assert_eq!(y_max, 23);
-    }
-
-    #[test]
-    fn heuristic_location_inference_works() {
-        let hk = infer_location_from_name("L1|香港优化01|3x").expect("HK inferred");
-        assert_eq!(hk.country_code, "HK");
-
-        let jp = infer_location_from_name("JP-Tokyo-HighSpeed").expect("JP inferred");
-        assert_eq!(jp.country_code, "JP");
-
-        let us = infer_location_from_name("🇺🇸 US Los Angeles 05").expect("US inferred");
-        assert_eq!(us.country_code, "US");
     }
 
     #[test]
