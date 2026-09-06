@@ -231,6 +231,22 @@ struct SustainedJob {
 }
 
 impl BenchmarkWorkflow {
+    pub(crate) fn is_running(&self) -> bool {
+        !self.jobs.is_empty() || !self.sustained_jobs.is_empty()
+    }
+
+    pub(crate) fn cancel_running_probes(&mut self) {
+        for job in &self.jobs {
+            if let Some(cancellation) = &job.cancellation {
+                cancellation.store(true, Ordering::Relaxed);
+            }
+        }
+        for job in &self.sustained_jobs {
+            job.cancellation.store(true, Ordering::Relaxed);
+        }
+    }
+
+
     pub(crate) fn open(
         base_url: String,
         client: AsyncClient,
@@ -1151,6 +1167,29 @@ impl BenchmarkWorkflow {
             let mut finished = false;
             loop {
                 match self.jobs[index].receiver.try_recv() {
+                    Ok(BenchmarkEvent::AttemptProgress(assessment)) => {
+                        let group = self.jobs[index].group.clone();
+                        let completed = assessment.attempts.len();
+                        let reachable = assessment
+                            .attempts
+                            .iter()
+                            .filter(|attempt| {
+                                matches!(attempt, crate::controller::ProbeOutcome::Reachable { .. })
+                            })
+                            .count();
+                        let best_label = format!(
+                            "{} attempt {completed}/3 ({reachable} reachable)",
+                            assessment.name
+                        );
+                        if self.jobs[index].quality_projection_current {
+                            self.jobs[index]
+                                .current_assessments
+                                .insert(assessment.name.clone(), assessment);
+                        } else {
+                            self.jobs[index].current_assessments.clear();
+                        }
+                        updates.push(BenchmarkUpdate::Progress { group, best_label });
+                    }
                     Ok(BenchmarkEvent::ReachabilityProgress(assessment)) => {
                         let group = self.jobs[index].group.clone();
                         let quality_receipt = self.jobs[index].quality_receipt.clone();
@@ -2665,6 +2704,54 @@ mod tests {
             }) if group == "select" && assessments.len() == 1
         ));
         assert!(workflow.active_nodes("select").is_none());
+    }
+
+    #[test]
+    fn attempt_progress_updates_live_projection_without_persisting_partial_assessment() {
+        let mut workflow = workflow(None);
+        let partial = NodeReachabilityAssessment::from_attempts(
+            "node-a".into(),
+            vec![ProbeOutcome::Reachable { delay_ms: 100 }],
+        );
+        let sender = queue_job(
+            &mut workflow,
+            request("select", &["node-a"]),
+            BenchmarkKind::Group,
+            [BenchmarkEvent::AttemptProgress(partial.clone())],
+            true,
+        )
+        .expect("keep partial assessment job open");
+
+        let updates = workflow.poll();
+
+        assert!(matches!(
+            updates.as_slice(),
+            [BenchmarkUpdate::Progress { group, best_label }]
+                if group == "select" && best_label == "node-a attempt 1/3 (1 reachable)"
+        ));
+        assert!(workflow.reachability_assessment("select", "node-a").is_none());
+        assert!(matches!(
+            workflow.active_quick_probe("select", "node-a"),
+            Some(ActiveQuickProbe::IncompleteAssessment(assessment))
+                if assessment == &partial
+        ));
+
+        sender
+            .send(BenchmarkEvent::ReachabilityProgress(reachable(
+                "node-a",
+                [100, 200, 400],
+            )))
+            .unwrap();
+        sender.send(BenchmarkEvent::Finished).unwrap();
+        let _ = workflow.poll();
+        assert_eq!(
+            workflow
+                .reachability_assessment("select", "node-a")
+                .expect("completed assessment is published")
+                .attempts
+                .len(),
+            3
+        );
     }
 
     #[test]

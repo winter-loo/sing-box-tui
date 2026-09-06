@@ -42,7 +42,7 @@ pub(super) struct ActiveUsabilityProbe {
 impl App {
     pub(super) fn start_manual_usability_probe(&mut self) {
         if self.usability_probe_job.is_some() {
-            self.set_status_only("A usability probe is already running");
+            self.pause_active_probes();
             return;
         }
         let manifest_id = match &self.node_view_panel {

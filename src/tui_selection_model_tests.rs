@@ -1,3 +1,17 @@
+#[test]
+fn pressing_u_or_esc_pauses_active_probe() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    assert!(!app.is_any_probe_running());
+
+    app.handle_key(KeyCode::Esc).expect("esc when idle");
+    assert!(!app.status.contains("Probe paused"));
+
+    // If pause_active_probes is called directly
+    app.pause_active_probes();
+    assert!(!app.is_any_probe_running());
+}
+
 use super::super::test_support::{install_streaming_probe_run, internet_routes_app, test_app};
 use super::live_usability_members;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};

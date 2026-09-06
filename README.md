@@ -555,7 +555,7 @@ Detached auto-pick worker commands are available separately:
 The TUI deliberately leaves terminal mouse capture disabled. Drag with the mouse to select text using your terminal's native selection and copy behavior.
 - `q`: quit
 
-During a quick assessment, rows show a brighter probing state and then `3/3`, `2/3`, `1/3`, `0/3`, or `incomplete`. Only timeout and transport failure count against a node; controller failure, invalid measurement, and cancellation leave the assessment incomplete.
+During a quick assessment, each current-selector row shows three thin Braille latency bars. Each bar uses one half of a fixed-width terminal cell and leaves the other half as a consistent visual gap; its top Braille row stays empty so signals on adjacent node rows remain visually separated. Untested bars are gray; completed attempts are colored by their measured latency, node-attributable failures are deep red, and the reachable samples' average appears to the right. Bar heights rebalance as the second and third reachable measurements arrive. Only timeout and transport failure count against a node; controller failure, invalid measurement, and cancellation remain gray because they leave the assessment incomplete.
 
 ## System Proxy
 

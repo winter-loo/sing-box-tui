@@ -84,6 +84,8 @@ mod input_workflow;
 mod managed_process;
 #[path = "../tui_network_mode.rs"]
 mod network_mode;
+#[path = "../tui_node_map.rs"]
+mod node_map_workflow;
 #[path = "../tui_node_quality_detail.rs"]
 mod node_quality_detail;
 #[path = "../tui_onboarding.rs"]
@@ -291,6 +293,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_private_access_updates()?;
         app.poll_verify_updates();
         app.poll_background_auto_pick_status()?;
+        app.poll_node_map_updates();
         app.maybe_start_subscription_refresh();
         app.maybe_refresh_node_quality_detail()?;
         app.maybe_refresh_connections();
@@ -449,6 +452,8 @@ struct App {
     private_access: PrivateAccessRuntime,
     private_access_progress: Option<PrivateAccessProgressModal>,
     private_access_auth: Option<PrivateAccessAuthModal>,
+    node_map: Option<crate::node_map::NodeMapState>,
+    node_map_job: Option<node_map_workflow::NodeMapJob>,
 }
 
 fn tui_persistent_path_registry(
@@ -663,6 +668,8 @@ impl App {
             private_access: PrivateAccessRuntime::new()?,
             private_access_progress: None,
             private_access_auth: None,
+            node_map: None,
+            node_map_job: None,
         };
         let initialization = (|| {
             app.apply_runtime_state(runtime_state.clone())?;
@@ -839,10 +846,54 @@ impl App {
             }
             return Ok(true);
         }
+        if self.node_map.is_some() {
+            match code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('M')
+                | KeyCode::Char('m')
+                | KeyCode::Char('q') => {
+                    self.close_node_map();
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(map) = &mut self.node_map {
+                        map.select_next();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                    if let Some(map) = &mut self.node_map {
+                        map.select_previous();
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if let Some(map) = &mut self.node_map {
+                        map.select_first();
+                    }
+                }
+                KeyCode::Char('G') => {
+                    if let Some(map) = &mut self.node_map {
+                        map.select_last();
+                    }
+                }
+                KeyCode::Char('f') => {
+                    if let Some(map) = &mut self.node_map {
+                        map.toggle_filter();
+                    }
+                }
+                KeyCode::Char('r') => {
+                    self.refresh_node_map_geolocation();
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc if self.network_transition_is_running() => {
                 self.set_status_only("Wait for the network mode update before exiting");
+            }
+            KeyCode::Esc if self.is_any_probe_running() => {
+                self.pause_active_probes();
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab => {
@@ -867,6 +918,7 @@ impl App {
             KeyCode::Char('t') => self.start_member_benchmark()?,
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('m') => self.cycle_clash_mode()?,
+            KeyCode::Char('M') => self.open_node_map()?,
             KeyCode::Char('b') => self.open_bypass_modal(),
             KeyCode::Char('B') => return self.keep_sing_box_running_in_background(),
             KeyCode::Char('p') => self.set_system_proxy(),
@@ -894,7 +946,30 @@ impl App {
         displayed.get(index).cloned()
     }
 
-    fn open_help_panel(&mut self) {
+        pub(super) fn is_any_probe_running(&self) -> bool {
+        self.usability_probe_job.is_some() || self.benchmark_workflow.is_running()
+    }
+
+    pub(super) fn pause_active_probes(&mut self) {
+        let mut stopped = false;
+        if self.usability_probe_job.is_some() {
+            if let Err(error) = self.cancel_active_usability_probe_with_reason("User paused probe") {
+                self.set_status_only(format!("Cannot pause usability probe: {error:#}"));
+            } else {
+                stopped = true;
+            }
+        }
+        if self.benchmark_workflow.is_running() {
+            self.benchmark_workflow.cancel_running_probes();
+            stopped = true;
+        }
+        if stopped {
+            self.manual_candidate_navigation = true;
+            self.set_status_only("Probe paused");
+        }
+    }
+
+fn open_help_panel(&mut self) {
         self.show_help = true;
         self.flash = None;
         self.set_status_only("Showing help");

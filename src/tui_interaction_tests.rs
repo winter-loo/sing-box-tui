@@ -184,3 +184,32 @@ fn sonicwall_auth_displays_secrets_and_prefills_only_static_credentials() {
     assert_eq!(state.password.as_deref(), Some("static-secret"));
     assert_eq!(state.password_env.as_deref(), Some("SONICWALL_PASSWORD"));
 }
+
+#[test]
+fn node_map_modal_opens_navigates_and_closes() {
+    let mut app = test_app();
+    assert!(app.node_map.is_none());
+
+    // Press 'M' to open
+    let handled = app.handle_key(KeyCode::Char('M')).expect("handle 'M'");
+    assert!(handled);
+    assert!(app.node_map.is_some());
+
+    // Check that state is active
+    let state = app.node_map.as_ref().unwrap();
+    assert_eq!(state.selected_index, 0);
+
+    // Navigate with 'j'
+    let handled = app.handle_key(KeyCode::Char('j')).expect("handle 'j'");
+    assert!(handled);
+
+    // Toggle filter with 'f'
+    let handled = app.handle_key(KeyCode::Char('f')).expect("handle 'f'");
+    assert!(handled);
+    assert!(app.node_map.as_ref().unwrap().filter_reachable_only);
+
+    // Press Esc to close
+    let handled = app.handle_key(KeyCode::Esc).expect("handle Esc");
+    assert!(handled);
+    assert!(app.node_map.is_none());
+}
