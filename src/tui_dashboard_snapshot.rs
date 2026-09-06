@@ -585,6 +585,7 @@ impl App {
             onboarding: self.onboarding.as_ref(),
             private_access_progress: self.private_access_progress.as_ref(),
             private_access_auth: self.private_access_auth.as_ref(),
+            node_map: self.node_map.as_ref(),
         }
     }
 }

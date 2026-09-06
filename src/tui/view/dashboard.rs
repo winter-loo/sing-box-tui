@@ -139,6 +139,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) onboarding: Option<&'a OnboardingState>,
     pub(crate) private_access_progress: Option<&'a PrivateAccessProgressModal>,
     pub(crate) private_access_auth: Option<&'a PrivateAccessAuthModal>,
+    pub(crate) node_map: Option<&'a crate::node_map::NodeMapState>,
 }
 
 fn latency_signal_glyph(height: u8) -> char {
@@ -573,6 +574,9 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     }
     if let Some(chart) = snapshot.node_quality_detail {
         draw_node_quality_detail(frame, chart);
+    }
+    if let Some(node_map) = snapshot.node_map {
+        draw_node_map_panel(frame, node_map);
     }
     if let Some(connections) = snapshot.connections.as_ref() {
         draw_connections_panel(frame, connections);

@@ -166,6 +166,8 @@ pub(super) fn test_app() -> App {
             .expect("private access runtime"),
         private_access_progress: None,
         private_access_auth: None,
+        node_map: None,
+        node_map_job: None,
     }
 }
 

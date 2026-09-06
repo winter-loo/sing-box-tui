@@ -19,7 +19,9 @@ mod import;
 mod internet_tun;
 #[cfg(target_os = "macos")]
 mod macos_privileged_helper;
+mod land_mask_data;
 mod managed_sing_box;
+mod node_map;
 mod node_quality_path;
 mod node_runtime_manager;
 mod private_access;

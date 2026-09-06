@@ -69,6 +69,11 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Switch the controller between available Clash modes.",
     },
     HelpBinding {
+        key: "M",
+        summary: "Node location world map",
+        detail: "Open an ASCII/Unicode world map displaying the physical geographical locations of all available nodes based on their server IPs.",
+    },
+    HelpBinding {
         key: "T",
         summary: "Quick-assess current scope",
         detail: "Run three live-controller reachability attempts for each node in the active selector or node-view scope.",

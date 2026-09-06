@@ -164,6 +164,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         onboarding: None,
         private_access_progress: None,
         private_access_auth: None,
+        node_map: None,
     }
 }
 
