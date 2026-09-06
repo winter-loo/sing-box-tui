@@ -46,6 +46,13 @@ pub(crate) fn draw_node_map_panel(frame: &mut Frame, state: &NodeMapState) {
         } else {
             ""
         };
+        let local_summary = if let Some(egress) = &state.local_egress {
+            format!(" | Local: {} · {}", egress.ip, egress.isp)
+        } else if state.is_resolving {
+            " | Local: Resolving...".to_string()
+        } else {
+            String::new()
+        };
         Line::from(vec![
             Span::styled(
                 " 🌍 Node Physical Location World Map ",
@@ -53,12 +60,13 @@ pub(crate) fn draw_node_map_panel(frame: &mut Frame, state: &NodeMapState) {
             ),
             Span::styled(
                 format!(
-                    "(Nodes: {} | Plotted: {} | Reachable: {} | Countries: {}{}) ",
+                    "(Nodes: {} | Plotted: {} | Reachable: {} | Countries: {}{}{}) ",
                     stats.total_nodes,
                     stats.plotted_nodes,
                     stats.reachable_nodes,
                     stats.unique_countries,
-                    resolving_text
+                    resolving_text,
+                    local_summary
                 ),
                 Style::default().fg(Color::Gray),
             ),
@@ -234,6 +242,13 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
     let eq_y = height / 2;
     let pm_x = width / 2;
 
+    let local_pt = state.local_egress.as_ref().and_then(|e| {
+        match (e.latitude, e.longitude) {
+            (Some(lat), Some(lon)) => Some(project_coords(lat, lon, width, height)),
+            _ => None,
+        }
+    });
+
     // Cluster nodes by projected (x, y)
     let selected_filtered_pos = state
         .selected_index
@@ -259,6 +274,7 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                 let contains_selected = selected_orig_idx
                     .map(|sel| cluster.iter().any(|(i, _)| *i == sel))
                     .unwrap_or(false);
+                let is_local = Some((x, y)) == local_pt;
 
                 if contains_selected {
                     spans.push(Span::styled(
@@ -266,6 +282,14 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                         Style::default()
                             .fg(Color::Yellow)
                             .bg(Color::Rgb(160, 40, 40))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else if is_local {
+                    spans.push(Span::styled(
+                        "★",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .bg(Color::Rgb(20, 50, 70))
                             .add_modifier(Modifier::BOLD),
                     ));
                 } else if cluster.len() > 1 {
@@ -296,6 +320,13 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
+            } else if Some((x, y)) == local_pt {
+                spans.push(Span::styled(
+                    "★",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
             } else if is_land_grid(x, y, width, height) {
                 spans.push(Span::styled(
                     "░",
@@ -324,7 +355,24 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
     frame.render_widget(Paragraph::new(lines), canvas_area);
 
     // Map Legend
+    let local_label = if let Some(egress) = &state.local_egress {
+        let short_isp = if egress.isp.contains("电信") {
+            "电信"
+        } else if egress.isp.contains("联通") {
+            "联通"
+        } else if egress.isp.contains("移动") {
+            "移动"
+        } else {
+            "Exit"
+        };
+        format!("Local ({short_isp})  ")
+    } else {
+        "Local Exit  ".to_string()
+    };
+
     let legend = Line::from(vec![
+        Span::styled("★ ", Style::default().fg(Color::Magenta)),
+        Span::raw(local_label),
         Span::styled("● ", Style::default().fg(Color::LightGreen)),
         Span::raw("Reachable  "),
         Span::styled("● ", Style::default().fg(Color::Yellow)),
@@ -340,8 +388,65 @@ fn draw_map_canvas(frame: &mut Frame, area: Rect, state: &NodeMapState) {
 }
 
 fn draw_info_pane(frame: &mut Frame, area: Rect, state: &NodeMapState) {
-    let [detail_area, list_area] =
-        Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).areas(area);
+    let [egress_area, detail_area, list_area] = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Length(9),
+        Constraint::Min(6),
+    ])
+    .areas(area);
+
+    // 1. Local Broadband Exit Card
+    let egress_block = Block::default()
+        .title(" 🏠 Local Exit (本地出口宽带) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let egress_inner = egress_block.inner(egress_area);
+    frame.render_widget(egress_block, egress_area);
+
+    let avail_w = egress_inner.width.saturating_sub(12) as usize;
+    let egress_lines = if let Some(egress) = &state.local_egress {
+        vec![
+            Line::from(vec![
+                Span::styled("IP:       ", Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    &egress.ip,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("ISP:      ", Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    truncate_for_width(&egress.isp, avail_w),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Location: ", Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    truncate_for_width(&egress.location, avail_w),
+                    Style::default().fg(Color::LightCyan),
+                ),
+            ]),
+        ]
+    } else if state.is_resolving {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " Resolving broadband exit...",
+                Style::default().fg(Color::Gray),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " Offline / Disconnected",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
+    frame.render_widget(Paragraph::new(egress_lines), egress_inner);
 
     // Detail card for currently selected node
     let detail_block = Block::default()
@@ -589,6 +694,54 @@ mod tests {
         assert!(rendered_text.contains("You are disconnected from the world."));
         assert!(rendered_text.contains("The world map is unavailable while offline."));
         assert!(rendered_text.contains("Disconnected from the world"));
+    }
+
+    #[test]
+    fn node_map_panel_renders_local_egress_info() {
+        let nodes = vec![NodeLocation {
+            tag: "US-LA-01".to_string(),
+            outbound_type: "vless".to_string(),
+            server_host: "us.example.com".to_string(),
+            server_port: Some(443),
+            ip: Some("1.2.3.4".to_string()),
+            location: Some(GeoLocation {
+                country: "United States".to_string(),
+                country_code: "US".to_string(),
+                region: "CA".to_string(),
+                city: "Los Angeles".to_string(),
+                latitude: 34.05,
+                longitude: -118.24,
+            }),
+            is_current: true,
+            latency_ms: Some(135),
+            reachability: "stable reachable".to_string(),
+            tone: NodeTone::Success,
+        }];
+
+        let mut state = NodeMapState::new(nodes);
+        state.local_egress = Some(crate::node_map::LocalEgressInfo {
+            ip: "220.184.215.38".to_string(),
+            isp: "中国电信 (China Telecom)".to_string(),
+            location: "中国 浙江 杭州".to_string(),
+            latitude: Some(30.27),
+            longitude: Some(120.16),
+        });
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal initializes");
+        terminal
+            .draw(|frame| draw_node_map_panel(frame, &state))
+            .expect("draws node map panel");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered_text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered_text.contains("Local Exit"));
+        assert!(rendered_text.contains("220.184.215.38"));
+        assert!(rendered_text.contains("China Telecom"));
     }
 }
 

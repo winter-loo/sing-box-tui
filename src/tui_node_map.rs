@@ -7,11 +7,12 @@ use serde_json::Value;
 use super::App;
 use crate::controller::ProbeOutcome;
 use crate::node_map::{
-    GeoLocation, NodeLocation, NodeMapState, NodeTone, spawn_ip_geolocation_worker,
+    NodeLocation, NodeMapState, NodeMapWorkerResult, NodeTone,
+    spawn_ip_geolocation_worker,
 };
 
 pub(super) struct NodeMapJob {
-    receiver: Receiver<Vec<(String, Option<String>, Option<GeoLocation>)>>,
+    receiver: Receiver<NodeMapWorkerResult>,
 }
 
 impl App {
@@ -120,18 +121,16 @@ impl App {
         }
 
         let mut state = NodeMapState::new(node_locations);
-        state.is_resolving = !targets_for_resolution.is_empty();
+        state.is_resolving = true;
         self.node_map = Some(state);
 
-        if !targets_for_resolution.is_empty() {
-            let (tx, rx) = mpsc::channel();
-            // Local proxy port: check inbounds or default 6780
-            let proxy_port = Some(6780);
-            spawn_ip_geolocation_worker(targets_for_resolution, proxy_port, move |results| {
-                let _ = tx.send(results);
-            });
-            self.node_map_job = Some(NodeMapJob { receiver: rx });
-        }
+        let (tx, rx) = mpsc::channel();
+        // Local proxy port: check inbounds or default 6780
+        let proxy_port = Some(6780);
+        spawn_ip_geolocation_worker(targets_for_resolution, proxy_port, move |result| {
+            let _ = tx.send(result);
+        });
+        self.node_map_job = Some(NodeMapJob { receiver: rx });
 
         self.flash = None;
         self.set_status_only("Opened node location world map (Esc/Enter/M to close)");
@@ -147,18 +146,27 @@ impl App {
     pub(super) fn poll_node_map_updates(&mut self) {
         if let Some(job) = &self.node_map_job {
             match job.receiver.try_recv() {
-                Ok(updates) => {
+                Ok(result) => {
                     if let Some(state) = &mut self.node_map {
-                        state.apply_resolved_locations(&updates);
+                        state.local_egress = result.local_egress;
+                        state.apply_resolved_locations(&result.node_locations);
                         state.is_resolving = false;
                         let stats = state.stats();
+                        let local_str = state
+                            .local_egress
+                            .as_ref()
+                            .map(|e| format!(" | Local: {} ({})", e.ip, e.isp))
+                            .unwrap_or_default();
                         if stats.plotted_nodes > 0 {
                             self.set_status_only(format!(
-                                "Node physical locations updated ({} plotted across {} countries)",
-                                stats.plotted_nodes, stats.unique_countries
+                                "Node physical locations updated ({} plotted across {} countries{})",
+                                stats.plotted_nodes, stats.unique_countries, local_str
                             ));
                         } else {
-                            self.set_status_only("You are disconnected from the world (0 nodes plotted)");
+                            self.set_status_only(format!(
+                                "You are disconnected from the world (0 nodes plotted{})",
+                                local_str
+                            ));
                         }
                     }
                     self.node_map_job = None;
@@ -186,16 +194,14 @@ impl App {
                 .filter(|n| !n.server_host.is_empty())
                 .map(|n| (n.tag.clone(), n.server_host.clone()))
                 .collect();
-            if !targets.is_empty() {
-                state.is_resolving = true;
-                let (tx, rx) = mpsc::channel();
-                let proxy_port = Some(6780);
-                spawn_ip_geolocation_worker(targets, proxy_port, move |results| {
-                    let _ = tx.send(results);
-                });
-                self.node_map_job = Some(NodeMapJob { receiver: rx });
-                self.set_status_only("Refreshing node IP physical locations...");
-            }
+            state.is_resolving = true;
+            let (tx, rx) = mpsc::channel();
+            let proxy_port = Some(6780);
+            spawn_ip_geolocation_worker(targets, proxy_port, move |result| {
+                let _ = tx.send(result);
+            });
+            self.node_map_job = Some(NodeMapJob { receiver: rx });
+            self.set_status_only("Refreshing node IP locations and local broadband exit...");
         }
     }
 }
