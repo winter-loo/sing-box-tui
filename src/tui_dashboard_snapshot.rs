@@ -18,22 +18,22 @@ fn extract_candidate_brief_marker(
     sustained: Option<&NodeSustainedQuality>,
     detail: Option<&str>,
 ) -> (String, String) {
-    if let Some(sustained) = sustained {
-        if let SustainedProbeOutcome::Completed(completion) = &sustained.outcome {
-            let speed = completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
-            let marker = format!("{:.1} MiB/s", speed);
-            let compact = format!("{:.1}M/s", speed);
-            return (marker, compact);
-        }
-    }
     if manifest_id == Some(&NodeViewId::streaming()) {
+        if let Some(sustained) = sustained {
+            if let SustainedProbeOutcome::Completed(completion) = &sustained.outcome {
+                let speed = completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
+                let marker = format!("{:.1} MiB/s", speed);
+                let compact = format!("{:.1}M/s", speed);
+                return (marker, compact);
+            }
+        }
         if let Some(detail_str) = detail {
             if let Some(idx) = detail_str.find("MiB/s") {
-                let prefix = &detail_str[..idx + 5];
-                if let Some(start) = prefix.rfind(' ') {
-                    let speed = &prefix[start + 1..];
-                    return (speed.to_string(), speed.to_string());
-                }
+                let trimmed = detail_str[..idx].trim_end();
+                let num_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                let speed = &detail_str[num_start..idx + 5];
+                let compact = speed.replace(" MiB/s", "M/s");
+                return (speed.to_string(), compact);
             }
         }
     }
@@ -189,12 +189,17 @@ impl App {
                                     };
                                     (m, c)
                                 } else {
-                                    let sustained = result
-                                        .and_then(|r| r.sustained_quality.as_ref())
-                                        .or_else(|| {
-                                            self.benchmark_workflow
-                                                .sustained_quality(&group.name, member)
-                                        });
+                                    let sustained = (usability_manifest_id.as_ref()
+                                        == Some(&NodeViewId::streaming()))
+                                    .then(|| {
+                                        result
+                                            .and_then(|r| r.sustained_quality.as_ref())
+                                            .or_else(|| {
+                                                self.benchmark_workflow
+                                                    .sustained_quality(&group.name, member)
+                                            })
+                                    })
+                                    .flatten();
                                     extract_candidate_brief_marker(
                                         usability_manifest_id.as_ref(),
                                         sustained,
@@ -238,9 +243,13 @@ impl App {
                                         | ActiveQuickProbe::IncompleteAssessment(_)
                                 )
                             );
-                            let sustained = self
-                                .benchmark_workflow
-                                .sustained_quality(&group.name, member);
+                            let sustained = (usability_manifest_id.as_ref()
+                                == Some(&NodeViewId::streaming()))
+                            .then(|| {
+                                self.benchmark_workflow
+                                    .sustained_quality(&group.name, member)
+                            })
+                            .flatten();
                             let (marker, compact_marker) = extract_candidate_brief_marker(
                                 usability_manifest_id.as_ref(),
                                 sustained,
@@ -843,5 +852,170 @@ mod tests {
             .all(|bar| bar.state == LatencySignalState::Untested));
         assert_eq!(signal.average_ms, None);
         assert_eq!(row.tone, CandidateTone::Pending);
+    }
+
+    #[test]
+    fn extract_candidate_brief_marker_uses_sustained_only_for_streaming_panel() {
+        use crate::automatic_selection::NodeViewId;
+        use crate::sustained_quality::{
+            NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
+        };
+
+        let streaming_id = NodeViewId::streaming();
+        let agy_id = NodeViewId::new("agy-gemini").unwrap();
+        let sustained = NodeSustainedQuality {
+            name: "node-a".into(),
+            outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                first_byte_ms: 100,
+                completion_ms: 500,
+                bytes_read: 1024 * 1024,
+                throughput_bytes_per_second: 1024 * 1024,
+            }),
+        };
+
+        // Streaming panel uses sustained throughput when available.
+        let (marker, compact) = super::extract_candidate_brief_marker(
+            Some(&streaming_id),
+            Some(&sustained),
+            Some("Streaming 1.0 MiB/s · first byte 100ms"),
+        );
+        assert_eq!(marker, "1.0 MiB/s");
+        assert_eq!(compact, "1.0M/s");
+
+        // Streaming panel falls back to parsing throughput from detail when sustained is absent.
+        let (marker, compact) = super::extract_candidate_brief_marker(
+            Some(&streaming_id),
+            None,
+            Some("Streaming 2.5 MiB/s · first byte 120ms"),
+        );
+        assert_eq!(marker, "2.5 MiB/s");
+        assert_eq!(compact, "2.5M/s");
+
+        // Agy Gemini panel must NOT display sustained throughput even when sustained quality exists.
+        let (marker, compact) = super::extract_candidate_brief_marker(
+            Some(&agy_id),
+            Some(&sustained),
+            Some("Agy Gemini command succeeded in 30513ms"),
+        );
+        assert_eq!(marker, "30513ms");
+        assert_eq!(compact, "30513ms");
+
+        // Agy Gemini panel extracts command elapsed time without sustained quality.
+        let (marker, compact) = super::extract_candidate_brief_marker(
+            Some(&agy_id),
+            None,
+            Some("Agy Gemini command succeeded in 1234ms"),
+        );
+        assert_eq!(marker, "1234ms");
+        assert_eq!(compact, "1234ms");
+    }
+
+    #[test]
+    fn snapshot_candidate_row_for_agy_panel_prefers_agy_elapsed_over_shared_throughput() {
+        use crate::automatic_selection::NodeViewId;
+        use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
+        use crate::sustained_quality::{
+            NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
+        };
+        use super::super::view::NodeViewPanel;
+
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+        app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+
+        // node-a has shared sustained throughput in benchmark workflow.
+        app.benchmark_workflow.set_sustained_quality(
+            "select",
+            NodeSustainedQuality {
+                name: "node-a".into(),
+                outcome: SustainedProbeOutcome::Completed(SustainedCompletion {
+                    first_byte_ms: 100,
+                    completion_ms: 500,
+                    bytes_read: 1024 * 1024,
+                    throughput_bytes_per_second: 1024 * 1024,
+                }),
+            },
+        );
+
+        let agy_id = NodeViewId::new("agy-gemini").unwrap();
+        app.usability_probe_manifests
+            .iter_mut()
+            .find(|m| m.id == agy_id)
+            .expect("agy-gemini manifest")
+            .visible = true;
+
+        app.usability_probe_projection_cache.insert(
+            (agy_id.clone(), "select".to_string()),
+            StoredUsabilityProbeRun {
+                run_id: 1,
+                completed_at_ms: 1000,
+                expires_at_ms: None,
+                summary: Some("complete".to_string()),
+                latest_attempt: None,
+                results: vec![
+                    UsabilityProbeFactRecord {
+                        node: "node-a".to_string(),
+                        usable: true,
+                        detail: Some("Agy Gemini command succeeded in 30513ms".to_string()),
+                    },
+                    UsabilityProbeFactRecord {
+                        node: "node-b".to_string(),
+                        usable: true,
+                        detail: Some("Agy Gemini command succeeded in 1200ms".to_string()),
+                    },
+                ],
+            },
+        );
+
+        let streaming_id = NodeViewId::streaming();
+        app.usability_probe_projection_cache.insert(
+            (streaming_id, "select".to_string()),
+            StoredUsabilityProbeRun {
+                run_id: 2,
+                completed_at_ms: 1000,
+                expires_at_ms: None,
+                summary: Some("complete".to_string()),
+                latest_attempt: None,
+                results: vec![UsabilityProbeFactRecord {
+                    node: "node-a".to_string(),
+                    usable: true,
+                    detail: Some(
+                        "Streaming 1.0 MiB/s · first byte 100ms · 512 KiB in 500ms".to_string(),
+                    ),
+                }],
+            },
+        );
+
+        // Switch to Agy Gemini panel: both nodes should display Agy elapsed time, not throughput.
+        app.node_view_panel = NodeViewPanel::Custom(agy_id);
+        let snapshot = app.view_snapshot();
+        assert_eq!(snapshot.candidate_rows.len(), 2);
+
+        let row_a = snapshot
+            .candidate_rows
+            .iter()
+            .find(|r| r.name == "node-a")
+            .unwrap();
+        assert_eq!(row_a.marker, "30513ms");
+        assert_eq!(row_a.compact_marker, "30513ms");
+
+        let row_b = snapshot
+            .candidate_rows
+            .iter()
+            .find(|r| r.name == "node-b")
+            .unwrap();
+        assert_eq!(row_b.marker, "1200ms");
+        assert_eq!(row_b.compact_marker, "1200ms");
+
+        // Switch to Streaming panel: node-a should still display its sustained throughput.
+        app.node_view_panel = NodeViewPanel::Streaming;
+        let snapshot = app.view_snapshot();
+        let streaming_row_a = snapshot
+            .candidate_rows
+            .iter()
+            .find(|r| r.name == "node-a")
+            .unwrap();
+        assert_eq!(streaming_row_a.marker, "1.0 MiB/s");
+        assert_eq!(streaming_row_a.compact_marker, "1.0M/s");
     }
 }
