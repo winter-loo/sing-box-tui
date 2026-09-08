@@ -202,9 +202,26 @@ impl App {
     }
 
     pub(super) fn poll_background_auto_pick_status(&mut self) -> Result<()> {
-        if !self.background_worker_management_enabled() {
+        self.poll_background_auto_pick_status_with_management(
+            self.background_worker_management_enabled(),
+        )
+    }
+
+    fn poll_background_auto_pick_status_with_management(&mut self, managed: bool) -> Result<()> {
+        if !managed {
             return Ok(());
         }
+        // Background maintenance is recoverable. In particular, subscription reconciliation
+        // can revoke the runtime receipt while the foreground must remain available for recovery.
+        if let Err(error) = self.try_poll_background_auto_pick_status() {
+            self.set_status_only(format!(
+                "Automatic selection worker deferred; will retry: {error:#}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn try_poll_background_auto_pick_status(&mut self) -> Result<()> {
         let config = self.auto_pick_config();
         let launch = self.background_launch_spec()?;
         let worker_enabled = self.auto_select_enabled || !self.background_probe_enabled.is_empty();
@@ -287,20 +304,28 @@ impl App {
         {
             return Ok(());
         }
-        let worker = self.ensure_auto_pick_background_worker()?;
-        self.set_status_only(format!(
-            "Automatic selection background worker {} pid {}",
-            worker.label(),
-            worker.pid()
-        ));
+        self.try_start_background_auto_pick_for_foreground();
         Ok(())
+    }
+
+    fn try_start_background_auto_pick_for_foreground(&mut self) {
+        match self.ensure_auto_pick_background_worker() {
+            Ok(worker) => self.set_status_only(format!(
+                "Automatic selection background worker {} pid {}",
+                worker.label(),
+                worker.pid()
+            )),
+            Err(error) => self.set_status_only(format!(
+                "Automatic selection worker deferred; will retry: {error:#}"
+            )),
+        }
     }
 
     pub(super) fn ensure_auto_pick_background_worker_after_state_change(&mut self) -> Result<()> {
         if (self.auto_select_enabled || !self.background_probe_enabled.is_empty())
             && self.background_worker_management_enabled()
         {
-            self.ensure_auto_pick_background_worker()?;
+            self.try_start_background_auto_pick_for_foreground();
         } else if self.background_worker_management_enabled() {
             self.stop_live_background_auto_pick_task()?;
         }

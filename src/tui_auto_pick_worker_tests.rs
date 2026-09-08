@@ -557,3 +557,77 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     drop(foreground);
     remove_shared_quality_fixture(&config_path, &database_path);
 }
+
+#[test]
+fn background_poll_without_runtime_receipt_keeps_tui_alive() {
+    for enabled in [false, true] {
+        let mut app = test_app();
+        app.auto_select_enabled = enabled;
+        assert!(app.benchmark_workflow.runtime_receipt().is_none());
+        app.poll_background_auto_pick_status_with_management(true)
+            .expect("missing runtime confirmation must not exit the foreground TUI");
+        assert_eq!(
+            app.auto_select_enabled, enabled,
+            "retain user intent for recovery"
+        );
+        assert!(
+            app.background_launch_spec().is_err(),
+            "never fabricate runtime authority"
+        );
+    }
+}
+
+#[test]
+fn background_start_without_runtime_receipt_preserves_foreground_and_intent() {
+    let mut app = test_app();
+    app.auto_select_enabled = true;
+    app.try_start_background_auto_pick_for_foreground();
+    assert!(app.auto_select_enabled);
+    assert!(app.status.contains("worker deferred"));
+    assert!(app.status.contains("confirmed managed runtime receipt"));
+    assert!(app.background_launch_spec().is_err());
+}
+
+#[test]
+fn background_poll_after_quality_pause_keeps_tui_alive_and_accepts_reconfirmation() {
+    let database_path = test_db_path();
+    let config_path = database_path.with_extension("receipt-recovery-config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"outbounds":[{"type":"direct","tag":"node-a"}]}"#,
+    )
+    .unwrap();
+    let mut app = test_app();
+    app.benchmark_workflow = open_persisted_workflow(&config_path, &database_path);
+    let confirm = |app: &mut super::App| {
+        app.benchmark_workflow
+            .confirm_managed_runtime_reload(&config_path, &database_path, || {
+                Ok(ManagedRuntimeObservation::new(
+                    (),
+                    &config_path,
+                    "http://127.0.0.1:9992",
+                    Some(std::process::id()),
+                ))
+            })
+            .unwrap();
+    };
+    confirm(&mut app);
+    assert!(app.background_launch_spec().is_ok());
+    // Subscription reconciliation and failed runtime reloads use this exact revocation path.
+    app.benchmark_workflow.pause_quality_persistence();
+    app.auto_select_enabled = true;
+    for _ in 0..3 {
+        app.poll_background_auto_pick_status_with_management(true)
+            .expect("a revoked receipt must not propagate out of the foreground loop");
+        assert!(app.status.contains("worker deferred"));
+        assert!(app.background_launch_spec().is_err());
+        assert!(app.auto_select_enabled);
+    }
+    confirm(&mut app);
+    assert!(
+        app.background_launch_spec().is_ok(),
+        "fresh confirmation restores launch authority"
+    );
+    drop(app);
+    remove_shared_quality_fixture(&config_path, &database_path);
+}
