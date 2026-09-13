@@ -152,6 +152,7 @@ pub(crate) fn render_top_header(
 
 /// Renders the canonical breadcrumb header according to Figma Components (828:2)
 /// e.g. "DASHBOARD / AirTCP / JP-Edge-03"
+#[allow(dead_code)]
 pub(crate) fn render_breadcrumb(
     frame: &mut Frame,
     area: Rect,
@@ -172,6 +173,7 @@ pub(crate) fn render_breadcrumb(
 /// Renders the one-line footer: shortcuts left-aligned, status right-aligned
 /// e.g. "Ctrl+K menu   c connections   i quality   o settings   ? help" (left)
 ///      "GLOBAL NET STABLE  ↓3.9M/s  ↑2.1M/s" (right)
+#[allow(dead_code)]
 pub(crate) fn render_footer(
     frame: &mut Frame,
     area: Rect,
@@ -218,6 +220,7 @@ pub(crate) fn render_footer(
 }
 
 /// Renders the Terminal Contract Unsupported Guard if window is smaller than 80x24
+#[allow(dead_code)]
 pub(crate) fn render_unsupported_guard(frame: &mut Frame, area: Rect, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)

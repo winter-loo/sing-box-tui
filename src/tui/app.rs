@@ -418,18 +418,25 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let snapshot = app.idle_dashboard_snapshot();
         view::render_idle_dashboard(frame, &snapshot);
     } else {
-        let snapshot = app.view_snapshot();
-        view::render(frame, &snapshot);
-
         let area = frame.area();
-        if area.height > 0 && area.width > 0 {
-            let header_area = ratatui::layout::Rect::new(area.x, area.y, area.width, 1);
-            let theme = crate::tui::ds::Theme::default();
-            let selector_name = app.selected_group().map(|g| g.name.as_str()).unwrap_or("—");
-            let tun_enabled = app.internet_tun.is_enabled();
-            let system_proxy_enabled = app.system_proxy.enabled();
-            let clash_mode = app.clash_mode.as_deref().unwrap_or("—");
+        let header_height = if area.height >= 2 && area.width < 90 { 2 } else { 1 };
+        let [header_area, body_area] = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(header_height),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .areas(area);
 
+        let theme = crate::tui::ds::Theme::default();
+        let selector_name = if app.operational_workspace == crate::tui_state::OperationalWorkspace::PrivateAccess {
+            app.private_access.focused_opt().map(|p| p.id.as_str()).unwrap_or("—")
+        } else {
+            app.selected_group().map(|g| g.name.as_str()).unwrap_or("—")
+        };
+        let tun_enabled = app.internet_tun.is_enabled();
+        let system_proxy_enabled = app.system_proxy.enabled();
+        let clash_mode = app.clash_mode.as_deref().unwrap_or("—");
+
+        if header_area.height > 0 && header_area.width > 0 {
             crate::tui::ds::widgets::render_top_header(
                 frame,
                 header_area,
@@ -441,6 +448,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 clash_mode,
             );
         }
+
+        let snapshot = app.view_snapshot();
+        view::render_in_area(frame, body_area, &snapshot);
     }
 
     if let Some(state) = &app.command_palette {
@@ -1699,5 +1709,122 @@ mod navigation_tests {
         assert!(text.contains("> █"));
         assert!(text.contains("[Enter] Execute  [Esc] Dismiss"));
     }
+
+    #[test]
+    fn test_dump_operational_views() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        
+        // 1. Internet 120x30
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 120x30 OPERATIONAL INTERNET ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 2. PrivateAccess 120x30
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess).unwrap();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 120x30 OPERATIONAL PRIVATE ACCESS ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 3. Idle Dashboard 120x30
+        app.active_view = ActiveView::IdleDashboard;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 120x30 IDLE DASHBOARD ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 4. Command Palette (Ctrl+K)
+        app.active_view = ActiveView::NodeList;
+        app.toggle_command_palette();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 120x30 COMMAND PALETTE ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 5. Connections modal (c)
+        app.toggle_command_palette(); // close palette
+        app.show_connections = true;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 120x30 CONNECTIONS MODAL ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 6. Compact 80x24 Operational Internet
+        app.show_connections = false;
+        app.set_operational_workspace(OperationalWorkspace::Internet).unwrap();
+        app.active_view = ActiveView::NodeList;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 80x24 OPERATIONAL INTERNET ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+
+        // 7. Compact 80x24 Idle Dashboard
+        app.active_view = ActiveView::IdleDashboard;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        println!("=== SCREEN BUFFER 80x24 IDLE DASHBOARD ===");
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            println!("{:02}: {}", y, line);
+        }
+    }
 }
+
 

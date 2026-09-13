@@ -92,6 +92,7 @@ fn braille_signal_uses_thin_half_cell_bars_with_fixed_spacing() {
 
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
+        operational_workspace: crate::tui_state::OperationalWorkspace::Internet,
         focus: Focus::Groups,
         left_pane_section: LeftPaneSection::Internet,
         internet_rows: vec![InternetRow {

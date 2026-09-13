@@ -1,7 +1,7 @@
 use super::*;
+use ratatui::layout::Rect;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
 use crate::tui::ds::theme::Theme;
-use crate::tui::ds::truncate_cjk_graphemes;
 
 pub(crate) trait ThemeExt {
     fn detect() -> Self;
@@ -183,6 +183,7 @@ pub(crate) struct CandidateNotice {
 }
 
 pub(crate) struct DashboardSnapshot<'a> {
+    pub(crate) operational_workspace: crate::tui_state::OperationalWorkspace,
     pub(crate) focus: Focus,
     pub(crate) left_pane_section: LeftPaneSection,
     pub(crate) internet_rows: Vec<InternetRow>,
@@ -268,7 +269,12 @@ fn render_latency_signal(signal: &LatencySignal) -> Vec<Span<'static>> {
 #[path = "dashboard_tests.rs"]
 mod tests;
 
+#[allow(dead_code)]
 pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
+    render_in_area(frame, frame.area(), snapshot);
+}
+
+pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot<'_>) {
     let theme = Theme::detect();
     let status_lines = status_lines(&snapshot.status);
     let status_footer = status_footer_line(&snapshot.status.footer);
@@ -276,69 +282,81 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     let status_box_height = status_line_count.saturating_add(2).max(3);
     let status_region_height = status_box_height.saturating_add(1);
     let [main, status_region] = Layout::vertical([
-        Constraint::Min(10),
+        Constraint::Min(8),
         Constraint::Length(status_region_height),
     ])
-    .areas(frame.area());
+    .areas(area);
     let [status_area, status_footer_area] =
         Layout::vertical([Constraint::Length(status_box_height), Constraint::Length(1)])
             .areas(status_region);
-    let [groups_area, members_area] =
-        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
-    let (internet_area, intranet_area) = if !snapshot.intranet_rows.is_empty() {
-        let [internet_area, intranet_area] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(groups_area);
-        (internet_area, Some(intranet_area))
+
+    let is_private_access = snapshot.operational_workspace
+        == crate::tui_state::OperationalWorkspace::PrivateAccess
+        || snapshot.left_pane_section == LeftPaneSection::Intranet;
+
+    if !is_private_access {
+        let (groups_area, members_area) = if !snapshot.internet_rows.is_empty() {
+            let [groups, members] =
+                Layout::horizontal([Constraint::Length(26), Constraint::Min(40)]).areas(main);
+            (Some(groups), members)
+        } else {
+            (None, main)
+        };
+
+        if let Some(groups_area) = groups_area {
+            let groups = snapshot
+                .internet_rows
+                .iter()
+                .map(|row| {
+                    let mut style = Style::default().fg(Color::Cyan);
+                    if row.is_current {
+                        style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
+                    }
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            truncate_for_width(
+                                &row.name,
+                                groups_area.width.saturating_sub(18) as usize,
+                            ),
+                            style,
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("[{}]", truncate_for_width(&row.current, 14)),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw(if row.is_current { "  *" } else { "" }),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+
+            let groups_title = "Internet Proxy";
+            let groups_block = Block::default()
+                .title(groups_title)
+                .borders(Borders::ALL)
+                .border_style(border_style(
+                    snapshot.focus == Focus::Groups
+                        && snapshot.left_pane_section == LeftPaneSection::Internet,
+                ));
+            let groups_widget = List::new(groups)
+                .block(groups_block)
+                .highlight_style(selected_style(
+                    snapshot.focus == Focus::Groups
+                        && snapshot.left_pane_section == LeftPaneSection::Internet,
+                ))
+                .highlight_symbol("> ");
+            let mut groups_state = ListState::default().with_selected(
+                (snapshot.left_pane_section == LeftPaneSection::Internet)
+                    .then_some(snapshot.internet_selected),
+            );
+            frame.render_stateful_widget(groups_widget, groups_area, &mut groups_state);
+        }
+
+        render_candidate_members(frame, members_area, snapshot, &theme);
     } else {
-        (groups_area, None)
-    };
+        let [intranet_area, details_area] =
+            Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).areas(main);
 
-    let groups = snapshot
-        .internet_rows
-        .iter()
-        .map(|row| {
-            let mut style = Style::default().fg(Color::Cyan);
-            if row.is_current {
-                style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
-            }
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    truncate_for_width(&row.name, internet_area.width.saturating_sub(18) as usize),
-                    style,
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("[{}]", truncate_for_width(&row.current, 14)),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::raw(if row.is_current { "  *" } else { "" }),
-            ]))
-        })
-        .collect::<Vec<_>>();
-
-    let groups_title = "Internet Proxy";
-    let groups_block = Block::default()
-        .title(groups_title)
-        .borders(Borders::ALL)
-        .border_style(border_style(
-            snapshot.focus == Focus::Groups
-                && snapshot.left_pane_section == LeftPaneSection::Internet,
-        ));
-    let groups_widget = List::new(groups)
-        .block(groups_block)
-        .highlight_style(selected_style(
-            snapshot.focus == Focus::Groups
-                && snapshot.left_pane_section == LeftPaneSection::Internet,
-        ))
-        .highlight_symbol("> ");
-    let mut groups_state = ListState::default().with_selected(
-        (snapshot.left_pane_section == LeftPaneSection::Internet)
-            .then_some(snapshot.internet_selected),
-    );
-    frame.render_stateful_widget(groups_widget, internet_area, &mut groups_state);
-
-    if let Some(intranet_area) = intranet_area {
         let profiles = snapshot
             .intranet_rows
             .iter()
@@ -367,17 +385,123 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
             .title("Intranet Proxy")
             .borders(Borders::ALL)
             .border_style(border_style(intranet_active));
-        let intranet_widget = List::new(profiles)
-            .block(intranet_block)
-            .highlight_style(selected_style(intranet_active))
-            .highlight_symbol("> ");
-        let mut intranet_state = ListState::default().with_selected(
-            (snapshot.left_pane_section == LeftPaneSection::Intranet)
-                .then_some(snapshot.intranet_selected),
-        );
-        frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
-    }
+            let intranet_widget = List::new(profiles)
+                .block(intranet_block)
+                .highlight_style(selected_style(intranet_active))
+                .highlight_symbol("> ");
+            let mut intranet_state = ListState::default().with_selected(
+                (snapshot.left_pane_section == LeftPaneSection::Intranet)
+                    .then_some(snapshot.intranet_selected),
+            );
+            frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
 
+            if let Some(detail) = snapshot.intranet_detail.as_ref() {
+                let profile = detail.profile;
+                let detail_view = private_access_detail_view(profile, |section| {
+                    detail
+                        .expanded_sections
+                        .contains(&format!("{}:{}", profile.id, section.key()))
+                });
+                let details_block = Block::default()
+                    .title(if detail.scroll == 0 {
+                        format!("Intranet: {}", profile.id)
+                    } else {
+                        format!("Intranet: {} [line {}]", profile.id, detail.scroll + 1)
+                    })
+                    .borders(Borders::ALL)
+                    .border_style(if detail.active {
+                        Style::default().fg(theme.border_focus())
+                    } else {
+                        Style::default().fg(theme.border_default())
+                    });
+                let details_inner = details_block.inner(details_area);
+                frame.render_widget(details_block, details_area);
+                let [details_content_area, footer_area] =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(details_inner);
+                let details = Paragraph::new(detail_view.lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((detail.scroll, 0));
+                frame.render_widget(details, details_content_area);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
+                        theme.style_muted(),
+                    ))),
+                    footer_area,
+                );
+            }
+        }
+
+    let help =
+        Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
+    frame.render_widget(help, status_area);
+    frame.render_widget(Paragraph::new(status_footer), status_footer_area);
+
+    if let Some(message) = snapshot.flash.as_deref() {
+        let estimated_width = area
+            .width
+            .saturating_mul(80)
+            .saturating_div(100)
+            .max(1);
+        let wrapped_lines = message
+            .lines()
+            .map(|line| {
+                let width = unicode_width::UnicodeWidthStr::width(line) as u16;
+                width
+                    .saturating_add(estimated_width - 1)
+                    .saturating_div(estimated_width)
+                    .max(1)
+            })
+            .sum::<u16>();
+        let height = wrapped_lines
+            .saturating_add(2)
+            .max(7)
+            .min(area.height);
+        let flash_area = centered_rect(80, height, area);
+        frame.render_widget(Clear, flash_area);
+        frame.render_widget(
+            Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
+            flash_area,
+        );
+    }
+    if let Some(chart) = snapshot.node_quality_detail {
+        draw_node_quality_detail(frame, chart);
+    }
+    if let Some(connections) = snapshot.connections.as_ref() {
+        draw_connections_panel(frame, connections);
+    }
+    if let Some(help_index) = snapshot.help_index {
+        draw_help_panel(frame, help_index, snapshot.usability_probe_diagnostics);
+    }
+    if let Some(settings) = snapshot.settings.as_ref() {
+        draw_settings_panel(frame, settings);
+    }
+    if let Some(onboarding) = snapshot.onboarding {
+        draw_onboarding_panel(frame, onboarding);
+    }
+    if let Some(progress) = snapshot.private_access_progress {
+        draw_private_access_progress_panel(frame, progress);
+    }
+    if let Some(auth) = snapshot.private_access_auth {
+        draw_private_access_auth_panel(frame, auth);
+    }
+    if let StatusFooter::Filter(input) = &snapshot.status.footer {
+        let cursor_x = status_area
+            .x
+            .saturating_add(1)
+            .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
+            .saturating_add(unicode_width::UnicodeWidthStr::width(input.as_str()) as u16);
+        let cursor_y = status_area.y.saturating_add(status_line_count);
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn render_candidate_members(
+    frame: &mut Frame,
+    members_area: Rect,
+    snapshot: &DashboardSnapshot<'_>,
+    theme: &Theme,
+) {
     let [tabs_area, candidate_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(members_area);
     let tab_titles = snapshot
@@ -476,10 +600,12 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
                 ("", 0)
             };
 
-            let name_max_width = remaining_for_name_and_marker.saturating_sub(marker_width);
-            let visible_name = truncate_cjk_graphemes(&row.name, name_max_width, "…");
+            let name_budget = remaining_for_name_and_marker.saturating_sub(marker_width);
+            let name = truncate_for_width(&row.name, name_budget);
 
-            let mut spans = vec![Span::styled(visible_name, name_style)];
+            let mut spans = vec![
+                Span::styled(name, name_style),
+            ];
 
             if !marker_text.is_empty() {
                 spans.push(Span::raw("  "));
@@ -598,107 +724,6 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         .highlight_symbol("> ");
     let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
     frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
-
-    if let Some(detail) = snapshot.intranet_detail.as_ref() {
-        let profile = detail.profile;
-        frame.render_widget(Clear, members_area);
-        let detail_view = private_access_detail_view(profile, |section| {
-            detail
-                .expanded_sections
-                .contains(&format!("{}:{}", profile.id, section.key()))
-        });
-        let details_block = Block::default()
-            .title(if detail.scroll == 0 {
-                format!("Intranet: {}", profile.id)
-            } else {
-                format!("Intranet: {} [line {}]", profile.id, detail.scroll + 1)
-            })
-            .borders(Borders::ALL)
-            .border_style(if detail.active {
-                Style::default().fg(theme.border_focus())
-            } else {
-                Style::default().fg(theme.border_default())
-            });
-        let details_inner = details_block.inner(members_area);
-        frame.render_widget(details_block, members_area);
-        let [details_area, footer_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(details_inner);
-        let details = Paragraph::new(detail_view.lines)
-            .wrap(Wrap { trim: false })
-            .scroll((detail.scroll, 0));
-        frame.render_widget(details, details_area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
-                theme.style_muted(),
-            ))),
-            footer_area,
-        );
-    }
-
-    let help =
-        Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
-    frame.render_widget(help, status_area);
-    frame.render_widget(Paragraph::new(status_footer), status_footer_area);
-
-    if let Some(message) = snapshot.flash.as_deref() {
-        let estimated_width = frame
-            .area()
-            .width
-            .saturating_mul(80)
-            .saturating_div(100)
-            .max(1);
-        let wrapped_lines = message
-            .lines()
-            .map(|line| {
-                let width = unicode_width::UnicodeWidthStr::width(line) as u16;
-                width
-                    .saturating_add(estimated_width - 1)
-                    .saturating_div(estimated_width)
-                    .max(1)
-            })
-            .sum::<u16>();
-        let height = wrapped_lines
-            .saturating_add(2)
-            .max(7)
-            .min(frame.area().height);
-        let area = centered_rect(80, height, frame.area());
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(message).block(Block::default().title("Info").borders(Borders::ALL)),
-            area,
-        );
-    }
-    if let Some(chart) = snapshot.node_quality_detail {
-        draw_node_quality_detail(frame, chart);
-    }
-    if let Some(connections) = snapshot.connections.as_ref() {
-        draw_connections_panel(frame, connections);
-    }
-    if let Some(help_index) = snapshot.help_index {
-        draw_help_panel(frame, help_index, snapshot.usability_probe_diagnostics);
-    }
-    if let Some(settings) = snapshot.settings.as_ref() {
-        draw_settings_panel(frame, settings);
-    }
-    if let Some(onboarding) = snapshot.onboarding {
-        draw_onboarding_panel(frame, onboarding);
-    }
-    if let Some(progress) = snapshot.private_access_progress {
-        draw_private_access_progress_panel(frame, progress);
-    }
-    if let Some(auth) = snapshot.private_access_auth {
-        draw_private_access_auth_panel(frame, auth);
-    }
-    if let StatusFooter::Filter(input) = &snapshot.status.footer {
-        let cursor_x = status_area
-            .x
-            .saturating_add(1)
-            .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(input.as_str()) as u16);
-        let cursor_y = status_area.y.saturating_add(status_line_count);
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
 }
 
 fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>> {

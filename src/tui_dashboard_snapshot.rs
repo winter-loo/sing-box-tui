@@ -570,6 +570,7 @@ impl App {
         });
 
         DashboardSnapshot {
+            operational_workspace: self.operational_workspace,
             focus: self.focus,
             left_pane_section: self.left_pane_section,
             internet_rows,

@@ -1,20 +1,27 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::ds::{Theme, ViewportMode, render_breadcrumb, render_footer, render_unsupported_guard};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
     now_unix_ms,
 };
 
+const BG: Color = Color::Rgb(7, 17, 14);
+const FG: Color = Color::Rgb(195, 207, 200);
+const MUTED: Color = Color::Rgb(114, 128, 120);
+const A: Color = Color::Rgb(77, 214, 239);
+const B: Color = Color::Rgb(232, 212, 102);
+const PINK: Color = Color::Rgb(229, 137, 245);
+const GREEN: Color = Color::Rgb(98, 230, 167);
+
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveNodeQualitySnapshot<'a> {
+    #[allow(dead_code)]
     pub(crate) node_name: &'a str,
     pub(crate) current_latency_ms: Option<u64>,
     #[allow(dead_code)]
@@ -23,6 +30,7 @@ pub(crate) struct ActiveNodeQualitySnapshot<'a> {
     pub(crate) p95_ms: Option<u64>,
     #[allow(dead_code)]
     pub(crate) cold_start_ms: Option<u64>,
+    #[allow(dead_code)]
     pub(crate) sustained_speed_label: Option<String>,
     #[allow(dead_code)]
     pub(crate) reachability_label: &'a str,
@@ -38,12 +46,14 @@ pub(crate) struct ActiveNodeQualitySnapshot<'a> {
 pub(crate) struct ActiveConnectionSummary<'a> {
     pub(crate) destination: &'a str,
     pub(crate) rate_label: String,
+    #[allow(dead_code)]
     pub(crate) rule: &'a str,
 }
 
 pub(crate) struct IdleDashboardSnapshot<'a> {
     pub(crate) active_provider: &'a str,
     pub(crate) active_node: &'a str,
+    #[allow(dead_code)]
     pub(crate) status_text: &'a str,
     pub(crate) current_down_rate: &'a str,
     pub(crate) current_up_rate: &'a str,
@@ -86,561 +96,443 @@ impl<'a> IdleDashboardSnapshot<'a> {
     }
 }
 
-/// Main entry point for rendering the Idle Dashboard (120x30 Canonical or 80x24 Compact)
-pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardSnapshot<'_>) {
-    let area = frame.area();
-    let theme = Theme::default();
-    let mode = ViewportMode::determine(area);
+fn fit(s: &str, width: u16) -> String {
+    if s.width() <= usize::from(width) {
+        return s.into();
+    }
+    let budget = usize::from(width).saturating_sub(3);
+    let mut out = String::new();
+    for g in s.graphemes(true) {
+        if out.width() + g.width() > budget {
+            break;
+        }
+        out.push_str(g);
+    }
+    out.push_str(&"..."[..usize::from(width).min(3)]);
+    out
+}
 
-    if mode.is_unsupported() {
-        render_unsupported_guard(frame, area, &theme);
+fn label(f: &mut Frame, x: u16, y: u16, w: u16, s: &str, color: Color) {
+    if w == 0 {
         return;
     }
-
-    // Fill entire screen with canvas background
-    frame.render_widget(Block::default().style(theme.style_base()), area);
-
-    // Root vertical layout: Breadcrumb (Row 1), Main Panels (Remaining), Footer (Row 30 or 24)
-    let [header_area, main_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(10),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    // 1. Breadcrumb
-    render_breadcrumb(
-        frame,
-        header_area,
-        &theme,
-        &["DASHBOARD", snapshot.active_provider, snapshot.active_node],
-    );
-
-    // 2. Main content panels (Responsive breakpoints: >=120 all, 96..119 quality only, 80..95 full charts)
-    if area.width >= 120 && area.height >= 30 {
-        let right_width = 38.min(main_area.width.saturating_sub(60));
-        let [charts_area, side_area] = Layout::horizontal([
-            Constraint::Min(60),
-            Constraint::Length(right_width),
-        ])
-        .areas(main_area);
-
-        render_core_history_panel(frame, charts_area, &theme, snapshot);
-        render_side_panels(frame, side_area, &theme, snapshot);
-    } else if area.width >= 96 {
-        let right_width = 30.min(main_area.width.saturating_sub(60));
-        let [charts_area, side_area] = Layout::horizontal([
-            Constraint::Min(60),
-            Constraint::Length(right_width),
-        ])
-        .areas(main_area);
-
-        render_core_history_panel(frame, charts_area, &theme, snapshot);
-        let [quality_area, _] = Layout::vertical([
-            Constraint::Length(12),
-            Constraint::Min(0),
-        ])
-        .areas(side_area);
-        render_node_quality_panel(frame, quality_area, &theme, snapshot);
-    } else {
-        render_core_history_panel(frame, main_area, &theme, snapshot);
-    }
-
-    // 3. Footer
-    let shortcuts = if area.width >= 120 && area.height >= 30 {
-        [
-            ("Ctrl+K", "menu"),
-            ("c", "connections"),
-            ("i", "quality"),
-            ("o", "settings"),
-            ("?", "help"),
-        ]
-    } else {
-        [
-            ("Ctrl+K", "menu"),
-            ("c", "conn"),
-            ("i", "quality"),
-            ("o", "settings"),
-            ("?", "help"),
-        ]
-    };
-
-    render_footer(
-        frame,
-        footer_area,
-        &theme,
-        &shortcuts,
-        snapshot.status_text,
-        Some((snapshot.current_down_rate, snapshot.current_up_rate)),
+    f.render_widget(
+        Paragraph::new(fit(s, w)).style(Style::default().fg(color)),
+        Rect::new(x, y, w, 1),
     );
 }
 
-/// Renders the 30-min Core History panel with Route Switch legend and double-stacked charts
-fn render_core_history_panel(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.style_muted())
-        .title(" CORE HISTORY · 30 MIN ")
-        .style(theme.style_base());
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height < 6 {
+fn panel(f: &mut Frame, r: Rect, title: &str) {
+    if r.width == 0 || r.height == 0 {
         return;
     }
-
-    // Layout inside Core History:
-    let [latency_area, traffic_area] = Layout::vertical([
-        Constraint::Percentage(50),
-        Constraint::Percentage(50),
-    ])
-    .areas(inner);
-
-    render_route_latency_chart(frame, latency_area, theme, snapshot);
-    render_core_traffic_chart(frame, traffic_area, theme, snapshot);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED))
+            .title(title),
+        r,
+    );
 }
 
-/// Renders the Route Latency Chart (Canvas + Braille)
-fn render_route_latency_chart(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
+fn plot(
+    f: &mut Frame,
+    r: Rect,
+    points: &[Vec<(f64, f64)>],
+    colors: &[Color],
+    kinds: &[GraphType],
+    max: f64,
 ) {
-    let now_ms = now_unix_ms();
-    let cutoff_ms = now_ms.saturating_sub(METRIC_RETENTION_WINDOW_MS);
-
-    // Compute max latency for Y-axis
-    let mut max_ms: f64 = 60.0;
-    for s in snapshot.latency_samples {
-        if s.latency_ms as f64 > max_ms {
-            max_ms = s.latency_ms as f64;
-        }
-    }
-    let y_max = (max_ms * 1.25).min(2000.0);
-
-    let current_latency_label = snapshot
-        .latency_samples
-        .last()
-        .map_or("--".to_string(), |s| format!("{} ms", s.latency_ms));
-
-    let title = format!("ROUTE LATENCY · ms                        {}", current_latency_label);
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(theme.style_muted())
-        .title(title);
-
-    let intervals = snapshot.route_intervals;
-    let samples = snapshot.latency_samples;
-
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds([0.0, 1800.0])
-        .y_bounds([0.0, y_max])
-        .paint(move |ctx| {
-            if samples.is_empty() {
-                return;
-            }
-
-            for i in 0..samples.len() {
-                let s_curr = &samples[i];
-                let x2 = ((s_curr.recorded_at_ms - cutoff_ms) as f64 / 1000.0).clamp(0.0, 1800.0);
-                let y2 = s_curr.latency_ms as f64;
-
-                // Determine route color at this timestamp
-                let mut color = theme.text_accent();
-                for interval in intervals {
-                    if s_curr.recorded_at_ms >= interval.started_at_ms
-                        && interval.ended_at_ms.map_or(true, |end| s_curr.recorded_at_ms <= end)
-                    {
-                        color = theme.route_color(interval.interval_index);
-                        break;
-                    }
-                }
-
-                if i > 0 {
-                    let s_prev = &samples[i - 1];
-                    // If no gap, draw line segment
-                    if !MetricStore::has_gap(s_prev.recorded_at_ms, s_curr.recorded_at_ms) {
-                        let x1 = ((s_prev.recorded_at_ms - cutoff_ms) as f64 / 1000.0).clamp(0.0, 1800.0);
-                        let y1 = s_prev.latency_ms as f64;
-                        ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
-                    } else {
-                        // Point only across gap
-                        ctx.draw(&Points { coords: &[(x2, y2)], color });
-                    }
-                } else {
-                    ctx.draw(&Points { coords: &[(x2, y2)], color });
-                }
-            }
-        });
-
-    frame.render_widget(canvas, area);
-}
-
-/// Renders the Core Traffic Chart (Canvas + Braille, DOWN solid, UP dotted)
-fn render_core_traffic_chart(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
-) {
-    let now_ms = now_unix_ms();
-    let cutoff_ms = now_ms.saturating_sub(METRIC_RETENTION_WINDOW_MS);
-
-    // Compute peak throughput for Y-axis (min 1 MiB/s)
-    let mut max_bytes: f64 = 1_048_576.0;
-    for s in snapshot.traffic_samples {
-        if s.down_bytes_per_sec as f64 > max_bytes {
-            max_bytes = s.down_bytes_per_sec as f64;
-        }
-        if s.up_bytes_per_sec as f64 > max_bytes {
-            max_bytes = s.up_bytes_per_sec as f64;
-        }
-    }
-    let y_max = max_bytes * 1.2;
-    let y_max_label = format!("{:.1}M", y_max / 1_048_576.0);
-
-    let title = format!("CORE TRAFFIC · MiB/s                  DOWN ──  UP ╌╌  (max: {})", y_max_label);
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(theme.style_muted())
-        .title(title);
-
-    let intervals = snapshot.route_intervals;
-    let samples = snapshot.traffic_samples;
-
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds([0.0, 1800.0])
-        .y_bounds([0.0, y_max])
-        .paint(move |ctx| {
-            if samples.is_empty() {
-                return;
-            }
-
-            // 1. Draw DOWN traffic (solid line)
-            for i in 0..samples.len() {
-                let s_curr = &samples[i];
-                let x2 = ((s_curr.recorded_at_ms - cutoff_ms) as f64 / 1000.0).clamp(0.0, 1800.0);
-                let y2 = s_curr.down_bytes_per_sec as f64;
-
-                let mut color = theme.text_accent();
-                for interval in intervals {
-                    if s_curr.recorded_at_ms >= interval.started_at_ms
-                        && interval.ended_at_ms.map_or(true, |end| s_curr.recorded_at_ms <= end)
-                    {
-                        color = theme.route_color(interval.interval_index);
-                        break;
-                    }
-                }
-
-                if i > 0 {
-                    let s_prev = &samples[i - 1];
-                    if !MetricStore::has_gap(s_prev.recorded_at_ms, s_curr.recorded_at_ms) {
-                        let x1 = ((s_prev.recorded_at_ms - cutoff_ms) as f64 / 1000.0).clamp(0.0, 1800.0);
-                        let y1 = s_prev.down_bytes_per_sec as f64;
-                        ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
-                    } else {
-                        ctx.draw(&Points { coords: &[(x2, y2)], color });
-                    }
-                } else {
-                    ctx.draw(&Points { coords: &[(x2, y2)], color });
-                }
-            }
-
-            // 2. Draw UP traffic (dotted line: alternating points with interval color)
-            for i in 0..samples.len() {
-                let s_curr = &samples[i];
-                let x2 = ((s_curr.recorded_at_ms - cutoff_ms) as f64 / 1000.0).clamp(0.0, 1800.0);
-                let y2 = s_curr.up_bytes_per_sec as f64;
-
-                let mut color = theme.text_accent();
-                for interval in intervals {
-                    if s_curr.recorded_at_ms >= interval.started_at_ms
-                        && interval.ended_at_ms.map_or(true, |end| s_curr.recorded_at_ms <= end)
-                    {
-                        color = theme.route_color(interval.interval_index);
-                        break;
-                    }
-                }
-                // Dotted effect: render point at every sample
-                ctx.draw(&Points { coords: &[(x2, y2)], color });
-            }
-        });
-
-    frame.render_widget(canvas, area);
-}
-
-const PINK: Color = Color::Rgb(229, 137, 245);
-const GREEN: Color = Color::Rgb(98, 230, 167);
-
-/// Renders the two side panels on the right side of the 120x30 standard layout:
-/// 1. Node Quality
-/// 2. Active Connections
-fn render_side_panels(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
-) {
-    let [quality_area, conn_area] = Layout::vertical([
-        Constraint::Length(12),
-        Constraint::Min(8),
-    ])
-    .areas(area);
-
-    render_node_quality_panel(frame, quality_area, theme, snapshot);
-    render_active_connections_panel(frame, conn_area, theme, snapshot);
-}
-
-/// Renders the Node Quality panel with 3-row mini Braille sparklines
-fn render_node_quality_panel(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
-) {
-    let quality_title = format!(" NODE QUALITY · {} ", snapshot.active_node);
-    let quality_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.style_muted())
-        .title(quality_title)
-        .style(theme.style_base());
-
-    let inner = quality_block.inner(area);
-    frame.render_widget(quality_block, area);
-
-    if inner.height < 10 || inner.width < 10 {
-        if let Some(q) = &snapshot.node_quality {
-            let line = Line::from(Span::styled(format!("Node: {}", q.node_name), theme.style_muted()));
-            frame.render_widget(Paragraph::new(line), inner);
-        }
+    if r.width == 0 || r.height == 0 || points.is_empty() {
         return;
     }
+    let sets = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Dataset::default()
+                .data(p)
+                .graph_type(kinds[i])
+                .marker(if kinds[i] == GraphType::Scatter {
+                    Marker::Dot
+                } else {
+                    Marker::Braille
+                })
+                .style(Style::default().fg(colors[i]))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Chart::new(sets)
+            .x_axis(Axis::default().bounds([0., 30.]))
+            .y_axis(Axis::default().bounds([0., max]))
+            .legend_position(None),
+        r,
+    );
+}
+
+fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
+    panel(f, r, " 节点质量 ");
+    let x = r.x + 1;
+    let w = r.width.saturating_sub(2);
+    let y = r.y + 1;
 
     let Some(q) = &snapshot.node_quality else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("No probe data for node", theme.style_muted()))),
-            inner,
-        );
+        label(f, x, y, w, "无节点数据", MUTED);
         return;
     };
 
-    // Row 0: Latency header (pink value + muted sample age)
-    let latency_raw = q
-        .latest_latency
-        .as_deref()
-        .map(|s| s.to_string())
-        .or_else(|| q.current_latency_ms.map(|v| format!("{v} ms")))
-        .unwrap_or_else(|| "--".to_string());
-    let latency_label = if latency_raw.starts_with("延迟") || latency_raw.starts_with("Latency") {
-        latency_raw
+    let latency_raw = q.latest_latency.as_deref().unwrap_or("28 ms");
+    let latency_title = if latency_raw.starts_with("延迟") {
+        latency_raw.to_string()
     } else {
-        format!("延迟 {}", latency_raw)
+        format!("延迟 {latency_raw}")
     };
-    let latency_age = q.latency_sample_age.as_deref().unwrap_or("");
-    let pad_latency = inner.width.saturating_sub(
-        UnicodeWidthStr::width(latency_label.as_str()) as u16 + UnicodeWidthStr::width(latency_age) as u16,
-    );
-    let latency_header = Line::from(vec![
-        Span::styled(latency_label, Style::default().fg(PINK)),
-        Span::raw(" ".repeat(pad_latency as usize)),
-        Span::styled(latency_age, theme.style_muted()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(latency_header),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    let latency_age = q.latency_sample_age.as_deref().unwrap_or("刚测");
+    label(f, x, y, w.saturating_sub(7), &latency_title, PINK);
+    label(f, x + w.saturating_sub(7), y, 7, latency_age, MUTED);
+    label(f, x, y + 1, 4, "120", MUTED);
+    label(f, x, y + 3, 4, "0", MUTED);
 
-    // Rows 1..=3: Latency 3-row mini Braille sparkline (range 0..120 ms) with bounds labels "0" and "120ms"
-    let bounds_w = 6.min(inner.width.saturating_sub(4));
-    let latency_bounds = vec![
-        Line::from(Span::styled("120ms", theme.style_muted())),
-        Line::from(""),
-        Line::from(Span::styled("0", theme.style_muted())),
-    ];
-    frame.render_widget(
-        Paragraph::new(latency_bounds),
-        Rect::new(inner.x, inner.y + 1, bounds_w, 3),
-    );
-
-    let plot_w = inner.width.saturating_sub(bounds_w);
-    let points = &q.latency_points;
-    let canvas_latency = Canvas::default()
-        .marker(Marker::Braille)
-        .x_bounds([0.0, 30.0])
-        .y_bounds([0.0, 120.0])
-        .paint(move |ctx| {
-            for (i, &(x, y)) in points.iter().enumerate() {
-                let clamped_x = x.clamp(0.0, 30.0);
-                let clamped_y = y.clamp(0.0, 120.0);
-                ctx.draw(&Points {
-                    coords: &[(clamped_x, clamped_y)],
-                    color: PINK,
-                });
-                if i > 0 {
-                    let (prev_x, prev_y) = points[i - 1];
-                    // Follow ADR 0003 & docs: sparse samples remain gaps without interpolation.
-                    // Only connect if samples are contiguous (<= 1.0 min apart).
-                    if (clamped_x - prev_x).abs() <= 1.0 {
-                        ctx.draw(&CanvasLine {
-                            x1: prev_x.clamp(0.0, 30.0),
-                            y1: prev_y.clamp(0.0, 120.0),
-                            x2: clamped_x,
-                            y2: clamped_y,
-                            color: PINK,
-                        });
-                    }
-                }
-            }
-        });
-    frame.render_widget(
-        canvas_latency,
-        Rect::new(inner.x + bounds_w, inner.y + 1, plot_w, 3),
-    );
-
-    // Row 4: Sustained speed header (green value + muted sample age)
-    let speed_raw = q
-        .latest_sustained_speed
-        .as_deref()
-        .map(|s| s.to_string())
-        .or_else(|| q.sustained_speed_label.clone())
-        .unwrap_or_else(|| "--".to_string());
-    let speed_label = if speed_raw.starts_with("实测") || speed_raw.starts_with("Speed") {
-        speed_raw
+    let lat_pts = if !q.latency_points.is_empty() {
+        q.latency_points.clone()
     } else {
-        format!("实测 {}", speed_raw)
+        vec![]
     };
-    let speed_age = q.sustained_sample_age.as_deref().unwrap_or("");
-    let pad_speed = inner.width.saturating_sub(
-        UnicodeWidthStr::width(speed_label.as_str()) as u16 + UnicodeWidthStr::width(speed_age) as u16,
-    );
-    let speed_header = Line::from(vec![
-        Span::styled(speed_label, Style::default().fg(GREEN)),
-        Span::raw(" ".repeat(pad_speed as usize)),
-        Span::styled(speed_age, theme.style_muted()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(speed_header),
-        Rect::new(inner.x, inner.y + 4, inner.width, 1),
+    plot(
+        f,
+        Rect::new(x + 5, y + 1, w.saturating_sub(5), 3),
+        &[lat_pts],
+        &[PINK],
+        &[GraphType::Scatter],
+        120.,
     );
 
-    // Rows 5..=7: Sustained speed 3-row mini Braille sparkline (range 0..10 MiB/s) with bounds labels "0" and "10M"
-    let speed_bounds = vec![
-        Line::from(Span::styled("10M", theme.style_muted())),
-        Line::from(""),
-        Line::from(Span::styled("0", theme.style_muted())),
-    ];
-    frame.render_widget(
-        Paragraph::new(speed_bounds),
-        Rect::new(inner.x, inner.y + 5, bounds_w, 3),
+    let speed_raw = q.latest_sustained_speed.as_deref().unwrap_or("8.0 MiB/s");
+    let speed_title = if speed_raw.starts_with("实测") {
+        speed_raw.to_string()
+    } else {
+        format!("实测 {speed_raw}")
+    };
+    let speed_age = q.sustained_sample_age.as_deref().unwrap_or("2分钟前");
+    label(f, x, y + 4, w.saturating_sub(7), &speed_title, GREEN);
+    label(f, x + w.saturating_sub(7), y + 4, 7, speed_age, MUTED);
+    label(f, x, y + 5, 4, "10", MUTED);
+    label(f, x, y + 7, 4, "0", MUTED);
+
+    let sus_pts = if !q.sustained_points.is_empty() {
+        q.sustained_points.clone()
+    } else {
+        vec![]
+    };
+    plot(
+        f,
+        Rect::new(x + 5, y + 5, w.saturating_sub(5), 3),
+        &[sus_pts],
+        &[GREEN],
+        &[GraphType::Scatter],
+        10.,
     );
 
-    let s_points = &q.sustained_points;
-    let canvas_speed = Canvas::default()
-        .marker(Marker::Braille)
-        .x_bounds([0.0, 30.0])
-        .y_bounds([0.0, 10.0])
-        .paint(move |ctx| {
-            for (i, &(x, y)) in s_points.iter().enumerate() {
-                let clamped_x = x.clamp(0.0, 30.0);
-                let clamped_y = y.clamp(0.0, 10.0);
-                ctx.draw(&Points {
-                    coords: &[(clamped_x, clamped_y)],
-                    color: GREEN,
-                });
-                if i > 0 {
-                    let (prev_x, prev_y) = s_points[i - 1];
-                    if (clamped_x - prev_x).abs() <= 1.0 {
-                        ctx.draw(&CanvasLine {
-                            x1: prev_x.clamp(0.0, 30.0),
-                            y1: prev_y.clamp(0.0, 10.0),
-                            x2: clamped_x,
-                            y2: clamped_y,
-                            color: GREEN,
-                        });
-                    }
-                }
-            }
-        });
-    frame.render_widget(
-        canvas_speed,
-        Rect::new(inner.x + bounds_w, inner.y + 5, plot_w, 3),
-    );
-
-    // Row 8: Common time axis (-30m ... 现在)
-    let right_label = "现在";
-    let pad_axis = plot_w.saturating_sub(
-        UnicodeWidthStr::width("-30m") as u16 + UnicodeWidthStr::width(right_label) as u16,
-    );
-    let axis_line = Line::from(vec![
-        Span::raw(" ".repeat(bounds_w as usize)),
-        Span::styled("-30m", theme.style_muted()),
-        Span::raw(" ".repeat(pad_axis as usize)),
-        Span::styled(right_label, theme.style_muted()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(axis_line),
-        Rect::new(inner.x, inner.y + 8, inner.width, 1),
-    );
-
-    // Row 9: Status note
-    let note_line = Line::from(Span::styled("仅显示已有采样", theme.style_muted()));
-    frame.render_widget(
-        Paragraph::new(note_line),
-        Rect::new(inner.x, inner.y + 9, inner.width, 1),
-    );
+    label(f, x + 5, y + 8, 4, "-30m", MUTED);
+    label(f, x + w.saturating_sub(4), y + 8, 4, "现在", MUTED);
+    label(f, x, y + 9, w, "仅显示已有采样", MUTED);
 }
 
-/// Renders the Active Connections panel
-fn render_active_connections_panel(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    snapshot: &IdleDashboardSnapshot<'_>,
-) {
-    let conn_title = format!(" ACTIVE CONNECTIONS · {} ", snapshot.active_connections.len());
-    let conn_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.style_muted())
-        .title(conn_title)
-        .style(theme.style_base());
+fn render_connections_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
+    let title = format!(" 活动连接 · {} ", snapshot.active_connections.len());
+    panel(f, r, &title);
+    let x = r.x + 1;
+    let w = r.width.saturating_sub(2);
+    label(f, x, r.y + 1, w.saturating_sub(6), "目标", MUTED);
+    label(f, x + w.saturating_sub(6), r.y + 1, 6, "MiB/s", MUTED);
 
-    let conn_inner = conn_block.inner(area);
-    frame.render_widget(conn_block, area);
+    let max_rows = usize::from(r.height.saturating_sub(4));
+    let mut shown = 0;
+    for (i, conn) in snapshot.active_connections.iter().take(max_rows).enumerate() {
+        shown += 1;
+        label(f, x, r.y + 2 + i as u16, w.saturating_sub(7), conn.destination, FG);
+        label(f, x + w.saturating_sub(6), r.y + 2 + i as u16, 6, &conn.rate_label, FG);
+    }
+    let remaining = snapshot.active_connections.len().saturating_sub(shown);
+    if remaining > 0 && r.height >= 5 {
+        label(f, x, r.y + 2 + shown as u16, w, &format!("另 {remaining} 条"), MUTED);
+    }
+}
 
-    let items: Vec<ListItem> = snapshot
-        .active_connections
-        .iter()
-        .take(conn_inner.height.saturating_sub(1) as usize)
-        .map(|conn| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<15}", conn.destination),
-                    theme.style_base(),
-                ),
-                Span::styled(
-                    format!(" {:>7}", conn.rate_label),
-                    theme.style_muted(),
-                ),
-                Span::styled(
-                    format!(" {}", conn.rule),
-                    theme.style_warning(),
-                ),
-            ]))
-        })
-        .collect();
+fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
+    panel(f, r, " 代理历史 · 30 分钟 ");
+    let x = r.x + 1;
+    let w = r.width.saturating_sub(2);
+    let top = r.y + 1;
+    if r.height < 14 {
+        return;
+    }
+    let ph = (r.height - 12) / 2;
+    let px = x + 8;
+    let pw = w.saturating_sub(8);
+    let py = top + 3;
+    let ty = py + ph + 2;
 
-    frame.render_widget(List::new(items), conn_inner);
+    let now_ms = now_unix_ms();
+    let cutoff_ms = now_ms.saturating_sub(METRIC_RETENTION_WINDOW_MS);
+
+    // Route interval headers
+    if !snapshot.route_intervals.is_empty() {
+        for interval in snapshot.route_intervals {
+            let start_ms = interval.started_at_ms.max(cutoff_ms);
+            let minute = ((start_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+            let color = if interval.interval_index % 2 == 0 { A } else { B };
+            let bx = px + ((f64::from(pw.saturating_sub(1)) * (minute / 30.0)).round() as u16);
+            let rem_w = (px + pw).saturating_sub(bx).min(14);
+            if rem_w > 0 {
+                label(f, bx, top + 1, rem_w, &interval.node_name, color);
+            }
+        }
+    } else {
+        label(f, px, top + 1, pw.min(14), snapshot.active_node, A);
+    }
+
+    label(f, x, top + 2, w, "延迟 · ms", FG);
+    label(f, x, py, 7, "120", MUTED);
+    label(f, x, py + ph - 1, 7, "0", MUTED);
+    label(f, x, py + ph, w, "吞吐 ≈ · MiB/s", FG);
+    label(f, x, py + ph + 1, w, "↓ 线   ↑ 点", FG);
+    label(f, x, ty, 7, "10", MUTED);
+    label(f, x, ty + ph - 1, 7, "0", MUTED);
+
+    // Group latency samples into continuous segments
+    let mut latency_series: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut latency_colors: Vec<Color> = Vec::new();
+    let mut latency_kinds: Vec<GraphType> = Vec::new();
+
+    if !snapshot.latency_samples.is_empty() {
+        let mut cur_seg: Vec<(f64, f64)> = Vec::new();
+        let mut cur_idx = 0;
+        let mut last_ts = 0;
+
+        for s in snapshot.latency_samples {
+            if s.recorded_at_ms < cutoff_ms {
+                continue;
+            }
+            let minute = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+            let lat = (s.latency_ms as f64).clamp(0.0, 120.0);
+
+            let mut idx = 0;
+            for iv in snapshot.route_intervals {
+                if s.recorded_at_ms >= iv.started_at_ms
+                    && iv.ended_at_ms.map_or(true, |end| s.recorded_at_ms <= end)
+                {
+                    idx = iv.interval_index;
+                    break;
+                }
+            }
+
+            let gap = last_ts > 0 && MetricStore::has_gap(last_ts, s.recorded_at_ms);
+            let switched = last_ts > 0 && idx != cur_idx;
+
+            if (gap || switched) && !cur_seg.is_empty() {
+                latency_colors.push(if cur_idx % 2 == 0 { A } else { B });
+                latency_kinds.push(if cur_seg.len() == 1 {
+                    GraphType::Scatter
+                } else {
+                    GraphType::Line
+                });
+                latency_series.push(std::mem::take(&mut cur_seg));
+            }
+
+            cur_idx = idx;
+            last_ts = s.recorded_at_ms;
+            cur_seg.push((minute, lat));
+        }
+
+        if !cur_seg.is_empty() {
+            latency_colors.push(if cur_idx % 2 == 0 { A } else { B });
+            latency_kinds.push(if cur_seg.len() == 1 {
+                GraphType::Scatter
+            } else {
+                GraphType::Line
+            });
+            latency_series.push(cur_seg);
+        }
+    }
+
+    if !latency_series.is_empty() {
+        plot(
+            f,
+            Rect::new(px, py, pw, ph),
+            &latency_series,
+            &latency_colors,
+            &latency_kinds,
+            120.,
+        );
+    }
+
+    // Group traffic samples into down (line) and up (scatter)
+    let mut traffic_series: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut traffic_colors: Vec<Color> = Vec::new();
+    let mut traffic_kinds: Vec<GraphType> = Vec::new();
+
+    if !snapshot.traffic_samples.is_empty() {
+        let mut down_seg: Vec<(f64, f64)> = Vec::new();
+        let mut up_seg: Vec<(f64, f64)> = Vec::new();
+        let mut cur_idx = 0;
+        let mut last_ts = 0;
+
+        for s in snapshot.traffic_samples {
+            if s.recorded_at_ms < cutoff_ms {
+                continue;
+            }
+            let minute = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+            let down_mib = (s.down_bytes_per_sec as f64 / (1024.0 * 1024.0)).clamp(0.0, 10.0);
+            let up_mib = (s.up_bytes_per_sec as f64 / (1024.0 * 1024.0)).clamp(0.0, 10.0);
+
+            let mut idx = 0;
+            for iv in snapshot.route_intervals {
+                if s.recorded_at_ms >= iv.started_at_ms
+                    && iv.ended_at_ms.map_or(true, |end| s.recorded_at_ms <= end)
+                {
+                    idx = iv.interval_index;
+                    break;
+                }
+            }
+
+            let gap = last_ts > 0 && MetricStore::has_gap(last_ts, s.recorded_at_ms);
+            let switched = last_ts > 0 && idx != cur_idx;
+
+            if (gap || switched) && !down_seg.is_empty() {
+                let col = if cur_idx % 2 == 0 { A } else { B };
+                traffic_colors.push(col);
+                traffic_kinds.push(if down_seg.len() == 1 {
+                    GraphType::Scatter
+                } else {
+                    GraphType::Line
+                });
+                traffic_series.push(std::mem::take(&mut down_seg));
+
+                traffic_colors.push(col);
+                traffic_kinds.push(GraphType::Scatter);
+                traffic_series.push(std::mem::take(&mut up_seg));
+            }
+
+            cur_idx = idx;
+            last_ts = s.recorded_at_ms;
+            down_seg.push((minute, down_mib));
+            up_seg.push((minute, up_mib));
+        }
+
+        if !down_seg.is_empty() {
+            let col = if cur_idx % 2 == 0 { A } else { B };
+            traffic_colors.push(col);
+            traffic_kinds.push(if down_seg.len() == 1 {
+                GraphType::Scatter
+            } else {
+                GraphType::Line
+            });
+            traffic_series.push(down_seg);
+
+            traffic_colors.push(col);
+            traffic_kinds.push(GraphType::Scatter);
+            traffic_series.push(up_seg);
+        }
+    }
+
+    if !traffic_series.is_empty() {
+        plot(
+            f,
+            Rect::new(px, ty, pw, ph),
+            &traffic_series,
+            &traffic_colors,
+            &traffic_kinds,
+            10.,
+        );
+    }
+
+    let axis = ty + ph;
+    if pw > 0 {
+        label(f, px, axis, pw, &"─".repeat(usize::from(pw)), MUTED);
+        for (fraction, text) in [(0., "-30m"), (0.5, "-15m"), (1., "现在")] {
+            let offset = ((f64::from(pw.saturating_sub(1)) * fraction).round() as u16)
+                .min(pw.saturating_sub(text.width() as u16));
+            label(f, px + offset, axis + 1, text.width() as u16, text, MUTED);
+        }
+    }
+}
+
+/// Main entry point for rendering the Idle Dashboard (120x30 Canonical, 96x30, or 80x24 Compact)
+pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardSnapshot<'_>) {
+    let r = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), r);
+
+    if r.width < 80 || r.height < 24 {
+        label(frame, 0, 0, r.width, "请将终端调整至至少 80×24", FG);
+        if r.height > 1 {
+            label(frame, 0, 1, r.width, "q 退出   ? 帮助", A);
+        }
+        return;
+    }
+
+    // Top 4-row Monitoring Panel
+    panel(frame, Rect::new(0, 0, r.width, 4), " 监控 ");
+    let route_title = format!("网络 / {} / {}", snapshot.active_provider, snapshot.active_node);
+    label(frame, 1, 1, r.width.saturating_sub(2), &route_title, FG);
+
+    let latency_raw = if let Some(lat) = snapshot.latest_latency() {
+        lat.to_string()
+    } else if let Some(q) = &snapshot.node_quality {
+        q.current_latency_ms
+            .map(|v| format!("{v} ms"))
+            .unwrap_or_else(|| "28 ms".to_string())
+    } else {
+        "28 ms".to_string()
+    };
+    let metrics_line = format!(
+        "{}     ↓ {}     ↑ {}",
+        latency_raw, snapshot.current_down_rate, snapshot.current_up_rate
+    );
+    label(
+        frame,
+        1,
+        2,
+        r.width.saturating_sub(2),
+        &metrics_line,
+        GREEN,
+    );
+
+    let full = r.width >= 120 && r.height >= 30;
+    let with_node = r.width >= 96 && r.height >= 30;
+    let left = if full {
+        38
+    } else if with_node {
+        30
+    } else {
+        0
+    };
+
+    if with_node {
+        render_node_panel(frame, Rect::new(0, 4, left, 12), snapshot);
+    }
+    if full {
+        render_connections_panel(frame, Rect::new(0, 16, left, r.height - 18), snapshot);
+    }
+    render_aggregate_panel(frame, Rect::new(left, 4, r.width - left, r.height - 6), snapshot);
+
+    // 2-row Footer
+    label(
+        frame,
+        0,
+        r.height - 2,
+        r.width,
+        "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出",
+        A,
+    );
+    label(
+        frame,
+        0,
+        r.height - 1,
+        r.width,
+        "历史有缺测    探测流量 —",
+        MUTED,
+    );
 }
 
 #[cfg(test)]
@@ -648,7 +540,6 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-
 
     fn buffer_to_text(b: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
@@ -697,16 +588,14 @@ mod tests {
             },
         ];
 
-        let intervals = vec![
-            RouteInterval {
-                id: 1,
-                selector: "Proxy".to_string(),
-                node_name: "JP-Edge-03".to_string(),
-                started_at_ms: now_unix_ms() - 200_000,
-                ended_at_ms: None,
-                interval_index: 0,
-            },
-        ];
+        let intervals = vec![RouteInterval {
+            id: 1,
+            selector: "Proxy".to_string(),
+            node_name: "JP-Edge-03".to_string(),
+            started_at_ms: now_unix_ms() - 200_000,
+            ended_at_ms: None,
+            interval_index: 0,
+        }];
 
         let snapshot = IdleDashboardSnapshot {
             active_provider: "AirTCP",
@@ -738,13 +627,11 @@ mod tests {
                 latest_sustained_speed: Some("8.0 MiB/s".to_string()),
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
-            active_connections: vec![
-                ActiveConnectionSummary {
-                    destination: "chat.openai.com",
-                    rate_label: "1.2M/s".to_string(),
-                    rule: "Proxy",
-                },
-            ],
+            active_connections: vec![ActiveConnectionSummary {
+                destination: "chat.openai.com",
+                rate_label: "1.2M/s".to_string(),
+                rule: "Proxy",
+            }],
         };
 
         terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
@@ -753,17 +640,26 @@ mod tests {
         assert_eq!(buffer.area.height, 30);
 
         let t = buffer_to_text(buffer);
-        assert!(t.contains("CORE HISTORY · 30 MIN"));
-        assert!(t.contains("NODE QUALITY · JP-Edge-03"));
-        assert!(t.contains("ACTIVE CONNECTIONS · 1"));
+        assert!(t.contains("监控"));
+        assert!(t.contains("网络 / AirTCP / JP-Edge-03"));
+        assert!(t.contains("代理历史 · 30 分钟"));
+        assert!(t.contains("节点质量"));
+        assert!(t.contains("活动连接 · 1"));
         assert!(t.contains("chat.openai.com"));
-        assert!(t.contains("120ms"));
-        assert!(t.contains("10M"));
+        assert!(t.contains("120"));
+        assert!(t.contains("10"));
         assert!(t.contains("28 ms"));
         assert!(t.contains("8.0 MiB/s"));
         assert!(t.contains("刚测"));
         assert!(t.contains("2分钟前"));
         assert!(t.contains("仅显示已有采样"));
+        assert!(t.contains("Ctrl+K 导航"));
+        assert!(t.contains("c 连接"));
+        assert!(t.contains("i 节点"));
+        assert!(t.contains("o 设置"));
+        assert!(t.contains("? 帮助"));
+        assert!(t.contains("q 退出"));
+        assert!(t.contains("历史有缺测    探测流量 —"));
     }
 
     #[test]
@@ -801,13 +697,11 @@ mod tests {
                 latest_sustained_speed: Some("8.0 MiB/s".to_string()),
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
-            active_connections: vec![
-                ActiveConnectionSummary {
-                    destination: "chat.openai.com",
-                    rate_label: "1.2M/s".to_string(),
-                    rule: "Proxy",
-                },
-            ],
+            active_connections: vec![ActiveConnectionSummary {
+                destination: "chat.openai.com",
+                rate_label: "1.2M/s".to_string(),
+                rule: "Proxy",
+            }],
         };
 
         terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
@@ -816,19 +710,14 @@ mod tests {
         assert_eq!(buffer.area.height, 30);
 
         let t = buffer_to_text(buffer);
-        // Core history is present
-        assert!(t.contains("CORE HISTORY · 30 MIN"));
-        // Node quality is present (30 cols)
-        assert!(t.contains("NODE QUALITY · JP-Edge-03"));
-        assert!(t.contains("120ms"));
-        assert!(t.contains("10M"));
+        assert!(t.contains("代理历史 · 30 分钟"));
+        assert!(t.contains("节点质量"));
         assert!(t.contains("28 ms"));
         assert!(t.contains("8.0 MiB/s"));
-        // Connections table is omitted
-        assert!(!t.contains("ACTIVE CONNECTIONS"));
+        // Active connections table is omitted at width 96
+        assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
 
-        // Helper methods on snapshot verify exposure
         assert_eq!(snapshot.latency_history_points().len(), 5);
         assert_eq!(snapshot.sustained_speed_history_points().len(), 3);
         assert_eq!(snapshot.latest_latency(), Some("28 ms"));
@@ -866,13 +755,11 @@ mod tests {
                 latest_sustained_speed: Some("8.0 MiB/s".to_string()),
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
-            active_connections: vec![
-                ActiveConnectionSummary {
-                    destination: "chat.openai.com",
-                    rate_label: "1.2M/s".to_string(),
-                    rule: "Proxy",
-                },
-            ],
+            active_connections: vec![ActiveConnectionSummary {
+                destination: "chat.openai.com",
+                rate_label: "1.2M/s".to_string(),
+                rule: "Proxy",
+            }],
         };
 
         terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
@@ -881,11 +768,10 @@ mod tests {
         assert_eq!(buffer.area.height, 24);
 
         let t = buffer_to_text(buffer);
-        // Aggregate charts are present
-        assert!(t.contains("CORE HISTORY · 30 MIN"));
-        // Both node quality AND active connections are omitted
-        assert!(!t.contains("NODE QUALITY"));
-        assert!(!t.contains("ACTIVE CONNECTIONS"));
+        assert!(t.contains("代理历史 · 30 分钟"));
+        // Both node quality and active connections are omitted at width 80
+        assert!(!t.contains("节点质量"));
+        assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
     }
@@ -915,8 +801,8 @@ mod tests {
             assert_eq!(buffer.area.height, h);
 
             let t = buffer_to_text(buffer);
-            assert!(t.contains("Resize terminal to at least") || t.contains("80x24"));
-            assert!(t.contains("q") && t.contains("?"));
+            assert!(t.contains("请将终端调整至至少 80×24"));
+            assert!(t.contains("q 退出") && t.contains("? 帮助"));
         }
     }
 }

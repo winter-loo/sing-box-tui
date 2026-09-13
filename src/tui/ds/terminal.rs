@@ -3,6 +3,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Viewport adaptation mode according to Figma Terminal Contract (05 Viewport Behavior)
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ViewportMode {
     /// Canonical Standard layout (>= 120 cols x >= 30 rows)
@@ -13,6 +14,7 @@ pub(crate) enum ViewportMode {
     Unsupported { width: u16, height: u16 },
 }
 
+#[allow(dead_code)]
 impl ViewportMode {
     pub(crate) const MIN_COLS: u16 = 80;
     pub(crate) const MIN_ROWS: u16 = 24;
