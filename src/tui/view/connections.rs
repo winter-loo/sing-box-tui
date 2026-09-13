@@ -60,64 +60,108 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+use crate::tui::ds::{render_dialog_frame, Theme};
+
 pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPanelSnapshot<'_>) {
-    let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(4).min(120);
-    let height = frame_area.height.saturating_sub(4).min(24);
-    let area = centered_rect(width.max(20), height.max(8), frame_area);
-    frame.render_widget(Clear, area);
+    let area = frame.area();
+    let theme = Theme::detect();
+    render_dialog_frame(
+        frame,
+        area,
+        &theme,
+        " ACTIVE CONNECTIONS (c) ",
+        96,
+        24,
+        |frame, inner_area| {
+            if inner_area.height == 0 || inner_area.width == 0 {
+                return;
+            }
 
-    let inner_width = area.width.saturating_sub(4) as usize;
-    let max_rows = area.height.saturating_sub(6) as usize;
-    let mut lines = vec![
-        Line::from(snapshot.summary.as_str()),
-        Line::from(vec![
-            Span::styled("Source", Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled("Target", Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled("Chain", Style::default().fg(Color::Cyan)),
-        ]),
-    ];
+            let (content_area, footer_area) = if inner_area.height >= 3 {
+                let [c, f] = Layout::vertical([
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .areas(inner_area);
+                (c, Some(f))
+            } else {
+                (inner_area, None)
+            };
 
-    if let Some(error) = snapshot.error {
-        lines.push(Line::from(format!(
-            "error: {}",
-            truncate_for_width(error, inner_width.saturating_sub(7))
-        )));
-    } else if snapshot.connections.connections.is_empty() {
-        lines.push(Line::from("No active connections"));
-    } else {
-        lines.extend(
-            snapshot
-                .connections
-                .connections
-                .iter()
-                .take(max_rows)
-                .map(|connection| Line::from(format_connection_line(connection, inner_width))),
-        );
-        let hidden = snapshot
-            .connections
-            .connections
-            .len()
-            .saturating_sub(max_rows);
-        if hidden > 0 {
-            lines.push(Line::from(format!("... {hidden} more connections")));
-        }
-    }
+            let inner_width = content_area.width as usize;
+            let max_rows = content_area.height.saturating_sub(2) as usize;
 
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .title("Active Connections (c/Esc close, r refresh)")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    snapshot.summary.as_str(),
+                    theme.style_base(),
+                )),
+                Line::from(vec![
+                    Span::styled("Source", theme.style_breadcrumb()),
+                    Span::raw("  "),
+                    Span::styled("Target", theme.style_breadcrumb()),
+                    Span::raw("  "),
+                    Span::styled("Chain", theme.style_breadcrumb()),
+                ]),
+            ];
+
+            if let Some(error) = snapshot.error {
+                lines.push(Line::from(vec![
+                    Span::styled("Error: ", theme.style_error()),
+                    Span::styled(
+                        truncate_for_width(error, inner_width.saturating_sub(7)),
+                        theme.style_error(),
+                    ),
+                ]));
+            } else if snapshot.connections.connections.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No active connections",
+                    theme.style_muted(),
+                )));
+            } else {
+                for connection in snapshot.connections.connections.iter().take(max_rows) {
+                    lines.push(Line::from(Span::styled(
+                        format_connection_line(connection, inner_width),
+                        theme.style_base(),
+                    )));
+                }
+                let hidden = snapshot
+                    .connections
+                    .connections
+                    .len()
+                    .saturating_sub(max_rows);
+                if hidden > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("... {hidden} more connections"),
+                        theme.style_muted(),
+                    )));
+                }
+            }
+
+            frame.render_widget(Paragraph::new(lines).style(theme.style_base()), content_area);
+
+            if let Some(footer) = footer_area {
+                let footer_line = Line::from(vec![
+                    Span::styled("[Esc/c]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Close", theme.style_muted()),
+                    Span::raw("  "),
+                    Span::styled("[r]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Refresh", theme.style_muted()),
+                ]);
+                frame.render_widget(Paragraph::new(footer_line).style(theme.style_base()), footer);
+            }
+        },
     );
-    frame.render_widget(widget, area);
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::controller::{ConnectionInfo, ConnectionMetadata};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn connection_and_byte_values_are_formatted_for_the_panel() {
@@ -145,5 +189,39 @@ mod tests {
         assert_eq!(format_bytes(2048), "2.0KiB");
         assert!(format_connection_line(&connection, 120).contains("www.google.com:443"));
         assert!(format_connection_line(&connection, 120).contains("node-a -> airtcp"));
+    }
+
+    #[test]
+    fn connections_panel_renders_dialog_frame_and_footer_hints() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let connections_data = ConnectionsSnapshot::default();
+        let snapshot = ConnectionsPanelSnapshot {
+            summary: "Active connections: 0 (proxy: 0, direct: 0)".to_string(),
+            connections: &connections_data,
+            error: None,
+        };
+
+        terminal
+            .draw(|f| {
+                draw_connections_panel(f, &snapshot);
+            })
+            .unwrap();
+
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(text.contains("ACTIVE CONNECTIONS (c)"));
+        assert!(text.contains("Active connections: 0"));
+        assert!(text.contains("Source  Target  Chain"));
+        assert!(text.contains("No active connections"));
+        assert!(text.contains("[Esc/c] Close  [r] Refresh"));
     }
 }

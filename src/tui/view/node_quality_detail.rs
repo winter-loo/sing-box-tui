@@ -23,24 +23,82 @@ pub(crate) struct UsabilityCriterionDetail {
     pub(crate) latest_failure: Option<String>,
 }
 
+use crate::tui::ds::{render_dialog_frame, Theme};
+
 pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDetailState) {
-    let area = centered_rect(90, 20, frame.area());
-    frame.render_widget(Clear, area);
-    let title = format!(
-        "Node quality: {} / {} (j/k scroll)",
-        detail.selector,
-        truncate_for_width(&detail.node, 36)
-    );
-    frame.render_widget(
-        Paragraph::new(node_quality_evidence_lines(detail))
-            .scroll((detail.evidence_scroll, 0))
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
+    let area = frame.area();
+    let theme = Theme::detect();
+    render_dialog_frame(
+        frame,
         area,
+        &theme,
+        " NODE QUALITY DETAIL (i) ",
+        90,
+        22,
+        |frame, inner_area| {
+            if inner_area.height == 0 || inner_area.width == 0 {
+                return;
+            }
+
+            let (header_area, evidence_area, footer_area) = if inner_area.height >= 4 {
+                let [h, e, f] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .areas(inner_area);
+                (Some(h), e, Some(f))
+            } else if inner_area.height >= 2 {
+                let [e, f] = Layout::vertical([
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .areas(inner_area);
+                (None, e, Some(f))
+            } else {
+                (None, inner_area, None)
+            };
+
+            if let Some(header) = header_area {
+                let header_line = Line::from(vec![
+                    Span::styled("Node: ", theme.style_muted()),
+                    Span::styled(
+                        truncate_for_width(&detail.node, 36),
+                        theme.style_breadcrumb(),
+                    ),
+                    Span::raw("   "),
+                    Span::styled("Selector: ", theme.style_muted()),
+                    Span::styled(&detail.selector, theme.style_breadcrumb()),
+                ]);
+                frame.render_widget(
+                    Paragraph::new(header_line).style(theme.style_base()),
+                    header,
+                );
+            }
+
+            frame.render_widget(
+                Paragraph::new(node_quality_evidence_lines(detail))
+                    .scroll((detail.evidence_scroll, 0))
+                    .style(theme.style_base()),
+                evidence_area,
+            );
+
+            if let Some(footer) = footer_area {
+                let footer_line = Line::from(vec![
+                    Span::styled("[Esc/i]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Close", theme.style_muted()),
+                    Span::raw("  "),
+                    Span::styled("[j/k]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Scroll", theme.style_muted()),
+                ]);
+                frame.render_widget(
+                    Paragraph::new(footer_line).style(theme.style_base()),
+                    footer,
+                );
+            }
+        },
     );
 }
 
@@ -222,5 +280,62 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("P95 90ms") && line.contains("cold-start 75ms"))
         );
+    }
+
+    #[test]
+    fn node_quality_detail_renders_dialog_frame_and_hints() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let detail = NodeQualityDetailState {
+            selector: "select".into(),
+            node: "node-a".into(),
+            last_refresh: Instant::now(),
+            reachability_assessment: Some(NodeReachabilityAssessment {
+                name: "node-a".into(),
+                attempts: vec![
+                    ProbeOutcome::Reachable { delay_ms: 40 },
+                    ProbeOutcome::Timeout,
+                ],
+                assessment: Some(ReachabilityAssessment::Degraded),
+            }),
+            quick_history: NodeQuickHistory {
+                successful_rounds: 4,
+                rounds: 5,
+                warm_median_ms: Some(40),
+                p95_ms: Some(90),
+                cold_start_ms: Some(75),
+            },
+            sustained_quality: None,
+            auto_selection_detail: None,
+            usability_details: Vec::new(),
+            evidence_scroll: 0,
+        };
+
+        terminal
+            .draw(|f| {
+                draw_node_quality_detail(f, &detail);
+            })
+            .unwrap();
+
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(text.contains("NODE QUALITY DETAIL (i)"));
+        assert!(text.contains("Node: node-a"));
+        assert!(text.contains("Selector: select"));
+        assert!(text.contains("Probe attempt 1: reachable (40ms)"));
+        assert!(text.contains("Probe attempt 2: timeout"));
+        assert!(text.contains("cold-start 75ms"));
+        assert!(text.contains("[Esc/i] Close"));
     }
 }
