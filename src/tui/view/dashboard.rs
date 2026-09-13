@@ -614,7 +614,11 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
                 format!("Intranet: {} [line {}]", profile.id, detail.scroll + 1)
             })
             .borders(Borders::ALL)
-            .border_style(border_style(detail.active));
+            .border_style(if detail.active {
+                Style::default().fg(theme.border_focus())
+            } else {
+                Style::default().fg(theme.border_default())
+            });
         let details_inner = details_block.inner(members_area);
         frame.render_widget(details_block, members_area);
         let [details_area, footer_area] =
@@ -626,7 +630,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
-                Style::default().fg(Color::DarkGray),
+                theme.style_muted(),
             ))),
             footer_area,
         );

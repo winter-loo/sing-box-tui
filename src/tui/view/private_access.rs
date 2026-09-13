@@ -1,4 +1,6 @@
 use super::*;
+use crate::tui::ds::theme::Theme;
+use crate::tui::ds::widgets::render_dialog_frame;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum IntranetDetailSection {
@@ -82,13 +84,11 @@ impl PrivateAccessProgressTone {
         }
     }
 
-    fn style(self) -> Style {
+    fn style(self, theme: &Theme) -> Style {
         match self {
-            Self::Info => Style::default().fg(Color::Cyan),
-            Self::Success => Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            Self::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Self::Info => theme.style_breadcrumb(),
+            Self::Success => theme.style_success().add_modifier(Modifier::BOLD),
+            Self::Error => theme.style_danger().add_modifier(Modifier::BOLD),
         }
     }
 }
@@ -120,17 +120,14 @@ pub(crate) fn private_access_state_badge(state: PrivateAccessState) -> &'static 
 }
 
 pub(crate) fn private_access_state_style(state: &PrivateAccessState) -> Style {
+    let theme = Theme::detect();
     match state {
-        PrivateAccessState::Connected => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        PrivateAccessState::Connecting | PrivateAccessState::Disconnecting => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        PrivateAccessState::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        PrivateAccessState::Disabled | PrivateAccessState::Disconnected => {
-            Style::default().fg(Color::DarkGray)
+        PrivateAccessState::Connected => theme.style_success().add_modifier(Modifier::BOLD),
+        PrivateAccessState::Connecting | PrivateAccessState::Disconnecting => {
+            theme.style_warning().add_modifier(Modifier::BOLD)
         }
+        PrivateAccessState::Error => theme.style_danger().add_modifier(Modifier::BOLD),
+        PrivateAccessState::Disabled | PrivateAccessState::Disconnected => theme.style_muted(),
     }
 }
 
@@ -350,129 +347,121 @@ pub(crate) fn draw_private_access_progress_panel(
     frame: &mut Frame,
     progress: &PrivateAccessProgressModal,
 ) {
+    let theme = Theme::detect();
     let frame_area = frame.area();
     let width = frame_area.width.saturating_sub(6).clamp(56, 88);
-    let height = (progress.entries.len() as u16 + 4)
+    let height = (progress.entries.len() as u16 + 5)
         .min(frame_area.height.saturating_sub(4))
         .max(8);
-    let area = centered_rect(width, height, frame_area);
-    frame.render_widget(Clear, area);
 
-    let max_entries = area.height.saturating_sub(4) as usize;
-    let start = progress.entries.len().saturating_sub(max_entries);
-    let mut lines = progress
-        .entries
-        .iter()
-        .skip(start)
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(entry.tone.prefix(), entry.tone.style()),
-                Span::raw(truncate_for_width(
-                    &entry.text,
-                    area.width.saturating_sub(8) as usize,
-                )),
-            ])
-        })
-        .collect::<Vec<_>>();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        if progress.done {
-            "Enter/Esc close"
-        } else {
-            "Private Access is running..."
-        },
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(progress.title.clone())
-                .borders(Borders::ALL)
-                .border_style(if progress.done {
-                    Style::default().fg(Color::Green)
+    render_dialog_frame(
+        frame,
+        frame_area,
+        &theme,
+        &format!(" PRIVATE ACCESS · {} ", progress.title),
+        width,
+        height,
+        |frame, inner_area| {
+            let max_entries = inner_area.height.saturating_sub(2) as usize;
+            let start = progress.entries.len().saturating_sub(max_entries);
+            let mut lines = progress
+                .entries
+                .iter()
+                .skip(start)
+                .map(|entry| {
+                    Line::from(vec![
+                        Span::styled(entry.tone.prefix(), entry.tone.style(&theme)),
+                        Span::raw(truncate_for_width(
+                            &entry.text,
+                            inner_area.width.saturating_sub(6) as usize,
+                        )),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                if progress.done {
+                    "[Enter/Esc] Close"
                 } else {
-                    Style::default().fg(Color::Cyan)
-                }),
-        ),
-        area,
+                    "Private Access is running..."
+                },
+                theme.style_muted(),
+            )));
+
+            frame.render_widget(Paragraph::new(lines), inner_area);
+        },
     );
 }
 
 pub(crate) fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAccessAuthModal) {
+    let theme = Theme::detect();
     let frame_area = frame.area();
     let width = frame_area.width.saturating_sub(6).clamp(52, 82);
     let message_rows = usize::from(!auth.message.trim().is_empty());
     let height = (auth.fields.len() + message_rows + 6) as u16;
-    let area = centered_rect(
-        width,
-        height.min(frame_area.height.saturating_sub(4)).max(9),
+
+    render_dialog_frame(
+        frame,
         frame_area,
-    );
-    frame.render_widget(Clear, area);
+        &theme,
+        &format!(" AUTHENTICATION · {} ", auth.title),
+        width,
+        height,
+        |frame, inner_area| {
+            let mut lines = vec![Line::from(vec![
+                Span::styled("[Enter]", theme.style_breadcrumb()),
+                Span::raw(" next/submit  "),
+                Span::styled("[Esc]", theme.style_muted()),
+                Span::raw(" cancel"),
+            ])];
+            if !auth.message.trim().is_empty() {
+                lines.push(Line::from(auth.message.as_str()));
+            }
+            lines.push(Line::raw(""));
+            let field_start = lines.len();
+            for (index, field) in auth.fields.iter().enumerate() {
+                let selected = index == auth.field_index;
+                let marker = if selected { "> " } else { "  " };
+                let value = private_access_auth_display_value(field, &auth.inputs[index]);
+                let style = if selected {
+                    theme.style_focused_row()
+                } else {
+                    Style::default()
+                };
+                lines.push(
+                    Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(field.label.as_str(), theme.style_breadcrumb()),
+                        Span::raw("  "),
+                        Span::raw(value),
+                    ])
+                    .style(style),
+                );
+            }
+            if let Some(error) = auth.error.as_deref() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(error, theme.style_danger()));
+            }
+            frame.render_widget(Paragraph::new(lines), inner_area);
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" next/submit  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
-        Span::raw(" cancel"),
-    ])];
-    if !auth.message.trim().is_empty() {
-        lines.push(Line::from(auth.message.as_str()));
-    }
-    lines.push(Line::raw(""));
-    let field_start = lines.len();
-    for (index, field) in auth.fields.iter().enumerate() {
-        let selected = index == auth.field_index;
-        let marker = if selected { "> " } else { "  " };
-        let value = private_access_auth_display_value(field, &auth.inputs[index]);
-        let style = if selected {
-            Style::default().bg(Color::Blue)
-        } else {
-            Style::default()
-        };
-        lines.push(
-            Line::from(vec![
-                Span::raw(marker),
-                Span::styled(field.label.as_str(), Style::default().fg(Color::Cyan)),
-                Span::raw("  "),
-                Span::raw(value),
-            ])
-            .style(style),
-        );
-    }
-    if let Some(error) = auth.error.as_deref() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(error, Style::default().fg(Color::Red)));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(auth.title.as_str())
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        ),
-        area,
+            if let Some(field) = auth.fields.get(auth.field_index) {
+                let display = private_access_auth_display_value(field, &auth.inputs[auth.field_index]);
+                let cursor_x = inner_area
+                    .x
+                    .saturating_add(2)
+                    .saturating_add(unicode_width::UnicodeWidthStr::width(field.label.as_str()) as u16)
+                    .saturating_add(2)
+                    .saturating_add(unicode_width::UnicodeWidthStr::width(display.as_str()) as u16)
+                    .min(inner_area.x.saturating_add(inner_area.width.saturating_sub(1)));
+                let cursor_y = inner_area
+                    .y
+                    .saturating_add(field_start as u16)
+                    .saturating_add(auth.field_index as u16)
+                    .min(inner_area.y.saturating_add(inner_area.height.saturating_sub(1)));
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        },
     );
-
-    if let Some(field) = auth.fields.get(auth.field_index) {
-        let display = private_access_auth_display_value(field, &auth.inputs[auth.field_index]);
-        let cursor_x = area
-            .x
-            .saturating_add(1)
-            .saturating_add(2)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(field.label.as_str()) as u16)
-            .saturating_add(2)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(display.as_str()) as u16)
-            .min(area.x.saturating_add(area.width.saturating_sub(2)));
-        let cursor_y = area
-            .y
-            .saturating_add(1)
-            .saturating_add(field_start as u16)
-            .saturating_add(auth.field_index as u16)
-            .min(area.y.saturating_add(area.height.saturating_sub(2)));
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
 }
 
 pub(crate) fn private_access_auth_display_value(
