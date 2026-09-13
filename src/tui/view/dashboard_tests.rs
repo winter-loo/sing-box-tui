@@ -433,3 +433,206 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     assert!(text.contains("*.corp.example"));
     assert!(text.contains("Enter expand/fold"));
 }
+
+#[test]
+fn reachability_badge_style_matches_four_level_design_system_tokens() {
+    let theme = Theme::detect();
+    assert_eq!(
+        reachability_badge_style("Stable", CandidateTone::Success, &theme),
+        theme.style_success()
+    );
+    assert_eq!(
+        reachability_badge_style("stable reachable", CandidateTone::Success, &theme),
+        theme.style_success()
+    );
+    assert_eq!(
+        reachability_badge_style("Reachable", CandidateTone::Success, &theme),
+        theme.style_breadcrumb()
+    );
+    assert_eq!(
+        reachability_badge_style("2/3 reachable", CandidateTone::Success, &theme),
+        theme.style_breadcrumb()
+    );
+    assert_eq!(
+        reachability_badge_style("Degraded", CandidateTone::Error, &theme),
+        theme.style_warning()
+    );
+    assert_eq!(
+        reachability_badge_style("1/3 degraded", CandidateTone::Error, &theme),
+        theme.style_warning()
+    );
+    assert_eq!(
+        reachability_badge_style("Unreachable", CandidateTone::Error, &theme),
+        theme.style_danger()
+    );
+    assert_eq!(
+        reachability_badge_style("0/3 unreachable", CandidateTone::Error, &theme),
+        theme.style_danger()
+    );
+    assert_eq!(
+        reachability_badge_style("Error", CandidateTone::Error, &theme),
+        theme.style_danger()
+    );
+}
+
+#[test]
+fn candidate_row_renders_four_level_reachability_assessment_badges() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows = vec![
+        CandidateRow {
+            name: "tokyo-01".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: "Stable".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Success,
+        },
+        CandidateRow {
+            name: "osaka-02".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: "Reachable".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Success,
+        },
+        CandidateRow {
+            name: "seoul-03".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: "Degraded".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Error,
+        },
+        CandidateRow {
+            name: "london-04".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: "Unreachable".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Error,
+        },
+    ];
+
+    let rendered = rendered_lines(&snapshot).join("\n");
+    assert!(rendered.contains("tokyo-01"));
+    assert!(rendered.contains("Stable"));
+    assert!(rendered.contains("osaka-02"));
+    assert!(rendered.contains("Reachable"));
+    assert!(rendered.contains("seoul-03"));
+    assert!(rendered.contains("Degraded"));
+    assert!(rendered.contains("london-04"));
+    assert!(rendered.contains("Unreachable"));
+}
+
+#[test]
+fn candidate_row_cjk_grapheme_truncation_preserves_multibyte_safety() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows = vec![CandidateRow {
+        name: "🌸东京直连专线节点UltraLongName".to_string(),
+        is_current: false,
+        latency_signal: Some(LatencySignal {
+            bars: [
+                LatencySignalBar {
+                    height: 8,
+                    state: LatencySignalState::Reachable { delay_ms: 50 },
+                },
+                LatencySignalBar {
+                    height: 8,
+                    state: LatencySignalState::Reachable { delay_ms: 50 },
+                },
+                LatencySignalBar {
+                    height: 8,
+                    state: LatencySignalState::Reachable { delay_ms: 50 },
+                },
+            ],
+            average_ms: Some(50),
+        }),
+        reachability: "Stable".to_string(),
+        marker: String::new(),
+        compact_marker: String::new(),
+        tone: CandidateTone::Success,
+    }];
+
+    let narrow = rendered_lines_at(&snapshot, 60, 24).join("\n");
+    assert!(narrow.contains("🌸"));
+    assert!(narrow.contains("50ms"));
+    assert!(narrow.contains("Stable"));
+}
+
+#[test]
+fn candidate_row_renders_cold_start_ms_and_sustained_throughput_speed() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows = vec![
+        CandidateRow {
+            name: "streaming-node".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: String::new(),
+            marker: "24.5 MiB/s".to_string(),
+            compact_marker: "24.5M/s".to_string(),
+            tone: CandidateTone::Success,
+        },
+        CandidateRow {
+            name: "cold-start-node".to_string(),
+            is_current: false,
+            latency_signal: None,
+            reachability: String::new(),
+            marker: "cold start 62ms".to_string(),
+            compact_marker: "62ms".to_string(),
+            tone: CandidateTone::Success,
+        },
+    ];
+
+    let wide = rendered_lines_at(&snapshot, 120, 30).join("\n");
+    assert!(wide.contains("streaming-node"));
+    assert!(wide.contains("24.5 MiB/s"));
+    assert!(wide.contains("cold-start-node"));
+    assert!(wide.contains("cold start 62ms"));
+}
+
+#[test]
+fn candidate_row_selected_focus_styling_matches_figma_accent() {
+    let theme = Theme::detect();
+    let focused = theme.style_focused_row();
+    let breadcrumb = theme.style_breadcrumb();
+
+    assert_eq!(focused.bg, Some(theme.bg_selected()));
+    assert_eq!(focused.fg, Some(theme.text_accent()));
+    assert_eq!(breadcrumb.fg, Some(theme.text_accent()));
+    assert!(focused.add_modifier.contains(Modifier::BOLD));
+    assert!(breadcrumb.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn usability_tabs_retain_current_selector_streaming_and_custom_views() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.node_view_tabs = vec![
+        NodeViewTab {
+            label: "Current selector".to_string(),
+            count: 5,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "Streaming".to_string(),
+            count: 3,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "Custom Gemini".to_string(),
+            count: 2,
+            spinner: None,
+        },
+    ];
+    snapshot.active_node_view_tab = 2;
+
+    let text = rendered_lines_at(&snapshot, 120, 30).join("\n");
+    assert!(text.contains("Current selector 5"));
+    assert!(text.contains("Streaming 3"));
+    assert!(text.contains("Custom Gemini 2"));
+    assert!(text.contains("Node views  ←/→"));
+}
+

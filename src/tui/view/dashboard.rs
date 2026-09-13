@@ -1,5 +1,74 @@
 use super::*;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
+use crate::tui::ds::theme::Theme;
+use crate::tui::ds::truncate_cjk_graphemes;
+
+pub(crate) trait ThemeExt {
+    fn detect() -> Self;
+    fn style_danger(&self) -> Style;
+}
+
+impl ThemeExt for Theme {
+    fn detect() -> Self {
+        Self::default()
+    }
+
+    fn style_danger(&self) -> Style {
+        self.style_error()
+    }
+}
+
+pub(crate) fn reachability_badge_style(
+    reachability: &str,
+    tone: CandidateTone,
+    theme: &Theme,
+) -> Style {
+    let lower = reachability.to_ascii_lowercase();
+    if lower.contains("stable") {
+        theme.style_success()
+    } else if lower.contains("degraded") {
+        theme.style_warning()
+    } else if lower.contains("unreachable") || lower.contains("error") {
+        theme.style_danger()
+    } else if lower.contains("reachable") {
+        theme.style_breadcrumb()
+    } else {
+        match tone {
+            CandidateTone::Pending => pending_candidate_style(false),
+            CandidateTone::Success => theme.style_success(),
+            CandidateTone::Error => theme.style_danger(),
+            CandidateTone::Missing => theme.style_muted(),
+        }
+    }
+}
+
+fn candidate_marker_style(
+    marker: &str,
+    tone: CandidateTone,
+    bright: bool,
+    theme: &Theme,
+) -> Style {
+    if tone == CandidateTone::Pending {
+        return pending_candidate_style(bright);
+    }
+    let lower = marker.to_ascii_lowercase();
+    if lower.contains("mib/s")
+        || lower.contains("mb/s")
+        || lower.contains("kib/s")
+        || lower.contains("kb/s")
+        || lower.contains("ms")
+        || lower.contains("cold")
+    {
+        theme.style_breadcrumb()
+    } else {
+        match tone {
+            CandidateTone::Pending => pending_candidate_style(bright),
+            CandidateTone::Success => theme.style_breadcrumb(),
+            CandidateTone::Error => theme.style_danger(),
+            CandidateTone::Missing => theme.style_muted(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -200,6 +269,7 @@ fn render_latency_signal(signal: &LatencySignal) -> Vec<Span<'static>> {
 mod tests;
 
 pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
+    let theme = Theme::detect();
     let status_lines = status_lines(&snapshot.status);
     let status_footer = status_footer_line(&snapshot.status.footer);
     let status_line_count = status_lines.len() as u16;
@@ -324,17 +394,17 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     frame.render_widget(
         Tabs::new(tab_titles)
             .select(snapshot.active_node_view_tab)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.style_breadcrumb())
             .divider(" │ ")
             .block(
                 Block::default()
                     .title("Node views  ←/→")
                     .borders(Borders::ALL)
-                    .border_style(border_style(snapshot.focus == Focus::Members)),
+                    .border_style(if snapshot.focus == Focus::Members {
+                        Style::default().fg(theme.border_focus())
+                    } else {
+                        Style::default().fg(theme.border_default())
+                    }),
             ),
         tabs_area,
     );
@@ -343,114 +413,123 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
         .candidate_rows
         .iter()
         .map(|row| {
-            let style = if row.is_current {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
+            let name_style = if row.is_current {
+                theme.style_success().add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-            };
-            let (marker_style, evidence_style, loading_suffix) = match row.tone {
-                CandidateTone::Pending => (
-                    pending_candidate_style(snapshot.pending_animation_bright),
-                    Style::default().fg(Color::DarkGray),
-                    "",
-                ),
-                CandidateTone::Success => (
-                    Style::default().fg(Color::Magenta),
-                    Style::default().fg(Color::Magenta),
-                    "",
-                ),
-                CandidateTone::Error => (
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    "",
-                ),
-                CandidateTone::Missing => (
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::DarkGray),
-                    "",
-                ),
+                Style::default().fg(theme.text_primary())
             };
             let current_suffix = if row.is_current { "  *" } else { "" };
             let available = candidate_area.width.saturating_sub(4) as usize;
+
+            let mut fixed_suffix_width = unicode_width::UnicodeWidthStr::width(current_suffix);
             if let Some(signal) = &row.latency_signal {
                 let average = latency_average_label(signal);
-                let suffix_width = 2
+                fixed_suffix_width += 2
                     + signal.bars.len()
                     + 2
-                    + unicode_width::UnicodeWidthStr::width(average.as_str())
-                    + unicode_width::UnicodeWidthStr::width(current_suffix);
-                let visible_name =
-                    truncate_for_width(&row.name, available.saturating_sub(suffix_width));
-                let mut spans = vec![Span::styled(visible_name, style), Span::raw("  ")];
-                spans.extend(render_latency_signal(signal));
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    average,
-                    Style::default().fg(if signal.average_ms.is_some() {
-                        Color::Gray
-                    } else {
-                        Color::DarkGray
-                    }),
-                ));
-                spans.push(Span::raw(current_suffix));
-                return ListItem::new(Line::from(spans));
+                    + unicode_width::UnicodeWidthStr::width(average.as_str());
             }
-            let reachability_width = unicode_width::UnicodeWidthStr::width(row.reachability.as_str());
-            let suffix_width = if reachability_width > 0 {
-                reachability_width + 2
-            } else {
-                0
-            } + unicode_width::UnicodeWidthStr::width(loading_suffix)
-                + unicode_width::UnicodeWidthStr::width(current_suffix);
+            if !row.reachability.is_empty() {
+                fixed_suffix_width += 2 + unicode_width::UnicodeWidthStr::width(row.reachability.as_str());
+            }
+
+            let remaining_for_name_and_marker = available.saturating_sub(fixed_suffix_width);
             let name_width = unicode_width::UnicodeWidthStr::width(row.name.as_str());
-            let marker = if !row.marker.is_empty()
+
+            let (marker_text, marker_width) = if !row.marker.is_empty()
                 && name_width
-                    + suffix_width
                     + 2
                     + unicode_width::UnicodeWidthStr::width(row.marker.as_str())
-                    <= available
+                    <= remaining_for_name_and_marker
             {
-                row.marker.as_str()
+                (
+                    row.marker.as_str(),
+                    2 + unicode_width::UnicodeWidthStr::width(row.marker.as_str()),
+                )
             } else if !row.compact_marker.is_empty()
                 && name_width
-                    + suffix_width
                     + 2
                     + unicode_width::UnicodeWidthStr::width(row.compact_marker.as_str())
-                    <= available
+                    <= remaining_for_name_and_marker
             {
-                row.compact_marker.as_str()
+                (
+                    row.compact_marker.as_str(),
+                    2 + unicode_width::UnicodeWidthStr::width(row.compact_marker.as_str()),
+                )
+            } else if !row.compact_marker.is_empty()
+                && remaining_for_name_and_marker
+                    >= 2 + unicode_width::UnicodeWidthStr::width(row.compact_marker.as_str()) + 4
+            {
+                (
+                    row.compact_marker.as_str(),
+                    2 + unicode_width::UnicodeWidthStr::width(row.compact_marker.as_str()),
+                )
+            } else if !row.marker.is_empty()
+                && remaining_for_name_and_marker
+                    >= 2 + unicode_width::UnicodeWidthStr::width(row.marker.as_str()) + 4
+            {
+                (
+                    row.marker.as_str(),
+                    2 + unicode_width::UnicodeWidthStr::width(row.marker.as_str()),
+                )
             } else {
-                ""
+                ("", 0)
             };
-            let marker_width = if marker.is_empty() {
-                0
-            } else {
-                unicode_width::UnicodeWidthStr::width(marker) + 2
-            };
-            let visible_name = truncate_for_width(
-                &row.name,
-                available.saturating_sub(suffix_width + marker_width),
-            );
-            let mut spans = vec![Span::styled(visible_name, style)];
-            if !marker.is_empty() {
+
+            let name_max_width = remaining_for_name_and_marker.saturating_sub(marker_width);
+            let visible_name = truncate_cjk_graphemes(&row.name, name_max_width, "…");
+
+            let mut spans = vec![Span::styled(visible_name, name_style)];
+
+            if !marker_text.is_empty() {
                 spans.push(Span::raw("  "));
                 if row.tone == CandidateTone::Pending {
                     spans.extend(render_pending_working_marker(
-                        marker,
+                        marker_text,
                         snapshot.pending_animation_tick,
                     ));
                 } else {
-                    spans.push(Span::styled(marker.to_string(), marker_style));
+                    spans.push(Span::styled(
+                        marker_text.to_string(),
+                        candidate_marker_style(
+                            marker_text,
+                            row.tone,
+                            snapshot.pending_animation_bright,
+                            &theme,
+                        ),
+                    ));
                 }
             }
+
             if !row.reachability.is_empty() {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(row.reachability.clone(), evidence_style));
+                spans.push(Span::styled(
+                    row.reachability.clone(),
+                    reachability_badge_style(&row.reachability, row.tone, &theme),
+                ));
             }
-            spans.push(Span::raw(loading_suffix));
-            spans.push(Span::raw(current_suffix));
+
+            if let Some(signal) = &row.latency_signal {
+                spans.push(Span::raw("  "));
+                spans.extend(render_latency_signal(signal));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    latency_average_label(signal),
+                    Style::default().fg(if signal.average_ms.is_some() {
+                        theme.text_secondary()
+                    } else {
+                        theme.text_muted()
+                    }),
+                ));
+            }
+
+            if !current_suffix.is_empty() {
+                spans.push(Span::styled(
+                    current_suffix,
+                    theme.style_success().add_modifier(Modifier::BOLD),
+                ));
+            }
+
             ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>();
@@ -478,29 +557,44 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     if let (Some(notice), Some(notice_area)) = (&snapshot.candidate_notice, candidate_notice_area) {
         frame.render_widget(
             Paragraph::new(notice.message.as_str())
-                .style(Style::default().fg(if notice.error {
-                    Color::LightRed
+                .style(if notice.error {
+                    theme.style_danger()
                 } else {
-                    Color::LightYellow
-                }))
+                    theme.style_warning()
+                })
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .title(notice.title.as_str())
-                        .borders(Borders::ALL),
+                        .borders(Borders::ALL)
+                        .border_style(if notice.error {
+                            theme.style_danger()
+                        } else {
+                            theme.style_warning()
+                        }),
                 ),
             notice_area,
         );
     }
 
     let members_title = snapshot.candidate_title.clone();
+    let members_border_style = if snapshot.focus == Focus::Members {
+        Style::default().fg(theme.border_focus())
+    } else {
+        Style::default().fg(theme.border_default())
+    };
     let members_block = Block::default()
         .title(members_title)
         .borders(Borders::ALL)
-        .border_style(border_style(snapshot.focus == Focus::Members));
+        .border_style(members_border_style);
+    let candidate_highlight_style = if snapshot.focus == Focus::Members {
+        theme.style_focused_row()
+    } else {
+        theme.style_breadcrumb()
+    };
     let members_widget = List::new(members)
         .block(members_block)
-        .highlight_style(selected_style(snapshot.focus == Focus::Members))
+        .highlight_style(candidate_highlight_style)
         .highlight_symbol("> ");
     let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
     frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
