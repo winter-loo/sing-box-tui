@@ -4,6 +4,34 @@ Terms that define how sing-box-tui owns proxy runtime and network-access behavio
 
 ## Language
 
+**Idle dashboard**:
+A passive monitoring view shown while the user is not operating the TUI, with separate histories for current-route node quality and core traffic. It is distinct from the operational home page and contains no candidate-node list.
+_Avoid_: Home page, node browser, node selection page
+
+**Core traffic**:
+Upload/download rates and cumulative bytes reported by the existing sing-box core, including direct traffic covered by its counters. The dashboard does not exclude direct traffic, attribute bytes to nodes, or separately account for probes. Coverage and resets follow the core; these are neither whole-machine counters nor subscription quota consumption. History continues across route and workspace changes; route colors mark switch times, not byte ownership.
+_Avoid_: Proxy-only usage, per-node usage, subscription quota consumed, whole-machine usage
+
+**Probe traffic**:
+Traffic carried through Internet Proxy nodes for reachability, sustained-quality, or application-level usability probing. The dashboard does not separately count or add these bytes; existing core counters may not cover every probe path.
+_Avoid_: Free traffic, user traffic, extra traffic
+
+**Current route node**:
+The Internet Proxy node selected by the current route's selector chain, independently of which candidate the user is browsing. It does not imply that existing connections have moved to that node.
+_Avoid_: Focused node, browsed node, all-traffic node
+
+**Route interval**:
+A continuous period during which the current route node remains unchanged, ending when that node switches. Returning to a previously used node starts a new interval rather than resuming its earlier interval.
+_Avoid_: Node identity, connection lifetime, probe attempt
+
+**Current route probe latency**:
+The measured probe delay through the node that was the current route node at the time of measurement. Its history spans route intervals and excludes background measurements of other candidate nodes; periods without measurements remain missing.
+_Avoid_: Business request latency, average candidate latency, whole-machine latency
+
+**Browsed node**:
+An Internet Proxy candidate currently in focus for inspection. Browsing it does not change the current route node; switching requires explicit activation.
+_Avoid_: Current route node, active node, connected node
+
 **Managed sing-box process**:
 A sing-box process started by the current `ManagedSingBox` instance and held in its explicit lifecycle ownership for one configuration. Existing, unrelated, user-owned, or previous-instance sing-box processes are never adopted, restarted, or stopped.
 _Avoid_: Managed child, adopted process, sing-box service
