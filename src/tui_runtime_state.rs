@@ -11,7 +11,7 @@ use crate::config::{
     TailscaleConfigOptions, config_has_china_ip_routing, inspect_tailscale_config,
     set_china_ip_routing, set_tailscale_config,
 };
-use crate::tui_state::TuiRuntimeState;
+use crate::tui_state::{OperationalWorkspace, TuiRuntimeState};
 
 #[cfg(test)]
 #[path = "tui_runtime_state_tests.rs"]
@@ -83,7 +83,12 @@ impl App {
         let _ = state.legacy_auto_select_threshold_ms;
         self.private_access
             .apply_state(&state, private_access_process_exists)?;
-        if !self.private_access.is_configured() {
+        let restored_workspace = state.operational_workspace();
+        if restored_workspace == OperationalWorkspace::PrivateAccess && self.private_access.is_configured() {
+            self.operational_workspace = OperationalWorkspace::PrivateAccess;
+            self.left_pane_section = LeftPaneSection::Intranet;
+        } else {
+            self.operational_workspace = OperationalWorkspace::Internet;
             self.left_pane_section = LeftPaneSection::Internet;
             self.intranet_detail_scroll = 0;
         }
@@ -186,6 +191,7 @@ impl App {
     pub(super) fn runtime_state(&self) -> TuiRuntimeState {
         let persisted_tun = self.internet_tun.persisted();
         TuiRuntimeState {
+            operational_workspace: Some(self.operational_workspace.as_str().to_string()),
             benchmark_filter: self.benchmark_filter.clone(),
             auto_pick_enabled: self.auto_select_enabled,
             auto_pick_selector: self.auto_select_selector.clone(),

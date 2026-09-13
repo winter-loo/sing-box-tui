@@ -62,7 +62,8 @@ use crate::subscriptions::DEFAULT_SUBSCRIPTION_SOURCE_PATH;
 use crate::sustained_quality::DEFAULT_SUSTAINED_TARGET_URL;
 use crate::system_proxy::SystemProxy;
 use crate::tui_state::{
-    BypassRuleSetStore, TuiStateStore, default_tui_state_path, resolved_tui_bypass_rule_set_path,
+    BypassRuleSetStore, OperationalWorkspace, TuiStateStore, default_tui_state_path,
+    resolved_tui_bypass_rule_set_path,
 };
 use crate::usability_probe::{
     ManifestDiagnostic, UsabilityProbeDiscovery, UsabilityProbeManifest,
@@ -411,6 +412,27 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         let snapshot = app.view_snapshot();
         view::render(frame, &snapshot);
+
+        let area = frame.area();
+        if area.height > 0 && area.width > 0 {
+            let header_area = ratatui::layout::Rect::new(area.x, area.y, area.width, 1);
+            let theme = crate::tui::ds::Theme::default();
+            let selector_name = app.selected_group().map(|g| g.name.as_str()).unwrap_or("—");
+            let tun_enabled = app.internet_tun.is_enabled();
+            let system_proxy_enabled = app.system_proxy.enabled();
+            let clash_mode = app.clash_mode.as_deref().unwrap_or("—");
+
+            crate::tui::ds::widgets::render_top_header(
+                frame,
+                header_area,
+                &theme,
+                app.operational_workspace,
+                selector_name,
+                tun_enabled,
+                system_proxy_enabled,
+                clash_mode,
+            );
+        }
     }
 }
 
@@ -501,6 +523,7 @@ struct App {
     private_access_auth: Option<PrivateAccessAuthModal>,
     metric_store: Option<crate::tui::metrics::MetricStore>,
     active_view: ActiveView,
+    operational_workspace: OperationalWorkspace,
     last_user_activity: Instant,
     last_traffic_totals: Option<(Instant, u64, u64)>,
     last_active_traffic_rate: (String, String),
@@ -729,6 +752,7 @@ impl App {
             private_access_auth: None,
             metric_store,
             active_view: ActiveView::NodeList,
+            operational_workspace: runtime_state.operational_workspace(),
             last_user_activity: Instant::now(),
             last_traffic_totals: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
@@ -972,10 +996,8 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Groups => Focus::Members,
-                    Focus::Members => Focus::Groups,
-                };
+                self.last_user_activity = Instant::now();
+                self.cycle_operational_workspace()?;
             }
             KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
             KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
@@ -1018,6 +1040,24 @@ impl App {
         let displayed = self.displayed_members();
         let index = self.displayed_member_index()?;
         displayed.get(index).cloned()
+    }
+
+    pub(crate) fn cycle_operational_workspace(&mut self) -> Result<()> {
+        self.operational_workspace = self.operational_workspace.cycle();
+        match self.operational_workspace {
+            OperationalWorkspace::Internet => {
+                self.left_pane_section = LeftPaneSection::Internet;
+                self.set_status_only("Switched to Internet workspace");
+            }
+            OperationalWorkspace::PrivateAccess => {
+                if self.private_access.is_configured() {
+                    self.left_pane_section = LeftPaneSection::Intranet;
+                }
+                self.set_status_only("Switched to Private Access workspace");
+            }
+        }
+        self.save_runtime_state()?;
+        Ok(())
     }
 
         pub(super) fn is_any_probe_running(&self) -> bool {
@@ -1216,3 +1256,120 @@ mod persistent_path_tests {
         let _ = fs::remove_dir_all(dir.parent().expect("temporary root"));
     }
 }
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use crossterm::event::KeyCode;
+    use crate::tui_state::{OperationalWorkspace, TuiRuntimeState, TuiStateStore};
+
+    #[test]
+    fn tab_cycles_operational_workspace_and_persists() {
+        let mut app = test_support::test_app();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sing-box-tui-tab-test-{nonce}.json"));
+        let store = TuiStateStore::new(&path);
+        app.state_store = Some(store.clone());
+
+        assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+        assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
+
+        let initial_activity = app.last_user_activity;
+        thread::sleep(Duration::from_millis(5));
+
+        // Tab -> PrivateAccess
+        app.handle_key(KeyCode::Tab).expect("tab handled");
+        assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
+        assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
+        assert!(app.last_user_activity > initial_activity);
+        let persisted = store.load().expect("load persisted state");
+        assert_eq!(persisted.operational_workspace.as_deref(), Some("private_access"));
+
+        let next_activity = app.last_user_activity;
+        thread::sleep(Duration::from_millis(5));
+
+        // Tab -> Internet
+        app.handle_key(KeyCode::Tab).expect("tab handled");
+        assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+        assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
+        assert!(app.last_user_activity > next_activity);
+        let persisted = store.load().expect("load persisted state");
+        assert_eq!(persisted.operational_workspace.as_deref(), Some("internet"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn restoring_workspace_does_not_connect_vpn_or_switch_selector() {
+        let mut app = test_support::test_app();
+        // Initial selector state
+        assert_eq!(app.groups[0].name, "select");
+        assert_eq!(app.groups[0].current.as_deref(), Some("node-a"));
+
+        // Simulate state with PrivateAccess restored
+        let mut state = app.runtime_state();
+        state.operational_workspace = Some("private_access".to_string());
+        state.current_selected_nodes.insert("select".to_string(), "node-a".to_string());
+
+        app.apply_runtime_state(state).expect("apply runtime state");
+
+        // Workspace restored
+        assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
+        // Selector must NOT have changed
+        assert_eq!(app.groups[0].current.as_deref(), Some("node-a"));
+        // VPN must NOT be connected or connecting
+        for profile in &app.private_access.profiles {
+            assert_eq!(profile.state, crate::private_access::PrivateAccessState::Disconnected);
+            assert_ne!(profile.state, crate::private_access::PrivateAccessState::Connected);
+            assert_ne!(profile.state, crate::private_access::PrivateAccessState::Connecting);
+        }
+    }
+
+    #[test]
+    fn unconfigured_private_access_defaults_restored_workspace_to_internet() {
+        let mut app = test_support::test_app_without_private_access();
+        let mut state = TuiRuntimeState::default();
+        state.operational_workspace = Some("private_access".to_string());
+
+        app.apply_runtime_state(state).expect("apply runtime state");
+
+        // Since private_access is not configured, fall back to Internet workspace
+        assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+        assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
+    }
+
+    #[test]
+    fn operational_view_draw_renders_top_header() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        app.active_view = ActiveView::NodeList;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(text.contains("SING-BOX TUI · INTERNET · select"));
+        assert!(text.contains("[Tab] Switch Workspace"));
+        assert!(text.contains("[Ctrl+K] Actions"));
+        assert!(text.contains("TUN: [OFF]"));
+        assert!(text.contains("SYS PROXY: [OFF]"));
+        assert!(text.contains("CLASH: [RULE]"));
+    }
+}
+

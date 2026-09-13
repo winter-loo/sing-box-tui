@@ -49,9 +49,83 @@ pub(crate) struct PrivateAccessProfileState {
     pub(crate) background_pid: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationalWorkspace {
+    #[default]
+    Internet,
+    PrivateAccess,
+}
+
+impl OperationalWorkspace {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Internet => "internet",
+            Self::PrivateAccess => "private_access",
+        }
+    }
+
+    pub(crate) fn header_label(&self) -> &'static str {
+        match self {
+            Self::Internet => "INTERNET",
+            Self::PrivateAccess => "PRIVATE ACCESS",
+        }
+    }
+
+    pub(crate) fn from_persisted(raw: Option<&str>) -> Self {
+        match raw {
+            Some("private_access") => Self::PrivateAccess,
+            _ => Self::Internet,
+        }
+    }
+
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            Self::Internet => Self::PrivateAccess,
+            Self::PrivateAccess => Self::Internet,
+        }
+    }
+}
+
+impl std::fmt::Display for OperationalWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.header_label())
+    }
+}
+
+impl FromStr for OperationalWorkspace {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_persisted(Some(s)))
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) type TuiState = TuiRuntimeState;
+
+fn deserialize_operational_workspace<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt.as_deref() {
+        None => Ok(None),
+        Some("private_access") => Ok(Some("private_access".to_string())),
+        Some("internet") => Ok(Some("internet".to_string())),
+        Some(_) => Ok(Some("internet".to_string())),
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TuiRuntimeState {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_operational_workspace"
+    )]
+    pub(crate) operational_workspace: Option<String>,
     #[serde(default)]
     pub(crate) benchmark_filter: String,
     #[serde(default)]
@@ -110,6 +184,12 @@ pub(crate) struct TuiRuntimeState {
     pub(crate) tun_auto_detect_interface_before_enable: Option<RouteAutoDetectInterfaceState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) private_access_profiles: Vec<PrivateAccessProfileState>,
+}
+
+impl TuiRuntimeState {
+    pub(crate) fn operational_workspace(&self) -> OperationalWorkspace {
+        OperationalWorkspace::from_persisted(self.operational_workspace.as_deref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -277,7 +357,8 @@ fn is_ip_entry(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrivateAccessProfileState, TuiRuntimeState, TuiStateStore, resolve_tui_bypass_rule_set_path,
+        OperationalWorkspace, PrivateAccessProfileState, TuiRuntimeState, TuiState, TuiStateStore,
+        resolve_tui_bypass_rule_set_path,
     };
     use crate::config::RouteAutoDetectInterfaceState;
     use crate::defaults::DEFAULT_BYPASS_RULE_SET_PATH;
@@ -567,4 +648,52 @@ mod tests {
 
         assert!(error.to_string().contains("legacy_profile"));
     }
+
+    #[test]
+    fn operational_workspace_round_trips_internet_and_private_access() {
+        let mut state = TuiState::default();
+        state.operational_workspace = Some("internet".to_string());
+        let json = serde_json::to_string(&state).expect("serializes internet workspace");
+        assert!(json.contains(r#""operational_workspace":"internet""#));
+        let restored: TuiState = serde_json::from_str(&json).expect("deserializes internet workspace");
+        assert_eq!(restored.operational_workspace.as_deref(), Some("internet"));
+        assert_eq!(restored.operational_workspace(), OperationalWorkspace::Internet);
+
+        let mut state = TuiState::default();
+        state.operational_workspace = Some("private_access".to_string());
+        let json = serde_json::to_string(&state).expect("serializes private_access workspace");
+        assert!(json.contains(r#""operational_workspace":"private_access""#));
+        let restored: TuiState = serde_json::from_str(&json).expect("deserializes private_access workspace");
+        assert_eq!(restored.operational_workspace.as_deref(), Some("private_access"));
+        assert_eq!(restored.operational_workspace(), OperationalWorkspace::PrivateAccess);
+
+        // Omitted workspace in JSON defaults to None and operational_workspace() evaluates to Internet
+        let state = TuiState::default();
+        let json = serde_json::to_string(&state).expect("serializes default");
+        assert!(!json.contains("operational_workspace"));
+        let restored: TuiState = serde_json::from_str(&json).expect("deserializes default");
+        assert_eq!(restored.operational_workspace, None);
+        assert_eq!(restored.operational_workspace(), OperationalWorkspace::Internet);
+    }
+
+    #[test]
+    fn operational_workspace_unknown_values_default_to_internet() {
+        let json = r#"{
+            "operational_workspace": "custom_enterprise_vpn",
+            "private_access_profiles": []
+        }"#;
+        let restored: TuiState = serde_json::from_str(json).expect("deserializes unknown workspace");
+        assert_eq!(restored.operational_workspace.as_deref(), Some("internet"));
+        assert_eq!(restored.operational_workspace(), OperationalWorkspace::Internet);
+
+        assert_eq!(OperationalWorkspace::from_persisted(None), OperationalWorkspace::Internet);
+        assert_eq!(OperationalWorkspace::from_persisted(Some("internet")), OperationalWorkspace::Internet);
+        assert_eq!(OperationalWorkspace::from_persisted(Some("private_access")), OperationalWorkspace::PrivateAccess);
+        assert_eq!(OperationalWorkspace::from_persisted(Some("something_else")), OperationalWorkspace::Internet);
+
+        // Test cycle
+        assert_eq!(OperationalWorkspace::Internet.cycle(), OperationalWorkspace::PrivateAccess);
+        assert_eq!(OperationalWorkspace::PrivateAccess.cycle(), OperationalWorkspace::Internet);
+    }
 }
+
