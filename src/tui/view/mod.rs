@@ -18,6 +18,7 @@ use crate::subscriptions::SubscriptionRefreshOutput;
 use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
 use crate::usability_probe::ManifestDiagnostic;
 
+mod command_palette;
 mod connections;
 mod dashboard;
 mod help;
@@ -29,6 +30,7 @@ mod settings;
 mod shared;
 mod status;
 
+pub(super) use command_palette::*;
 pub(super) use connections::*;
 pub(super) use dashboard::*;
 pub(super) use help::*;

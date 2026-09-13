@@ -169,6 +169,7 @@ pub(super) fn test_app() -> App {
         metric_store: None,
         active_view: super::ActiveView::NodeList,
         operational_workspace: crate::tui_state::OperationalWorkspace::Internet,
+        command_palette: None,
         last_user_activity: Instant::now(),
         last_traffic_totals: None,
         last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),

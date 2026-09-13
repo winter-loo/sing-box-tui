@@ -312,6 +312,18 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 app.last_user_activity = Instant::now();
+                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
+                {
+                    app.toggle_command_palette();
+                    continue;
+                }
+                if app.command_palette.is_some() {
+                    if !app.handle_command_palette_key(key.code)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 if app.active_view == ActiveView::IdleDashboard && !app.has_active_modal() {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
@@ -337,11 +349,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                     }
                 }
-                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
-                {
-                    app.open_help_panel();
-                } else if matches!(key.code, KeyCode::Char('V'))
+                if matches!(key.code, KeyCode::Char('V'))
                     && app.private_access_connect_needs_terminal_prompt()
                 {
                     app.connect_private_access_with_terminal_prompt(&mut terminal)?;
@@ -434,12 +442,42 @@ fn draw(frame: &mut Frame, app: &mut App) {
             );
         }
     }
+
+    if let Some(state) = &app.command_palette {
+        let theme = crate::tui::ds::Theme::default();
+        let filtered = view::filter_commands(&view::builtin_commands(), &state.query);
+        view::render_command_palette(
+            frame,
+            frame.area(),
+            &theme,
+            &state.query,
+            state.selected_index,
+            &filtered,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ActiveView {
     NodeList,
     IdleDashboard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandPaletteState {
+    pub(crate) query: String,
+    pub(crate) selected_index: usize,
+    pub(crate) origin_view: ActiveView,
+}
+
+impl CommandPaletteState {
+    pub(crate) fn new(origin_view: ActiveView) -> Self {
+        Self {
+            query: String::new(),
+            selected_index: 0,
+            origin_view,
+        }
+    }
 }
 
 struct App {
@@ -524,6 +562,7 @@ struct App {
     metric_store: Option<crate::tui::metrics::MetricStore>,
     active_view: ActiveView,
     operational_workspace: OperationalWorkspace,
+    pub(crate) command_palette: Option<CommandPaletteState>,
     last_user_activity: Instant,
     last_traffic_totals: Option<(Instant, u64, u64)>,
     last_active_traffic_rate: (String, String),
@@ -753,6 +792,7 @@ impl App {
             metric_store,
             active_view: ActiveView::NodeList,
             operational_workspace: runtime_state.operational_workspace(),
+            command_palette: None,
             last_user_activity: Instant::now(),
             last_traffic_totals: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
@@ -834,6 +874,7 @@ impl App {
             || self.show_help
             || self.show_connections
             || self.node_quality_detail.is_some()
+            || self.command_palette.is_some()
     }
 
     pub(crate) fn check_and_record_active_route(&mut self) {
@@ -915,6 +956,9 @@ impl App {
         {
             self.set_status_only("Wait for the network mode update before exiting");
             return Ok(true);
+        }
+        if self.command_palette.is_some() {
+            return self.handle_command_palette_key(code);
         }
         if self.private_access_auth.is_some() {
             return self.handle_private_access_auth_key(code);
@@ -1042,8 +1086,127 @@ impl App {
         displayed.get(index).cloned()
     }
 
-    pub(crate) fn cycle_operational_workspace(&mut self) -> Result<()> {
-        self.operational_workspace = self.operational_workspace.cycle();
+    pub(crate) fn toggle_command_palette(&mut self) {
+        if let Some(state) = self.command_palette.take() {
+            self.active_view = state.origin_view;
+        } else {
+            self.command_palette = Some(CommandPaletteState::new(self.active_view));
+        }
+    }
+
+    pub(crate) fn close_command_palette(&mut self) {
+        if let Some(state) = self.command_palette.take() {
+            self.active_view = state.origin_view;
+        }
+    }
+
+    pub(crate) fn handle_command_palette_key(&mut self, code: KeyCode) -> Result<bool> {
+        if matches!(code, KeyCode::Esc) {
+            self.close_command_palette();
+            return Ok(true);
+        }
+
+        let Some(mut state) = self.command_palette.take() else {
+            return Ok(true);
+        };
+
+        match code {
+            KeyCode::Esc => unreachable!(),
+            KeyCode::Up => {
+                state.selected_index = state.selected_index.saturating_sub(1);
+                self.command_palette = Some(state);
+            }
+            KeyCode::Down => {
+                let filtered = view::filter_commands(&view::builtin_commands(), &state.query);
+                if !filtered.is_empty() && state.selected_index + 1 < filtered.len() {
+                    state.selected_index += 1;
+                }
+                self.command_palette = Some(state);
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                let filtered = view::filter_commands(&view::builtin_commands(), &state.query);
+                if state.selected_index >= filtered.len() {
+                    state.selected_index = filtered.len().saturating_sub(1);
+                }
+                self.command_palette = Some(state);
+            }
+            KeyCode::Char(ch) => {
+                state.query.push(ch);
+                state.selected_index = 0;
+                self.command_palette = Some(state);
+            }
+            KeyCode::Enter => {
+                let filtered = view::filter_commands(&view::builtin_commands(), &state.query);
+                if let Some(item) = filtered.get(state.selected_index) {
+                    let action_id = item.id;
+                    self.command_palette = None;
+                    return self.execute_command(action_id);
+                }
+                self.command_palette = Some(state);
+            }
+            _ => {
+                self.command_palette = Some(state);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn execute_command(&mut self, action_id: &str) -> Result<bool> {
+        match action_id {
+            view::CMD_SWITCH_INTERNET => {
+                self.set_operational_workspace(OperationalWorkspace::Internet)?;
+                self.active_view = ActiveView::NodeList;
+            }
+            view::CMD_SWITCH_PRIVATE_ACCESS => {
+                self.set_operational_workspace(OperationalWorkspace::PrivateAccess)?;
+                self.active_view = ActiveView::NodeList;
+            }
+            view::CMD_TOGGLE_TUN => {
+                self.toggle_tun_mode();
+            }
+            view::CMD_TOGGLE_SYSTEM_PROXY => {
+                self.set_system_proxy();
+            }
+            view::CMD_TRIGGER_USABILITY_PROBES => {
+                self.start_manual_usability_probe();
+            }
+            view::CMD_REFRESH_SUBSCRIPTIONS => {
+                self.start_manual_subscription_refresh();
+            }
+            view::CMD_REFRESH_CONNECTIONS => {
+                self.last_connection_refresh = Instant::now() - CONNECTION_REFRESH_INTERVAL;
+                self.maybe_refresh_connections();
+                self.set_status_only("Connection details refreshed");
+            }
+            view::CMD_VIEW_CONNECTIONS => {
+                self.open_connections_panel();
+            }
+            view::CMD_VIEW_NODE_QUALITY => {
+                let _ = self.open_node_quality_detail();
+            }
+            view::CMD_OPEN_SETTINGS => {
+                self.open_settings_panel();
+            }
+            view::CMD_OPEN_HELP => {
+                self.open_help_panel();
+            }
+            view::CMD_ENTER_IDLE_DASHBOARD => {
+                self.active_view = ActiveView::IdleDashboard;
+            }
+            view::CMD_QUIT => {
+                return Ok(false);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn set_operational_workspace(
+        &mut self,
+        workspace: OperationalWorkspace,
+    ) -> Result<()> {
+        self.operational_workspace = workspace;
         match self.operational_workspace {
             OperationalWorkspace::Internet => {
                 self.left_pane_section = LeftPaneSection::Internet;
@@ -1058,6 +1221,11 @@ impl App {
         }
         self.save_runtime_state()?;
         Ok(())
+    }
+
+    pub(crate) fn cycle_operational_workspace(&mut self) -> Result<()> {
+        let next = self.operational_workspace.cycle();
+        self.set_operational_workspace(next)
     }
 
         pub(super) fn is_any_probe_running(&self) -> bool {
@@ -1370,6 +1538,166 @@ mod navigation_tests {
         assert!(text.contains("TUN: [OFF]"));
         assert!(text.contains("SYS PROXY: [OFF]"));
         assert!(text.contains("CLASH: [RULE]"));
+    }
+
+    #[test]
+    fn command_palette_toggle_and_esc_lifecycle() {
+        let mut app = test_support::test_app();
+        app.active_view = ActiveView::NodeList;
+        assert!(app.command_palette.is_none());
+        assert!(!app.has_active_modal());
+
+        // Open palette
+        app.toggle_command_palette();
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.command_palette.as_ref().unwrap().origin_view,
+            ActiveView::NodeList
+        );
+        assert_eq!(app.command_palette.as_ref().unwrap().query, "");
+        assert_eq!(app.command_palette.as_ref().unwrap().selected_index, 0);
+        assert!(app.has_active_modal());
+
+        // Toggle closes palette
+        app.toggle_command_palette();
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.active_view, ActiveView::NodeList);
+        assert!(!app.has_active_modal());
+
+        // Open from IdleDashboard and close with Esc
+        app.active_view = ActiveView::IdleDashboard;
+        app.toggle_command_palette();
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.command_palette.as_ref().unwrap().origin_view,
+            ActiveView::IdleDashboard
+        );
+
+        let res = app.handle_command_palette_key(KeyCode::Esc).unwrap();
+        assert!(res);
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+    }
+
+    #[test]
+    fn command_palette_query_typing_and_navigation() {
+        let mut app = test_support::test_app();
+        app.toggle_command_palette();
+
+        // Navigate Down
+        app.handle_command_palette_key(KeyCode::Down).unwrap();
+        assert_eq!(app.command_palette.as_ref().unwrap().selected_index, 1);
+
+        // Navigate Up
+        app.handle_command_palette_key(KeyCode::Up).unwrap();
+        assert_eq!(app.command_palette.as_ref().unwrap().selected_index, 0);
+
+        // Typing character appends and resets selected_index
+        app.handle_command_palette_key(KeyCode::Down).unwrap();
+        assert_eq!(app.command_palette.as_ref().unwrap().selected_index, 1);
+
+        app.handle_command_palette_key(KeyCode::Char('t')).unwrap();
+        app.handle_command_palette_key(KeyCode::Char('u')).unwrap();
+        app.handle_command_palette_key(KeyCode::Char('n')).unwrap();
+        assert_eq!(app.command_palette.as_ref().unwrap().query, "tun");
+        assert_eq!(app.command_palette.as_ref().unwrap().selected_index, 0);
+
+        // Backspace pops character
+        app.handle_command_palette_key(KeyCode::Backspace).unwrap();
+        assert_eq!(app.command_palette.as_ref().unwrap().query, "tu");
+    }
+
+    #[test]
+    fn command_palette_execution_workspace_switch() {
+        let mut app = test_support::test_app();
+        app.operational_workspace = OperationalWorkspace::Internet;
+        app.toggle_command_palette();
+
+        // Type query for private access
+        for c in "private".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        let filtered = view::filter_commands(
+            &view::builtin_commands(),
+            &app.command_palette.as_ref().unwrap().query,
+        );
+        assert!(!filtered.is_empty());
+        assert_eq!(filtered[0].id, view::CMD_SWITCH_PRIVATE_ACCESS);
+
+        // Press Enter
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert_eq!(
+            app.operational_workspace,
+            OperationalWorkspace::PrivateAccess
+        );
+    }
+
+    #[test]
+    fn command_palette_execution_overlay_and_views() {
+        let mut app = test_support::test_app();
+
+        // Open settings via command palette
+        app.toggle_command_palette();
+        for c in "settings".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert!(app.show_settings);
+
+        // Open connections via command palette
+        app.toggle_command_palette();
+        for c in "view conn".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert!(app.show_connections);
+
+        // Enter idle dashboard
+        app.toggle_command_palette();
+        for c in "idle".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // Quit command returns Ok(false)
+        app.toggle_command_palette();
+        for c in "quit".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        let quit_result = app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(!quit_result);
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
+    fn command_palette_draw_over_view() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        app.toggle_command_palette();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+        assert!(text.contains("> █"));
+        assert!(text.contains("[Enter] Execute  [Esc] Dismiss"));
     }
 }
 
