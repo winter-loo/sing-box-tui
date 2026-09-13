@@ -1,9 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::ds::{Theme, ViewportMode, render_breadcrumb, render_footer, render_unsupported_guard};
 use crate::tui::metrics::{
@@ -15,11 +17,21 @@ use crate::tui::metrics::{
 pub(crate) struct ActiveNodeQualitySnapshot<'a> {
     pub(crate) node_name: &'a str,
     pub(crate) current_latency_ms: Option<u64>,
+    #[allow(dead_code)]
     pub(crate) warm_median_ms: Option<u64>,
+    #[allow(dead_code)]
     pub(crate) p95_ms: Option<u64>,
+    #[allow(dead_code)]
     pub(crate) cold_start_ms: Option<u64>,
     pub(crate) sustained_speed_label: Option<String>,
+    #[allow(dead_code)]
     pub(crate) reachability_label: &'a str,
+    pub(crate) latency_points: Vec<(f64, f64)>,
+    pub(crate) sustained_points: Vec<(f64, f64)>,
+    pub(crate) latest_latency: Option<String>,
+    pub(crate) latency_sample_age: Option<String>,
+    pub(crate) latest_sustained_speed: Option<String>,
+    pub(crate) sustained_sample_age: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +52,38 @@ pub(crate) struct IdleDashboardSnapshot<'a> {
     pub(crate) route_intervals: &'a [RouteInterval],
     pub(crate) node_quality: Option<ActiveNodeQualitySnapshot<'a>>,
     pub(crate) active_connections: Vec<ActiveConnectionSummary<'a>>,
+}
+
+impl<'a> IdleDashboardSnapshot<'a> {
+    #[allow(dead_code)]
+    pub(crate) fn latency_history_points(&self) -> &[(f64, f64)] {
+        self.node_quality.as_ref().map_or(&[], |q| &q.latency_points)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sustained_speed_history_points(&self) -> &[(f64, f64)] {
+        self.node_quality.as_ref().map_or(&[], |q| &q.sustained_points)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn latest_latency(&self) -> Option<&str> {
+        self.node_quality.as_ref().and_then(|q| q.latest_latency.as_deref())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn latency_sample_age(&self) -> Option<&str> {
+        self.node_quality.as_ref().and_then(|q| q.latency_sample_age.as_deref())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn latest_sustained_speed(&self) -> Option<&str> {
+        self.node_quality.as_ref().and_then(|q| q.latest_sustained_speed.as_deref())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sustained_sample_age(&self) -> Option<&str> {
+        self.node_quality.as_ref().and_then(|q| q.sustained_sample_age.as_deref())
+    }
 }
 
 /// Main entry point for rendering the Idle Dashboard (120x30 Canonical or 80x24 Compact)
@@ -72,42 +116,53 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         &["DASHBOARD", snapshot.active_provider, snapshot.active_node],
     );
 
-    // 2. Main content panels
-    match mode {
-        ViewportMode::Standard => {
-            let right_width = 38.min(main_area.width.saturating_sub(60));
-            let [charts_area, side_area] = Layout::horizontal([
-                Constraint::Min(60),
-                Constraint::Length(right_width),
-            ])
-            .areas(main_area);
+    // 2. Main content panels (Responsive breakpoints: >=120 all, 96..119 quality only, 80..95 full charts)
+    if area.width >= 120 && area.height >= 30 {
+        let right_width = 38.min(main_area.width.saturating_sub(60));
+        let [charts_area, side_area] = Layout::horizontal([
+            Constraint::Min(60),
+            Constraint::Length(right_width),
+        ])
+        .areas(main_area);
 
-            render_core_history_panel(frame, charts_area, &theme, snapshot);
-            render_side_panels(frame, side_area, &theme, snapshot);
-        }
-        ViewportMode::Compact => {
-            render_core_history_panel(frame, main_area, &theme, snapshot);
-        }
-        ViewportMode::Unsupported { .. } => unreachable!(),
+        render_core_history_panel(frame, charts_area, &theme, snapshot);
+        render_side_panels(frame, side_area, &theme, snapshot);
+    } else if area.width >= 96 {
+        let right_width = 30.min(main_area.width.saturating_sub(60));
+        let [charts_area, side_area] = Layout::horizontal([
+            Constraint::Min(60),
+            Constraint::Length(right_width),
+        ])
+        .areas(main_area);
+
+        render_core_history_panel(frame, charts_area, &theme, snapshot);
+        let [quality_area, _] = Layout::vertical([
+            Constraint::Length(12),
+            Constraint::Min(0),
+        ])
+        .areas(side_area);
+        render_node_quality_panel(frame, quality_area, &theme, snapshot);
+    } else {
+        render_core_history_panel(frame, main_area, &theme, snapshot);
     }
 
     // 3. Footer
-    let shortcuts = match mode {
-        ViewportMode::Standard => [
+    let shortcuts = if area.width >= 120 && area.height >= 30 {
+        [
             ("Ctrl+K", "menu"),
             ("c", "connections"),
             ("i", "quality"),
             ("o", "settings"),
             ("?", "help"),
-        ],
-        ViewportMode::Compact => [
+        ]
+    } else {
+        [
             ("Ctrl+K", "menu"),
             ("c", "conn"),
             ("i", "quality"),
             ("o", "settings"),
             ("?", "help"),
-        ],
-        _ => unreachable!(),
+        ]
     };
 
     render_footer(
@@ -325,6 +380,9 @@ fn render_core_traffic_chart(
     frame.render_widget(canvas, area);
 }
 
+const PINK: Color = Color::Rgb(229, 137, 245);
+const GREEN: Color = Color::Rgb(98, 230, 167);
+
 /// Renders the two side panels on the right side of the 120x30 standard layout:
 /// 1. Node Quality
 /// 2. Active Connections
@@ -340,7 +398,17 @@ fn render_side_panels(
     ])
     .areas(area);
 
-    // --- Panel 1: Node Quality ---
+    render_node_quality_panel(frame, quality_area, theme, snapshot);
+    render_active_connections_panel(frame, conn_area, theme, snapshot);
+}
+
+/// Renders the Node Quality panel with 3-row mini Braille sparklines
+fn render_node_quality_panel(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    snapshot: &IdleDashboardSnapshot<'_>,
+) {
     let quality_title = format!(" NODE QUALITY · {} ", snapshot.active_node);
     let quality_block = Block::default()
         .borders(Borders::ALL)
@@ -348,55 +416,198 @@ fn render_side_panels(
         .title(quality_title)
         .style(theme.style_base());
 
-    let quality_inner = quality_block.inner(quality_area);
-    frame.render_widget(quality_block, quality_area);
+    let inner = quality_block.inner(area);
+    frame.render_widget(quality_block, area);
 
-    let mut quality_lines = Vec::new();
-    if let Some(q) = &snapshot.node_quality {
-        quality_lines.push(Line::from(vec![
-            Span::styled("Node:         ", theme.style_muted()),
-            Span::styled(q.node_name, theme.style_breadcrumb()),
-        ]));
-        quality_lines.push(Line::from(vec![
-            Span::styled("Reachability: ", theme.style_muted()),
-            Span::styled(q.reachability_label, theme.style_success()),
-        ]));
-        if let Some(lat) = q.current_latency_ms {
-            quality_lines.push(Line::from(vec![
-                Span::styled("Current:      ", theme.style_muted()),
-                Span::styled(format!("{} ms", lat), theme.style_breadcrumb()),
-            ]));
+    if inner.height < 10 || inner.width < 10 {
+        if let Some(q) = &snapshot.node_quality {
+            let line = Line::from(Span::styled(format!("Node: {}", q.node_name), theme.style_muted()));
+            frame.render_widget(Paragraph::new(line), inner);
         }
-        quality_lines.push(Line::from(vec![
-            Span::styled("Median / P95: ", theme.style_muted()),
-            Span::styled(
-                format!(
-                    "{} / {}",
-                    q.warm_median_ms.map_or("--".to_string(), |v| format!("{}ms", v)),
-                    q.p95_ms.map_or("--".to_string(), |v| format!("{}ms", v))
-                ),
-                theme.style_warning(),
-            ),
-        ]));
-        quality_lines.push(Line::from(vec![
-            Span::styled("Cold Start:   ", theme.style_muted()),
-            Span::styled(
-                q.cold_start_ms.map_or("--".to_string(), |v| format!("{} ms", v)),
-                theme.style_muted(),
-            ),
-        ]));
-        if let Some(speed) = &q.sustained_speed_label {
-            quality_lines.push(Line::from(vec![
-                Span::styled("Sustained:    ", theme.style_muted()),
-                Span::styled(speed, theme.style_success()),
-            ]));
-        }
-    } else {
-        quality_lines.push(Line::from(Span::styled("No probe data for node", theme.style_muted())));
+        return;
     }
-    frame.render_widget(Paragraph::new(quality_lines), quality_inner);
 
-    // --- Panel 2: Active Connections ---
+    let Some(q) = &snapshot.node_quality else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("No probe data for node", theme.style_muted()))),
+            inner,
+        );
+        return;
+    };
+
+    // Row 0: Latency header (pink value + muted sample age)
+    let latency_raw = q
+        .latest_latency
+        .as_deref()
+        .map(|s| s.to_string())
+        .or_else(|| q.current_latency_ms.map(|v| format!("{v} ms")))
+        .unwrap_or_else(|| "--".to_string());
+    let latency_label = if latency_raw.starts_with("延迟") || latency_raw.starts_with("Latency") {
+        latency_raw
+    } else {
+        format!("延迟 {}", latency_raw)
+    };
+    let latency_age = q.latency_sample_age.as_deref().unwrap_or("");
+    let pad_latency = inner.width.saturating_sub(
+        UnicodeWidthStr::width(latency_label.as_str()) as u16 + UnicodeWidthStr::width(latency_age) as u16,
+    );
+    let latency_header = Line::from(vec![
+        Span::styled(latency_label, Style::default().fg(PINK)),
+        Span::raw(" ".repeat(pad_latency as usize)),
+        Span::styled(latency_age, theme.style_muted()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(latency_header),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Rows 1..=3: Latency 3-row mini Braille sparkline (range 0..120 ms) with bounds labels "0" and "120ms"
+    let bounds_w = 6.min(inner.width.saturating_sub(4));
+    let latency_bounds = vec![
+        Line::from(Span::styled("120ms", theme.style_muted())),
+        Line::from(""),
+        Line::from(Span::styled("0", theme.style_muted())),
+    ];
+    frame.render_widget(
+        Paragraph::new(latency_bounds),
+        Rect::new(inner.x, inner.y + 1, bounds_w, 3),
+    );
+
+    let plot_w = inner.width.saturating_sub(bounds_w);
+    let points = &q.latency_points;
+    let canvas_latency = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, 30.0])
+        .y_bounds([0.0, 120.0])
+        .paint(move |ctx| {
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let clamped_x = x.clamp(0.0, 30.0);
+                let clamped_y = y.clamp(0.0, 120.0);
+                ctx.draw(&Points {
+                    coords: &[(clamped_x, clamped_y)],
+                    color: PINK,
+                });
+                if i > 0 {
+                    let (prev_x, prev_y) = points[i - 1];
+                    // Follow ADR 0003 & docs: sparse samples remain gaps without interpolation.
+                    // Only connect if samples are contiguous (<= 1.0 min apart).
+                    if (clamped_x - prev_x).abs() <= 1.0 {
+                        ctx.draw(&CanvasLine {
+                            x1: prev_x.clamp(0.0, 30.0),
+                            y1: prev_y.clamp(0.0, 120.0),
+                            x2: clamped_x,
+                            y2: clamped_y,
+                            color: PINK,
+                        });
+                    }
+                }
+            }
+        });
+    frame.render_widget(
+        canvas_latency,
+        Rect::new(inner.x + bounds_w, inner.y + 1, plot_w, 3),
+    );
+
+    // Row 4: Sustained speed header (green value + muted sample age)
+    let speed_raw = q
+        .latest_sustained_speed
+        .as_deref()
+        .map(|s| s.to_string())
+        .or_else(|| q.sustained_speed_label.clone())
+        .unwrap_or_else(|| "--".to_string());
+    let speed_label = if speed_raw.starts_with("实测") || speed_raw.starts_with("Speed") {
+        speed_raw
+    } else {
+        format!("实测 {}", speed_raw)
+    };
+    let speed_age = q.sustained_sample_age.as_deref().unwrap_or("");
+    let pad_speed = inner.width.saturating_sub(
+        UnicodeWidthStr::width(speed_label.as_str()) as u16 + UnicodeWidthStr::width(speed_age) as u16,
+    );
+    let speed_header = Line::from(vec![
+        Span::styled(speed_label, Style::default().fg(GREEN)),
+        Span::raw(" ".repeat(pad_speed as usize)),
+        Span::styled(speed_age, theme.style_muted()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(speed_header),
+        Rect::new(inner.x, inner.y + 4, inner.width, 1),
+    );
+
+    // Rows 5..=7: Sustained speed 3-row mini Braille sparkline (range 0..10 MiB/s) with bounds labels "0" and "10M"
+    let speed_bounds = vec![
+        Line::from(Span::styled("10M", theme.style_muted())),
+        Line::from(""),
+        Line::from(Span::styled("0", theme.style_muted())),
+    ];
+    frame.render_widget(
+        Paragraph::new(speed_bounds),
+        Rect::new(inner.x, inner.y + 5, bounds_w, 3),
+    );
+
+    let s_points = &q.sustained_points;
+    let canvas_speed = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, 30.0])
+        .y_bounds([0.0, 10.0])
+        .paint(move |ctx| {
+            for (i, &(x, y)) in s_points.iter().enumerate() {
+                let clamped_x = x.clamp(0.0, 30.0);
+                let clamped_y = y.clamp(0.0, 10.0);
+                ctx.draw(&Points {
+                    coords: &[(clamped_x, clamped_y)],
+                    color: GREEN,
+                });
+                if i > 0 {
+                    let (prev_x, prev_y) = s_points[i - 1];
+                    if (clamped_x - prev_x).abs() <= 1.0 {
+                        ctx.draw(&CanvasLine {
+                            x1: prev_x.clamp(0.0, 30.0),
+                            y1: prev_y.clamp(0.0, 10.0),
+                            x2: clamped_x,
+                            y2: clamped_y,
+                            color: GREEN,
+                        });
+                    }
+                }
+            }
+        });
+    frame.render_widget(
+        canvas_speed,
+        Rect::new(inner.x + bounds_w, inner.y + 5, plot_w, 3),
+    );
+
+    // Row 8: Common time axis (-30m ... 现在)
+    let right_label = "现在";
+    let pad_axis = plot_w.saturating_sub(
+        UnicodeWidthStr::width("-30m") as u16 + UnicodeWidthStr::width(right_label) as u16,
+    );
+    let axis_line = Line::from(vec![
+        Span::raw(" ".repeat(bounds_w as usize)),
+        Span::styled("-30m", theme.style_muted()),
+        Span::raw(" ".repeat(pad_axis as usize)),
+        Span::styled(right_label, theme.style_muted()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(axis_line),
+        Rect::new(inner.x, inner.y + 8, inner.width, 1),
+    );
+
+    // Row 9: Status note
+    let note_line = Line::from(Span::styled("仅显示已有采样", theme.style_muted()));
+    frame.render_widget(
+        Paragraph::new(note_line),
+        Rect::new(inner.x, inner.y + 9, inner.width, 1),
+    );
+}
+
+/// Renders the Active Connections panel
+fn render_active_connections_panel(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    snapshot: &IdleDashboardSnapshot<'_>,
+) {
     let conn_title = format!(" ACTIVE CONNECTIONS · {} ", snapshot.active_connections.len());
     let conn_block = Block::default()
         .borders(Borders::ALL)
@@ -404,8 +615,8 @@ fn render_side_panels(
         .title(conn_title)
         .style(theme.style_base());
 
-    let conn_inner = conn_block.inner(conn_area);
-    frame.render_widget(conn_block, conn_area);
+    let conn_inner = conn_block.inner(area);
+    frame.render_widget(conn_block, area);
 
     let items: Vec<ListItem> = snapshot
         .active_connections
@@ -437,6 +648,21 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+
+    fn buffer_to_text(b: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..b.area.height {
+            let mut x = 0;
+            while x < b.area.width {
+                let s = b[(x, y)].symbol();
+                out.push_str(s);
+                x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+            }
+            out.push('\n');
+        }
+        out
+    }
 
     #[test]
     fn test_render_idle_dashboard_standard_120x30() {
@@ -493,12 +719,24 @@ mod tests {
             route_intervals: &intervals,
             node_quality: Some(ActiveNodeQualitySnapshot {
                 node_name: "JP-Edge-03",
-                current_latency_ms: Some(26),
+                current_latency_ms: Some(28),
                 warm_median_ms: Some(28),
                 p95_ms: Some(35),
                 cold_start_ms: Some(42),
-                sustained_speed_label: Some("12.4 MiB/s".to_string()),
+                sustained_speed_label: Some("8.0 MiB/s".to_string()),
                 reachability_label: "Stable Reachable",
+                latency_points: vec![
+                    (2.0, 45.0),
+                    (9.0, 55.0),
+                    (21.0, 35.0),
+                    (29.0, 50.0),
+                    (30.0, 28.0),
+                ],
+                sustained_points: vec![(3.0, 7.0), (13.0, 5.0), (28.0, 8.0)],
+                latest_latency: Some("28 ms".to_string()),
+                latency_sample_age: Some("刚测".to_string()),
+                latest_sustained_speed: Some("8.0 MiB/s".to_string()),
+                sustained_sample_age: Some("2分钟前".to_string()),
             }),
             active_connections: vec![
                 ActiveConnectionSummary {
@@ -513,6 +751,90 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 120);
         assert_eq!(buffer.area.height, 30);
+
+        let t = buffer_to_text(buffer);
+        assert!(t.contains("CORE HISTORY · 30 MIN"));
+        assert!(t.contains("NODE QUALITY · JP-Edge-03"));
+        assert!(t.contains("ACTIVE CONNECTIONS · 1"));
+        assert!(t.contains("chat.openai.com"));
+        assert!(t.contains("120ms"));
+        assert!(t.contains("10M"));
+        assert!(t.contains("28 ms"));
+        assert!(t.contains("8.0 MiB/s"));
+        assert!(t.contains("刚测"));
+        assert!(t.contains("2分钟前"));
+        assert!(t.contains("仅显示已有采样"));
+    }
+
+    #[test]
+    fn test_render_idle_dashboard_breakpoint_96x30() {
+        let backend = TestBackend::new(96, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let snapshot = IdleDashboardSnapshot {
+            active_provider: "AirTCP",
+            active_node: "JP-Edge-03",
+            status_text: "GLOBAL NET  STABLE",
+            current_down_rate: "3.9M/s",
+            current_up_rate: "2.1M/s",
+            traffic_samples: &[],
+            latency_samples: &[],
+            route_intervals: &[],
+            node_quality: Some(ActiveNodeQualitySnapshot {
+                node_name: "JP-Edge-03",
+                current_latency_ms: Some(28),
+                warm_median_ms: Some(28),
+                p95_ms: Some(35),
+                cold_start_ms: Some(42),
+                sustained_speed_label: Some("8.0 MiB/s".to_string()),
+                reachability_label: "Stable Reachable",
+                latency_points: vec![
+                    (2.0, 45.0),
+                    (9.0, 55.0),
+                    (21.0, 35.0),
+                    (29.0, 50.0),
+                    (30.0, 28.0),
+                ],
+                sustained_points: vec![(3.0, 7.0), (13.0, 5.0), (28.0, 8.0)],
+                latest_latency: Some("28 ms".to_string()),
+                latency_sample_age: Some("刚测".to_string()),
+                latest_sustained_speed: Some("8.0 MiB/s".to_string()),
+                sustained_sample_age: Some("2分钟前".to_string()),
+            }),
+            active_connections: vec![
+                ActiveConnectionSummary {
+                    destination: "chat.openai.com",
+                    rate_label: "1.2M/s".to_string(),
+                    rule: "Proxy",
+                },
+            ],
+        };
+
+        terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.area.width, 96);
+        assert_eq!(buffer.area.height, 30);
+
+        let t = buffer_to_text(buffer);
+        // Core history is present
+        assert!(t.contains("CORE HISTORY · 30 MIN"));
+        // Node quality is present (30 cols)
+        assert!(t.contains("NODE QUALITY · JP-Edge-03"));
+        assert!(t.contains("120ms"));
+        assert!(t.contains("10M"));
+        assert!(t.contains("28 ms"));
+        assert!(t.contains("8.0 MiB/s"));
+        // Connections table is omitted
+        assert!(!t.contains("ACTIVE CONNECTIONS"));
+        assert!(!t.contains("chat.openai.com"));
+
+        // Helper methods on snapshot verify exposure
+        assert_eq!(snapshot.latency_history_points().len(), 5);
+        assert_eq!(snapshot.sustained_speed_history_points().len(), 3);
+        assert_eq!(snapshot.latest_latency(), Some("28 ms"));
+        assert_eq!(snapshot.latency_sample_age(), Some("刚测"));
+        assert_eq!(snapshot.latest_sustained_speed(), Some("8.0 MiB/s"));
+        assert_eq!(snapshot.sustained_sample_age(), Some("2分钟前"));
     }
 
     #[test]
@@ -529,37 +851,72 @@ mod tests {
             traffic_samples: &[],
             latency_samples: &[],
             route_intervals: &[],
-            node_quality: None,
-            active_connections: vec![],
+            node_quality: Some(ActiveNodeQualitySnapshot {
+                node_name: "JP-Edge-03",
+                current_latency_ms: Some(28),
+                warm_median_ms: Some(28),
+                p95_ms: Some(35),
+                cold_start_ms: Some(42),
+                sustained_speed_label: Some("8.0 MiB/s".to_string()),
+                reachability_label: "Stable Reachable",
+                latency_points: vec![(2.0, 45.0), (30.0, 28.0)],
+                sustained_points: vec![(28.0, 8.0)],
+                latest_latency: Some("28 ms".to_string()),
+                latency_sample_age: Some("刚测".to_string()),
+                latest_sustained_speed: Some("8.0 MiB/s".to_string()),
+                sustained_sample_age: Some("2分钟前".to_string()),
+            }),
+            active_connections: vec![
+                ActiveConnectionSummary {
+                    destination: "chat.openai.com",
+                    rate_label: "1.2M/s".to_string(),
+                    rule: "Proxy",
+                },
+            ],
         };
 
         terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 80);
         assert_eq!(buffer.area.height, 24);
+
+        let t = buffer_to_text(buffer);
+        // Aggregate charts are present
+        assert!(t.contains("CORE HISTORY · 30 MIN"));
+        // Both node quality AND active connections are omitted
+        assert!(!t.contains("NODE QUALITY"));
+        assert!(!t.contains("ACTIVE CONNECTIONS"));
+        assert!(!t.contains("chat.openai.com"));
+        assert!(!t.contains("8.0 MiB/s"));
     }
 
     #[test]
     fn test_render_idle_dashboard_unsupported_guard() {
-        let backend = TestBackend::new(70, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
+        for (w, h) in [(70, 20), (79, 24), (80, 23)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
 
-        let snapshot = IdleDashboardSnapshot {
-            active_provider: "AirTCP",
-            active_node: "JP-Edge-03",
-            status_text: "GLOBAL NET  STABLE",
-            current_down_rate: "0.0M/s",
-            current_up_rate: "0.0M/s",
-            traffic_samples: &[],
-            latency_samples: &[],
-            route_intervals: &[],
-            node_quality: None,
-            active_connections: vec![],
-        };
+            let snapshot = IdleDashboardSnapshot {
+                active_provider: "AirTCP",
+                active_node: "JP-Edge-03",
+                status_text: "GLOBAL NET  STABLE",
+                current_down_rate: "0.0M/s",
+                current_up_rate: "0.0M/s",
+                traffic_samples: &[],
+                latency_samples: &[],
+                route_intervals: &[],
+                node_quality: None,
+                active_connections: vec![],
+            };
 
-        terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.area.width, 70);
-        assert_eq!(buffer.area.height, 20);
+            terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.area.width, w);
+            assert_eq!(buffer.area.height, h);
+
+            let t = buffer_to_text(buffer);
+            assert!(t.contains("Resize terminal to at least") || t.contains("80x24"));
+            assert!(t.contains("q") && t.contains("?"));
+        }
     }
 }

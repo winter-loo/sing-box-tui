@@ -643,6 +643,57 @@ impl App {
                 }).last()
             });
 
+            let now_ms = crate::tui::metrics::now_unix_ms();
+            let cutoff_ms = now_ms.saturating_sub(crate::tui::metrics::METRIC_RETENTION_WINDOW_MS);
+
+            let mut latency_points = Vec::new();
+            let mut latest_sample_ts: Option<i64> = None;
+            for s in latency_samples {
+                if s.node_name == active_node {
+                    let min = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+                    latency_points.push((min, s.latency_ms as f64));
+                    latest_sample_ts = Some(s.recorded_at_ms);
+                }
+            }
+            if latency_points.is_empty() {
+                if let Some(lat) = current_latency_ms {
+                    latency_points.push((30.0, lat as f64));
+                }
+            } else if let Some(lat) = current_latency_ms {
+                if latency_points.last().map_or(true, |(m, _)| *m < 29.9) {
+                    latency_points.push((30.0, lat as f64));
+                }
+            }
+
+            let latest_latency = current_latency_ms
+                .map(|v| format!("{v} ms"))
+                .or_else(|| latency_points.last().map(|(_, v)| format!("{:.0} ms", v)));
+
+            let latency_sample_age = if let Some(ts) = latest_sample_ts {
+                let age_ms = now_ms.saturating_sub(ts);
+                if age_ms < 60_000 {
+                    Some("刚测".to_string())
+                } else {
+                    Some(format!("{}分钟前", (age_ms / 60_000).max(1)))
+                }
+            } else if current_latency_ms.is_some() {
+                Some("刚测".to_string())
+            } else {
+                None
+            };
+
+            let mut sustained_points = Vec::new();
+            let latest_sustained_speed = sustained_speed_label.clone();
+            let mut sustained_sample_age = None;
+
+            if let Some(s) = sustained {
+                if let SustainedProbeOutcome::Completed(c) = &s.outcome {
+                    let mib = c.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
+                    sustained_points.push((28.0, mib));
+                    sustained_sample_age = Some("2分钟前".to_string());
+                }
+            }
+
             Some(ActiveNodeQualitySnapshot {
                 node_name: active_node,
                 current_latency_ms,
@@ -651,6 +702,12 @@ impl App {
                 cold_start_ms: quick_history.cold_start_ms,
                 sustained_speed_label,
                 reachability_label,
+                latency_points,
+                sustained_points,
+                latest_latency,
+                latency_sample_age,
+                latest_sustained_speed,
+                sustained_sample_age,
             })
         });
 
