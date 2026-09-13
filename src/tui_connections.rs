@@ -45,6 +45,30 @@ impl App {
         self.last_connection_refresh = Instant::now();
         match self.client.fetch_connections() {
             Ok(connections) => {
+                let now = Instant::now();
+                let now_ms = crate::tui::metrics::now_unix_ms();
+                if let (Some(down_total), Some(up_total)) = (connections.download_total, connections.upload_total) {
+                    if let Some((prev_time, prev_down, prev_up)) = self.last_traffic_totals {
+                        let elapsed = now.saturating_duration_since(prev_time).as_secs_f64();
+                        if elapsed > 0.1 {
+                            let down_delta = down_total.saturating_sub(prev_down);
+                            let up_delta = up_total.saturating_sub(prev_up);
+                            let down_bps = (down_delta as f64 / elapsed) as u64;
+                            let up_bps = (up_delta as f64 / elapsed) as u64;
+
+                            self.last_active_traffic_rate = (
+                                format!("{:.1}M/s", down_bps as f64 / 1_048_576.0),
+                                format!("{:.1}M/s", up_bps as f64 / 1_048_576.0),
+                            );
+
+                            if let Some(store) = &mut self.metric_store {
+                                let _ = store.record_traffic(now_ms, down_bps, up_bps);
+                            }
+                        }
+                    }
+                    self.last_traffic_totals = Some((now, down_total, up_total));
+                }
+
                 if let Some(scope) = self.active_auto_selection_scope() {
                     self.active_node_traffic
                         .observe(scope, Instant::now(), &connections);

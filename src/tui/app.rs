@@ -294,6 +294,15 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.maybe_start_subscription_refresh();
         app.maybe_refresh_node_quality_detail()?;
         app.maybe_refresh_connections();
+        app.check_and_record_active_route();
+
+        if !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
+        {
+            app.active_view = ActiveView::IdleDashboard;
+        }
+
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -301,7 +310,37 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if matches!(key.code, KeyCode::Char('V'))
+                app.last_user_activity = Instant::now();
+                if app.active_view == ActiveView::IdleDashboard && !app.has_active_modal() {
+                    match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('?') => {
+                            app.open_help_panel();
+                            continue;
+                        }
+                        KeyCode::Char('c') => {
+                            app.show_connections = true;
+                            continue;
+                        }
+                        KeyCode::Char('i') => {
+                            let _ = app.open_node_quality_detail();
+                            continue;
+                        }
+                        KeyCode::Enter => {
+                            app.active_view = ActiveView::NodeList;
+                            continue;
+                        }
+                        _ => {
+                            // ADR 0002: unbound keys do not navigate away from dashboard
+                            continue;
+                        }
+                    }
+                }
+                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
+                {
+                    app.open_help_panel();
+                } else if matches!(key.code, KeyCode::Char('V'))
                     && app.private_access_connect_needs_terminal_prompt()
                 {
                     app.connect_private_access_with_terminal_prompt(&mut terminal)?;
@@ -366,8 +405,19 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let snapshot = app.view_snapshot();
-    view::render(frame, &snapshot);
+    if app.active_view == ActiveView::IdleDashboard {
+        let snapshot = app.idle_dashboard_snapshot();
+        view::render_idle_dashboard(frame, &snapshot);
+    } else {
+        let snapshot = app.view_snapshot();
+        view::render(frame, &snapshot);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveView {
+    NodeList,
+    IdleDashboard,
 }
 
 struct App {
@@ -449,6 +499,11 @@ struct App {
     private_access: PrivateAccessRuntime,
     private_access_progress: Option<PrivateAccessProgressModal>,
     private_access_auth: Option<PrivateAccessAuthModal>,
+    metric_store: Option<crate::tui::metrics::MetricStore>,
+    active_view: ActiveView,
+    last_user_activity: Instant,
+    last_traffic_totals: Option<(Instant, u64, u64)>,
+    last_active_traffic_rate: (String, String),
 }
 
 fn tui_persistent_path_registry(
@@ -534,6 +589,11 @@ impl App {
             ("background task state", background_state),
             ("background task log", background_log),
         ];
+        let cache_db_path = system_proxy_config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("cache.db");
+        persistent_paths.push(("metric history database", cache_db_path.clone()));
         if !paths_refer_to_same_target(
             &subscription_refresh_options.input,
             &onboarding_subscription,
@@ -547,6 +607,10 @@ impl App {
             &node_quality_db_path,
             &persistent_paths,
         )?;
+        let mut metric_store = crate::tui::metrics::MetricStore::open(&cache_db_path).ok();
+        if let Some(store) = &mut metric_store {
+            let _ = store.load_recent_history(crate::tui::metrics::now_unix_ms());
+        }
         let state_store = TuiStateStore::new(state_path);
         let existing_state_file = state_store.exists();
         let mut runtime_state = state_store.load()?;
@@ -663,6 +727,11 @@ impl App {
             private_access: PrivateAccessRuntime::new()?,
             private_access_progress: None,
             private_access_auth: None,
+            metric_store,
+            active_view: ActiveView::NodeList,
+            last_user_activity: Instant::now(),
+            last_traffic_totals: None,
+            last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
         };
         let initialization = (|| {
             app.apply_runtime_state(runtime_state.clone())?;
@@ -729,6 +798,60 @@ impl App {
 
     fn status_line(&self) -> String {
         self.status.clone()
+    }
+
+    pub(crate) fn has_active_modal(&self) -> bool {
+        self.private_access_auth.is_some()
+            || self.private_access_progress.is_some()
+            || self.onboarding.is_some()
+            || self.show_settings
+            || self.filter_input.is_some()
+            || self.bypass_input.is_some()
+            || self.show_help
+            || self.show_connections
+            || self.node_quality_detail.is_some()
+    }
+
+    pub(crate) fn check_and_record_active_route(&mut self) {
+        let now_ms = crate::tui::metrics::now_unix_ms();
+        if let Some(group) = self.selected_group().cloned() {
+            if let Some(current_node) = &group.current {
+                if let Some(store) = &mut self.metric_store {
+                    let route_changed = store
+                        .route_intervals()
+                        .last()
+                        .map_or(true, |i| i.selector != group.name || i.node_name != *current_node);
+                    let _ = store.record_route_switch(now_ms, &group.name, current_node);
+
+                    let should_record_latency = route_changed
+                        || store.latency_samples().last().map_or(true, |l| {
+                            (now_ms - l.recorded_at_ms) >= 10_000
+                        });
+
+                    if should_record_latency {
+                        let latency_ms = self
+                            .benchmark_workflow
+                            .reachability_assessment(&group.name, current_node)
+                            .and_then(|a| {
+                                a.attempts.iter().filter_map(|att| match att {
+                                    crate::controller::ProbeOutcome::Reachable { delay_ms, .. } => {
+                                        Some(*delay_ms)
+                                    }
+                                    _ => None,
+                                }).last()
+                            })
+                            .or_else(|| {
+                                self.benchmark_workflow
+                                    .quick_history(&group.name, current_node)
+                                    .warm_median_ms
+                            });
+                        if let Some(ms) = latency_ms {
+                            let _ = store.record_latency(now_ms, &group.name, current_node, ms);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn sing_box_summary_line(&self) -> String {

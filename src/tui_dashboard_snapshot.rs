@@ -3,8 +3,9 @@ const BRAILLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "�
 use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
-    CandidateNotice, CandidateRow, CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot,
-    Focus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
+    ActiveConnectionSummary, ActiveNodeQualitySnapshot, CandidateNotice, CandidateRow,
+    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, IdleDashboardSnapshot,
+    InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
     LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow, SettingsPanelSnapshot,
     StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
 };
@@ -596,6 +597,99 @@ impl App {
             private_access_auth: self.private_access_auth.as_ref(),
         }
     }
+
+    pub(crate) fn idle_dashboard_snapshot(&self) -> IdleDashboardSnapshot<'_> {
+        let selected_group = self.groups.get(self.group_index);
+        let active_provider = selected_group
+            .map(|g| g.name.as_str())
+            .unwrap_or("Internet");
+        let active_node = selected_group
+            .and_then(|g| g.current.as_deref())
+            .unwrap_or("Direct");
+
+        let (traffic_samples, latency_samples, route_intervals) = if let Some(store) = &self.metric_store {
+            (store.traffic_samples(), store.latency_samples(), store.route_intervals())
+        } else {
+            (&[][..], &[][..], &[][..])
+        };
+
+        let node_quality = selected_group.and_then(|group| {
+            let member = active_node;
+            let sustained = self.benchmark_workflow.sustained_quality(&group.name, member);
+            let assessment = self.benchmark_workflow.reachability_assessment(&group.name, member);
+            let quick_history = self.benchmark_workflow.quick_history(&group.name, member);
+
+            let sustained_speed_label = sustained.and_then(|s| {
+                if let SustainedProbeOutcome::Completed(c) = &s.outcome {
+                    let mib = c.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
+                    Some(format!("{:.1} MiB/s", mib))
+                } else {
+                    None
+                }
+            });
+
+            let reachability_label = match assessment.as_ref().and_then(|a| a.assessment.as_ref()) {
+                Some(crate::controller::ReachabilityAssessment::StableReachable) => "Stable Reachable",
+                Some(crate::controller::ReachabilityAssessment::Reachable) => "Reachable",
+                Some(crate::controller::ReachabilityAssessment::Degraded) => "Degraded",
+                Some(crate::controller::ReachabilityAssessment::Unreachable) => "Unreachable",
+                None => "Untested",
+            };
+
+            let current_latency_ms = assessment.as_ref().and_then(|a| {
+                a.attempts.iter().filter_map(|att| match att {
+                    ProbeOutcome::Reachable { delay_ms, .. } => Some(*delay_ms),
+                    _ => None,
+                }).last()
+            });
+
+            Some(ActiveNodeQualitySnapshot {
+                node_name: active_node,
+                current_latency_ms,
+                warm_median_ms: quick_history.warm_median_ms,
+                p95_ms: quick_history.p95_ms,
+                cold_start_ms: quick_history.cold_start_ms,
+                sustained_speed_label,
+                reachability_label,
+            })
+        });
+
+        let active_connections = self.connections.connections
+            .iter()
+            .take(10)
+            .map(|c| {
+                let dest = c.metadata.host.as_deref()
+                    .or(c.metadata.destination_ip.as_deref())
+                    .unwrap_or(&c.id);
+                let rate = super::view::format_bytes_opt(Some(c.download + c.upload));
+                let rule = c.rule.as_deref().unwrap_or("Direct");
+                ActiveConnectionSummary {
+                    destination: dest,
+                    rate_label: rate,
+                    rule,
+                }
+            })
+            .collect();
+
+        let status_text = if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
+            "GLOBAL NET  STABLE"
+        } else {
+            "GLOBAL NET  IDLE"
+        };
+
+        IdleDashboardSnapshot {
+            active_provider,
+            active_node,
+            status_text,
+            current_down_rate: &self.last_active_traffic_rate.0,
+            current_up_rate: &self.last_active_traffic_rate.1,
+            traffic_samples,
+            latency_samples,
+            route_intervals,
+            node_quality,
+            active_connections,
+        }
+    }
 }
 
 fn format_custom_probe_progress(
@@ -1017,5 +1111,57 @@ mod tests {
             .unwrap();
         assert_eq!(streaming_row_a.marker, "1.0 MiB/s");
         assert_eq!(streaming_row_a.compact_marker, "1.0M/s");
+    }
+
+    #[test]
+    fn test_idle_dashboard_inactivity_and_wake_up() {
+        use std::time::Duration;
+        use super::super::ActiveView;
+
+        let mut app = test_app();
+        assert_eq!(app.active_view, ActiveView::NodeList);
+
+        // 1. Inactivity less than 30s does not trigger idle dashboard
+        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(10);
+        if !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
+        {
+            app.active_view = ActiveView::IdleDashboard;
+        }
+        assert_eq!(app.active_view, ActiveView::NodeList);
+
+        // 2. Inactivity >= 30s triggers idle dashboard
+        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(31);
+        if !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
+        {
+            app.active_view = ActiveView::IdleDashboard;
+        }
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // 3. Waking up on keypress restores NodeList immediately
+        app.last_user_activity = std::time::Instant::now();
+        if app.active_view == ActiveView::IdleDashboard {
+            app.active_view = ActiveView::NodeList;
+        }
+        assert_eq!(app.active_view, ActiveView::NodeList);
+
+        // 4. If modal is active, inactivity >= 30s is suspended
+        app.show_help = true;
+        assert!(app.has_active_modal());
+        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(35);
+        if !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
+        {
+            app.active_view = ActiveView::IdleDashboard;
+        }
+        assert_eq!(app.active_view, ActiveView::NodeList);
+
+        // 5. idle_dashboard_snapshot succeeds
+        let snapshot = app.idle_dashboard_snapshot();
+        assert_eq!(snapshot.active_provider, "select");
     }
 }
