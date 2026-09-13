@@ -1,4 +1,6 @@
 mod app;
+pub(crate) mod ds;
+pub(crate) mod metrics;
 
 pub(crate) use app::{
     TuiSubscriptionRefreshOptions, run_background_status, run_background_stop,

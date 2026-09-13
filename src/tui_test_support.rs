@@ -166,6 +166,11 @@ pub(super) fn test_app() -> App {
             .expect("private access runtime"),
         private_access_progress: None,
         private_access_auth: None,
+        metric_store: None,
+        active_view: super::ActiveView::NodeList,
+        last_user_activity: Instant::now(),
+        last_traffic_totals: None,
+        last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
     }
 }
 
