@@ -332,6 +332,12 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                     continue;
                 }
+                if app.provider_modal.is_some() {
+                    if !app.handle_provider_modal_key(key.code)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 if app.active_view == ActiveView::IdleDashboard && !app.has_active_modal() {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
@@ -349,6 +355,10 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                         KeyCode::Char('o') | KeyCode::Char('s') => {
                             app.open_settings_panel();
+                            continue;
+                        }
+                        KeyCode::Char('p') => {
+                            app.open_provider_modal();
                             continue;
                         }
                         KeyCode::Enter => {
@@ -485,20 +495,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(modal) = &app.provider_modal {
         let theme = crate::tui::ds::Theme::default();
-        let provider_items = app
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(i, g)| view::ProviderItem {
-                name: g.name.clone(),
-                is_current: i == app.group_index,
-                node_count: g.members.len(),
-            })
-            .collect::<Vec<_>>();
+        let (title, provider_items) = app.provider_modal_items();
         view::render_provider_modal(
             frame,
             frame.area(),
             &theme,
+            title,
             &provider_items,
             modal.selected_index,
         );
@@ -531,6 +533,7 @@ impl CommandPaletteState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderModalState {
     pub(crate) selected_index: usize,
+    pub(crate) origin_view: ActiveView,
 }
 
 struct App {
@@ -1173,22 +1176,103 @@ impl App {
         }
     }
 
-    pub(crate) fn open_provider_modal(&mut self) {
-        if !self.groups.is_empty() {
-            self.pause_inactivity_timer();
-            self.provider_modal = Some(ProviderModalState {
-                selected_index: self.group_index.min(self.groups.len().saturating_sub(1)),
-            });
+    fn provider_modal_items(&self) -> (&'static str, Vec<view::ProviderItem>) {
+        if self.operational_workspace == OperationalWorkspace::PrivateAccess {
+            let items = self
+                .private_access
+                .profiles
+                .iter()
+                .enumerate()
+                .map(|(i, p)| view::ProviderItem {
+                    name: p.id.clone(),
+                    is_current: i == self.private_access.focused_index,
+                })
+                .collect();
+            ("INTRANET PROFILE", items)
+        } else {
+            let items = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| view::ProviderItem {
+                    name: g.name.clone(),
+                    is_current: i == self.group_index,
+                })
+                .collect();
+            ("INTERNET PROXY PROVIDER", items)
         }
+    }
+
+    fn provider_modal_selected_index(&self) -> usize {
+        if self.operational_workspace == OperationalWorkspace::PrivateAccess {
+            self.private_access
+                .focused_index
+                .min(self.private_access.profiles.len().saturating_sub(1))
+        } else {
+            self.group_index.min(self.groups.len().saturating_sub(1))
+        }
+    }
+
+    fn apply_selected_provider(&mut self, chosen: usize) {
+        if self.operational_workspace == OperationalWorkspace::PrivateAccess {
+            if chosen < self.private_access.profiles.len() {
+                self.private_access.focused_index = chosen;
+                let name = self.private_access.profiles[chosen].id.clone();
+                self.set_status_only(format!(
+                    "Private access profile switched to {}",
+                    name
+                ));
+            }
+        } else if chosen < self.groups.len() {
+            self.group_index = chosen;
+            self.sync_member_selection_to_current();
+            let name = self.groups[chosen].name.clone();
+            self.set_status_only(format!(
+                "Provider switched to {}",
+                name
+            ));
+        }
+    }
+
+    pub(crate) fn open_provider_modal(&mut self) {
+        let is_private = self.operational_workspace == OperationalWorkspace::PrivateAccess;
+        let count = if is_private {
+            self.private_access.profiles.len()
+        } else {
+            self.groups.len()
+        };
+
+        if count == 0 {
+            let msg = if is_private {
+                "No private access profiles configured"
+            } else {
+                "No proxy providers configured"
+            };
+            self.set_status_only(msg);
+            return;
+        }
+
+        self.pause_inactivity_timer();
+        self.provider_modal = Some(ProviderModalState {
+            selected_index: self.provider_modal_selected_index(),
+            origin_view: self.active_view,
+        });
     }
 
     pub(crate) fn handle_provider_modal_key(&mut self, code: KeyCode) -> Result<bool> {
         let Some(modal) = &mut self.provider_modal else {
             return Ok(true);
         };
+        let count = if self.operational_workspace == OperationalWorkspace::PrivateAccess {
+            self.private_access.profiles.len()
+        } else {
+            self.groups.len()
+        };
         match code {
             KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => {
+                let origin = modal.origin_view;
                 self.provider_modal = None;
+                self.active_view = origin;
                 self.resume_inactivity_timer();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1197,22 +1281,17 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if modal.selected_index + 1 < self.groups.len() {
+                if modal.selected_index + 1 < count {
                     modal.selected_index += 1;
                 }
             }
             KeyCode::Enter => {
                 let chosen = modal.selected_index;
-                if chosen < self.groups.len() {
-                    self.group_index = chosen;
-                    self.sync_member_selection_to_current();
-                    self.set_status_only(format!(
-                        "Provider switched to {}",
-                        self.groups[chosen].name
-                    ));
-                }
+                let origin = modal.origin_view;
+                self.apply_selected_provider(chosen);
                 self.provider_modal = None;
                 self.resume_inactivity_timer();
+                self.active_view = origin;
             }
             KeyCode::Char('q') => return Ok(false),
             _ => {}
@@ -1294,6 +1373,13 @@ impl App {
             view::CMD_SWITCH_PROVIDER => {
                 if !self.groups.is_empty() {
                     self.set_operational_workspace(OperationalWorkspace::Internet)?;
+                    self.active_view = ActiveView::NodeList;
+                    self.open_provider_modal();
+                }
+            }
+            view::CMD_SWITCH_PROFILE => {
+                if !self.private_access.profiles.is_empty() {
+                    self.set_operational_workspace(OperationalWorkspace::PrivateAccess)?;
                     self.active_view = ActiveView::NodeList;
                     self.open_provider_modal();
                 }
@@ -2138,6 +2224,99 @@ mod navigation_tests {
         assert!(app.command_palette.is_none());
         assert_eq!(app.active_view, ActiveView::NodeList);
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+    }
+
+    #[test]
+    fn test_provider_modal_lifecycle_and_switching() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        app.groups.push(ProxyGroup {
+            name: "backup-group".to_string(),
+            kind: "Selector".to_string(),
+            current: Some("node-b".to_string()),
+            members: vec!["node-b".to_string()],
+        });
+
+        // 1. Open from IdleDashboard in Internet workspace
+        app.active_view = ActiveView::IdleDashboard;
+        app.open_provider_modal();
+        assert!(app.provider_modal.is_some());
+        assert_eq!(
+            app.provider_modal.as_ref().unwrap().origin_view,
+            ActiveView::IdleDashboard
+        );
+        assert!(app.has_active_modal());
+
+        // Render buffer check
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("INTERNET PROXY PROVIDER"));
+        assert!(text.contains("select"));
+        assert!(text.contains("backup-group"));
+        assert!(text.contains("[Enter]") && text.contains("Select"));
+        assert!(text.contains("[Esc]") && text.contains("Close"));
+
+        // Moving focus alone must not apply a selection (Figma handoff 1014:2)
+        app.handle_provider_modal_key(KeyCode::Down).unwrap();
+        assert_eq!(app.provider_modal.as_ref().unwrap().selected_index, 1);
+        assert_eq!(app.group_index, 0);
+
+        // Dismiss with Esc cancels and returns to IdleDashboard
+        app.handle_provider_modal_key(KeyCode::Esc).unwrap();
+        assert!(app.provider_modal.is_none());
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.group_index, 0);
+
+        // Open again, move down, and confirm with Enter -> applies selection and returns to IdleDashboard (ADR 0002)
+        app.open_provider_modal();
+        app.handle_provider_modal_key(KeyCode::Char('j')).unwrap();
+        app.handle_provider_modal_key(KeyCode::Enter).unwrap();
+        assert!(app.provider_modal.is_none());
+        assert_eq!(app.group_index, 1);
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert!(app.status.contains("backup-group"));
+
+        // 2. Private Access workspace modal
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess).unwrap();
+        app.private_access.profiles = vec![
+            crate::private_access_session::PrivateAccessProfileRuntime::default_hillstone().unwrap(),
+            crate::private_access_session::PrivateAccessProfileRuntime::default_sonicwall().unwrap(),
+        ];
+        app.private_access.focused_index = 0;
+
+        app.open_provider_modal();
+        assert!(app.provider_modal.is_some());
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut pa_text = String::new();
+        let pa_buf = terminal.backend().buffer();
+        for y in 0..pa_buf.area.height {
+            for x in 0..pa_buf.area.width {
+                pa_text.push_str(pa_buf[(x, y)].symbol());
+            }
+            pa_text.push('\n');
+        }
+        assert!(pa_text.contains("INTRANET PROFILE"));
+        assert!(pa_text.contains("hillstone"));
+        assert!(pa_text.contains("sonicwall"));
+
+        // Select second profile
+        app.handle_provider_modal_key(KeyCode::Down).unwrap();
+        app.handle_provider_modal_key(KeyCode::Enter).unwrap();
+        assert!(app.provider_modal.is_none());
+        assert_eq!(app.private_access.focused_index, 1);
+        assert!(app.status.contains("sonicwall"));
     }
 }
 

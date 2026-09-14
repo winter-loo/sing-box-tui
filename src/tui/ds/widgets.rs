@@ -130,7 +130,7 @@ pub(crate) fn render_top_header(
         );
         frame.render_widget(Paragraph::new(Line::from(hint_spans)).style(theme.style_base()), row1);
     } else {
-        if left_width >= 72 {
+        if left_width >= 60 {
             left_spans.push(Span::raw("   "));
             left_spans.extend(hint_spans);
         }

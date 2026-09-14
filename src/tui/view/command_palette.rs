@@ -31,8 +31,10 @@ impl CommandItem {
 
 pub const CMD_SWITCH_INTERNET: &str = "switch_internet";
 pub const CMD_SWITCH_PRIVATE_ACCESS: &str = "switch_private_access";
-pub const CMD_SWITCH_SUBSCRIPTIONS: &str = "switch_subscriptions";
-pub const CMD_SWITCH_PROVIDER: &str = CMD_SWITCH_SUBSCRIPTIONS;
+pub const CMD_SWITCH_PROVIDER: &str = "switch_provider";
+pub const CMD_SWITCH_PROFILE: &str = "switch_profile";
+#[allow(dead_code)]
+pub const CMD_SWITCH_SUBSCRIPTIONS: &str = CMD_SWITCH_PROVIDER;
 pub const CMD_TOGGLE_TUN: &str = "toggle_tun";
 pub const CMD_TOGGLE_SYSTEM_PROXY: &str = "toggle_system_proxy";
 pub const CMD_TRIGGER_USABILITY_PROBES: &str = "trigger_usability_probes";
@@ -60,8 +62,14 @@ pub fn builtin_commands() -> Vec<CommandItem> {
             Some("Tab"),
         ),
         CommandItem::new(
-            CMD_SWITCH_SUBSCRIPTIONS,
-            "Switch to Subscriptions Workspace",
+            CMD_SWITCH_PROVIDER,
+            "Switch Proxy Provider",
+            "Navigation",
+            Some("p"),
+        ),
+        CommandItem::new(
+            CMD_SWITCH_PROFILE,
+            "Switch Private Access Profile",
             "Navigation",
             Some("p"),
         ),
@@ -333,12 +341,13 @@ mod tests {
     #[test]
     fn test_builtin_commands_structure() {
         let cmds = builtin_commands();
-        assert_eq!(cmds.len(), 14);
+        assert_eq!(cmds.len(), 15);
 
         let ids: Vec<&str> = cmds.iter().map(|c| c.id).collect();
         assert!(ids.contains(&CMD_SWITCH_INTERNET));
         assert!(ids.contains(&CMD_SWITCH_PRIVATE_ACCESS));
         assert!(ids.contains(&CMD_SWITCH_PROVIDER));
+        assert!(ids.contains(&CMD_SWITCH_PROFILE));
         assert!(ids.contains(&CMD_TOGGLE_TUN));
         assert!(ids.contains(&CMD_TOGGLE_SYSTEM_PROXY));
         assert!(ids.contains(&CMD_TRIGGER_USABILITY_PROBES));
@@ -388,10 +397,11 @@ mod tests {
 
         // Substring on category
         let filtered_cat = filter_commands(&cmds, "navigation");
-        assert_eq!(filtered_cat.len(), 3);
+        assert_eq!(filtered_cat.len(), 4);
         assert_eq!(filtered_cat[0].id, CMD_SWITCH_INTERNET);
         assert_eq!(filtered_cat[1].id, CMD_SWITCH_PRIVATE_ACCESS);
         assert_eq!(filtered_cat[2].id, CMD_SWITCH_PROVIDER);
+        assert_eq!(filtered_cat[3].id, CMD_SWITCH_PROFILE);
 
         // Substring on shortcut
         let filtered_sc = filter_commands(&cmds, "Tab");
