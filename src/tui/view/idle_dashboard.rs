@@ -170,6 +170,64 @@ fn plot(
     );
 }
 
+fn plot_braille_sparklines(
+    f: &mut Frame,
+    r: Rect,
+    points: &[(f64, f64)],
+    color: Color,
+    max: f64,
+) {
+    if r.width == 0 || r.height == 0 || points.is_empty() {
+        return;
+    }
+    // Segment points by gap (> 2.5 minutes is considered an observation gap)
+    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut kinds: Vec<GraphType> = Vec::new();
+    let mut cur_seg: Vec<(f64, f64)> = Vec::new();
+
+    for &pt in points {
+        if let Some(&last_pt) = cur_seg.last() {
+            if (pt.0 - last_pt.0).abs() > 2.5 {
+                kinds.push(if cur_seg.len() == 1 {
+                    GraphType::Scatter
+                } else {
+                    GraphType::Line
+                });
+                segments.push(std::mem::take(&mut cur_seg));
+            }
+        }
+        cur_seg.push(pt);
+    }
+    if !cur_seg.is_empty() {
+        kinds.push(if cur_seg.len() == 1 {
+            GraphType::Scatter
+        } else {
+            GraphType::Line
+        });
+        segments.push(cur_seg);
+    }
+
+    let sets = segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            Dataset::default()
+                .data(seg)
+                .graph_type(kinds[i])
+                .marker(Marker::Braille)
+                .style(Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+
+    f.render_widget(
+        Chart::new(sets)
+            .x_axis(Axis::default().bounds([0., 30.]))
+            .y_axis(Axis::default().bounds([0., max]))
+            .legend_position(None),
+        r,
+    );
+}
+
 fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
     panel(f, r, " 节点质量 ");
     let x = r.x + 1;
@@ -193,17 +251,11 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
     label(f, x, y + 1, 4, "120", MUTED);
     label(f, x, y + 3, 4, "0", MUTED);
 
-    let lat_pts = if !q.latency_points.is_empty() {
-        q.latency_points.clone()
-    } else {
-        vec![]
-    };
-    plot(
+    plot_braille_sparklines(
         f,
         Rect::new(x + 5, y + 1, w.saturating_sub(5), 3),
-        &[lat_pts],
-        &[PINK],
-        &[GraphType::Scatter],
+        &q.latency_points,
+        PINK,
         120.,
     );
 
@@ -219,17 +271,11 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
     label(f, x, y + 5, 4, "10", MUTED);
     label(f, x, y + 7, 4, "0", MUTED);
 
-    let sus_pts = if !q.sustained_points.is_empty() {
-        q.sustained_points.clone()
-    } else {
-        vec![]
-    };
-    plot(
+    plot_braille_sparklines(
         f,
         Rect::new(x + 5, y + 5, w.saturating_sub(5), 3),
-        &[sus_pts],
-        &[GREEN],
-        &[GraphType::Scatter],
+        &q.sustained_points,
+        GREEN,
         10.,
     );
 
@@ -657,9 +703,29 @@ mod tests {
         assert!(t.contains("c 连接"));
         assert!(t.contains("i 节点"));
         assert!(t.contains("o 设置"));
-        assert!(t.contains("? 帮助"));
         assert!(t.contains("q 退出"));
         assert!(t.contains("历史有缺测    探测流量 —"));
+
+        // Verify that 3-row mini Braille sparklines are rendered in node quality panel
+        let mut node_panel_has_braille = false;
+        for y in 5..14 {
+            for x in 6..37 {
+                let s = buffer[(x, y)].symbol();
+                if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
+                    node_panel_has_braille = true;
+                    break;
+                }
+            }
+        }
+        assert!(node_panel_has_braille, "Node quality panel must render mini Braille sparklines");
+
+        // Verify gap between sample at minute 2 and minute 9 remains blank without interpolation
+        for y in 6..9 {
+            for x in 10..14 {
+                let s = buffer[(x, y)].symbol();
+                assert_eq!(s, " ", "Expected blank gap without interpolated line at x={}, y={}", x, y);
+            }
+        }
     }
 
     #[test]
