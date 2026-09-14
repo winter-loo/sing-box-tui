@@ -170,6 +170,39 @@ fn plot(
     );
 }
 
+const SPARKLINE_OBSERVATION_GAP_MINUTES: f64 = 2.5;
+
+fn segment_sparkline_series(
+    points: &[(f64, f64)],
+    gap_minutes: f64,
+) -> Vec<(Vec<(f64, f64)>, GraphType)> {
+    let mut segments = Vec::new();
+    let mut cur_seg: Vec<(f64, f64)> = Vec::new();
+
+    for &pt in points {
+        if let Some(&last_pt) = cur_seg.last() {
+            if (pt.0 - last_pt.0).abs() > gap_minutes {
+                let kind = if cur_seg.len() == 1 {
+                    GraphType::Scatter
+                } else {
+                    GraphType::Line
+                };
+                segments.push((std::mem::take(&mut cur_seg), kind));
+            }
+        }
+        cur_seg.push(pt);
+    }
+    if !cur_seg.is_empty() {
+        let kind = if cur_seg.len() == 1 {
+            GraphType::Scatter
+        } else {
+            GraphType::Line
+        };
+        segments.push((cur_seg, kind));
+    }
+    segments
+}
+
 fn plot_braille_sparklines(
     f: &mut Frame,
     r: Rect,
@@ -180,40 +213,13 @@ fn plot_braille_sparklines(
     if r.width == 0 || r.height == 0 || points.is_empty() {
         return;
     }
-    // Segment points by gap (> 2.5 minutes is considered an observation gap)
-    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut kinds: Vec<GraphType> = Vec::new();
-    let mut cur_seg: Vec<(f64, f64)> = Vec::new();
-
-    for &pt in points {
-        if let Some(&last_pt) = cur_seg.last() {
-            if (pt.0 - last_pt.0).abs() > 2.5 {
-                kinds.push(if cur_seg.len() == 1 {
-                    GraphType::Scatter
-                } else {
-                    GraphType::Line
-                });
-                segments.push(std::mem::take(&mut cur_seg));
-            }
-        }
-        cur_seg.push(pt);
-    }
-    if !cur_seg.is_empty() {
-        kinds.push(if cur_seg.len() == 1 {
-            GraphType::Scatter
-        } else {
-            GraphType::Line
-        });
-        segments.push(cur_seg);
-    }
-
+    let segments = segment_sparkline_series(points, SPARKLINE_OBSERVATION_GAP_MINUTES);
     let sets = segments
         .iter()
-        .enumerate()
-        .map(|(i, seg)| {
+        .map(|(seg, kind)| {
             Dataset::default()
                 .data(seg)
-                .graph_type(kinds[i])
+                .graph_type(*kind)
                 .marker(Marker::Braille)
                 .style(Style::default().fg(color))
         })
@@ -703,6 +709,7 @@ mod tests {
         assert!(t.contains("c 连接"));
         assert!(t.contains("i 节点"));
         assert!(t.contains("o 设置"));
+        assert!(t.contains("? 帮助"));
         assert!(t.contains("q 退出"));
         assert!(t.contains("历史有缺测    探测流量 —"));
 
@@ -784,6 +791,25 @@ mod tests {
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
 
+        // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
+        let mut node_panel_has_braille = false;
+        for y in 5..14 {
+            for x in 6..29 {
+                let s = buffer[(x, y)].symbol();
+                if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
+                    node_panel_has_braille = true;
+                    break;
+                }
+            }
+        }
+        assert!(node_panel_has_braille, "96x30 node quality panel must render mini Braille sparklines");
+
+        // Verify connections panel is not rendered in left column below node panel
+        for y in 16..28 {
+            let s = buffer[(0, y)].symbol();
+            assert_ne!(s, "┌", "Active connections panel must be omitted at 96x30");
+        }
+
         assert_eq!(snapshot.latency_history_points().len(), 5);
         assert_eq!(snapshot.sustained_speed_history_points().len(), 3);
         assert_eq!(snapshot.latest_latency(), Some("28 ms"));
@@ -840,6 +866,10 @@ mod tests {
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
+
+        // Verify aggregate panel starts at column 0 across full width
+        assert_eq!(buffer[(0, 4)].symbol(), "┌");
+        assert_eq!(buffer[(79, 4)].symbol(), "┐");
     }
 
     #[test]
