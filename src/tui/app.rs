@@ -339,6 +339,10 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             let _ = app.open_node_quality_detail();
                             continue;
                         }
+                        KeyCode::Char('o') | KeyCode::Char('s') => {
+                            app.open_settings_panel();
+                            continue;
+                        }
                         KeyCode::Enter => {
                             app.active_view = ActiveView::NodeList;
                             continue;
@@ -417,6 +421,22 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.active_view == ActiveView::IdleDashboard {
         let snapshot = app.idle_dashboard_snapshot();
         view::render_idle_dashboard(frame, &snapshot);
+
+        if app.has_active_modal() {
+            let view_snapshot = app.view_snapshot();
+            if let Some(chart) = view_snapshot.node_quality_detail {
+                view::draw_node_quality_detail(frame, chart);
+            }
+            if let Some(connections) = view_snapshot.connections.as_ref() {
+                view::draw_connections_panel(frame, connections);
+            }
+            if let Some(help_index) = view_snapshot.help_index {
+                view::draw_help_panel(frame, help_index, view_snapshot.usability_probe_diagnostics);
+            }
+            if let Some(settings) = view_snapshot.settings.as_ref() {
+                view::draw_settings_panel(frame, settings);
+            }
+        }
     } else {
         let area = frame.area();
         let header_height = if area.height >= 2 && area.width < 90 { 2 } else { 1 };
@@ -1029,6 +1049,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
                     self.show_help = false;
+                    self.last_user_activity = Instant::now();
                     self.set_status_only("Help closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
@@ -1047,6 +1068,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') => {
                     self.show_connections = false;
+                    self.last_user_activity = Instant::now();
                     self.set_status_only("Connection details closed");
                 }
                 KeyCode::Char('r') => {
@@ -1063,6 +1085,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
                     self.node_quality_detail = None;
+                    self.last_user_activity = Instant::now();
                     self.set_status_only("Node quality detail closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_node_quality_detail_down(),
@@ -1110,7 +1133,7 @@ impl App {
             KeyCode::Char('c') => self.open_connections_panel(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('V') => self.toggle_private_access_with_progress()?,
-            KeyCode::Char('o') => self.open_settings_panel(),
+            KeyCode::Char('o') | KeyCode::Char('s') => self.open_settings_panel(),
             KeyCode::Char('?') => self.open_help_panel(),
             KeyCode::Char('/') => self.open_benchmark_filter_modal(),
             KeyCode::Char(' ') => self.activate_selection()?,
@@ -1184,6 +1207,7 @@ impl App {
     pub(crate) fn close_command_palette(&mut self) {
         if let Some(state) = self.command_palette.take() {
             self.active_view = state.origin_view;
+            self.last_user_activity = Instant::now();
         }
     }
 
@@ -1240,6 +1264,7 @@ impl App {
     }
 
     pub(crate) fn execute_command(&mut self, action_id: &str) -> Result<bool> {
+        self.last_user_activity = Instant::now();
         match action_id {
             view::CMD_SWITCH_INTERNET => {
                 self.set_operational_workspace(OperationalWorkspace::Internet)?;
@@ -1910,6 +1935,182 @@ mod navigation_tests {
             }
             println!("{:02}: {}", y, line);
         }
+    }
+
+    #[test]
+    fn test_modals_render_and_dismiss_on_idle_dashboard() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        app.active_view = ActiveView::IdleDashboard;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Connections modal over IdleDashboard
+        app.show_connections = true;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("ACTIVE CONNECTIONS (c)"));
+        assert!(text.contains("[Esc/c] Close  [r] Refresh"));
+        // Dismiss via 'c'
+        app.handle_key(KeyCode::Char('c')).unwrap();
+        assert!(!app.show_connections);
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // 2. Node quality detail modal over IdleDashboard
+        app.open_node_quality_detail().unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("NODE QUALITY DETAIL (i)"));
+        assert!(text.contains("[Esc/i] Close"));
+        // Dismiss via Esc
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert!(app.node_quality_detail.is_none());
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // 3. Settings modal over IdleDashboard
+        app.open_settings_panel();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("SETTINGS (s)"));
+        assert!(text.contains("[Esc/s] Close  [Enter] Save"));
+        // Dismiss via 's'
+        app.handle_settings_key(KeyCode::Char('s')).unwrap();
+        assert!(!app.show_settings);
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // 4. Help modal over IdleDashboard
+        app.open_help_panel();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("KEYBOARD SHORTCUTS & HELP (?)"));
+        assert!(text.contains("[Esc/?] Close"));
+        // Dismiss via '?'
+        app.handle_key(KeyCode::Char('?')).unwrap();
+        assert!(!app.show_help);
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+    }
+
+    #[test]
+    fn test_inactivity_timer_paused_during_modals_and_resumes_after_dismissal() {
+        let mut app = test_support::test_app();
+        app.active_view = ActiveView::NodeList;
+        assert!(!app.has_active_modal());
+
+        // Inactivity triggers when no modal is active and >= 30s elapsed
+        app.last_user_activity = Instant::now() - Duration::from_secs(35);
+        let would_trigger = !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
+        assert!(would_trigger);
+
+        // Open modal (e.g. connections)
+        app.show_connections = true;
+        assert!(app.has_active_modal());
+
+        // Even with 45s elapsed, modal pauses inactivity transition
+        app.last_user_activity = Instant::now() - Duration::from_secs(45);
+        let would_trigger_with_modal = !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
+        assert!(!would_trigger_with_modal);
+
+        // Dismiss modal
+        app.handle_key(KeyCode::Esc).unwrap();
+        assert!(!app.show_connections);
+        assert!(!app.has_active_modal());
+
+        // Activity timer was reset upon modal close
+        assert!(app.last_user_activity.elapsed() < Duration::from_secs(2));
+        let would_trigger_after_close = !app.has_active_modal()
+            && app.active_view == ActiveView::NodeList
+            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
+        assert!(!would_trigger_after_close);
+    }
+
+    #[test]
+    fn test_command_palette_from_idle_dashboard_lifecycle_and_actions() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_support::test_app();
+        app.active_view = ActiveView::IdleDashboard;
+
+        // Open palette from IdleDashboard
+        app.toggle_command_palette();
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.command_palette.as_ref().unwrap().origin_view,
+            ActiveView::IdleDashboard
+        );
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let mut text = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+
+        // Dismiss with Esc returns to IdleDashboard
+        app.handle_command_palette_key(KeyCode::Esc).unwrap();
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // Quick action: toggle TUN returns to IdleDashboard
+        app.toggle_command_palette();
+        for c in "tun".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert!(app.internet_tun.is_transitioning() || app.status.contains("TUN"));
+        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+
+        // Navigation action: switch to internet navigates to NodeList
+        app.toggle_command_palette();
+        for c in "internet".chars() {
+            app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
+        }
+        app.handle_command_palette_key(KeyCode::Enter).unwrap();
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.active_view, ActiveView::NodeList);
+        assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
     }
 }
 

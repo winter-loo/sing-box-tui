@@ -1,5 +1,5 @@
 use std::net::SocketAddrV4;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::KeyCode;
@@ -217,9 +217,10 @@ impl App {
         let fields = visible_settings_fields(self);
         self.settings_index = self.settings_index.min(fields.len().saturating_sub(1));
         match code {
-            KeyCode::Esc | KeyCode::Char('o') => {
+            KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('s') => {
                 self.show_settings = false;
                 self.settings_error = None;
+                self.last_user_activity = Instant::now();
                 self.set_status_only("Settings closed");
             }
             KeyCode::Down | KeyCode::Char('j') => {

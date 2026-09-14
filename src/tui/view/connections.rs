@@ -6,17 +6,22 @@ pub(crate) struct ConnectionsPanelSnapshot<'a> {
     pub(crate) error: Option<&'a str>,
 }
 
+fn format_connection_rate(connection: &ConnectionInfo) -> String {
+    format!("↓{} ↑{}", format_bytes(connection.download), format_bytes(connection.upload))
+}
+
 fn format_connection_line(connection: &ConnectionInfo, max_width: usize) -> String {
     let source = format_connection_source(connection);
     let target = format_connection_target(connection);
+    let rule = connection.rule.as_deref().unwrap_or("-");
+    let rate = format_connection_rate(connection);
     let chain = if connection.chains.is_empty() {
         "-".to_string()
     } else {
         connection.chains.join(" -> ")
     };
-    let rule = connection.rule.as_deref().unwrap_or("-");
     truncate_for_width(
-        &format!("{source:<14} {target:<28} {chain}  {rule}"),
+        &format!("{source:<12} {target:<30} {rule:<16} {rate:<18} {chain}"),
         max_width,
     )
 }
@@ -97,10 +102,14 @@ pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPa
                     theme.style_base(),
                 )),
                 Line::from(vec![
-                    Span::styled("Source", theme.style_breadcrumb()),
-                    Span::raw("  "),
-                    Span::styled("Target", theme.style_breadcrumb()),
-                    Span::raw("  "),
+                    Span::styled(format!("{:<12}", "Source"), theme.style_breadcrumb()),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<30}", "Destination"), theme.style_breadcrumb()),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<16}", "Rule"), theme.style_breadcrumb()),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<18}", "Rate (↓ / ↑)"), theme.style_breadcrumb()),
+                    Span::raw(" "),
                     Span::styled("Chain", theme.style_breadcrumb()),
                 ]),
             ];
@@ -167,8 +176,8 @@ mod tests {
     fn connection_and_byte_values_are_formatted_for_the_panel() {
         let connection = ConnectionInfo {
             id: "connection-1".to_string(),
-            upload: 0,
-            download: 0,
+            upload: 512,
+            download: 2048,
             start: None,
             chains: vec!["node-a".to_string(), "airtcp".to_string()],
             rule: Some("route(select)".to_string()),
@@ -187,8 +196,11 @@ mod tests {
 
         assert_eq!(format_bytes(512), "512B");
         assert_eq!(format_bytes(2048), "2.0KiB");
-        assert!(format_connection_line(&connection, 120).contains("www.google.com:443"));
-        assert!(format_connection_line(&connection, 120).contains("node-a -> airtcp"));
+        let formatted = format_connection_line(&connection, 120);
+        assert!(formatted.contains("www.google.com:443"));
+        assert!(formatted.contains("route(select)"));
+        assert!(formatted.contains("↓2.0KiB ↑512B"));
+        assert!(formatted.contains("node-a -> airtcp"));
     }
 
     #[test]
@@ -220,7 +232,11 @@ mod tests {
 
         assert!(text.contains("ACTIVE CONNECTIONS (c)"));
         assert!(text.contains("Active connections: 0"));
-        assert!(text.contains("Source  Target  Chain"));
+        assert!(text.contains("Source"));
+        assert!(text.contains("Destination"));
+        assert!(text.contains("Rule"));
+        assert!(text.contains("Rate (↓ / ↑)"));
+        assert!(text.contains("Chain"));
         assert!(text.contains("No active connections"));
         assert!(text.contains("[Esc/c] Close  [r] Refresh"));
     }

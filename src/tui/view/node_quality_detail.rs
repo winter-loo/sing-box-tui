@@ -1,4 +1,5 @@
 use super::*;
+use crate::controller::ReachabilityAssessment;
 use crate::storage::NodeQuickHistory;
 
 #[derive(Clone, Debug)]
@@ -103,95 +104,164 @@ pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDe
 }
 
 fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'static>> {
+    let theme = Theme::detect();
     let mut lines = Vec::new();
     if let Some(explanation) = &detail.auto_selection_detail {
-        lines.push(Line::from(format!(
-            "Automatic selection: {}",
-            truncate_for_width(explanation, 96)
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("Automatic selection: ", theme.style_breadcrumb()),
+            Span::styled(truncate_for_width(explanation, 96), theme.style_base()),
+        ]));
     }
     if let Some(assessment) = &detail.reachability_assessment {
-        lines.push(Line::from(format!(
-            "Reachability assessment: {}",
-            assessment.compact_evidence()
-        )));
+        let (assess_text, assess_style) = match assessment.assessment {
+            Some(ReachabilityAssessment::StableReachable) | Some(ReachabilityAssessment::Reachable) => {
+                (assessment.compact_evidence(), theme.style_success())
+            }
+            Some(ReachabilityAssessment::Degraded) => {
+                (assessment.compact_evidence(), theme.style_warning())
+            }
+            Some(ReachabilityAssessment::Unreachable) => {
+                (assessment.compact_evidence(), theme.style_danger())
+            }
+            None => (assessment.compact_evidence(), theme.style_muted()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Reachability assessment: ", theme.style_breadcrumb()),
+            Span::styled(assess_text, assess_style),
+        ]));
         for (index, outcome) in assessment.attempts.iter().enumerate() {
-            lines.push(Line::from(format!(
-                "Probe attempt {}: {}",
-                index + 1,
-                probe_outcome_label(outcome)
-            )));
+            let (label, outcome_style) = match outcome {
+                ProbeOutcome::Reachable { .. } => (probe_outcome_label(outcome), theme.style_success()),
+                ProbeOutcome::Timeout => (probe_outcome_label(outcome), theme.style_warning()),
+                _ => (probe_outcome_label(outcome), theme.style_danger()),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("Probe attempt {}: ", index + 1), theme.style_muted()),
+                Span::styled(label, outcome_style),
+            ]));
         }
     } else {
-        lines.push(Line::from("Reachability assessment: untested"));
+        lines.push(Line::from(vec![
+            Span::styled("Reachability assessment: ", theme.style_breadcrumb()),
+            Span::styled("untested", theme.style_muted()),
+        ]));
     }
     if detail.quick_history.rounds == 0 {
-        lines.push(Line::from("Recent quick success: untested"));
+        lines.push(Line::from(vec![
+            Span::styled("Recent quick success: ", theme.style_muted()),
+            Span::styled("untested", theme.style_muted()),
+        ]));
     } else {
-        lines.push(Line::from(format!(
-            "Recent quick success: {}/{} rounds",
-            detail.quick_history.successful_rounds, detail.quick_history.rounds
-        )));
-        lines.push(Line::from(format!(
-            "Quick history: warm median {}  P95 {}  cold-start {}",
-            metric_label(detail.quick_history.warm_median_ms),
-            metric_label(detail.quick_history.p95_ms),
-            metric_label(detail.quick_history.cold_start_ms),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("Recent quick success: ", theme.style_muted()),
+            Span::styled(
+                format!("{}/{} rounds", detail.quick_history.successful_rounds, detail.quick_history.rounds),
+                theme.style_base(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Quick history: ", theme.style_breadcrumb()),
+            Span::styled(
+                format!(
+                    "warm median {}  P95 {}  cold-start {}",
+                    metric_label(detail.quick_history.warm_median_ms),
+                    metric_label(detail.quick_history.p95_ms),
+                    metric_label(detail.quick_history.cold_start_ms),
+                ),
+                theme.style_base(),
+            ),
+        ]));
     }
     if let Some(sustained) = &detail.sustained_quality {
         match &sustained.outcome {
             SustainedProbeOutcome::Completed(completion) => {
-                lines.push(Line::from(format!(
-                    "Sustained quality: {:.1} MiB/s, {} bytes",
-                    completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0),
-                    completion.bytes_read
-                )));
-                lines.push(Line::from(format!(
-                    "First byte: {}ms  Completion: {}ms",
-                    completion.first_byte_ms, completion.completion_ms
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        format!(
+                            "{:.1} MiB/s, {} bytes",
+                            completion.throughput_bytes_per_second as f64 / (1024.0 * 1024.0),
+                            completion.bytes_read
+                        ),
+                        theme.style_success(),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "First byte: {}ms  Completion: {}ms",
+                            completion.first_byte_ms, completion.completion_ms
+                        ),
+                        theme.style_base(),
+                    ),
+                ]));
             }
-            SustainedProbeOutcome::TransferFailed { detail } => lines.push(Line::from(format!(
-                "Sustained quality: transfer failed ({})",
-                truncate_for_width(detail, 72)
-            ))),
-            SustainedProbeOutcome::RuntimeFailed { detail } => lines.push(Line::from(format!(
-                "Sustained quality: runtime failed ({})",
-                truncate_for_width(detail, 72)
-            ))),
+            SustainedProbeOutcome::TransferFailed { detail } => {
+                lines.push(Line::from(vec![
+                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        format!("transfer failed ({})", truncate_for_width(detail, 72)),
+                        theme.style_danger(),
+                    ),
+                ]));
+            }
+            SustainedProbeOutcome::RuntimeFailed { detail } => {
+                lines.push(Line::from(vec![
+                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        format!("runtime failed ({})", truncate_for_width(detail, 72)),
+                        theme.style_danger(),
+                    ),
+                ]));
+            }
             SustainedProbeOutcome::Cancelled => {
-                lines.push(Line::from("Sustained quality: cancelled"));
+                lines.push(Line::from(vec![
+                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled("cancelled", theme.style_warning()),
+                ]));
             }
         }
     } else {
-        lines.push(Line::from("Sustained quality: untested"));
+        lines.push(Line::from(vec![
+            Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+            Span::styled("untested", theme.style_muted()),
+        ]));
     }
     for criterion in &detail.usability_details {
         if let Some(usable) = criterion.usable {
-            lines.push(Line::from(format!(
-                "{} usability criterion: {}{}",
-                criterion.label,
-                if usable { "usable" } else { "rejected" },
-                criterion
-                    .detail
-                    .as_deref()
-                    .map(|value| format!(" ({})", truncate_for_width(value, 56)))
-                    .unwrap_or_default()
-            )));
+            let (status_text, status_style) = if usable {
+                ("usable", theme.style_success())
+            } else {
+                ("rejected", theme.style_danger())
+            };
+            let mut spans = vec![
+                Span::styled(format!("{} usability criterion: ", criterion.label), theme.style_breadcrumb()),
+                Span::styled(status_text, status_style),
+            ];
+            if let Some(value) = criterion.detail.as_deref() {
+                spans.push(Span::styled(
+                    format!(" ({})", truncate_for_width(value, 56)),
+                    theme.style_muted(),
+                ));
+            }
+            lines.push(Line::from(spans));
             if criterion.expired {
-                lines.push(Line::from(format!(
-                    "{} result: expired (excluded from candidates)",
-                    criterion.label
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} result: expired (excluded from candidates)", criterion.label),
+                        theme.style_warning(),
+                    ),
+                ]));
             }
         }
         if let Some(failure) = &criterion.latest_failure {
-            lines.push(Line::from(format!(
-                "{} latest probe attempt: {}",
-                criterion.label,
-                truncate_for_width(failure, 72)
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} latest probe attempt: ", criterion.label),
+                    theme.style_muted(),
+                ),
+                Span::styled(truncate_for_width(failure, 72), theme.style_danger()),
+            ]));
         }
     }
     lines

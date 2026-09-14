@@ -186,7 +186,7 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
 
             if let Some(footer) = footer_area {
                 let footer_line = Line::from(vec![
-                    Span::styled("[Esc]", theme.style_footer_keys()),
+                    Span::styled("[Esc/s]", theme.style_footer_keys()),
                     Span::raw(" "),
                     Span::styled("Close", theme.style_muted()),
                     Span::raw("  "),
@@ -275,6 +275,6 @@ mod tests {
         assert!(text.contains("> Quick probe HTTPS target"));
         assert!(text.contains("https://example.test/ping"));
         assert!(text.contains("China IP routing"));
-        assert!(text.contains("[Esc] Close  [Enter] Save"));
+        assert!(text.contains("[Esc/s] Close  [Enter] Save"));
     }
 }
