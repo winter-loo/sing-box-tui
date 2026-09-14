@@ -465,6 +465,27 @@ fn draw(frame: &mut Frame, app: &mut App) {
             &filtered,
         );
     }
+
+    if let Some(modal) = &app.provider_modal {
+        let theme = crate::tui::ds::Theme::default();
+        let provider_items = app
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| view::ProviderItem {
+                name: g.name.clone(),
+                is_current: i == app.group_index,
+                node_count: g.members.len(),
+            })
+            .collect::<Vec<_>>();
+        view::render_provider_modal(
+            frame,
+            frame.area(),
+            &theme,
+            &provider_items,
+            modal.selected_index,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -488,6 +509,11 @@ impl CommandPaletteState {
             origin_view,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderModalState {
+    pub(crate) selected_index: usize,
 }
 
 struct App {
@@ -573,6 +599,7 @@ struct App {
     active_view: ActiveView,
     operational_workspace: OperationalWorkspace,
     pub(crate) command_palette: Option<CommandPaletteState>,
+    pub(crate) provider_modal: Option<ProviderModalState>,
     last_user_activity: Instant,
     last_traffic_totals: Option<(Instant, u64, u64)>,
     last_active_traffic_rate: (String, String),
@@ -803,6 +830,7 @@ impl App {
             active_view: ActiveView::NodeList,
             operational_workspace: runtime_state.operational_workspace(),
             command_palette: None,
+            provider_modal: None,
             last_user_activity: Instant::now(),
             last_traffic_totals: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
@@ -885,6 +913,7 @@ impl App {
             || self.show_connections
             || self.node_quality_detail.is_some()
             || self.command_palette.is_some()
+            || self.provider_modal.is_some()
     }
 
     pub(crate) fn check_and_record_active_route(&mut self) {
@@ -969,6 +998,9 @@ impl App {
         }
         if self.command_palette.is_some() {
             return self.handle_command_palette_key(code);
+        }
+        if self.provider_modal.is_some() {
+            return self.handle_provider_modal_key(code);
         }
         if self.private_access_auth.is_some() {
             return self.handle_private_access_auth_key(code);
@@ -1071,7 +1103,8 @@ impl App {
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('b') => self.open_bypass_modal(),
             KeyCode::Char('B') => return self.keep_sing_box_running_in_background(),
-            KeyCode::Char('p') => self.set_system_proxy(),
+            KeyCode::Char('x') => self.set_system_proxy(),
+            KeyCode::Char('p') => self.open_provider_modal(),
             KeyCode::Char('\\') => self.toggle_tun_mode(),
             KeyCode::Char('i') => self.open_node_quality_detail()?,
             KeyCode::Char('c') => self.open_connections_panel(),
@@ -1102,6 +1135,50 @@ impl App {
         } else {
             self.command_palette = Some(CommandPaletteState::new(self.active_view));
         }
+    }
+
+    pub(crate) fn open_provider_modal(&mut self) {
+        if !self.groups.is_empty() {
+            self.provider_modal = Some(ProviderModalState {
+                selected_index: self.group_index.min(self.groups.len().saturating_sub(1)),
+            });
+        }
+    }
+
+    pub(crate) fn handle_provider_modal_key(&mut self, code: KeyCode) -> Result<bool> {
+        let Some(modal) = &mut self.provider_modal else {
+            return Ok(true);
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.provider_modal = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if modal.selected_index > 0 {
+                    modal.selected_index -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if modal.selected_index + 1 < self.groups.len() {
+                    modal.selected_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let chosen = modal.selected_index;
+                if chosen < self.groups.len() {
+                    self.group_index = chosen;
+                    self.sync_member_selection_to_current();
+                    self.set_status_only(format!(
+                        "Provider switched to {}",
+                        self.groups[chosen].name
+                    ));
+                }
+                self.provider_modal = None;
+            }
+            KeyCode::Char('q') => return Ok(false),
+            _ => {}
+        }
+        Ok(true)
     }
 
     pub(crate) fn close_command_palette(&mut self) {
@@ -1172,6 +1249,13 @@ impl App {
                 self.set_operational_workspace(OperationalWorkspace::PrivateAccess)?;
                 self.active_view = ActiveView::NodeList;
             }
+            view::CMD_SWITCH_PROVIDER => {
+                if !self.groups.is_empty() {
+                    self.set_operational_workspace(OperationalWorkspace::Internet)?;
+                    self.active_view = ActiveView::NodeList;
+                    self.open_provider_modal();
+                }
+            }
             view::CMD_TOGGLE_TUN => {
                 self.toggle_tun_mode();
             }
@@ -1220,12 +1304,14 @@ impl App {
         match self.operational_workspace {
             OperationalWorkspace::Internet => {
                 self.left_pane_section = LeftPaneSection::Internet;
+                self.focus = Focus::Members;
                 self.set_status_only("Switched to Internet workspace");
             }
             OperationalWorkspace::PrivateAccess => {
                 if self.private_access.is_configured() {
                     self.left_pane_section = LeftPaneSection::Intranet;
                 }
+                self.focus = Focus::Groups;
                 self.set_status_only("Switched to Private Access workspace");
             }
         }

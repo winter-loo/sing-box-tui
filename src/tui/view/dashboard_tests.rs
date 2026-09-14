@@ -276,16 +276,20 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     let lines = rendered_lines(&dashboard_snapshot());
     let text = lines.join("\n");
 
-    assert!(text.contains("Internet Proxy"));
-    assert!(text.contains("select"));
     assert!(text.contains("node-a"));
     assert!(text.contains("⡆⡄⡀"));
     assert!(text.contains("233ms"));
     assert!(!text.contains("avg"));
     assert!(!text.contains("stable reachable"));
     assert!(!text.contains("3/3"));
-    assert!(text.contains("System Proxy: disabled"));
-    assert!(text.contains("Tun Mode: enabled"));
+    assert!(text.contains("dashboard"));
+    assert!(text.contains("connections"));
+    assert!(text.contains("quality"));
+    assert!(text.contains("settings"));
+    assert!(text.contains("help"));
+    assert!(text.contains("provider"));
+    assert!(text.contains("GLOBAL NET"));
+    assert!(text.contains("STABLE"));
     assert!(!text.contains("Intranet Proxy"));
     assert!(has_help_binding("\\", "Toggle TUN mode"));
 }
@@ -324,10 +328,12 @@ fn status_footer_is_rendered_below_its_box() {
         .position(|line| line.contains("ready"))
         .expect("status footer row");
 
-    assert!(message_row > 0);
+    assert_eq!(message_row, 29);
     assert!(!lines[message_row].contains('─'));
-    assert!(lines[message_row - 1].contains('└'));
-    assert!(lines[message_row - 1].contains('┘'));
+    assert!(!lines[message_row - 1].contains('└'));
+    assert!(!lines[message_row - 1].contains('┘'));
+    assert!(lines[message_row].contains("GLOBAL NET"));
+    assert!(lines[message_row].contains("STABLE"));
 }
 
 #[test]
@@ -634,6 +640,216 @@ fn usability_tabs_retain_current_selector_streaming_and_custom_views() {
     assert!(text.contains("Current selector 5"));
     assert!(text.contains("Streaming 3"));
     assert!(text.contains("Custom Gemini 2"));
-    assert!(text.contains("Node views  ←/→"));
+    assert!(text.contains("│"));
+}
+
+#[test]
+fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.node_view_tabs = vec![
+        NodeViewTab {
+            label: "All".to_string(),
+            count: 18,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "Streaming".to_string(),
+            count: 12,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "GitHub SSH".to_string(),
+            count: 5,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "Agy Gemini".to_string(),
+            count: 2,
+            spinner: None,
+        },
+        NodeViewTab {
+            label: "GitHub Web".to_string(),
+            count: 17,
+            spinner: None,
+        },
+    ];
+    snapshot.candidate_rows = vec![
+        CandidateRow {
+            name: "JP-Edge-03".to_string(),
+            is_current: true,
+            latency_signal: Some(LatencySignal {
+                bars: [
+                    LatencySignalBar {
+                        height: 8,
+                        state: LatencySignalState::Reachable { delay_ms: 42 },
+                    },
+                    LatencySignalBar {
+                        height: 5,
+                        state: LatencySignalState::Reachable { delay_ms: 42 },
+                    },
+                    LatencySignalBar {
+                        height: 2,
+                        state: LatencySignalState::Reachable { delay_ms: 42 },
+                    },
+                ],
+                average_ms: Some(42),
+            }),
+            reachability: "Stable".to_string(),
+            marker: "8.0 MiB/s".to_string(),
+            compact_marker: "8.0M/s".to_string(),
+            tone: CandidateTone::Success,
+        },
+        CandidateRow {
+            name: "SG-Transit-07".to_string(),
+            is_current: false,
+            latency_signal: Some(LatencySignal {
+                bars: [
+                    LatencySignalBar {
+                        height: 8,
+                        state: LatencySignalState::Reachable { delay_ms: 68 },
+                    },
+                    LatencySignalBar {
+                        height: 5,
+                        state: LatencySignalState::Reachable { delay_ms: 68 },
+                    },
+                    LatencySignalBar {
+                        height: 2,
+                        state: LatencySignalState::Reachable { delay_ms: 68 },
+                    },
+                ],
+                average_ms: Some(68),
+            }),
+            reachability: "Stable".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Success,
+        },
+        CandidateRow {
+            name: "JP-Backup-01".to_string(),
+            is_current: false,
+            latency_signal: Some(LatencySignal {
+                bars: [
+                    LatencySignalBar {
+                        height: 8,
+                        state: LatencySignalState::Reachable { delay_ms: 63 },
+                    },
+                    LatencySignalBar {
+                        height: 5,
+                        state: LatencySignalState::Reachable { delay_ms: 63 },
+                    },
+                    LatencySignalBar {
+                        height: 2,
+                        state: LatencySignalState::Reachable { delay_ms: 63 },
+                    },
+                ],
+                average_ms: Some(63),
+            }),
+            reachability: "Stable".to_string(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Success,
+        },
+    ];
+
+    let lines = rendered_lines_at(&snapshot, 120, 30);
+    assert_eq!(lines.len(), 30);
+
+    // Row 0 of body: Filter Tabs (borderless)
+    let tabs_row = &lines[0];
+    assert!(tabs_row.contains("All 18"));
+    assert!(tabs_row.contains("Streaming 12"));
+    assert!(tabs_row.contains("GitHub SSH 5"));
+    assert!(tabs_row.contains("Agy Gemini 2"));
+    assert!(tabs_row.contains("GitHub Web 17"));
+    assert!(tabs_row.contains("│"));
+    assert!(!tabs_row.contains("┌"));
+    assert!(!tabs_row.contains("Node views"));
+
+    // Candidate rows start at Row 1, full 120-column width without sidebar or box borders
+    let row1 = &lines[1];
+    assert!(row1.contains("* JP-Edge-03"));
+    assert!(row1.contains("8.0 MiB/s"));
+    assert!(row1.contains("Stable"));
+    assert!(row1.contains("⡆⡄⡀"));
+    assert!(row1.contains("42ms"));
+    assert!(!row1.contains("│")); // No 26-column sidebar divider!
+
+    let row2 = &lines[2];
+    assert!(row2.contains("SG-Transit-07"));
+    assert!(row2.contains("68ms"));
+    assert!(!row2.contains("│"));
+
+    let row3 = &lines[3];
+    assert!(row3.contains("JP-Backup-01"));
+    assert!(row3.contains("63ms"));
+    assert!(!row3.contains("│"));
+
+    // Bottom row (Row 29): Integrated Footer
+    let footer_row = &lines[29];
+    assert!(footer_row.contains("dashboard"));
+    assert!(footer_row.contains("connections"));
+    assert!(footer_row.contains("quality"));
+    assert!(footer_row.contains("settings"));
+    assert!(footer_row.contains("help"));
+    assert!(footer_row.contains("provider"));
+    assert!(footer_row.contains("Intranet →"));
+    assert!(footer_row.contains("GLOBAL NET"));
+    assert!(footer_row.contains("STABLE"));
+
+    // Verify no legacy box borders anywhere in the 30 rows
+    assert!(!lines.iter().any(|line| line.contains("Internet Proxy")));
+    assert!(!lines.iter().any(|line| line.contains("Status") && line.contains("─")));
+}
+
+fn rendered_provider_modal_lines_at(
+    providers: &[ProviderItem],
+    selected_index: usize,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let theme = Theme::detect();
+    terminal
+        .draw(|frame| {
+            render_provider_modal(frame, frame.area(), &theme, providers, selected_index)
+        })
+        .expect("provider modal renders");
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .chunks(width as usize)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
+#[test]
+fn provider_modal_renders_centered_dialog_with_providers() {
+    let providers = vec![
+        ProviderItem {
+            name: "AirTCP".to_string(),
+            is_current: true,
+            node_count: 18,
+        },
+        ProviderItem {
+            name: "宝贝云".to_string(),
+            is_current: false,
+            node_count: 12,
+        },
+    ];
+
+    let lines = rendered_provider_modal_lines_at(&providers, 1, 120, 30);
+    let text = lines.join("\n");
+    assert!(text.contains("INTERNET PROXY PROVIDER (p)"));
+    assert!(text.contains("AirTCP"));
+    assert!(text.contains("* CURRENT"));
+    assert!(text.contains("(18)"));
+    assert!(text.contains("> 宝") && text.contains("云"));
+    assert!(text.contains("(12)"));
+    assert!(text.contains("[Enter]"));
+    assert!(text.contains("Confirm"));
+    assert!(text.contains("[Esc]"));
+    assert!(text.contains("Close"));
 }
 
