@@ -85,6 +85,7 @@ impl App {
     }
 
     pub(super) fn open_connections_panel(&mut self) {
+        self.pause_inactivity_timer();
         self.show_connections = true;
         self.set_status_only("Showing active connections");
     }

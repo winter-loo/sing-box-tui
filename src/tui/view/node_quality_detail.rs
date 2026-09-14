@@ -133,7 +133,10 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             let (label, outcome_style) = match outcome {
                 ProbeOutcome::Reachable { .. } => (probe_outcome_label(outcome), theme.style_success()),
                 ProbeOutcome::Timeout => (probe_outcome_label(outcome), theme.style_warning()),
-                _ => (probe_outcome_label(outcome), theme.style_danger()),
+                ProbeOutcome::TransportFailure { .. } => (probe_outcome_label(outcome), theme.style_danger()),
+                ProbeOutcome::Cancelled
+                | ProbeOutcome::ControllerFailure { .. }
+                | ProbeOutcome::InvalidMeasurement => (probe_outcome_label(outcome), theme.style_warning()),
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("Probe attempt {}: ", index + 1), theme.style_muted()),

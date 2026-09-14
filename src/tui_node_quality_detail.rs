@@ -28,6 +28,7 @@ impl App {
             .selected_member_panel_group()
             .map(|group| group.members.clone())
             .unwrap_or_default();
+        self.pause_inactivity_timer();
         self.node_quality_detail = Some(NodeQualityDetailState {
             selector: group_name.clone(),
             node: node.clone(),

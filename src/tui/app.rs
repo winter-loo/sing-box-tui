@@ -297,6 +297,12 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.maybe_refresh_connections();
         app.check_and_record_active_route();
 
+        if app.has_active_modal() {
+            app.pause_inactivity_timer();
+        } else {
+            app.resume_inactivity_timer();
+        }
+
         if !app.has_active_modal()
             && app.active_view == ActiveView::NodeList
             && app.last_user_activity.elapsed() >= Duration::from_secs(30)
@@ -311,7 +317,9 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                app.last_user_activity = Instant::now();
+                if !app.has_active_modal() {
+                    app.last_user_activity = Instant::now();
+                }
                 if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
                 {
@@ -424,18 +432,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
         if app.has_active_modal() {
             let view_snapshot = app.view_snapshot();
-            if let Some(chart) = view_snapshot.node_quality_detail {
-                view::draw_node_quality_detail(frame, chart);
-            }
-            if let Some(connections) = view_snapshot.connections.as_ref() {
-                view::draw_connections_panel(frame, connections);
-            }
-            if let Some(help_index) = view_snapshot.help_index {
-                view::draw_help_panel(frame, help_index, view_snapshot.usability_probe_diagnostics);
-            }
-            if let Some(settings) = view_snapshot.settings.as_ref() {
-                view::draw_settings_panel(frame, settings);
-            }
+            view::render_active_modals(frame, &view_snapshot);
         }
     } else {
         let area = frame.area();
@@ -621,6 +618,7 @@ struct App {
     pub(crate) command_palette: Option<CommandPaletteState>,
     pub(crate) provider_modal: Option<ProviderModalState>,
     last_user_activity: Instant,
+    pub(crate) inactivity_paused_at: Option<Instant>,
     last_traffic_totals: Option<(Instant, u64, u64)>,
     last_active_traffic_rate: (String, String),
 }
@@ -852,6 +850,7 @@ impl App {
             command_palette: None,
             provider_modal: None,
             last_user_activity: Instant::now(),
+            inactivity_paused_at: None,
             last_traffic_totals: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
         };
@@ -934,6 +933,18 @@ impl App {
             || self.node_quality_detail.is_some()
             || self.command_palette.is_some()
             || self.provider_modal.is_some()
+    }
+
+    pub(crate) fn pause_inactivity_timer(&mut self) {
+        if self.inactivity_paused_at.is_none() {
+            self.inactivity_paused_at = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn resume_inactivity_timer(&mut self) {
+        if let Some(paused_at) = self.inactivity_paused_at.take() {
+            self.last_user_activity += paused_at.elapsed();
+        }
     }
 
     pub(crate) fn check_and_record_active_route(&mut self) {
@@ -1049,7 +1060,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
                     self.show_help = false;
-                    self.last_user_activity = Instant::now();
+                    self.resume_inactivity_timer();
                     self.set_status_only("Help closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
@@ -1068,7 +1079,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') => {
                     self.show_connections = false;
-                    self.last_user_activity = Instant::now();
+                    self.resume_inactivity_timer();
                     self.set_status_only("Connection details closed");
                 }
                 KeyCode::Char('r') => {
@@ -1085,7 +1096,7 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
                     self.node_quality_detail = None;
-                    self.last_user_activity = Instant::now();
+                    self.resume_inactivity_timer();
                     self.set_status_only("Node quality detail closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_node_quality_detail_down(),
@@ -1155,13 +1166,16 @@ impl App {
     pub(crate) fn toggle_command_palette(&mut self) {
         if let Some(state) = self.command_palette.take() {
             self.active_view = state.origin_view;
+            self.resume_inactivity_timer();
         } else {
+            self.pause_inactivity_timer();
             self.command_palette = Some(CommandPaletteState::new(self.active_view));
         }
     }
 
     pub(crate) fn open_provider_modal(&mut self) {
         if !self.groups.is_empty() {
+            self.pause_inactivity_timer();
             self.provider_modal = Some(ProviderModalState {
                 selected_index: self.group_index.min(self.groups.len().saturating_sub(1)),
             });
@@ -1175,6 +1189,7 @@ impl App {
         match code {
             KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => {
                 self.provider_modal = None;
+                self.resume_inactivity_timer();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if modal.selected_index > 0 {
@@ -1197,6 +1212,7 @@ impl App {
                     ));
                 }
                 self.provider_modal = None;
+                self.resume_inactivity_timer();
             }
             KeyCode::Char('q') => return Ok(false),
             _ => {}
@@ -1207,7 +1223,7 @@ impl App {
     pub(crate) fn close_command_palette(&mut self) {
         if let Some(state) = self.command_palette.take() {
             self.active_view = state.origin_view;
-            self.last_user_activity = Instant::now();
+            self.resume_inactivity_timer();
         }
     }
 
@@ -1264,6 +1280,7 @@ impl App {
     }
 
     pub(crate) fn execute_command(&mut self, action_id: &str) -> Result<bool> {
+        self.inactivity_paused_at = None;
         self.last_user_activity = Instant::now();
         match action_id {
             view::CMD_SWITCH_INTERNET => {
@@ -1372,7 +1389,8 @@ impl App {
         }
     }
 
-fn open_help_panel(&mut self) {
+    fn open_help_panel(&mut self) {
+        self.pause_inactivity_timer();
         self.show_help = true;
         self.flash = None;
         self.set_status_only("Showing help");
@@ -2034,12 +2052,18 @@ mod navigation_tests {
             && app.last_user_activity.elapsed() >= Duration::from_secs(30);
         assert!(would_trigger);
 
-        // Open modal (e.g. connections)
-        app.show_connections = true;
-        assert!(app.has_active_modal());
+        // Simulate user idle for 20s, then modal opened and active for 10s (total 30s since last user activity)
+        app.last_user_activity = Instant::now() - Duration::from_secs(30);
 
-        // Even with 45s elapsed, modal pauses inactivity transition
-        app.last_user_activity = Instant::now() - Duration::from_secs(45);
+        // Open modal (e.g. connections)
+        app.open_connections_panel();
+        assert!(app.has_active_modal());
+        assert!(app.inactivity_paused_at.is_some());
+
+        // Simulate 10s elapsed while modal was open
+        app.inactivity_paused_at = Some(Instant::now() - Duration::from_secs(10));
+
+        // Even though 30s elapsed from initial activity, the open modal prevents the transition
         let would_trigger_with_modal = !app.has_active_modal()
             && app.active_view == ActiveView::NodeList
             && app.last_user_activity.elapsed() >= Duration::from_secs(30);
@@ -2049,9 +2073,12 @@ mod navigation_tests {
         app.handle_key(KeyCode::Esc).unwrap();
         assert!(!app.show_connections);
         assert!(!app.has_active_modal());
+        assert!(app.inactivity_paused_at.is_none());
 
-        // Activity timer was reset upon modal close
-        assert!(app.last_user_activity.elapsed() < Duration::from_secs(2));
+        // Timer resumed: the 10s spent inside the modal is excluded,
+        // so elapsed inactivity resumes at ~20s (neither 30s nor reset to 0s).
+        let elapsed = app.last_user_activity.elapsed();
+        assert!(elapsed >= Duration::from_secs(19) && elapsed < Duration::from_secs(22));
         let would_trigger_after_close = !app.has_active_modal()
             && app.active_view == ActiveView::NodeList
             && app.last_user_activity.elapsed() >= Duration::from_secs(30);

@@ -405,6 +405,19 @@ pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &Dashboard
             flash_area,
         );
     }
+    render_active_modals(frame, snapshot);
+    if let Some(onboarding) = snapshot.onboarding {
+        draw_onboarding_panel(frame, onboarding);
+    }
+    if let Some(progress) = snapshot.private_access_progress {
+        draw_private_access_progress_panel(frame, progress);
+    }
+    if let Some(auth) = snapshot.private_access_auth {
+        draw_private_access_auth_panel(frame, auth);
+    }
+}
+
+pub(crate) fn render_active_modals(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     if let Some(chart) = snapshot.node_quality_detail {
         draw_node_quality_detail(frame, chart);
     }
@@ -416,15 +429,6 @@ pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &Dashboard
     }
     if let Some(settings) = snapshot.settings.as_ref() {
         draw_settings_panel(frame, settings);
-    }
-    if let Some(onboarding) = snapshot.onboarding {
-        draw_onboarding_panel(frame, onboarding);
-    }
-    if let Some(progress) = snapshot.private_access_progress {
-        draw_private_access_progress_panel(frame, progress);
-    }
-    if let Some(auth) = snapshot.private_access_auth {
-        draw_private_access_auth_panel(frame, auth);
     }
 }
 

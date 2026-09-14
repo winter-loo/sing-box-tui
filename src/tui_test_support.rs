@@ -172,6 +172,7 @@ pub(super) fn test_app() -> App {
         command_palette: None,
         provider_modal: None,
         last_user_activity: Instant::now(),
+        inactivity_paused_at: None,
         last_traffic_totals: None,
         last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
     }

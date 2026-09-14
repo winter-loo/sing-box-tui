@@ -6,7 +6,7 @@ pub(crate) struct ConnectionsPanelSnapshot<'a> {
     pub(crate) error: Option<&'a str>,
 }
 
-fn format_connection_rate(connection: &ConnectionInfo) -> String {
+fn format_connection_transfer(connection: &ConnectionInfo) -> String {
     format!("↓{} ↑{}", format_bytes(connection.download), format_bytes(connection.upload))
 }
 
@@ -14,14 +14,14 @@ fn format_connection_line(connection: &ConnectionInfo, max_width: usize) -> Stri
     let source = format_connection_source(connection);
     let target = format_connection_target(connection);
     let rule = connection.rule.as_deref().unwrap_or("-");
-    let rate = format_connection_rate(connection);
+    let transfer = format_connection_transfer(connection);
     let chain = if connection.chains.is_empty() {
         "-".to_string()
     } else {
         connection.chains.join(" -> ")
     };
     truncate_for_width(
-        &format!("{source:<12} {target:<30} {rule:<16} {rate:<18} {chain}"),
+        &format!("{source:<12} {target:<30} {rule:<16} {transfer:<18} {chain}"),
         max_width,
     )
 }
@@ -108,7 +108,7 @@ pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPa
                     Span::raw(" "),
                     Span::styled(format!("{:<16}", "Rule"), theme.style_breadcrumb()),
                     Span::raw(" "),
-                    Span::styled(format!("{:<18}", "Rate (↓ / ↑)"), theme.style_breadcrumb()),
+                    Span::styled(format!("{:<18}", "Transfer (↓ / ↑)"), theme.style_breadcrumb()),
                     Span::raw(" "),
                     Span::styled("Chain", theme.style_breadcrumb()),
                 ]),
@@ -235,7 +235,7 @@ mod tests {
         assert!(text.contains("Source"));
         assert!(text.contains("Destination"));
         assert!(text.contains("Rule"));
-        assert!(text.contains("Rate (↓ / ↑)"));
+        assert!(text.contains("Transfer (↓ / ↑)"));
         assert!(text.contains("Chain"));
         assert!(text.contains("No active connections"));
         assert!(text.contains("[Esc/c] Close  [r] Refresh"));

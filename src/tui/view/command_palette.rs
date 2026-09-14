@@ -31,7 +31,8 @@ impl CommandItem {
 
 pub const CMD_SWITCH_INTERNET: &str = "switch_internet";
 pub const CMD_SWITCH_PRIVATE_ACCESS: &str = "switch_private_access";
-pub const CMD_SWITCH_PROVIDER: &str = "switch_provider";
+pub const CMD_SWITCH_SUBSCRIPTIONS: &str = "switch_subscriptions";
+pub const CMD_SWITCH_PROVIDER: &str = CMD_SWITCH_SUBSCRIPTIONS;
 pub const CMD_TOGGLE_TUN: &str = "toggle_tun";
 pub const CMD_TOGGLE_SYSTEM_PROXY: &str = "toggle_system_proxy";
 pub const CMD_TRIGGER_USABILITY_PROBES: &str = "trigger_usability_probes";
@@ -59,8 +60,8 @@ pub fn builtin_commands() -> Vec<CommandItem> {
             Some("Tab"),
         ),
         CommandItem::new(
-            CMD_SWITCH_PROVIDER,
-            "Switch Internet Provider",
+            CMD_SWITCH_SUBSCRIPTIONS,
+            "Switch to Subscriptions Workspace",
             "Navigation",
             Some("p"),
         ),
