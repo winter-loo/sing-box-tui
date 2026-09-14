@@ -949,6 +949,87 @@ mod tests {
     }
 
     #[test]
+    fn profile_focus_and_v_toggle_preserves_other_active_profiles_session_tracking() {
+        let mut app = test_app();
+        app.private_access
+            .profiles
+            .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+
+        // Profile 0 is Connected
+        app.private_access.profiles[0].state = PrivateAccessState::Connected;
+        assert_eq!(app.private_access.focused_index, 0);
+        assert_eq!(app.private_access.focused().id, "hillstone");
+
+        // Switch focus to Profile 1
+        assert!(app.private_access.set_focus_by_id("sonicwall").expect("set focus"));
+        assert_eq!(app.private_access.focused_index, 1);
+        assert_eq!(app.private_access.focused().id, "sonicwall");
+
+        // Profile 0 remains Connected despite switching focus
+        assert_eq!(app.private_access.profiles[0].state, PrivateAccessState::Connected);
+
+        // V toggle on Profile 1 does not affect Profile 0
+        let _ = app.toggle_private_access_with_progress();
+        assert_eq!(app.private_access.profiles[0].state, PrivateAccessState::Connected);
+
+        // Switch focus back to Profile 0
+        assert!(app.private_access.set_focus_by_id("hillstone").expect("set focus"));
+        assert_eq!(app.private_access.focused_index, 0);
+
+        // Disconnecting Profile 0 via V toggle leaves Profile 1 unaffected
+        app.toggle_private_access_with_progress().expect("V disconnect succeeds");
+        assert_eq!(app.private_access.profiles[0].state, PrivateAccessState::Disconnected);
+        assert_eq!(app.private_access.profiles[1].state, PrivateAccessState::Connecting);
+    }
+
+    #[test]
+    fn profile_selection_and_key_navigation_in_private_access() {
+        let mut app = test_app();
+        app.private_access
+            .profiles
+            .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+
+        app.focus = Focus::Groups;
+        app.left_pane_section = LeftPaneSection::Intranet;
+        app.private_access.focused_index = 0;
+
+        assert_eq!(app.private_access.focused_index, 0);
+        assert_eq!(app.private_access.focused().id, "hillstone");
+
+        // Navigate next (j)
+        app.move_next();
+        assert_eq!(app.private_access.focused_index, 1);
+        assert_eq!(app.private_access.focused().id, "sonicwall");
+
+        // Navigate previous (k)
+        app.move_previous();
+        assert_eq!(app.private_access.focused_index, 0);
+        assert_eq!(app.private_access.focused().id, "hillstone");
+    }
+
+    #[test]
+    fn authentication_and_terminal_prompt_lifecycle_suspends_and_restores() {
+        let mut app = test_app();
+        app.private_access.focused_mut().mode = PrivateAccessMode::Tun;
+        app.private_access.focused_mut().tun_helper = vec![
+            "sudo".to_string(),
+            "target/debug/sing-box-tui".to_string(),
+            "private-access-tun-helper".to_string(),
+            "--stdio".to_string(),
+        ];
+
+        let needs_prompt = app.private_access_connect_needs_terminal_prompt();
+        let tun_helper = app.private_access_tun_helper_for_connect(app.private_access.focused());
+
+        assert!(needs_prompt);
+        assert!(tun_helper.is_some_and(|cmd| cmd.contains(&"-n".to_string())));
+
+        // Bridge mode never requires terminal sudo prompt
+        app.private_access.focused_mut().mode = PrivateAccessMode::Bridge;
+        assert!(!app.private_access_connect_needs_terminal_prompt());
+    }
+
+    #[test]
     fn sonicwall_conflict_warning_names_the_official_clients() {
         let warning = format_official_sonicwall_client_warning(&[
             "SnwlVpn.exe".to_string(),

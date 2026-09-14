@@ -147,11 +147,7 @@ impl App {
             .private_access
             .profiles
             .iter()
-            .map(|profile| IntranetRow {
-                id: profile.id.clone(),
-                state: profile.state.clone(),
-                background: profile.background_pid.is_some(),
-            })
+            .map(IntranetRow::from_profile)
             .collect();
 
         let selected_group = self.selected_member_panel_group();

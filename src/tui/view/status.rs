@@ -74,68 +74,6 @@ pub(crate) fn format_duration_badge(duration: Duration) -> String {
         format!("{secs}s")
     }
 }
-
-pub(crate) fn status_lines(status: &StatusSnapshot) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("System Proxy: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if status.system_proxy_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                Style::default().fg(if status.system_proxy_enabled {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::raw("  "),
-            Span::styled("Tun Mode: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if status.tun_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                Style::default().fg(if status.tun_enabled {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::raw("  "),
-            Span::raw(status.selection_context.clone()),
-        ]),
-        Line::from(status.connections.clone()),
-        Line::from(status.subscription.clone()),
-        Line::from(status.sing_box.clone()),
-    ]
-}
-
-pub(crate) fn status_footer_line(footer: &StatusFooter) -> Line<'_> {
-    let line = match footer {
-        StatusFooter::Filter(input) => Line::from(vec![
-            Span::styled("Filter: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input.as_str()),
-            Span::styled(
-                "  Enter apply  Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        StatusFooter::Bypass(input) => Line::from(vec![
-            Span::styled("Bypass: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input.as_str()),
-            Span::styled(
-                "  domains/IPs/CIDRs comma-separated  Enter save  Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        StatusFooter::Status(status) => Line::from(status.as_str()),
-    };
-    line.patch_style(Style::default().fg(Color::DarkGray))
-}
 #[cfg(test)]
 mod tests {
     use super::*;

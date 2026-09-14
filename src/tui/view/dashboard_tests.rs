@@ -418,11 +418,7 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     let expanded_sections = BTreeSet::new();
     let mut snapshot = dashboard_snapshot();
     snapshot.left_pane_section = LeftPaneSection::Intranet;
-    snapshot.intranet_rows = vec![IntranetRow {
-        id: profile.id.clone(),
-        state: profile.state.clone(),
-        background: false,
-    }];
+    snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
         expanded_sections: &expanded_sections,
@@ -431,14 +427,75 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     });
 
     let text = rendered_lines(&snapshot).join("\n");
-    assert!(text.contains("Intranet Proxy"));
-    assert!(text.contains("Intranet: hillstone"));
+    assert!(text.contains("Private Access · Profiles"));
+    assert!(text.contains("Private Access: hillstone"));
     assert!(text.contains("vpn.example.com:4433"));
     assert!(text.contains("10.20.0.0/16"));
     assert!(text.contains("10.20.0.53"));
     assert!(text.contains("portal.internal.example"));
     assert!(text.contains("*.corp.example"));
-    assert!(text.contains("Enter expand/fold"));
+    assert!(text.contains("[Tab] Internet →"));
+    assert!(text.contains("[V] Connect/Disconnect"));
+    assert!(text.contains("CONNECTED"));
+}
+
+#[test]
+fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
+    let mut profile = PrivateAccessProfileRuntime::default_hillstone().expect("hillstone profile");
+    profile.server = "vpn.corp.com".to_string();
+    profile.state = PrivateAccessState::Connected;
+    let expanded_sections = BTreeSet::new();
+
+    let mut snapshot = dashboard_snapshot();
+    snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+    snapshot.left_pane_section = LeftPaneSection::Intranet;
+    snapshot.intranet_rows = vec![
+        IntranetRow {
+            id: "hillstone".to_string(),
+            server: "vpn.corp.com:4433".to_string(),
+            mode: crate::private_access_session::PrivateAccessMode::Tun,
+            routes_count: 2,
+            state: PrivateAccessState::Connected,
+            background: false,
+        },
+        IntranetRow {
+            id: "sonicwall".to_string(),
+            server: "portal.corp.com:443".to_string(),
+            mode: crate::private_access_session::PrivateAccessMode::Bridge,
+            routes_count: 5,
+            state: PrivateAccessState::Disconnected,
+            background: false,
+        },
+    ];
+    snapshot.intranet_selected = 0;
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &expanded_sections,
+        scroll: 0,
+        active: true,
+    });
+
+    // 120x30 standard workspace
+    let lines_120 = rendered_lines_at(&snapshot, 120, 30);
+    let text_120 = lines_120.join("\n");
+    assert!(text_120.contains("Private Access · Profiles"));
+    assert!(text_120.contains("hillstone"));
+    assert!(text_120.contains("CONNECTED"));
+    assert!(text_120.contains("sonicwall"));
+    assert!(text_120.contains("DISCONNECTED"));
+    assert!(text_120.contains("vpn.corp.com:4433 · TUN · 2 routes"));
+    assert!(text_120.contains("portal.corp.com:443 · Bridge · 5 routes"));
+    assert!(text_120.contains("Private Access: hillstone"));
+    assert!(text_120.contains("[Tab] Internet →"));
+    assert!(text_120.contains("[V] Connect/Disconnect"));
+    assert!(text_120.contains("1 CONNECTED"));
+
+    // 80x24 compact workspace
+    let lines_80 = rendered_lines_at(&snapshot, 80, 24);
+    let text_80 = lines_80.join("\n");
+    assert!(text_80.contains("Private Access · Profiles"));
+    assert!(text_80.contains("hillstone"));
+    assert!(text_80.contains("Private Access: hillstone"));
 }
 
 #[test]

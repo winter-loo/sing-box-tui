@@ -1,26 +1,5 @@
 use super::*;
 
-pub(crate) fn border_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
-}
-
-pub(crate) fn selected_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    }
-}
-
 pub(crate) fn centered_rect(
     width: u16,
     height: u16,

@@ -176,9 +176,10 @@ pub(crate) fn private_access_detail_view(
     .collect::<Vec<_>>()
     .join(", ");
 
+    let theme = Theme::detect();
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("State: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("State: ", theme.style_muted()),
             Span::styled(state_label, private_access_state_style(&profile.state)),
         ]),
         private_access_detail_line("Service", &profile.manifest.name),
@@ -261,7 +262,7 @@ pub(crate) fn private_access_detail_view(
         lines.push(private_access_detail_heading("Last error"));
         lines.push(Line::from(Span::styled(
             error.to_string(),
-            Style::default().fg(Color::Red),
+            theme.style_danger(),
         )));
     }
 
@@ -306,9 +307,10 @@ fn append_private_access_detail_section(
                 .map(|item| Line::from(format!("  {item}"))),
         );
         if foldable && !expanded {
+            let theme = Theme::detect();
             lines.push(Line::from(Span::styled(
                 format!("  … {} more item(s)", item_count - visible_count),
-                Style::default().fg(Color::DarkGray),
+                theme.style_muted(),
             )));
         }
     }
@@ -321,25 +323,26 @@ fn append_private_access_detail_section(
 }
 
 fn private_access_detail_line(label: &str, value: &str) -> Line<'static> {
+    let theme = Theme::detect();
     Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(value.to_string()),
+        Span::styled(format!("{label}: "), theme.style_muted()),
+        Span::styled(value.to_string(), theme.style_base()),
     ])
 }
 
 fn private_access_detail_heading(value: impl Into<String>) -> Line<'static> {
+    let theme = Theme::detect();
     Line::from(Span::styled(
         value.into(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        theme.style_breadcrumb().add_modifier(Modifier::BOLD),
     ))
 }
 
 fn private_access_detail_empty(value: &str) -> Line<'static> {
+    let theme = Theme::detect();
     Line::from(Span::styled(
         format!("  {value}"),
-        Style::default().fg(Color::DarkGray),
+        theme.style_muted(),
     ))
 }
 

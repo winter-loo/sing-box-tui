@@ -1,6 +1,7 @@
 use super::*;
 use ratatui::layout::Rect;
 use crate::automatic_selection::{NodeViewId, RankingPolicy};
+use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRuntime};
 use crate::tui::ds::theme::Theme;
 
 pub(crate) trait ThemeExt {
@@ -133,8 +134,29 @@ pub(crate) struct InternetRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IntranetRow {
     pub(crate) id: String,
+    pub(crate) server: String,
+    pub(crate) mode: PrivateAccessMode,
+    pub(crate) routes_count: usize,
     pub(crate) state: PrivateAccessState,
     pub(crate) background: bool,
+}
+
+impl IntranetRow {
+    pub(crate) fn from_profile(profile: &PrivateAccessProfileRuntime) -> Self {
+        let server = if profile.server.trim().is_empty() {
+            "-".to_string()
+        } else {
+            format!("{}:{}", profile.server, profile.port)
+        };
+        Self {
+            id: profile.id.clone(),
+            server,
+            mode: profile.mode,
+            routes_count: profile.routes.len(),
+            state: profile.state.clone(),
+            background: profile.background_pid.is_some(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -776,59 +798,95 @@ fn render_intranet_workspace(
     snapshot: &DashboardSnapshot<'_>,
     theme: &Theme,
 ) {
-    let status_lines = status_lines(&snapshot.status);
-    let status_footer = status_footer_line(&snapshot.status.footer);
-    let status_line_count = status_lines.len() as u16;
-    let status_box_height = status_line_count.saturating_add(2).max(3);
-    let status_region_height = status_box_height.saturating_add(1);
-    let [main, status_region] = Layout::vertical([
-        Constraint::Min(8),
-        Constraint::Length(status_region_height),
-    ])
-    .areas(area);
-    let [status_area, status_footer_area] =
-        Layout::vertical([Constraint::Length(status_box_height), Constraint::Length(1)])
-            .areas(status_region);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let [main_area, footer_area] = if area.height >= 2 {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area)
+    } else {
+        [area, Rect::default()]
+    };
+
+    let left_width = if main_area.width >= 120 {
+        46
+    } else if main_area.width >= 100 {
+        40
+    } else if main_area.width >= 80 {
+        34
+    } else {
+        (main_area.width / 2).max(24)
+    };
 
     let [intranet_area, details_area] =
-        Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).areas(main);
+        Layout::horizontal([Constraint::Length(left_width), Constraint::Min(20)]).areas(main_area);
 
+    let inner_width = intranet_area.width.saturating_sub(2) as usize;
     let profiles = snapshot
         .intranet_rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(idx, row)| {
+            let is_selected = idx == snapshot.intranet_selected;
             let state_label = if row.background {
                 "BACKGROUND"
             } else {
                 private_access_state_badge(row.state.clone())
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    truncate_for_width(
-                        &row.id,
-                        intranet_area.width.saturating_sub(18) as usize,
-                    ),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-                Span::styled(state_label, private_access_state_style(&row.state)),
-            ]))
+            let state_style = private_access_state_style(&row.state);
+            let prefix = if is_selected { "> " } else { "  " };
+            let prefix_style = if is_selected {
+                theme.style_focused_row()
+            } else {
+                theme.style_muted()
+            };
+            let id_style = if is_selected {
+                theme.style_focused_row()
+            } else {
+                Style::default().fg(theme.text_primary())
+            };
+
+            let state_width = unicode_width::UnicodeWidthStr::width(state_label);
+            let id_budget = inner_width.saturating_sub(2 + state_width + 1);
+            let truncated_id = truncate_for_width(&row.id, id_budget);
+            let id_width = unicode_width::UnicodeWidthStr::width(truncated_id.as_str());
+            let padding = inner_width.saturating_sub(2 + id_width + state_width);
+
+            let mut line1_spans = vec![
+                Span::styled(prefix, prefix_style),
+                Span::styled(truncated_id, id_style),
+            ];
+            if padding > 0 {
+                line1_spans.push(Span::raw(" ".repeat(padding)));
+            }
+            line1_spans.push(Span::styled(state_label, state_style));
+
+            let mode_str = match row.mode {
+                PrivateAccessMode::Tun => "TUN",
+                PrivateAccessMode::Bridge => "Bridge",
+            };
+            let meta_text = format!(
+                "  {} · {} · {} routes",
+                row.server, mode_str, row.routes_count
+            );
+            let truncated_meta = truncate_for_width(&meta_text, inner_width);
+            let line2 = Line::from(Span::styled(truncated_meta, theme.style_muted()));
+
+            ListItem::new(vec![Line::from(line1_spans), line2])
         })
         .collect::<Vec<_>>();
-    let intranet_active = snapshot.focus == Focus::Groups
-        && snapshot.left_pane_section == LeftPaneSection::Intranet;
+
+    let intranet_active = snapshot.focus == Focus::Groups;
     let intranet_block = Block::default()
-        .title("Intranet Proxy")
+        .title(" Private Access · Profiles ")
         .borders(Borders::ALL)
-        .border_style(border_style(intranet_active));
-    let intranet_widget = List::new(profiles)
-        .block(intranet_block)
-        .highlight_style(selected_style(intranet_active))
-        .highlight_symbol("> ");
-    let mut intranet_state = ListState::default().with_selected(
-        (snapshot.left_pane_section == LeftPaneSection::Intranet)
-            .then_some(snapshot.intranet_selected),
-    );
+        .border_style(if intranet_active {
+            Style::default().fg(theme.border_focus())
+        } else {
+            Style::default().fg(theme.border_default())
+        });
+    let intranet_widget = List::new(profiles).block(intranet_block);
+    let mut intranet_state = ListState::default().with_selected(Some(snapshot.intranet_selected));
     frame.render_stateful_widget(intranet_widget, intranet_area, &mut intranet_state);
 
     if let Some(detail) = snapshot.intranet_detail.as_ref() {
@@ -838,12 +896,13 @@ fn render_intranet_workspace(
                 .expanded_sections
                 .contains(&format!("{}:{}", profile.id, section.key()))
         });
+        let title = if detail.scroll == 0 {
+            format!(" Private Access: {} ", profile.id)
+        } else {
+            format!(" Private Access: {} [line {}] ", profile.id, detail.scroll + 1)
+        };
         let details_block = Block::default()
-            .title(if detail.scroll == 0 {
-                format!("Intranet: {}", profile.id)
-            } else {
-                format!("Intranet: {} [line {}]", profile.id, detail.scroll + 1)
-            })
+            .title(title)
             .borders(Borders::ALL)
             .border_style(if detail.active {
                 Style::default().fg(theme.border_focus())
@@ -852,35 +911,123 @@ fn render_intranet_workspace(
             });
         let details_inner = details_block.inner(details_area);
         frame.render_widget(details_block, details_area);
-        let [details_content_area, footer_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(details_inner);
         let details = Paragraph::new(detail_view.lines)
             .wrap(Wrap { trim: false })
             .scroll((detail.scroll, 0));
-        frame.render_widget(details, details_content_area);
+        frame.render_widget(details, details_inner);
+    } else {
+        let empty_block = Block::default()
+            .title(" Private Access Detail ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_default()));
+        let empty_inner = empty_block.inner(details_area);
+        frame.render_widget(empty_block, details_area);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "j/k scroll  Enter expand/fold  V connect/disconnect  o configure",
-                theme.style_muted(),
-            ))),
-            footer_area,
+            Paragraph::new("No profile selected").style(theme.style_muted()),
+            empty_inner,
         );
     }
 
-    let help =
-        Paragraph::new(status_lines).block(Block::default().title("Status").borders(Borders::ALL));
-    frame.render_widget(help, status_area);
-    frame.render_widget(Paragraph::new(status_footer), status_footer_area);
+    if footer_area.height == 0 {
+        return;
+    }
 
     if let StatusFooter::Filter(input) = &snapshot.status.footer {
-        let cursor_x = status_area
+        let spans = vec![
+            Span::styled("Filter: ", theme.style_breadcrumb()),
+            Span::styled(input.clone(), theme.style_base()),
+            Span::raw("   "),
+            Span::styled("[Enter]", theme.style_footer_keys()),
+            Span::raw(" "),
+            Span::styled("Confirm", theme.style_muted()),
+            Span::raw("  "),
+            Span::styled("[Esc]", theme.style_footer_keys()),
+            Span::raw(" "),
+            Span::styled("Clear", theme.style_muted()),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+
+        let cursor_x = footer_area
             .x
-            .saturating_add(1)
             .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
             .saturating_add(unicode_width::UnicodeWidthStr::width(input.as_str()) as u16);
-        let cursor_y = status_area.y.saturating_add(status_line_count);
-        frame.set_cursor_position((cursor_x, cursor_y));
+        frame.set_cursor_position((cursor_x, footer_area.y));
+        return;
     }
+
+    let left_spans = vec![
+        Span::styled("[Tab]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Internet →", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[V]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Connect/Disconnect", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[j/k]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Navigate", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[Enter]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Fold/Expand", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[o]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Settings", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[?]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Help", theme.style_muted()),
+        Span::raw("   "),
+        Span::styled("[Ctrl+K]", theme.style_footer_keys()),
+        Span::raw(" "),
+        Span::styled("Actions", theme.style_muted()),
+    ];
+
+    let mut right_spans = Vec::new();
+    if let StatusFooter::Status(msg) = &snapshot.status.footer {
+        if !msg.is_empty() {
+            let msg_style = if msg == "ready" {
+                theme.style_muted()
+            } else {
+                theme.style_warning()
+            };
+            right_spans.push(Span::styled(msg.clone(), msg_style));
+            right_spans.push(Span::raw("  "));
+        }
+    }
+    let connected_count = snapshot
+        .intranet_rows
+        .iter()
+        .filter(|r| matches!(r.state, PrivateAccessState::Connected))
+        .count();
+    if connected_count > 0 {
+        right_spans.push(Span::styled(
+            format!("{connected_count} CONNECTED"),
+            theme.style_success(),
+        ));
+    } else {
+        right_spans.push(Span::styled("DISCONNECTED", theme.style_muted()));
+    }
+
+    let total_right: usize = right_spans
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let right_width = (total_right as u16).min(footer_area.width);
+    let left_width = footer_area.width.saturating_sub(right_width);
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Length(left_width),
+        Constraint::Min(right_width),
+    ])
+    .areas(footer_area);
+
+    frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(right_spans)).alignment(ratatui::layout::Alignment::Right),
+        right_area,
+    );
 }
 
 fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>> {
