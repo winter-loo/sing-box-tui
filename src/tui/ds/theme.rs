@@ -62,6 +62,10 @@ impl Default for Theme {
 
 #[allow(dead_code)]
 impl Theme {
+    pub(crate) fn detect() -> Self {
+        Self::default()
+    }
+
     pub(crate) fn new(capability: ColorCapability) -> Self {
         Self { capability }
     }

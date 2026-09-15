@@ -150,15 +150,33 @@ pub(crate) fn render_top_header(
     }
 }
 
-/// Renders the canonical breadcrumb header according to Figma Components (828:2)
+/// Renders the canonical breadcrumb header according to Figma Components (830:4 / 828:2)
 /// e.g. "DASHBOARD / AirTCP / JP-Edge-03"
-#[allow(dead_code)]
+/// Features:
+/// - Unbordered, clean minimalist navigation
+/// - Horizontal optical padding (12px / ~1.5 columns -> pad_x: 1)
+/// - Slash delimiters (" / ") styled in muted tone
+/// - Segment labels styled in bold accent cyan
 pub(crate) fn render_breadcrumb(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     segments: &[&str],
 ) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme.style_base()), area);
+
+    let pad_x = if area.width > 2 { 1 } else { 0 };
+    let text_area = Rect::new(
+        area.x + pad_x,
+        area.y,
+        area.width.saturating_sub(pad_x * 2),
+        1.min(area.height),
+    );
+
     let mut spans = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
@@ -167,7 +185,7 @@ pub(crate) fn render_breadcrumb(
         spans.push(Span::styled(*seg, theme.style_breadcrumb()));
     }
     let p = Paragraph::new(Line::from(spans)).style(theme.style_base());
-    frame.render_widget(p, area);
+    frame.render_widget(p, text_area);
 }
 
 /// Renders the one-line footer: shortcuts left-aligned, status right-aligned
@@ -388,6 +406,39 @@ mod tests {
         assert!(t.contains("TUN: [OFF]"));
         assert!(t.contains("SYS PROXY: [ON]"));
         assert!(t.contains("CLASH: [GLOBAL]"));
+    }
+
+    #[test]
+    fn breadcrumb_renders_unbordered_slash_delimited_with_padding() {
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        terminal
+            .draw(|f| {
+                render_breadcrumb(f, f.area(), &theme, &["DASHBOARD", "AirTCP", "JP-Edge-03"]);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let t = buffer_to_text(buffer);
+        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
+        // Left padding: x=0 is empty
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        // First character starts at x=1
+        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        // No outer borders or frames
+        for y in 0..2 {
+            for x in 0..120 {
+                let sym = buffer[(x, y)].symbol();
+                assert_ne!(sym, "┌");
+                assert_ne!(sym, "┐");
+                assert_ne!(sym, "─");
+                assert_ne!(sym, "│");
+                assert_ne!(sym, "└");
+                assert_ne!(sym, "┘");
+            }
+        }
     }
 }
 

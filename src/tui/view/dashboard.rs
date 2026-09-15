@@ -5,15 +5,10 @@ use crate::private_access_session::{PrivateAccessMode, PrivateAccessProfileRunti
 use crate::tui::ds::theme::Theme;
 
 pub(crate) trait ThemeExt {
-    fn detect() -> Self;
     fn style_danger(&self) -> Style;
 }
 
 impl ThemeExt for Theme {
-    fn detect() -> Self {
-        Self::default()
-    }
-
     fn style_danger(&self) -> Style {
         self.style_error()
     }

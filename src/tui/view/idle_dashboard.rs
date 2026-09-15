@@ -6,6 +6,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::ds::{render_breadcrumb, Theme};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
     now_unix_ms,
@@ -529,10 +530,26 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         return;
     }
 
-    // Top 3-row Monitoring Panel
-    panel(frame, Rect::new(0, 0, r.width, 3), " 监控 ");
-    let route_title = format!("网络 / {} / {}", snapshot.active_provider, snapshot.active_node);
-    label(frame, 1, 1, r.width.saturating_sub(2), &route_title, FG);
+    let theme = Theme::detect();
+    let provider = if snapshot.active_provider.is_empty() {
+        "AirTCP"
+    } else {
+        snapshot.active_provider
+    };
+    let node = if snapshot.active_node.is_empty() {
+        "—"
+    } else {
+        snapshot.active_node
+    };
+
+    // Canonical Figma Breadcrumb navigation (node 830:4 / 1025:3):
+    // Unbordered, 2 rows (row 0: text, row 1: breathing gap), slash-delimited with optical padding
+    render_breadcrumb(
+        frame,
+        Rect::new(0, 0, r.width, 2),
+        &theme,
+        &["DASHBOARD", provider, node],
+    );
 
     let full = r.width >= 120 && r.height >= 30;
     let with_node = r.width >= 96 && r.height >= 30;
@@ -545,12 +562,12 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
     };
 
     if with_node {
-        render_node_panel(frame, Rect::new(0, 3, left, 12), snapshot);
+        render_node_panel(frame, Rect::new(0, 2, left, 13), snapshot);
     }
     if full {
-        render_connections_panel(frame, Rect::new(0, 15, left, r.height - 16), snapshot);
+        render_connections_panel(frame, Rect::new(0, 15, left, r.height.saturating_sub(16)), snapshot);
     }
-    render_aggregate_panel(frame, Rect::new(left, 3, r.width - left, r.height - 4), snapshot);
+    render_aggregate_panel(frame, Rect::new(left, 2, r.width - left, r.height.saturating_sub(3)), snapshot);
 
     // 1-row Footer at the bottom of the screen (r.height - 1)
     let footer_y = r.height - 1;
@@ -676,8 +693,8 @@ mod tests {
         assert_eq!(buffer.area.height, 30);
 
         let t = buffer_to_text(buffer);
-        assert!(t.contains("监控"));
-        assert!(t.contains("网络 / AirTCP / JP-Edge-03"));
+        assert!(!t.contains("监控"));
+        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("代理历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("活动连接 · 1"));
@@ -699,6 +716,12 @@ mod tests {
         assert!(!t.contains("探测流量"));
         assert!(t.contains("↓3.9M/s  ↑2.1M/s"));
 
+        // Verify unbordered breadcrumb padding at row 0 and main panels at row 2
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), "┌");
+        assert_eq!(buffer[(38, 2)].symbol(), "┌");
+
         // Verify that 3-row mini Braille sparklines are rendered in node quality panel
         let mut node_panel_has_braille = false;
         for y in 4..14 {
@@ -713,7 +736,7 @@ mod tests {
         assert!(node_panel_has_braille, "Node quality panel must render mini Braille sparklines");
 
         // Verify gap between sample at minute 2 and minute 9 remains blank without interpolation
-        for y in 5..8 {
+        for y in 4..7 {
             for x in 10..14 {
                 let s = buffer[(x, y)].symbol();
                 assert_eq!(s, " ", "Expected blank gap without interpolated line at x={}, y={}", x, y);
@@ -769,6 +792,8 @@ mod tests {
         assert_eq!(buffer.area.height, 30);
 
         let t = buffer_to_text(buffer);
+        assert!(!t.contains("监控"));
+        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("代理历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("28 ms"));
@@ -776,6 +801,12 @@ mod tests {
         // Active connections table is omitted at width 96
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
+
+        // Verify breadcrumb padding and panel positions at row 2
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), "┌");
+        assert_eq!(buffer[(30, 2)].symbol(), "┌");
 
         // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
         let mut node_panel_has_braille = false;
@@ -846,6 +877,8 @@ mod tests {
         assert_eq!(buffer.area.height, 24);
 
         let t = buffer_to_text(buffer);
+        assert!(!t.contains("监控"));
+        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("代理历史 · 30 分钟"));
         // Both node quality and active connections are omitted at width 80
         assert!(!t.contains("节点质量"));
@@ -853,9 +886,11 @@ mod tests {
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
 
-        // Verify aggregate panel starts at column 0 across full width
-        assert_eq!(buffer[(0, 3)].symbol(), "┌");
-        assert_eq!(buffer[(79, 3)].symbol(), "┐");
+        // Verify breadcrumb padding and aggregate panel starts at column 0 across full width at row 2
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), "┌");
+        assert_eq!(buffer[(79, 2)].symbol(), "┐");
     }
 
     #[test]
