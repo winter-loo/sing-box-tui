@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn breadcrumb_renders_unbordered_slash_delimited_with_padding() {
-        let backend = TestBackend::new(120, 3);
+        let backend = TestBackend::new(120, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default();
 
@@ -424,24 +424,18 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let t = buffer_to_text(buffer);
         assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
-        // Top padding at row 0
+        // Optical left padding at x=0, text starts at x=1
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        // Vertically centered at row 1, with left padding at x=0
-        assert_eq!(buffer[(0, 1)].symbol(), " ");
-        assert_eq!(buffer[(1, 1)].symbol(), "D");
-        // Bottom padding at row 2
-        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), "D");
         // No outer borders or frames
-        for y in 0..3 {
-            for x in 0..120 {
-                let sym = buffer[(x, y)].symbol();
-                assert_ne!(sym, "┌");
-                assert_ne!(sym, "┐");
-                assert_ne!(sym, "─");
-                assert_ne!(sym, "│");
-                assert_ne!(sym, "└");
-                assert_ne!(sym, "┘");
-            }
+        for x in 0..120 {
+            let sym = buffer[(x, 0)].symbol();
+            assert_ne!(sym, "┌");
+            assert_ne!(sym, "┐");
+            assert_ne!(sym, "─");
+            assert_ne!(sym, "│");
+            assert_ne!(sym, "└");
+            assert_ne!(sym, "┘");
         }
     }
 }
