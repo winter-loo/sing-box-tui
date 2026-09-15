@@ -532,7 +532,7 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
 
     let theme = Theme::detect();
     let provider = if snapshot.active_provider.is_empty() {
-        "AirTCP"
+        "—"
     } else {
         snapshot.active_provider
     };
