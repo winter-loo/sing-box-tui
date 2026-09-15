@@ -170,9 +170,10 @@ pub(crate) fn render_breadcrumb(
     frame.render_widget(Block::default().style(theme.style_base()), area);
 
     let pad_x = if area.width > 2 { 1 } else { 0 };
+    let y_offset = (area.height.saturating_sub(1)) / 2;
     let text_area = Rect::new(
         area.x + pad_x,
-        area.y,
+        area.y + y_offset,
         area.width.saturating_sub(pad_x * 2),
         1.min(area.height),
     );
@@ -410,7 +411,7 @@ mod tests {
 
     #[test]
     fn breadcrumb_renders_unbordered_slash_delimited_with_padding() {
-        let backend = TestBackend::new(120, 2);
+        let backend = TestBackend::new(120, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default();
 
@@ -423,12 +424,15 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let t = buffer_to_text(buffer);
         assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
-        // Left padding: x=0 is empty
+        // Top padding at row 0
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        // First character starts at x=1
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        // Vertically centered at row 1, with left padding at x=0
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(1, 1)].symbol(), "D");
+        // Bottom padding at row 2
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
         // No outer borders or frames
-        for y in 0..2 {
+        for y in 0..3 {
             for x in 0..120 {
                 let sym = buffer[(x, y)].symbol();
                 assert_ne!(sym, "┌");

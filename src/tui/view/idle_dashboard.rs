@@ -543,10 +543,11 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
     };
 
     // Canonical Figma Breadcrumb navigation (node 830:4 / 1025:3):
-    // Unbordered, 2 rows (row 0: text, row 1: breathing gap), slash-delimited with optical padding
+    // Unbordered, 3 rows (row 0: top padding, row 1: text, row 2: bottom padding),
+    // slash-delimited with optical padding and symmetrical vertical centering
     render_breadcrumb(
         frame,
-        Rect::new(0, 0, r.width, 2),
+        Rect::new(0, 0, r.width, 3),
         &theme,
         &["DASHBOARD", provider, node],
     );
@@ -562,12 +563,12 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
     };
 
     if with_node {
-        render_node_panel(frame, Rect::new(0, 2, left, 13), snapshot);
+        render_node_panel(frame, Rect::new(0, 3, left, 12), snapshot);
     }
     if full {
         render_connections_panel(frame, Rect::new(0, 15, left, r.height.saturating_sub(16)), snapshot);
     }
-    render_aggregate_panel(frame, Rect::new(left, 2, r.width - left, r.height.saturating_sub(3)), snapshot);
+    render_aggregate_panel(frame, Rect::new(left, 3, r.width - left, r.height.saturating_sub(4)), snapshot);
 
     // 1-row Footer at the bottom of the screen (r.height - 1)
     let footer_y = r.height - 1;
@@ -716,11 +717,13 @@ mod tests {
         assert!(!t.contains("探测流量"));
         assert!(t.contains("↓3.9M/s  ↑2.1M/s"));
 
-        // Verify unbordered breadcrumb padding at row 0 and main panels at row 2
+        // Verify unbordered breadcrumb centered at row 1 with row 0 top padding and row 2 bottom padding
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 2)].symbol(), "┌");
-        assert_eq!(buffer[(38, 2)].symbol(), "┌");
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(1, 1)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_eq!(buffer[(0, 3)].symbol(), "┌");
+        assert_eq!(buffer[(38, 3)].symbol(), "┌");
 
         // Verify that 3-row mini Braille sparklines are rendered in node quality panel
         let mut node_panel_has_braille = false;
@@ -736,7 +739,7 @@ mod tests {
         assert!(node_panel_has_braille, "Node quality panel must render mini Braille sparklines");
 
         // Verify gap between sample at minute 2 and minute 9 remains blank without interpolation
-        for y in 4..7 {
+        for y in 5..8 {
             for x in 10..14 {
                 let s = buffer[(x, y)].symbol();
                 assert_eq!(s, " ", "Expected blank gap without interpolated line at x={}, y={}", x, y);
@@ -802,11 +805,13 @@ mod tests {
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
 
-        // Verify breadcrumb padding and panel positions at row 2
+        // Verify breadcrumb padding and panel positions at row 3
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 2)].symbol(), "┌");
-        assert_eq!(buffer[(30, 2)].symbol(), "┌");
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(1, 1)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_eq!(buffer[(0, 3)].symbol(), "┌");
+        assert_eq!(buffer[(30, 3)].symbol(), "┌");
 
         // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
         let mut node_panel_has_braille = false;
@@ -886,11 +891,13 @@ mod tests {
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
 
-        // Verify breadcrumb padding and aggregate panel starts at column 0 across full width at row 2
+        // Verify breadcrumb padding and aggregate panel starts at column 0 across full width at row 3
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 2)].symbol(), "┌");
-        assert_eq!(buffer[(79, 2)].symbol(), "┐");
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_eq!(buffer[(1, 1)].symbol(), "D");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_eq!(buffer[(0, 3)].symbol(), "┌");
+        assert_eq!(buffer[(79, 3)].symbol(), "┐");
     }
 
     #[test]
