@@ -245,11 +245,17 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
         return;
     };
 
-    let latency_raw = q.latest_latency.as_deref().unwrap_or("28 ms");
-    let latency_title = if latency_raw.starts_with("延迟") {
-        latency_raw.to_string()
+    let latency_val = if let Some(latest) = q.latest_latency.as_deref() {
+        latest.to_string()
+    } else if let Some(ms) = q.current_latency_ms {
+        format!("{ms} ms")
     } else {
-        format!("延迟 {latency_raw}")
+        "28 ms".to_string()
+    };
+    let latency_title = if latency_val.starts_with("延迟") {
+        latency_val
+    } else {
+        format!("延迟 {latency_val}")
     };
     let latency_age = q.latency_sample_age.as_deref().unwrap_or("刚测");
     label(f, x, y, w.saturating_sub(7), &latency_title, PINK);
@@ -523,32 +529,10 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         return;
     }
 
-    // Top 4-row Monitoring Panel
-    panel(frame, Rect::new(0, 0, r.width, 4), " 监控 ");
+    // Top 3-row Monitoring Panel
+    panel(frame, Rect::new(0, 0, r.width, 3), " 监控 ");
     let route_title = format!("网络 / {} / {}", snapshot.active_provider, snapshot.active_node);
     label(frame, 1, 1, r.width.saturating_sub(2), &route_title, FG);
-
-    let latency_raw = if let Some(lat) = snapshot.latest_latency() {
-        lat.to_string()
-    } else if let Some(q) = &snapshot.node_quality {
-        q.current_latency_ms
-            .map(|v| format!("{v} ms"))
-            .unwrap_or_else(|| "28 ms".to_string())
-    } else {
-        "28 ms".to_string()
-    };
-    let metrics_line = format!(
-        "{}     ↓ {}     ↑ {}",
-        latency_raw, snapshot.current_down_rate, snapshot.current_up_rate
-    );
-    label(
-        frame,
-        1,
-        2,
-        r.width.saturating_sub(2),
-        &metrics_line,
-        GREEN,
-    );
 
     let full = r.width >= 120 && r.height >= 30;
     let with_node = r.width >= 96 && r.height >= 30;
@@ -561,30 +545,30 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
     };
 
     if with_node {
-        render_node_panel(frame, Rect::new(0, 4, left, 12), snapshot);
+        render_node_panel(frame, Rect::new(0, 3, left, 12), snapshot);
     }
     if full {
-        render_connections_panel(frame, Rect::new(0, 16, left, r.height - 18), snapshot);
+        render_connections_panel(frame, Rect::new(0, 15, left, r.height - 16), snapshot);
     }
-    render_aggregate_panel(frame, Rect::new(left, 4, r.width - left, r.height - 6), snapshot);
+    render_aggregate_panel(frame, Rect::new(left, 3, r.width - left, r.height - 4), snapshot);
 
-    // 2-row Footer
-    label(
-        frame,
-        0,
-        r.height - 2,
-        r.width,
-        "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出",
-        A,
-    );
-    label(
-        frame,
-        0,
-        r.height - 1,
-        r.width,
-        "历史有缺测    探测流量 —",
-        MUTED,
-    );
+    // 1-row Footer at the bottom of the screen (r.height - 1)
+    let footer_y = r.height - 1;
+    let shortcuts = "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出";
+    label(frame, 0, footer_y, r.width, shortcuts, A);
+
+    let rates = format!("↓{}  ↑{}", snapshot.current_down_rate, snapshot.current_up_rate);
+    let rates_width = rates.width() as u16;
+    if r.width >= shortcuts.width() as u16 + rates_width + 2 {
+        label(
+            frame,
+            r.width.saturating_sub(rates_width),
+            footer_y,
+            rates_width,
+            &rates,
+            GREEN,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -711,11 +695,13 @@ mod tests {
         assert!(t.contains("o 设置"));
         assert!(t.contains("? 帮助"));
         assert!(t.contains("q 退出"));
-        assert!(t.contains("历史有缺测    探测流量 —"));
+        assert!(!t.contains("历史有缺测"));
+        assert!(!t.contains("探测流量"));
+        assert!(t.contains("↓3.9M/s  ↑2.1M/s"));
 
         // Verify that 3-row mini Braille sparklines are rendered in node quality panel
         let mut node_panel_has_braille = false;
-        for y in 5..14 {
+        for y in 4..14 {
             for x in 6..37 {
                 let s = buffer[(x, y)].symbol();
                 if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
@@ -727,7 +713,7 @@ mod tests {
         assert!(node_panel_has_braille, "Node quality panel must render mini Braille sparklines");
 
         // Verify gap between sample at minute 2 and minute 9 remains blank without interpolation
-        for y in 6..9 {
+        for y in 5..8 {
             for x in 10..14 {
                 let s = buffer[(x, y)].symbol();
                 assert_eq!(s, " ", "Expected blank gap without interpolated line at x={}, y={}", x, y);
@@ -793,7 +779,7 @@ mod tests {
 
         // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
         let mut node_panel_has_braille = false;
-        for y in 5..14 {
+        for y in 4..14 {
             for x in 6..29 {
                 let s = buffer[(x, y)].symbol();
                 if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
@@ -805,7 +791,7 @@ mod tests {
         assert!(node_panel_has_braille, "96x30 node quality panel must render mini Braille sparklines");
 
         // Verify connections panel is not rendered in left column below node panel
-        for y in 16..28 {
+        for y in 15..29 {
             let s = buffer[(0, y)].symbol();
             assert_ne!(s, "┌", "Active connections panel must be omitted at 96x30");
         }
@@ -868,8 +854,8 @@ mod tests {
         assert!(!t.contains("8.0 MiB/s"));
 
         // Verify aggregate panel starts at column 0 across full width
-        assert_eq!(buffer[(0, 4)].symbol(), "┌");
-        assert_eq!(buffer[(79, 4)].symbol(), "┐");
+        assert_eq!(buffer[(0, 3)].symbol(), "┌");
+        assert_eq!(buffer[(79, 3)].symbol(), "┐");
     }
 
     #[test]
