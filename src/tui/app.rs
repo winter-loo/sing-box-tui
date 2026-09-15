@@ -357,10 +357,6 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             app.open_settings_panel();
                             continue;
                         }
-                        KeyCode::Char('p') => {
-                            app.open_provider_modal();
-                            continue;
-                        }
                         KeyCode::Enter => {
                             app.active_view = ActiveView::NodeList;
                             continue;
@@ -1235,6 +1231,10 @@ impl App {
     }
 
     pub(crate) fn open_provider_modal(&mut self) {
+        if self.active_view != ActiveView::NodeList {
+            return;
+        }
+
         let is_private = self.operational_workspace == OperationalWorkspace::PrivateAccess;
         let count = if is_private {
             self.private_access.profiles.len()
@@ -2239,13 +2239,19 @@ mod navigation_tests {
             members: vec!["node-b".to_string()],
         });
 
-        // 1. Open from IdleDashboard in Internet workspace
+        // 1. IdleDashboard: p must NOT open provider modal
         app.active_view = ActiveView::IdleDashboard;
+        app.open_provider_modal();
+        assert!(app.provider_modal.is_none());
+        assert!(!app.has_active_modal());
+
+        // 2. NodeList operational workspace: open provider modal
+        app.active_view = ActiveView::NodeList;
         app.open_provider_modal();
         assert!(app.provider_modal.is_some());
         assert_eq!(
             app.provider_modal.as_ref().unwrap().origin_view,
-            ActiveView::IdleDashboard
+            ActiveView::NodeList
         );
         assert!(app.has_active_modal());
 
@@ -2272,22 +2278,22 @@ mod navigation_tests {
         assert_eq!(app.provider_modal.as_ref().unwrap().selected_index, 1);
         assert_eq!(app.group_index, 0);
 
-        // Dismiss with Esc cancels and returns to IdleDashboard
+        // Dismiss with Esc cancels and remains in NodeList
         app.handle_provider_modal_key(KeyCode::Esc).unwrap();
         assert!(app.provider_modal.is_none());
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeList);
         assert_eq!(app.group_index, 0);
 
-        // Open again, move down, and confirm with Enter -> applies selection and returns to IdleDashboard (ADR 0002)
+        // Open again, move down, and confirm with Enter -> applies selection and returns to NodeList
         app.open_provider_modal();
         app.handle_provider_modal_key(KeyCode::Char('j')).unwrap();
         app.handle_provider_modal_key(KeyCode::Enter).unwrap();
         assert!(app.provider_modal.is_none());
         assert_eq!(app.group_index, 1);
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeList);
         assert!(app.status.contains("backup-group"));
 
-        // 2. Private Access workspace modal
+        // 3. Private Access workspace modal (NodeList)
         app.set_operational_workspace(OperationalWorkspace::PrivateAccess).unwrap();
         app.private_access.profiles = vec![
             crate::private_access_session::PrivateAccessProfileRuntime::default_hillstone().unwrap(),
@@ -2317,6 +2323,7 @@ mod navigation_tests {
         assert!(app.provider_modal.is_none());
         assert_eq!(app.private_access.focused_index, 1);
         assert!(app.status.contains("sonicwall"));
+        assert_eq!(app.active_view, ActiveView::NodeList);
     }
 }
 
