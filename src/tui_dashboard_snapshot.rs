@@ -5,9 +5,9 @@ use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     ActiveConnectionSummary, ActiveNodeQualitySnapshot, CandidateNotice, CandidateRow,
     CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, IdleDashboardSnapshot,
-    InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
-    LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow, SettingsPanelSnapshot,
-    StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
+    GlobalNetworkStatus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal,
+    LatencySignalBar, LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow,
+    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
 };
 use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::ActiveQuickProbe;
@@ -603,12 +603,13 @@ impl App {
     }
 
     pub(crate) fn idle_dashboard_snapshot(&self) -> IdleDashboardSnapshot<'_> {
-        let selected_group = self.groups.get(self.group_index);
-        let active_provider = selected_group
-            .map(|g| g.name.as_str())
+        let current_route = self.current_route_target();
+        let selected_group = current_route.map(|(_, group, _)| group);
+        let active_provider = current_route
+            .map(|(provider, _, _)| provider.name.as_str())
             .unwrap_or("Internet");
-        let active_node = selected_group
-            .and_then(|g| g.current.as_deref())
+        let active_node = current_route
+            .map(|(_, _, node)| node)
             .unwrap_or("Direct");
 
         let (traffic_samples, latency_samples, route_intervals) = if let Some(store) = &self.metric_store {
@@ -653,7 +654,7 @@ impl App {
             let mut latency_points = Vec::new();
             let mut latest_sample_ts: Option<i64> = None;
             for s in latency_samples {
-                if s.node_name == active_node {
+                if s.selector == group.name && s.node_name == active_node {
                     let min = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
                     latency_points.push((min, s.latency_ms as f64));
                     latest_sample_ts = Some(s.recorded_at_ms);
@@ -732,16 +733,16 @@ impl App {
             })
             .collect();
 
-        let status_text = if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
-            "GLOBAL NET  STABLE"
+        let network_status = if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
+            GlobalNetworkStatus::Stable
         } else {
-            "GLOBAL NET  IDLE"
+            GlobalNetworkStatus::Idle
         };
 
         IdleDashboardSnapshot {
             active_provider,
             active_node,
-            status_text,
+            network_status,
             current_down_rate: &self.last_active_traffic_rate.0,
             current_up_rate: &self.last_active_traffic_rate.1,
             traffic_samples,
@@ -784,7 +785,7 @@ fn pending_candidate_marker(stage: &str, elapsed_seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::test_app;
+    use super::super::test_support::{internet_routes_app, test_app};
     use super::super::view::{CandidateTone, LatencySignalState};
     use super::{format_custom_probe_progress, pending_candidate_marker};
     use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
@@ -805,6 +806,74 @@ mod tests {
             format_custom_probe_progress(Some(&metrics), 0),
             "HTTPS 44/108 · TCP 22 3/17 · accepted 2"
         );
+    }
+
+    #[test]
+    fn idle_dashboard_follows_applied_route_instead_of_browsed_group() {
+        let mut app = internet_routes_app();
+        app.internet_route_index = 0;
+        let now_ms = crate::tui::metrics::now_unix_ms();
+        let mut store = crate::tui::metrics::MetricStore::open_in_memory().unwrap();
+        store
+            .record_latency(now_ms - 5_000, "AirTCP", "bby-2", 12)
+            .unwrap();
+        store
+            .record_latency(now_ms, "宝贝云", "bby-2", 92)
+            .unwrap();
+        app.metric_store = Some(store);
+        app.benchmark_workflow.set_reachability_assessment(
+            "宝贝云",
+            NodeReachabilityAssessment::from_attempts(
+                "bby-2".to_string(),
+                vec![ProbeOutcome::Reachable { delay_ms: 92 }],
+            ),
+        );
+
+        let snapshot = app.idle_dashboard_snapshot();
+
+        assert_eq!(snapshot.active_provider, "宝贝云");
+        assert_eq!(snapshot.active_node, "bby-2");
+        assert_eq!(
+            snapshot
+                .node_quality
+                .as_ref()
+                .and_then(|quality| quality.current_latency_ms),
+            Some(92)
+        );
+        assert!(
+            snapshot
+                .node_quality
+                .as_ref()
+                .unwrap()
+                .latency_points
+                .iter()
+                .all(|(_, latency)| *latency == 92.0)
+        );
+    }
+
+    #[test]
+    fn idle_dashboard_collection_uses_applied_route_instead_of_browsed_group() {
+        let mut app = internet_routes_app();
+        app.internet_route_index = 0;
+        app.metric_store = Some(crate::tui::metrics::MetricStore::open_in_memory().unwrap());
+        app.benchmark_workflow.set_reachability_assessment(
+            "宝贝云",
+            NodeReachabilityAssessment::from_attempts(
+                "bby-2".to_string(),
+                vec![ProbeOutcome::Reachable { delay_ms: 92 }],
+            ),
+        );
+
+        app.check_and_record_active_route();
+
+        let store = app.metric_store.as_ref().unwrap();
+        let interval = store.route_intervals().last().unwrap();
+        assert_eq!(interval.selector, "宝贝云");
+        assert_eq!(interval.node_name, "bby-2");
+        let latency = store.latency_samples().last().unwrap();
+        assert_eq!(latency.selector, "宝贝云");
+        assert_eq!(latency.node_name, "bby-2");
+        assert_eq!(latency.latency_ms, 92);
     }
 
     #[test]

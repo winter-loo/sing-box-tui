@@ -969,40 +969,45 @@ impl App {
 
     pub(crate) fn check_and_record_active_route(&mut self) {
         let now_ms = crate::tui::metrics::now_unix_ms();
-        if let Some(group) = self.selected_group().cloned() {
-            if let Some(current_node) = &group.current {
-                if let Some(store) = &mut self.metric_store {
-                    let route_changed = store
-                        .route_intervals()
+        let current_route = self
+            .current_route_target()
+            .map(|(_, group, node)| (group.name.clone(), node.to_string()));
+        if let Some((selector, current_node)) = current_route {
+            if let Some(store) = &mut self.metric_store {
+                let route_changed = store
+                    .route_intervals()
+                    .last()
+                    .map_or(true, |i| i.selector != selector || i.node_name != current_node);
+                let _ = store.record_route_switch(now_ms, &selector, &current_node);
+
+                let should_record_latency = route_changed
+                    || store
+                        .latency_samples()
                         .last()
-                        .map_or(true, |i| i.selector != group.name || i.node_name != *current_node);
-                    let _ = store.record_route_switch(now_ms, &group.name, current_node);
+                        .map_or(true, |l| (now_ms - l.recorded_at_ms) >= 10_000);
 
-                    let should_record_latency = route_changed
-                        || store.latency_samples().last().map_or(true, |l| {
-                            (now_ms - l.recorded_at_ms) >= 10_000
-                        });
-
-                    if should_record_latency {
-                        let latency_ms = self
-                            .benchmark_workflow
-                            .reachability_assessment(&group.name, current_node)
-                            .and_then(|a| {
-                                a.attempts.iter().filter_map(|att| match att {
-                                    crate::controller::ProbeOutcome::Reachable { delay_ms, .. } => {
-                                        Some(*delay_ms)
-                                    }
+                if should_record_latency {
+                    let latency_ms = self
+                        .benchmark_workflow
+                        .reachability_assessment(&selector, &current_node)
+                        .and_then(|a| {
+                            a.attempts
+                                .iter()
+                                .filter_map(|att| match att {
+                                    crate::controller::ProbeOutcome::Reachable {
+                                        delay_ms, ..
+                                    } => Some(*delay_ms),
                                     _ => None,
-                                }).last()
-                            })
-                            .or_else(|| {
-                                self.benchmark_workflow
-                                    .quick_history(&group.name, current_node)
-                                    .warm_median_ms
-                            });
-                        if let Some(ms) = latency_ms {
-                            let _ = store.record_latency(now_ms, &group.name, current_node, ms);
-                        }
+                                })
+                                .last()
+                        })
+                        .or_else(|| {
+                            self.benchmark_workflow
+                                .quick_history(&selector, &current_node)
+                                .warm_median_ms
+                        });
+                    if let Some(ms) = latency_ms {
+                        let _ = store.record_latency(now_ms, &selector, &current_node, ms);
                     }
                 }
             }

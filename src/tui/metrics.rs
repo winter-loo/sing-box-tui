@@ -6,7 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Maximum interval between samples (in ms) before considering it an observation gap.
 /// If time between two samples exceeds this, do not draw a continuous line between them.
-pub(crate) const OBSERVATION_GAP_THRESHOLD_MS: i64 = 6_000;
+pub(crate) const TRAFFIC_OBSERVATION_GAP_THRESHOLD_MS: i64 = 6_000;
+pub(crate) const LATENCY_OBSERVATION_GAP_THRESHOLD_MS: i64 = 15_000;
 
 /// Retention window for metric history (30 minutes in ms).
 pub(crate) const METRIC_RETENTION_WINDOW_MS: i64 = 30 * 60 * 1_000;
@@ -349,8 +350,14 @@ impl MetricStore {
     }
 
     /// Checks whether two consecutive sample timestamps have a missing observation gap.
-    pub(crate) fn has_gap(prev_ms: i64, next_ms: i64) -> bool {
-        (next_ms - prev_ms).abs() > OBSERVATION_GAP_THRESHOLD_MS
+    pub(crate) fn has_traffic_gap(prev_ms: i64, next_ms: i64) -> bool {
+        (next_ms - prev_ms).abs() > TRAFFIC_OBSERVATION_GAP_THRESHOLD_MS
+    }
+
+    /// Latency is sampled every ten seconds, so its continuity budget must
+    /// tolerate one normal collection interval plus scheduler jitter.
+    pub(crate) fn has_latency_gap(prev_ms: i64, next_ms: i64) -> bool {
+        (next_ms - prev_ms).abs() > LATENCY_OBSERVATION_GAP_THRESHOLD_MS
     }
 }
 
@@ -377,8 +384,10 @@ mod tests {
         assert_eq!(store.traffic_samples()[1].down_bytes_per_sec, 2048);
 
         // Gap detection
-        assert!(!MetricStore::has_gap(now, now + 1000));
-        assert!(MetricStore::has_gap(now, now + 10_000));
+        assert!(!MetricStore::has_traffic_gap(now, now + 1000));
+        assert!(MetricStore::has_traffic_gap(now, now + 10_000));
+        assert!(!MetricStore::has_latency_gap(now, now + 10_000));
+        assert!(MetricStore::has_latency_gap(now, now + 20_000));
     }
 
     #[test]

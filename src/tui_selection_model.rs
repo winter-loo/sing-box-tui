@@ -42,30 +42,33 @@ impl App {
     }
 
     pub(super) fn current_route_labels(&self) -> (String, String) {
+        self.current_route_target()
+            .map(|(provider, _, route_node)| (provider.name.clone(), route_node.to_string()))
+            .unwrap_or_else(|| ("—".to_string(), "—".to_string()))
+    }
+
+    pub(super) fn current_route_target(&self) -> Option<(&ProxyGroup, &ProxyGroup, &str)> {
         let provider = if let Some(root) = self.implicit_root_group() {
             root.current
                 .as_deref()
                 .and_then(|name| self.group_by_name(name))
                 .unwrap_or(root)
         } else {
-            match self.groups.get(self.group_index) {
-                Some(group) => group,
-                None => return ("—".to_string(), "—".to_string()),
-            }
+            self.groups.get(self.group_index)?
         };
 
         let mut current = provider;
-        let mut route_node = current.current.clone().unwrap_or_else(|| "—".to_string());
         let mut visited = BTreeSet::from([current.name.clone()]);
-        while let Some(next) = self.group_by_name(&route_node) {
+        loop {
+            let route_node = current.current.as_deref().unwrap_or("—");
+            let Some(next) = self.group_by_name(route_node) else {
+                return Some((provider, current, route_node));
+            };
             if !visited.insert(next.name.clone()) {
-                break;
+                return Some((provider, current, route_node));
             }
             current = next;
-            route_node = current.current.clone().unwrap_or_else(|| "—".to_string());
         }
-
-        (provider.name.clone(), route_node)
     }
 
     pub(super) fn internet_outbound_root_selector(&self) -> Option<String> {

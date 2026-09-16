@@ -2,11 +2,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::ds::{render_breadcrumb, render_unsupported_guard, Theme};
+use crate::tui::ds::{Theme, render_breadcrumb, render_unsupported_guard};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
     now_unix_ms,
@@ -43,10 +44,32 @@ pub(crate) struct ActiveConnectionSummary<'a> {
     pub(crate) rule: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlobalNetworkStatus {
+    Stable,
+    Idle,
+}
+
+impl GlobalNetworkStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "STABLE",
+            Self::Idle => "IDLE",
+        }
+    }
+
+    fn color(self, theme: &Theme) -> Color {
+        match self {
+            Self::Stable => theme.text_status_active(),
+            Self::Idle => theme.text_muted(),
+        }
+    }
+}
+
 pub(crate) struct IdleDashboardSnapshot<'a> {
     pub(crate) active_provider: &'a str,
     pub(crate) active_node: &'a str,
-    pub(crate) status_text: &'a str,
+    pub(crate) network_status: GlobalNetworkStatus,
     pub(crate) current_down_rate: &'a str,
     pub(crate) current_up_rate: &'a str,
     pub(crate) traffic_samples: &'a [TrafficSample],
@@ -59,32 +82,44 @@ pub(crate) struct IdleDashboardSnapshot<'a> {
 impl<'a> IdleDashboardSnapshot<'a> {
     #[allow(dead_code)]
     pub(crate) fn latency_history_points(&self) -> &[(f64, f64)] {
-        self.node_quality.as_ref().map_or(&[], |q| &q.latency_points)
+        self.node_quality
+            .as_ref()
+            .map_or(&[], |q| &q.latency_points)
     }
 
     #[allow(dead_code)]
     pub(crate) fn sustained_speed_history_points(&self) -> &[(f64, f64)] {
-        self.node_quality.as_ref().map_or(&[], |q| &q.sustained_points)
+        self.node_quality
+            .as_ref()
+            .map_or(&[], |q| &q.sustained_points)
     }
 
     #[allow(dead_code)]
     pub(crate) fn latest_latency(&self) -> Option<&str> {
-        self.node_quality.as_ref().and_then(|q| q.latest_latency.as_deref())
+        self.node_quality
+            .as_ref()
+            .and_then(|q| q.latest_latency.as_deref())
     }
 
     #[allow(dead_code)]
     pub(crate) fn latency_sample_age(&self) -> Option<&str> {
-        self.node_quality.as_ref().and_then(|q| q.latency_sample_age.as_deref())
+        self.node_quality
+            .as_ref()
+            .and_then(|q| q.latency_sample_age.as_deref())
     }
 
     #[allow(dead_code)]
     pub(crate) fn latest_sustained_speed(&self) -> Option<&str> {
-        self.node_quality.as_ref().and_then(|q| q.latest_sustained_speed.as_deref())
+        self.node_quality
+            .as_ref()
+            .and_then(|q| q.latest_sustained_speed.as_deref())
     }
 
     #[allow(dead_code)]
     pub(crate) fn sustained_sample_age(&self) -> Option<&str> {
-        self.node_quality.as_ref().and_then(|q| q.sustained_sample_age.as_deref())
+        self.node_quality
+            .as_ref()
+            .and_then(|q| q.sustained_sample_age.as_deref())
     }
 }
 
@@ -118,11 +153,26 @@ fn panel(f: &mut Frame, r: Rect, title: &str, theme: &Theme) {
     if r.width == 0 || r.height == 0 {
         return;
     }
+    surface(f, r, theme);
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_default()))
             .title(title),
+        r,
+    );
+}
+
+fn surface(f: &mut Frame, r: Rect, theme: &Theme) {
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Block::default().style(
+            Style::default()
+                .bg(theme.bg_surface())
+                .fg(theme.text_primary()),
+        ),
         r,
     );
 }
@@ -195,13 +245,7 @@ fn segment_sparkline_series(
     segments
 }
 
-fn plot_braille_sparklines(
-    f: &mut Frame,
-    r: Rect,
-    points: &[(f64, f64)],
-    color: Color,
-    max: f64,
-) {
+fn plot_braille_sparklines(f: &mut Frame, r: Rect, points: &[(f64, f64)], color: Color, max: f64) {
     if r.width == 0 || r.height == 0 || points.is_empty() {
         return;
     }
@@ -226,39 +270,41 @@ fn plot_braille_sparklines(
     );
 }
 
-fn render_node_panel(
-    f: &mut Frame,
-    r: Rect,
-    snapshot: &IdleDashboardSnapshot<'_>,
-    theme: &Theme,
-) {
-    panel(f, r, " 节点质量 ", theme);
+fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>, theme: &Theme) {
+    surface(f, r, theme);
     let x = r.x + 1;
     let w = r.width.saturating_sub(2);
-    let y = r.y + 1;
+    let y = r.y;
+
+    label(
+        f,
+        x,
+        y,
+        w,
+        &format!("节点质量 · {}", snapshot.active_node),
+        theme.text_secondary(),
+    );
 
     let Some(q) = &snapshot.node_quality else {
-        label(f, x, y, w, "无节点数据", theme.text_muted());
+        label(f, x, y + 2, w, "无节点数据", theme.text_muted());
         return;
     };
 
-    let latency_val = if let Some(latest) = q.latest_latency.as_deref() {
-        latest.to_string()
-    } else if let Some(ms) = q.current_latency_ms {
-        format!("{ms} ms")
-    } else {
-        "28 ms".to_string()
-    };
+    let latency_val = q
+        .latest_latency
+        .clone()
+        .or_else(|| q.current_latency_ms.map(|ms| format!("{ms} ms")))
+        .unwrap_or_else(|| "—".to_string());
     let latency_title = if latency_val.starts_with("延迟") {
         latency_val
     } else {
         format!("延迟 {latency_val}")
     };
-    let latency_age = q.latency_sample_age.as_deref().unwrap_or("刚测");
+    let latency_age = q.latency_sample_age.as_deref().unwrap_or("—");
     label(
         f,
         x,
-        y,
+        y + 2,
         w.saturating_sub(7),
         &latency_title,
         theme.text_latency(),
@@ -266,33 +312,46 @@ fn render_node_panel(
     label(
         f,
         x + w.saturating_sub(7),
-        y,
+        y + 2,
         7,
         latency_age,
         theme.text_muted(),
     );
-    label(f, x, y + 1, 4, "120", theme.text_muted());
-    label(f, x, y + 3, 4, "0", theme.text_muted());
+    label(f, x, y + 3, 4, "120", theme.text_muted());
+    label(f, x, y + 6, 4, "0", theme.text_muted());
 
     plot_braille_sparklines(
         f,
-        Rect::new(x + 5, y + 1, w.saturating_sub(5), 3),
+        Rect::new(x + 5, y + 3, w.saturating_sub(5), 4),
         &q.latency_points,
         theme.text_latency(),
         120.,
     );
+    label(f, x + 5, y + 7, 4, "-30m", theme.text_muted());
+    label(
+        f,
+        x + w.saturating_sub(4),
+        y + 7,
+        4,
+        "现在",
+        theme.text_muted(),
+    );
 
-    let speed_raw = q.latest_sustained_speed.as_deref().unwrap_or("8.0 MiB/s");
+    let speed_raw = q
+        .latest_sustained_speed
+        .as_deref()
+        .or(q.sustained_speed_label.as_deref())
+        .unwrap_or("—");
     let speed_title = if speed_raw.starts_with("实测") {
         speed_raw.to_string()
     } else {
         format!("实测 {speed_raw}")
     };
-    let speed_age = q.sustained_sample_age.as_deref().unwrap_or("2分钟前");
+    let speed_age = q.sustained_sample_age.as_deref().unwrap_or("—");
     label(
         f,
         x,
-        y + 4,
+        y + 9,
         w.saturating_sub(7),
         &speed_title,
         theme.text_success(),
@@ -300,25 +359,31 @@ fn render_node_panel(
     label(
         f,
         x + w.saturating_sub(7),
-        y + 4,
+        y + 9,
         7,
         speed_age,
         theme.text_muted(),
     );
-    label(f, x, y + 5, 4, "10", theme.text_muted());
-    label(f, x, y + 7, 4, "0", theme.text_muted());
+    label(f, x, y + 10, 4, "10", theme.text_muted());
+    label(f, x, y + 13, 4, "0", theme.text_muted());
 
     plot_braille_sparklines(
         f,
-        Rect::new(x + 5, y + 5, w.saturating_sub(5), 3),
+        Rect::new(x + 5, y + 10, w.saturating_sub(5), 4),
         &q.sustained_points,
         theme.text_success(),
         10.,
     );
 
-    label(f, x + 5, y + 8, 4, "-30m", theme.text_muted());
-    label(f, x + w.saturating_sub(4), y + 8, 4, "现在", theme.text_muted());
-    label(f, x, y + 9, w, "仅显示已有采样", theme.text_muted());
+    label(f, x + 5, y + 14, 4, "-30m", theme.text_muted());
+    label(
+        f,
+        x + w.saturating_sub(4),
+        y + 14,
+        4,
+        "现在",
+        theme.text_muted(),
+    );
 }
 
 fn render_connections_panel(
@@ -350,7 +415,12 @@ fn render_connections_panel(
 
     let max_rows = usize::from(r.height.saturating_sub(4));
     let mut shown = 0;
-    for (i, conn) in snapshot.active_connections.iter().take(max_rows).enumerate() {
+    for (i, conn) in snapshot
+        .active_connections
+        .iter()
+        .take(max_rows)
+        .enumerate()
+    {
         shown += 1;
         label(
             f,
@@ -388,18 +458,24 @@ fn render_aggregate_panel(
     snapshot: &IdleDashboardSnapshot<'_>,
     theme: &Theme,
 ) {
-    panel(f, r, " 代理历史 · 30 分钟 ", theme);
-    let x = r.x + 1;
-    let w = r.width.saturating_sub(2);
-    let top = r.y + 1;
-    if r.height < 14 {
+    surface(f, r, theme);
+    let x = r.x + 2;
+    let w = r.width.saturating_sub(4);
+    let top = r.y;
+    if r.height < 20 || w < 12 {
         return;
     }
-    let ph = (r.height - 12) / 2;
-    let px = x + 8;
-    let pw = w.saturating_sub(8);
-    let py = top + 3;
-    let ty = py + ph + 2;
+    label(f, x, top, w, "核心历史 · 30 分钟", theme.text_secondary());
+
+    let plot_height = (r.height - 12) / 2;
+    let plot_x = x + 4;
+    let plot_width = w.saturating_sub(4);
+    let latency_title_y = top + 4;
+    let latency_plot_y = latency_title_y + 1;
+    let latency_axis_y = latency_plot_y + plot_height;
+    let traffic_title_y = latency_axis_y + 3;
+    let traffic_plot_y = traffic_title_y + 1;
+    let traffic_axis_y = traffic_plot_y + plot_height;
 
     let now_ms = now_unix_ms();
     let cutoff_ms = now_ms.saturating_sub(METRIC_RETENTION_WINDOW_MS);
@@ -410,30 +486,76 @@ fn render_aggregate_panel(
             let start_ms = interval.started_at_ms.max(cutoff_ms);
             let minute = ((start_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
             let color = theme.route_color(interval.interval_index);
-            let bx = px + ((f64::from(pw.saturating_sub(1)) * (minute / 30.0)).round() as u16);
-            let rem_w = (px + pw).saturating_sub(bx).min(14);
+            let bx = plot_x
+                + ((f64::from(plot_width.saturating_sub(1)) * (minute / 30.0)).round()
+                    as u16);
+            let rem_w = (plot_x + plot_width).saturating_sub(bx).min(14);
             if rem_w > 0 {
-                label(f, bx, top + 1, rem_w, &interval.node_name, color);
+                label(f, bx, top + 2, rem_w, &interval.node_name, color);
             }
         }
     } else {
         label(
             f,
-            px,
-            top + 1,
-            pw.min(14),
+            plot_x,
+            top + 2,
+            plot_width.min(14),
             snapshot.active_node,
             theme.route_color(0),
         );
     }
 
-    label(f, x, top + 2, w, "延迟 · ms", theme.text_primary());
-    label(f, x, py, 7, "120", theme.text_muted());
-    label(f, x, py + ph - 1, 7, "0", theme.text_muted());
-    label(f, x, py + ph, w, "吞吐 ≈ · MiB/s", theme.text_primary());
-    label(f, x, py + ph + 1, w, "↓ 线   ↑ 点", theme.text_primary());
-    label(f, x, ty, 7, "10", theme.text_muted());
-    label(f, x, ty + ph - 1, 7, "0", theme.text_muted());
+    label(f, x, latency_title_y, w, "延迟 · ms", theme.text_muted());
+    let latest_latency = snapshot
+        .latency_samples
+        .last()
+        .map(|sample| sample.latency_ms)
+        .or_else(|| snapshot.node_quality.as_ref()?.current_latency_ms);
+    if let Some(latency_ms) = latest_latency {
+        let value = latency_ms.to_string();
+        label(
+            f,
+            x + w.saturating_sub(value.width() as u16),
+            latency_title_y,
+            value.width() as u16,
+            &value,
+            theme.text_muted(),
+        );
+    }
+    label(f, x, latency_plot_y, 3, "120", theme.text_muted());
+    label(
+        f,
+        x + 2,
+        latency_plot_y + plot_height - 1,
+        1,
+        "0",
+        theme.text_muted(),
+    );
+    label(
+        f,
+        x,
+        traffic_title_y,
+        w,
+        "核心流量 · MiB/s",
+        theme.text_muted(),
+    );
+    label(
+        f,
+        x + w.saturating_sub(12),
+        traffic_title_y,
+        12,
+        "↓ 线   ↑ 点",
+        theme.text_muted(),
+    );
+    label(f, x + 1, traffic_plot_y, 2, "10", theme.text_muted());
+    label(
+        f,
+        x + 2,
+        traffic_plot_y + plot_height - 1,
+        1,
+        "0",
+        theme.text_muted(),
+    );
 
     // Group latency samples into continuous segments
     let mut latency_series: Vec<Vec<(f64, f64)>> = Vec::new();
@@ -462,7 +584,7 @@ fn render_aggregate_panel(
                 }
             }
 
-            let gap = last_ts > 0 && MetricStore::has_gap(last_ts, s.recorded_at_ms);
+            let gap = last_ts > 0 && MetricStore::has_latency_gap(last_ts, s.recorded_at_ms);
             let switched = last_ts > 0 && idx != cur_idx;
 
             if (gap || switched) && !cur_seg.is_empty() {
@@ -494,7 +616,7 @@ fn render_aggregate_panel(
     if !latency_series.is_empty() {
         plot(
             f,
-            Rect::new(px, py, pw, ph),
+            Rect::new(plot_x, latency_plot_y, plot_width, plot_height),
             &latency_series,
             &latency_colors,
             &latency_kinds,
@@ -531,7 +653,7 @@ fn render_aggregate_panel(
                 }
             }
 
-            let gap = last_ts > 0 && MetricStore::has_gap(last_ts, s.recorded_at_ms);
+            let gap = last_ts > 0 && MetricStore::has_traffic_gap(last_ts, s.recorded_at_ms);
             let switched = last_ts > 0 && idx != cur_idx;
 
             if (gap || switched) && !down_seg.is_empty() {
@@ -574,7 +696,7 @@ fn render_aggregate_panel(
     if !traffic_series.is_empty() {
         plot(
             f,
-            Rect::new(px, ty, pw, ph),
+            Rect::new(plot_x, traffic_plot_y, plot_width, plot_height),
             &traffic_series,
             &traffic_colors,
             &traffic_kinds,
@@ -582,32 +704,101 @@ fn render_aggregate_panel(
         );
     }
 
-    let axis = ty + ph;
-    if pw > 0 {
-        label(
-            f,
-            px,
-            axis,
-            pw,
-            &"─".repeat(usize::from(pw)),
-            theme.text_muted(),
-        );
-        for (fraction, text) in [(0., "-30m"), (0.5, "-15m"), (1., "现在")] {
-            let offset = ((f64::from(pw.saturating_sub(1)) * fraction).round() as u16)
-                .min(pw.saturating_sub(text.width() as u16));
+    if plot_width > 0 {
+        for axis in [latency_axis_y, traffic_axis_y] {
             label(
                 f,
-                px + offset,
-                axis + 1,
-                text.width() as u16,
-                text,
+                plot_x,
+                axis,
+                plot_width,
+                &"─".repeat(usize::from(plot_width)),
                 theme.text_muted(),
             );
+            for (fraction, text) in [(0., "-30m"), (0.5, "-15m"), (1., "现在")] {
+                let offset =
+                    ((f64::from(plot_width.saturating_sub(1)) * fraction).round() as u16)
+                        .min(plot_width.saturating_sub(text.width() as u16));
+                label(
+                    f,
+                    plot_x + offset,
+                    axis + 1,
+                    text.width() as u16,
+                    text,
+                    theme.text_muted(),
+                );
+            }
         }
     }
 }
 
-/// Main entry point for rendering the Idle Dashboard (120x30 Canonical, 96x30, or 80x24 Compact)
+#[derive(Clone, Copy, Debug)]
+struct IdleDashboardLayout {
+    node: Option<Rect>,
+    connections: Option<Rect>,
+    aggregate: Rect,
+}
+
+impl IdleDashboardLayout {
+    const HEADER_HEIGHT: u16 = 2;
+    const FOOTER_HEIGHT: u16 = 2;
+    const MAX_CONTENT_WIDTH: u16 = 144;
+    const MAX_CONTENT_HEIGHT: u16 = 30;
+
+    fn from_area(area: Rect) -> Self {
+        let body_y = area.y + Self::HEADER_HEIGHT;
+        let body_height = area
+            .height
+            .saturating_sub(Self::HEADER_HEIGHT + Self::FOOTER_HEIGHT);
+        let content_width = area.width.saturating_sub(2).min(Self::MAX_CONTENT_WIDTH);
+        let content_height = body_height.min(Self::MAX_CONTENT_HEIGHT);
+        let content = Rect::new(
+            area.x + (area.width.saturating_sub(content_width)) / 2,
+            body_y + (body_height.saturating_sub(content_height)) / 2,
+            content_width,
+            content_height,
+        );
+
+        let full = content.width >= 118 && content.height >= 26;
+        let with_node = content.width >= 94 && content.height >= 20;
+        if !with_node {
+            return Self {
+                node: None,
+                connections: None,
+                aggregate: content,
+            };
+        }
+
+        let left_width = if full {
+            ((u32::from(content.width) * 37 + 59) / 118) as u16
+        } else {
+            30
+        }
+        .clamp(30, 42);
+        let aggregate = Rect::new(
+            content.x + left_width + 1,
+            content.y,
+            content.width.saturating_sub(left_width + 1),
+            content.height,
+        );
+        let node = Some(Rect::new(content.x, content.y, left_width, 15));
+        let connections = full.then(|| {
+            Rect::new(
+                content.x,
+                content.y + 16,
+                left_width,
+                content.height.saturating_sub(16),
+            )
+        });
+
+        Self {
+            node,
+            connections,
+            aggregate,
+        }
+    }
+}
+
+/// Main entry point for rendering the Idle Dashboard from the available terminal-cell budget.
 pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardSnapshot<'_>) {
     let r = frame.area();
     let theme = Theme::detect();
@@ -637,77 +828,85 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         &theme,
         &["DASHBOARD", provider, node],
     );
-
-    let full = r.width >= 120 && r.height >= 30;
-    let with_node = r.width >= 96 && r.height >= 30;
-    let left = if full {
-        38
-    } else if with_node {
-        30
-    } else {
-        0
-    };
-
-    if with_node {
-        render_node_panel(frame, Rect::new(0, 1, left, 14), snapshot, &theme);
-    }
-    if full {
-        render_connections_panel(
-            frame,
-            Rect::new(0, 15, left, r.height.saturating_sub(16)),
-            snapshot,
-            &theme,
-        );
-    }
-    render_aggregate_panel(
-        frame,
-        Rect::new(left, 1, r.width - left, r.height.saturating_sub(2)),
-        snapshot,
-        &theme,
-    );
-
-    // 1-row Footer at the bottom of the screen (r.height - 1)
-    let footer_y = r.height - 1;
-    let shortcuts = if r.width >= 96 {
-        "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出"
-    } else {
-        "Ctrl+K  c 连接  i 节点  ? 帮助  q 退出"
-    };
-    let shortcuts_width = shortcuts.width() as u16;
     label(
         frame,
         0,
+        1,
+        r.width,
+        &"─".repeat(usize::from(r.width)),
+        theme.border_default(),
+    );
+
+    let layout = IdleDashboardLayout::from_area(r);
+    if let Some(node_area) = layout.node {
+        render_node_panel(frame, node_area, snapshot, &theme);
+    }
+    if let Some(connections_area) = layout.connections {
+        render_connections_panel(frame, connections_area, snapshot, &theme);
+    }
+    render_aggregate_panel(frame, layout.aggregate, snapshot, &theme);
+
+    let footer_rule_y = r.height - 2;
+    let footer_y = r.height - 1;
+    label(
+        frame,
+        0,
+        footer_rule_y,
+        r.width,
+        &"─".repeat(usize::from(r.width)),
+        theme.border_default(),
+    );
+
+    let rates_str = format!(
+        "↓{}  ↑{}",
+        snapshot.current_down_rate, snapshot.current_up_rate
+    );
+    let status_str = format!("GLOBAL NET  {}  {}", snapshot.network_status.label(), rates_str);
+    let status_width = status_str.width() as u16;
+    let shortcut_candidates = [
+        "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出",
+        "Ctrl+K  c 连接  i 节点  o 设置  ?  q",
+        "Ctrl+K  c  i  o  ?  q",
+    ];
+    let shortcut_budget = r.width.saturating_sub(status_width + 3);
+    let shortcuts = shortcut_candidates
+        .into_iter()
+        .find(|candidate| candidate.width() as u16 <= shortcut_budget)
+        .unwrap_or("Ctrl+K  ?  q");
+    let shortcuts_width = shortcuts.width() as u16;
+    label(
+        frame,
+        1,
         footer_y,
         shortcuts_width,
         shortcuts,
         theme.text_accent(),
     );
-
-    // Global system status in the bottom-right corner per Figma (nodes 1036:8 / 1025:6 / 1036:10):
-    // e.g. "GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"
-    let rates_str = format!("↓{}  ↑{}", snapshot.current_down_rate, snapshot.current_up_rate);
-    let (status_str, status_width) = if !snapshot.status_text.is_empty() {
-        let full = format!("{}  {}", snapshot.status_text, rates_str);
-        let w = full.width() as u16;
-        if r.width >= shortcuts_width + w + 1 {
-            (full, w)
-        } else {
-            let rw = rates_str.width() as u16;
-            (rates_str, rw)
-        }
-    } else {
-        let rw = rates_str.width() as u16;
-        (rates_str, rw)
-    };
-
-    if r.width >= shortcuts_width + status_width + 1 {
-        label(
-            frame,
-            r.width.saturating_sub(status_width),
-            footer_y,
-            status_width,
-            &status_str,
-            theme.text_success(),
+    if r.width >= shortcuts_width + status_width + 3 {
+        let mut status_spans = Vec::new();
+        status_spans.push(Span::styled("GLOBAL NET  ", theme.style_muted()));
+        status_spans.push(Span::styled(
+            snapshot.network_status.label(),
+            Style::default().fg(snapshot.network_status.color(&theme)),
+        ));
+        status_spans.push(Span::raw("  "));
+        status_spans.push(Span::styled(
+            format!("↓{}", snapshot.current_down_rate),
+            Style::default().fg(theme.text_transfer()),
+        ));
+        status_spans.push(Span::raw("  "));
+        status_spans.push(Span::styled(
+            format!("↑{}", snapshot.current_up_rate),
+            Style::default().fg(theme.text_transfer()),
+        ));
+        frame.render_widget(
+            Paragraph::new(Line::from(status_spans)),
+            Rect::new(
+                r.width.saturating_sub(status_width + 1),
+                footer_y,
+                status_width,
+                1,
+            ),
         );
     }
 }
@@ -715,8 +914,8 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn buffer_to_text(b: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
@@ -739,12 +938,12 @@ mod tests {
 
         let traffic = vec![
             TrafficSample {
-                recorded_at_ms: now_unix_ms() - 100_000,
+                recorded_at_ms: now_unix_ms() - 25 * 60_000,
                 down_bytes_per_sec: 2_000_000,
                 up_bytes_per_sec: 1_000_000,
             },
             TrafficSample {
-                recorded_at_ms: now_unix_ms(),
+                recorded_at_ms: now_unix_ms() - 5 * 60_000,
                 down_bytes_per_sec: 3_900_000,
                 up_bytes_per_sec: 2_100_000,
             },
@@ -752,13 +951,13 @@ mod tests {
 
         let latency = vec![
             LatencySample {
-                recorded_at_ms: now_unix_ms() - 100_000,
+                recorded_at_ms: now_unix_ms() - 25 * 60_000,
                 selector: "Proxy".to_string(),
                 node_name: "JP-Edge-03".to_string(),
                 latency_ms: 28,
             },
             LatencySample {
-                recorded_at_ms: now_unix_ms(),
+                recorded_at_ms: now_unix_ms() - 5 * 60_000,
                 selector: "Proxy".to_string(),
                 node_name: "JP-Edge-03".to_string(),
                 latency_ms: 26,
@@ -777,7 +976,7 @@ mod tests {
         let snapshot = IdleDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            status_text: "GLOBAL NET  STABLE",
+            network_status: GlobalNetworkStatus::Stable,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &traffic,
@@ -811,7 +1010,9 @@ mod tests {
             }],
         };
 
-        terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 120);
         assert_eq!(buffer.area.height, 30);
@@ -819,7 +1020,7 @@ mod tests {
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("代理历史 · 30 分钟"));
+        assert!(t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("活动连接 · 1"));
         assert!(t.contains("chat.openai.com"));
@@ -829,7 +1030,6 @@ mod tests {
         assert!(t.contains("8.0 MiB/s"));
         assert!(t.contains("刚测"));
         assert!(t.contains("2分钟前"));
-        assert!(t.contains("仅显示已有采样"));
         assert!(t.contains("Ctrl+K 导航"));
         assert!(t.contains("c 连接"));
         assert!(t.contains("i 节点"));
@@ -840,16 +1040,23 @@ mod tests {
         assert!(!t.contains("探测流量"));
         assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
-        // Verify unbordered breadcrumb at row 0 and main panels at row 1
+        // Figma 1025:2 maps its 8x16 design grid to terminal cells: the body has
+        // one-cell outer gutters, a 37-cell left rail, a one-cell panel gap,
+        // and an 80-cell global-history surface.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(38, 1)].symbol(), "┌");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_ne!(buffer[(1, 2)].symbol(), "┌");
+        assert_ne!(buffer[(39, 2)].symbol(), "┌");
+        assert_eq!(buffer[(41, 2)].symbol(), "核");
+        assert_eq!(buffer[(1, 18)].symbol(), "┌");
+        assert_eq!(buffer[(38, 18)].symbol(), " ");
+        assert_eq!(buffer[(119, 18)].symbol(), " ");
 
         // Verify that 3-row mini Braille sparklines are rendered in node quality panel
         let mut node_panel_has_braille = false;
-        for y in 3..14 {
-            for x in 6..37 {
+        for y in 4..17 {
+            for x in 7..37 {
                 let s = buffer[(x, y)].symbol();
                 if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
                     node_panel_has_braille = true;
@@ -857,13 +1064,34 @@ mod tests {
                 }
             }
         }
-        assert!(node_panel_has_braille, "Node quality panel must render mini Braille sparklines");
+        assert!(
+            node_panel_has_braille,
+            "Node quality panel must render mini Braille sparklines"
+        );
 
         // Verify gap between sample at minute 2 and minute 9 remains blank without interpolation
-        for y in 3..6 {
-            for x in 10..14 {
+        for y in 5..8 {
+            for x in 11..15 {
                 let s = buffer[(x, y)].symbol();
-                assert_eq!(s, " ", "Expected blank gap without interpolated line at x={}, y={}", x, y);
+                assert_eq!(
+                    s, " ",
+                    "Expected blank gap without interpolated line at x={}, y={}",
+                    x, y
+                );
+            }
+        }
+
+        // The two global samples are twenty minutes apart. Both charts must
+        // retain the missing interval instead of drawing across it.
+        for y in (7..14).chain(18..25) {
+            for x in 75..91 {
+                let symbol = buffer[(x, y)].symbol();
+                assert!(
+                    !symbol
+                        .chars()
+                        .any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)),
+                    "Expected a missing-data gap at x={x}, y={y}, got {symbol:?}"
+                );
             }
         }
     }
@@ -876,7 +1104,7 @@ mod tests {
         let snapshot = IdleDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            status_text: "GLOBAL NET  STABLE",
+            network_status: GlobalNetworkStatus::Stable,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &[],
@@ -910,7 +1138,9 @@ mod tests {
             }],
         };
 
-        terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 96);
         assert_eq!(buffer.area.height, 30);
@@ -918,7 +1148,7 @@ mod tests {
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("代理历史 · 30 分钟"));
+        assert!(t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("28 ms"));
         assert!(t.contains("8.0 MiB/s"));
@@ -927,16 +1157,19 @@ mod tests {
         assert!(!t.contains("chat.openai.com"));
         assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
-        // Verify breadcrumb padding and panel positions at row 1
+        // One-cell gutters and one-cell inter-panel gap remain at the
+        // intermediate breakpoint; connections are hidden before quality.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(30, 1)].symbol(), "┌");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_ne!(buffer[(1, 2)].symbol(), "┌");
+        assert_eq!(buffer[(31, 2)].symbol(), " ");
+        assert_ne!(buffer[(32, 2)].symbol(), "┌");
 
         // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
         let mut node_panel_has_braille = false;
-        for y in 3..14 {
-            for x in 6..29 {
+        for y in 4..17 {
+            for x in 7..30 {
                 let s = buffer[(x, y)].symbol();
                 if s.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)) {
                     node_panel_has_braille = true;
@@ -944,11 +1177,14 @@ mod tests {
                 }
             }
         }
-        assert!(node_panel_has_braille, "96x30 node quality panel must render mini Braille sparklines");
+        assert!(
+            node_panel_has_braille,
+            "96x30 node quality panel must render mini Braille sparklines"
+        );
 
         // Verify connections panel is not rendered in left column below node panel
-        for y in 15..29 {
-            let s = buffer[(0, y)].symbol();
+        for y in 2..28 {
+            let s = buffer[(1, y)].symbol();
             assert_ne!(s, "┌", "Active connections panel must be omitted at 96x30");
         }
 
@@ -968,7 +1204,7 @@ mod tests {
         let snapshot = IdleDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            status_text: "GLOBAL NET  STABLE",
+            network_status: GlobalNetworkStatus::Stable,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &[],
@@ -996,7 +1232,9 @@ mod tests {
             }],
         };
 
-        terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 80);
         assert_eq!(buffer.area.height, 24);
@@ -1004,19 +1242,152 @@ mod tests {
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("代理历史 · 30 分钟"));
+        assert!(t.contains("核心历史 · 30 分钟"));
         // Both node quality and active connections are omitted at width 80
         assert!(!t.contains("节点质量"));
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
         assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
+        assert!(t.contains("延迟 · ms"));
+        assert!(t.contains("核心流量 · MiB/s"));
+        assert!(t.contains("-30m") && t.contains("-15m") && t.contains("现在"));
 
-        // Verify breadcrumb padding and aggregate panel starts at column 0 across full width at row 1
+        // Compact Figma 1027:16 keeps a one-cell outer gutter around the
+        // global-history surface and moves the footer to the final two rows.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "D");
-        assert_eq!(buffer[(0, 1)].symbol(), "┌");
-        assert_eq!(buffer[(79, 1)].symbol(), "┐");
+        assert_eq!(buffer[(0, 2)].symbol(), " ");
+        assert_ne!(buffer[(1, 2)].symbol(), "┌");
+        assert_eq!(buffer[(3, 2)].symbol(), "核");
+        assert_eq!(buffer[(79, 2)].symbol(), " ");
+        assert!(
+            buffer_to_text(buffer)
+                .lines()
+                .nth(23)
+                .unwrap()
+                .contains("GLOBAL NET  STABLE")
+        );
+    }
+
+    #[test]
+    fn test_render_idle_dashboard_caps_and_centers_large_windows_terminal_compositions() {
+        let snapshot = IdleDashboardSnapshot {
+            active_provider: "AirTCP",
+            active_node: "JP-Edge-03",
+            network_status: GlobalNetworkStatus::Stable,
+            current_down_rate: "3.9M/s",
+            current_up_rate: "2.1M/s",
+            traffic_samples: &[],
+            latency_samples: &[],
+            route_intervals: &[],
+            node_quality: None,
+            active_connections: vec![],
+        };
+
+        for (width, height, content_x, content_y, aggregate_title_x) in
+            [(132, 36, 1, 3, 45), (160, 45, 8, 7, 53)]
+        {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render_idle_dashboard(f, &snapshot))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(content_x + 1, content_y)].symbol(), "节");
+            assert_eq!(buffer[(aggregate_title_x, content_y)].symbol(), "核");
+            assert_eq!(buffer[(content_x, content_y + 16)].symbol(), "┌");
+            if content_x > 0 {
+                assert_eq!(buffer[(content_x - 1, content_y)].symbol(), " ");
+            }
+            if content_y > 2 {
+                assert_eq!(buffer[(content_x + 1, content_y - 1)].symbol(), " ");
+            }
+
+            let footer = buffer_to_text(buffer);
+            let footer = footer.lines().nth(usize::from(height - 1)).unwrap();
+            assert!(footer.starts_with(' '));
+            assert!(footer.contains("Ctrl+K"));
+            assert!(footer.ends_with("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s "));
+        }
+
+        let backend = TestBackend::new(150, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer_to_text(buffer);
+        assert_eq!(buffer[(4, 2)].symbol(), "节");
+        assert!(text.contains("节点质量"));
+        assert!(!text.contains("活动连接"));
+        assert!(text.lines().nth(23).unwrap().contains("GLOBAL NET  STABLE"));
+
+        let backend = TestBackend::new(120, 29);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        assert!(text.contains("节点质量"));
+        assert!(!text.contains("活动连接"));
+        assert!(text.contains("核心历史 · 30 分钟"));
+    }
+
+    #[test]
+    fn test_render_idle_dashboard_does_not_fabricate_missing_quality_measurements() {
+        let backend = TestBackend::new(96, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snapshot = IdleDashboardSnapshot {
+            active_provider: "AirTCP",
+            active_node: "JP-Edge-03",
+            network_status: GlobalNetworkStatus::Idle,
+            current_down_rate: "0B/s",
+            current_up_rate: "0B/s",
+            traffic_samples: &[],
+            latency_samples: &[],
+            route_intervals: &[],
+            node_quality: Some(ActiveNodeQualitySnapshot {
+                node_name: "JP-Edge-03",
+                current_latency_ms: None,
+                warm_median_ms: None,
+                p95_ms: None,
+                cold_start_ms: None,
+                sustained_speed_label: None,
+                reachability_label: "Untested",
+                latency_points: vec![],
+                sustained_points: vec![],
+                latest_latency: None,
+                latency_sample_age: None,
+                latest_sustained_speed: None,
+                sustained_sample_age: None,
+            }),
+            active_connections: vec![],
+        };
+
+        terminal
+            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        assert!(!text.contains("28 ms"));
+        assert!(!text.contains("8.0 MiB/s"));
+        assert!(!text.contains("刚测"));
+        assert!(!text.contains("2分钟前"));
+        assert!(text.contains("延迟 —"));
+        assert!(text.contains("实测 —"));
+
+        let footer = text.lines().nth(29).unwrap();
+        let idle_offset = footer.find("IDLE").unwrap();
+        let transfer_offset = footer.find('↓').unwrap();
+        let idle_x = unicode_width::UnicodeWidthStr::width(&footer[..idle_offset]) as u16;
+        let transfer_x = unicode_width::UnicodeWidthStr::width(&footer[..transfer_offset]) as u16;
+        let theme = Theme::detect();
+        assert_eq!(terminal.backend().buffer()[(idle_x, 29)].fg, theme.text_muted());
+        assert_eq!(
+            terminal.backend().buffer()[(transfer_x, 29)].fg,
+            theme.text_transfer()
+        );
     }
 
     #[test]
@@ -1028,7 +1399,7 @@ mod tests {
             let snapshot = IdleDashboardSnapshot {
                 active_provider: "AirTCP",
                 active_node: "JP-Edge-03",
-                status_text: "GLOBAL NET  STABLE",
+                network_status: GlobalNetworkStatus::Stable,
                 current_down_rate: "0.0M/s",
                 current_up_rate: "0.0M/s",
                 traffic_samples: &[],
@@ -1038,7 +1409,9 @@ mod tests {
                 active_connections: vec![],
             };
 
-            terminal.draw(|f| render_idle_dashboard(f, &snapshot)).unwrap();
+            terminal
+                .draw(|f| render_idle_dashboard(f, &snapshot))
+                .unwrap();
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer.area.width, w);
             assert_eq!(buffer.area.height, h);
