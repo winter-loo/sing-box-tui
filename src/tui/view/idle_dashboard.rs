@@ -54,7 +54,6 @@ pub(crate) struct ActiveConnectionSummary<'a> {
 pub(crate) struct IdleDashboardSnapshot<'a> {
     pub(crate) active_provider: &'a str,
     pub(crate) active_node: &'a str,
-    #[allow(dead_code)]
     pub(crate) status_text: &'a str,
     pub(crate) current_down_rate: &'a str,
     pub(crate) current_up_rate: &'a str,
@@ -571,18 +570,38 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
 
     // 1-row Footer at the bottom of the screen (r.height - 1)
     let footer_y = r.height - 1;
-    let shortcuts = "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出";
-    label(frame, 0, footer_y, r.width, shortcuts, A);
+    let shortcuts = if r.width >= 96 {
+        "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出"
+    } else {
+        "Ctrl+K  c 连接  i 节点  ? 帮助  q 退出"
+    };
+    let shortcuts_width = shortcuts.width() as u16;
+    label(frame, 0, footer_y, shortcuts_width, shortcuts, A);
 
-    let rates = format!("↓{}  ↑{}", snapshot.current_down_rate, snapshot.current_up_rate);
-    let rates_width = rates.width() as u16;
-    if r.width >= shortcuts.width() as u16 + rates_width + 2 {
+    // Global system status in the bottom-right corner per Figma (nodes 1036:8 / 1025:6 / 1036:10):
+    // e.g. "GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"
+    let rates_str = format!("↓{}  ↑{}", snapshot.current_down_rate, snapshot.current_up_rate);
+    let (status_str, status_width) = if !snapshot.status_text.is_empty() {
+        let full = format!("{}  {}", snapshot.status_text, rates_str);
+        let w = full.width() as u16;
+        if r.width >= shortcuts_width + w + 1 {
+            (full, w)
+        } else {
+            let rw = rates_str.width() as u16;
+            (rates_str, rw)
+        }
+    } else {
+        let rw = rates_str.width() as u16;
+        (rates_str, rw)
+    };
+
+    if r.width >= shortcuts_width + status_width + 1 {
         label(
             frame,
-            r.width.saturating_sub(rates_width),
+            r.width.saturating_sub(status_width),
             footer_y,
-            rates_width,
-            &rates,
+            status_width,
+            &status_str,
             GREEN,
         );
     }
@@ -714,7 +733,7 @@ mod tests {
         assert!(t.contains("q 退出"));
         assert!(!t.contains("历史有缺测"));
         assert!(!t.contains("探测流量"));
-        assert!(t.contains("↓3.9M/s  ↑2.1M/s"));
+        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
         // Verify unbordered breadcrumb at row 0 and main panels at row 1
         assert_eq!(buffer[(0, 0)].symbol(), " ");
@@ -801,6 +820,7 @@ mod tests {
         // Active connections table is omitted at width 96
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
+        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
         // Verify breadcrumb padding and panel positions at row 1
         assert_eq!(buffer[(0, 0)].symbol(), " ");
@@ -885,6 +905,7 @@ mod tests {
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
+        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
         // Verify breadcrumb padding and aggregate panel starts at column 0 across full width at row 1
         assert_eq!(buffer[(0, 0)].symbol(), " ");
