@@ -6,6 +6,7 @@ pub(crate) struct OnboardingState {
 }
 
 pub(crate) fn draw_onboarding_panel(frame: &mut Frame, onboarding: &OnboardingState) {
+    let theme = crate::tui::ds::Theme::detect();
     let frame_area = frame.area();
     let area = centered_rect(86, 13, frame_area);
     frame.render_widget(Clear, area);
@@ -16,7 +17,7 @@ pub(crate) fn draw_onboarding_panel(frame: &mut Frame, onboarding: &OnboardingSt
         Line::from("Press s to skip, or Esc to keep this wizard for next time."),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("URL: ", Style::default().fg(Color::Cyan)),
+            Span::styled("URL: ", theme.style_breadcrumb()),
             Span::raw(onboarding.input.as_str()),
         ]),
         Line::raw(""),
@@ -27,7 +28,8 @@ pub(crate) fn draw_onboarding_panel(frame: &mut Frame, onboarding: &OnboardingSt
             Block::default()
                 .title("Welcome")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(theme.style_success())
+                .style(theme.style_base()),
         ),
         area,
     );

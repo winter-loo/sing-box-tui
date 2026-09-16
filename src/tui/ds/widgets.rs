@@ -241,6 +241,12 @@ pub(crate) fn render_footer(
 /// Renders the Terminal Contract Unsupported Guard if window is smaller than 80x24
 #[allow(dead_code)]
 pub(crate) fn render_unsupported_guard(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme.style_base()), area);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.style_error())
@@ -272,7 +278,7 @@ pub(crate) fn render_unsupported_guard(frame: &mut Frame, area: Rect, theme: &Th
 
     let [_, center_row, _] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(8),
+        Constraint::Length(area.height.min(8)),
         Constraint::Fill(1),
     ])
     .areas(area);

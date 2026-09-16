@@ -6,19 +6,11 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::ds::{render_breadcrumb, Theme};
+use crate::tui::ds::{render_breadcrumb, render_unsupported_guard, Theme};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
     now_unix_ms,
 };
-
-const BG: Color = Color::Rgb(7, 17, 14);
-const FG: Color = Color::Rgb(195, 207, 200);
-const MUTED: Color = Color::Rgb(114, 128, 120);
-const A: Color = Color::Rgb(77, 214, 239);
-const B: Color = Color::Rgb(232, 212, 102);
-const PINK: Color = Color::Rgb(229, 137, 245);
-const GREEN: Color = Color::Rgb(98, 230, 167);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveNodeQualitySnapshot<'a> {
@@ -122,14 +114,14 @@ fn label(f: &mut Frame, x: u16, y: u16, w: u16, s: &str, color: Color) {
     );
 }
 
-fn panel(f: &mut Frame, r: Rect, title: &str) {
+fn panel(f: &mut Frame, r: Rect, title: &str, theme: &Theme) {
     if r.width == 0 || r.height == 0 {
         return;
     }
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MUTED))
+            .border_style(Style::default().fg(theme.border_default()))
             .title(title),
         r,
     );
@@ -234,14 +226,19 @@ fn plot_braille_sparklines(
     );
 }
 
-fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
-    panel(f, r, " 节点质量 ");
+fn render_node_panel(
+    f: &mut Frame,
+    r: Rect,
+    snapshot: &IdleDashboardSnapshot<'_>,
+    theme: &Theme,
+) {
+    panel(f, r, " 节点质量 ", theme);
     let x = r.x + 1;
     let w = r.width.saturating_sub(2);
     let y = r.y + 1;
 
     let Some(q) = &snapshot.node_quality else {
-        label(f, x, y, w, "无节点数据", MUTED);
+        label(f, x, y, w, "无节点数据", theme.text_muted());
         return;
     };
 
@@ -258,16 +255,30 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
         format!("延迟 {latency_val}")
     };
     let latency_age = q.latency_sample_age.as_deref().unwrap_or("刚测");
-    label(f, x, y, w.saturating_sub(7), &latency_title, PINK);
-    label(f, x + w.saturating_sub(7), y, 7, latency_age, MUTED);
-    label(f, x, y + 1, 4, "120", MUTED);
-    label(f, x, y + 3, 4, "0", MUTED);
+    label(
+        f,
+        x,
+        y,
+        w.saturating_sub(7),
+        &latency_title,
+        theme.text_latency(),
+    );
+    label(
+        f,
+        x + w.saturating_sub(7),
+        y,
+        7,
+        latency_age,
+        theme.text_muted(),
+    );
+    label(f, x, y + 1, 4, "120", theme.text_muted());
+    label(f, x, y + 3, 4, "0", theme.text_muted());
 
     plot_braille_sparklines(
         f,
         Rect::new(x + 5, y + 1, w.saturating_sub(5), 3),
         &q.latency_points,
-        PINK,
+        theme.text_latency(),
         120.,
     );
 
@@ -278,47 +289,106 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
         format!("实测 {speed_raw}")
     };
     let speed_age = q.sustained_sample_age.as_deref().unwrap_or("2分钟前");
-    label(f, x, y + 4, w.saturating_sub(7), &speed_title, GREEN);
-    label(f, x + w.saturating_sub(7), y + 4, 7, speed_age, MUTED);
-    label(f, x, y + 5, 4, "10", MUTED);
-    label(f, x, y + 7, 4, "0", MUTED);
+    label(
+        f,
+        x,
+        y + 4,
+        w.saturating_sub(7),
+        &speed_title,
+        theme.text_success(),
+    );
+    label(
+        f,
+        x + w.saturating_sub(7),
+        y + 4,
+        7,
+        speed_age,
+        theme.text_muted(),
+    );
+    label(f, x, y + 5, 4, "10", theme.text_muted());
+    label(f, x, y + 7, 4, "0", theme.text_muted());
 
     plot_braille_sparklines(
         f,
         Rect::new(x + 5, y + 5, w.saturating_sub(5), 3),
         &q.sustained_points,
-        GREEN,
+        theme.text_success(),
         10.,
     );
 
-    label(f, x + 5, y + 8, 4, "-30m", MUTED);
-    label(f, x + w.saturating_sub(4), y + 8, 4, "现在", MUTED);
-    label(f, x, y + 9, w, "仅显示已有采样", MUTED);
+    label(f, x + 5, y + 8, 4, "-30m", theme.text_muted());
+    label(f, x + w.saturating_sub(4), y + 8, 4, "现在", theme.text_muted());
+    label(f, x, y + 9, w, "仅显示已有采样", theme.text_muted());
 }
 
-fn render_connections_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
+fn render_connections_panel(
+    f: &mut Frame,
+    r: Rect,
+    snapshot: &IdleDashboardSnapshot<'_>,
+    theme: &Theme,
+) {
     let title = format!(" 活动连接 · {} ", snapshot.active_connections.len());
-    panel(f, r, &title);
+    panel(f, r, &title, theme);
     let x = r.x + 1;
     let w = r.width.saturating_sub(2);
-    label(f, x, r.y + 1, w.saturating_sub(6), "目标", MUTED);
-    label(f, x + w.saturating_sub(6), r.y + 1, 6, "MiB/s", MUTED);
+    label(
+        f,
+        x,
+        r.y + 1,
+        w.saturating_sub(6),
+        "目标",
+        theme.text_muted(),
+    );
+    label(
+        f,
+        x + w.saturating_sub(6),
+        r.y + 1,
+        6,
+        "MiB/s",
+        theme.text_muted(),
+    );
 
     let max_rows = usize::from(r.height.saturating_sub(4));
     let mut shown = 0;
     for (i, conn) in snapshot.active_connections.iter().take(max_rows).enumerate() {
         shown += 1;
-        label(f, x, r.y + 2 + i as u16, w.saturating_sub(7), conn.destination, FG);
-        label(f, x + w.saturating_sub(6), r.y + 2 + i as u16, 6, &conn.rate_label, FG);
+        label(
+            f,
+            x,
+            r.y + 2 + i as u16,
+            w.saturating_sub(7),
+            conn.destination,
+            theme.text_primary(),
+        );
+        label(
+            f,
+            x + w.saturating_sub(6),
+            r.y + 2 + i as u16,
+            6,
+            &conn.rate_label,
+            theme.text_primary(),
+        );
     }
     let remaining = snapshot.active_connections.len().saturating_sub(shown);
     if remaining > 0 && r.height >= 5 {
-        label(f, x, r.y + 2 + shown as u16, w, &format!("另 {remaining} 条"), MUTED);
+        label(
+            f,
+            x,
+            r.y + 2 + shown as u16,
+            w,
+            &format!("另 {remaining} 条"),
+            theme.text_muted(),
+        );
     }
 }
 
-fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>) {
-    panel(f, r, " 代理历史 · 30 分钟 ");
+fn render_aggregate_panel(
+    f: &mut Frame,
+    r: Rect,
+    snapshot: &IdleDashboardSnapshot<'_>,
+    theme: &Theme,
+) {
+    panel(f, r, " 代理历史 · 30 分钟 ", theme);
     let x = r.x + 1;
     let w = r.width.saturating_sub(2);
     let top = r.y + 1;
@@ -339,7 +409,7 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
         for interval in snapshot.route_intervals {
             let start_ms = interval.started_at_ms.max(cutoff_ms);
             let minute = ((start_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
-            let color = if interval.interval_index % 2 == 0 { A } else { B };
+            let color = theme.route_color(interval.interval_index);
             let bx = px + ((f64::from(pw.saturating_sub(1)) * (minute / 30.0)).round() as u16);
             let rem_w = (px + pw).saturating_sub(bx).min(14);
             if rem_w > 0 {
@@ -347,16 +417,23 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
             }
         }
     } else {
-        label(f, px, top + 1, pw.min(14), snapshot.active_node, A);
+        label(
+            f,
+            px,
+            top + 1,
+            pw.min(14),
+            snapshot.active_node,
+            theme.route_color(0),
+        );
     }
 
-    label(f, x, top + 2, w, "延迟 · ms", FG);
-    label(f, x, py, 7, "120", MUTED);
-    label(f, x, py + ph - 1, 7, "0", MUTED);
-    label(f, x, py + ph, w, "吞吐 ≈ · MiB/s", FG);
-    label(f, x, py + ph + 1, w, "↓ 线   ↑ 点", FG);
-    label(f, x, ty, 7, "10", MUTED);
-    label(f, x, ty + ph - 1, 7, "0", MUTED);
+    label(f, x, top + 2, w, "延迟 · ms", theme.text_primary());
+    label(f, x, py, 7, "120", theme.text_muted());
+    label(f, x, py + ph - 1, 7, "0", theme.text_muted());
+    label(f, x, py + ph, w, "吞吐 ≈ · MiB/s", theme.text_primary());
+    label(f, x, py + ph + 1, w, "↓ 线   ↑ 点", theme.text_primary());
+    label(f, x, ty, 7, "10", theme.text_muted());
+    label(f, x, ty + ph - 1, 7, "0", theme.text_muted());
 
     // Group latency samples into continuous segments
     let mut latency_series: Vec<Vec<(f64, f64)>> = Vec::new();
@@ -389,7 +466,7 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
             let switched = last_ts > 0 && idx != cur_idx;
 
             if (gap || switched) && !cur_seg.is_empty() {
-                latency_colors.push(if cur_idx % 2 == 0 { A } else { B });
+                latency_colors.push(theme.route_color(cur_idx));
                 latency_kinds.push(if cur_seg.len() == 1 {
                     GraphType::Scatter
                 } else {
@@ -404,7 +481,7 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
         }
 
         if !cur_seg.is_empty() {
-            latency_colors.push(if cur_idx % 2 == 0 { A } else { B });
+            latency_colors.push(theme.route_color(cur_idx));
             latency_kinds.push(if cur_seg.len() == 1 {
                 GraphType::Scatter
             } else {
@@ -458,7 +535,7 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
             let switched = last_ts > 0 && idx != cur_idx;
 
             if (gap || switched) && !down_seg.is_empty() {
-                let col = if cur_idx % 2 == 0 { A } else { B };
+                let col = theme.route_color(cur_idx);
                 traffic_colors.push(col);
                 traffic_kinds.push(if down_seg.len() == 1 {
                     GraphType::Scatter
@@ -479,7 +556,7 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
         }
 
         if !down_seg.is_empty() {
-            let col = if cur_idx % 2 == 0 { A } else { B };
+            let col = theme.route_color(cur_idx);
             traffic_colors.push(col);
             traffic_kinds.push(if down_seg.len() == 1 {
                 GraphType::Scatter
@@ -507,11 +584,25 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
 
     let axis = ty + ph;
     if pw > 0 {
-        label(f, px, axis, pw, &"─".repeat(usize::from(pw)), MUTED);
+        label(
+            f,
+            px,
+            axis,
+            pw,
+            &"─".repeat(usize::from(pw)),
+            theme.text_muted(),
+        );
         for (fraction, text) in [(0., "-30m"), (0.5, "-15m"), (1., "现在")] {
             let offset = ((f64::from(pw.saturating_sub(1)) * fraction).round() as u16)
                 .min(pw.saturating_sub(text.width() as u16));
-            label(f, px + offset, axis + 1, text.width() as u16, text, MUTED);
+            label(
+                f,
+                px + offset,
+                axis + 1,
+                text.width() as u16,
+                text,
+                theme.text_muted(),
+            );
         }
     }
 }
@@ -519,17 +610,14 @@ fn render_aggregate_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapsh
 /// Main entry point for rendering the Idle Dashboard (120x30 Canonical, 96x30, or 80x24 Compact)
 pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardSnapshot<'_>) {
     let r = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), r);
+    let theme = Theme::detect();
+    frame.render_widget(Block::default().style(theme.style_base()), r);
 
     if r.width < 80 || r.height < 24 {
-        label(frame, 0, 0, r.width, "请将终端调整至至少 80×24", FG);
-        if r.height > 1 {
-            label(frame, 0, 1, r.width, "q 退出   ? 帮助", A);
-        }
+        render_unsupported_guard(frame, r, &theme);
         return;
     }
 
-    let theme = Theme::detect();
     let provider = if snapshot.active_provider.is_empty() {
         "—"
     } else {
@@ -561,12 +649,22 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
     };
 
     if with_node {
-        render_node_panel(frame, Rect::new(0, 1, left, 14), snapshot);
+        render_node_panel(frame, Rect::new(0, 1, left, 14), snapshot, &theme);
     }
     if full {
-        render_connections_panel(frame, Rect::new(0, 15, left, r.height.saturating_sub(16)), snapshot);
+        render_connections_panel(
+            frame,
+            Rect::new(0, 15, left, r.height.saturating_sub(16)),
+            snapshot,
+            &theme,
+        );
     }
-    render_aggregate_panel(frame, Rect::new(left, 1, r.width - left, r.height.saturating_sub(2)), snapshot);
+    render_aggregate_panel(
+        frame,
+        Rect::new(left, 1, r.width - left, r.height.saturating_sub(2)),
+        snapshot,
+        &theme,
+    );
 
     // 1-row Footer at the bottom of the screen (r.height - 1)
     let footer_y = r.height - 1;
@@ -576,7 +674,14 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         "Ctrl+K  c 连接  i 节点  ? 帮助  q 退出"
     };
     let shortcuts_width = shortcuts.width() as u16;
-    label(frame, 0, footer_y, shortcuts_width, shortcuts, A);
+    label(
+        frame,
+        0,
+        footer_y,
+        shortcuts_width,
+        shortcuts,
+        theme.text_accent(),
+    );
 
     // Global system status in the bottom-right corner per Figma (nodes 1036:8 / 1025:6 / 1036:10):
     // e.g. "GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"
@@ -602,7 +707,7 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
             footer_y,
             status_width,
             &status_str,
-            GREEN,
+            theme.text_success(),
         );
     }
 }
@@ -939,8 +1044,8 @@ mod tests {
             assert_eq!(buffer.area.height, h);
 
             let t = buffer_to_text(buffer);
-            assert!(t.contains("请将终端调整至至少 80×24"));
-            assert!(t.contains("q 退出") && t.contains("? 帮助"));
+            assert!(t.contains("Resize terminal to at least 80x24"));
+            assert!(t.contains("q to quit") && t.contains("? for help"));
         }
     }
 }

@@ -30,7 +30,7 @@ pub(crate) fn reachability_badge_style(
         theme.style_breadcrumb()
     } else {
         match tone {
-            CandidateTone::Pending => pending_candidate_style(false),
+            CandidateTone::Pending => pending_candidate_style(false, theme),
             CandidateTone::Success => theme.style_success(),
             CandidateTone::Error => theme.style_danger(),
             CandidateTone::Missing => theme.style_muted(),
@@ -45,7 +45,7 @@ fn candidate_marker_style(
     theme: &Theme,
 ) -> Style {
     if tone == CandidateTone::Pending {
-        return pending_candidate_style(bright);
+        return pending_candidate_style(bright, theme);
     }
     let lower = marker.to_ascii_lowercase();
     if lower.contains("mib/s")
@@ -58,7 +58,7 @@ fn candidate_marker_style(
         theme.style_breadcrumb()
     } else {
         match tone {
-            CandidateTone::Pending => pending_candidate_style(bright),
+            CandidateTone::Pending => pending_candidate_style(bright, theme),
             CandidateTone::Success => theme.style_breadcrumb(),
             CandidateTone::Error => theme.style_danger(),
             CandidateTone::Missing => theme.style_muted(),
@@ -219,6 +219,9 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) pending_animation_bright: bool,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
     pub(crate) status: StatusSnapshot,
+    pub(crate) network_status: &'static str,
+    pub(crate) current_down_rate: &'a str,
+    pub(crate) current_up_rate: &'a str,
     pub(crate) flash: Option<String>,
     pub(crate) node_quality_detail: Option<&'a NodeQualityDetailState>,
     pub(crate) connections: Option<ConnectionsPanelSnapshot<'a>>,
@@ -243,24 +246,18 @@ fn latency_signal_glyph(height: u8) -> char {
     }
 }
 
-fn latency_signal_style(state: LatencySignalState) -> Style {
+fn latency_signal_style(state: LatencySignalState, theme: &Theme) -> Style {
     match state {
-        LatencySignalState::Untested => Style::default().fg(Color::DarkGray),
+        LatencySignalState::Untested => theme.style_muted(),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 200 => {
-            Style::default().fg(Color::Green)
+            theme.style_success()
         }
         LatencySignalState::Reachable { delay_ms } if delay_ms < 400 => {
-            Style::default().fg(Color::Yellow)
+            theme.style_warning()
         }
-        LatencySignalState::Reachable { delay_ms } if delay_ms < 600 => {
-            Style::default().fg(Color::Rgb(184, 134, 11))
-        }
-        LatencySignalState::Reachable { .. } => {
-            Style::default().fg(Color::Rgb(205, 92, 92))
-        }
-        LatencySignalState::Unreachable => Style::default()
-            .fg(Color::Rgb(139, 0, 0))
-            .add_modifier(Modifier::BOLD),
+        LatencySignalState::Reachable { delay_ms } if delay_ms < 600 => theme.style_warning(),
+        LatencySignalState::Reachable { .. } => theme.style_error(),
+        LatencySignalState::Unreachable => theme.style_error().add_modifier(Modifier::BOLD),
     }
 }
 
@@ -271,14 +268,14 @@ fn latency_average_label(signal: &LatencySignal) -> String {
     )
 }
 
-fn render_latency_signal(signal: &LatencySignal) -> Vec<Span<'static>> {
+fn render_latency_signal(signal: &LatencySignal, theme: &Theme) -> Vec<Span<'static>> {
     signal
         .bars
         .iter()
         .map(|bar| {
             Span::styled(
                 latency_signal_glyph(bar.height).to_string(),
-                latency_signal_style(bar.state),
+                latency_signal_style(bar.state, theme),
             )
         })
         .collect()
@@ -295,6 +292,7 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
 
 pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot<'_>) {
     let theme = Theme::detect();
+    frame.render_widget(Block::default().style(theme.style_base()), area);
 
     let is_private_access = snapshot.operational_workspace
         == crate::tui_state::OperationalWorkspace::PrivateAccess
@@ -534,6 +532,7 @@ fn render_candidate_table(
                     right_spans.extend(render_pending_working_marker(
                         marker_text,
                         snapshot.pending_animation_tick,
+                        theme,
                     ));
                 } else {
                     right_spans.push(Span::styled(
@@ -558,7 +557,7 @@ fn render_candidate_table(
             }
 
             if let Some(signal) = &row.latency_signal {
-                right_spans.extend(render_latency_signal(signal));
+                right_spans.extend(render_latency_signal(signal, theme));
                 right_spans.push(Span::raw(" "));
                 right_spans.push(Span::styled(
                     latency_average_label(signal),
@@ -610,83 +609,111 @@ fn render_internet_footer(
         return;
     }
 
-    if let StatusFooter::Filter(input) = &snapshot.status.footer {
-        let spans = vec![
-            Span::styled("Filter: ", theme.style_breadcrumb()),
-            Span::styled(input.clone(), theme.style_base()),
-            Span::raw("   "),
-            Span::styled("[Enter]", theme.style_footer_keys()),
-            Span::raw(" "),
-            Span::styled("Confirm", theme.style_muted()),
-            Span::raw("  "),
-            Span::styled("[Esc]", theme.style_footer_keys()),
-            Span::raw(" "),
-            Span::styled("Clear", theme.style_muted()),
-        ];
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-        let cursor_x = area
-            .x
-            .saturating_add(unicode_width::UnicodeWidthStr::width("Filter: ") as u16)
-            .saturating_add(unicode_width::UnicodeWidthStr::width(input.as_str()) as u16);
-        frame.set_cursor_position((cursor_x, area.y));
-        return;
-    }
-
-    let left_spans = vec![
-        Span::styled("g", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("dashboard", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("c", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("connections", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("i", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("quality", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("o", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("settings", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("?", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("help", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("p", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("provider", theme.style_muted()),
-        Span::raw("   "),
-        Span::styled("[Tab]", theme.style_footer_keys()),
-        Span::raw(" "),
-        Span::styled("Intranet →", theme.style_muted()),
-    ];
-
     let mut right_spans = Vec::new();
-    if let StatusFooter::Status(msg) = &snapshot.status.footer {
-        if !msg.is_empty() {
-            let msg_style = if msg == "ready" {
-                theme.style_muted()
-            } else {
-                theme.style_warning()
-            };
-            right_spans.push(Span::styled(msg.clone(), msg_style));
-            right_spans.push(Span::raw("  "));
-        }
-    }
     right_spans.push(Span::styled("GLOBAL NET", theme.style_muted()));
     right_spans.push(Span::raw("  "));
-    right_spans.push(Span::styled("STABLE", theme.style_success()));
+    right_spans.push(Span::styled(
+        snapshot.network_status,
+        if snapshot.network_status == "STABLE" {
+            Style::default().fg(theme.text_status_active())
+        } else {
+            theme.style_muted()
+        },
+    ));
+    right_spans.push(Span::raw("  "));
+    right_spans.push(Span::styled(
+        format!("↓{}", snapshot.current_down_rate),
+        Style::default().fg(theme.text_transfer()),
+    ));
+    right_spans.push(Span::raw("  "));
+    right_spans.push(Span::styled(
+        format!("↑{}", snapshot.current_up_rate),
+        Style::default().fg(theme.text_transfer()),
+    ));
 
     let total_right: usize = right_spans
         .iter()
         .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let right_width = (total_right as u16).min(area.width);
-    let left_width = area.width.saturating_sub(right_width);
-    let [left_area, right_area] = Layout::horizontal([
+    let gap_width = u16::from(area.width > right_width);
+    let left_width = area.width.saturating_sub(right_width + gap_width);
+
+    let shortcut_variants: &[&[(&str, &str)]] = &[
+        &[
+            ("Ctrl+K", "actions"),
+            ("c", "connections"),
+            ("i", "quality"),
+            ("o", "settings"),
+            ("?", "help"),
+            ("p", "provider"),
+            ("[Tab]", "Intranet →"),
+        ],
+        &[
+            ("Ctrl+K", "actions"),
+            ("c", "connections"),
+            ("i", "quality"),
+            ("?", "help"),
+            ("[Tab]", "Intranet →"),
+        ],
+        &[("Ctrl+K", "actions"), ("?", "help"), ("[Tab]", "Intranet")],
+        &[("Ctrl+K", ""), ("?", ""), ("[Tab]", "")],
+    ];
+    let shortcut_width = |items: &[(&str, &str)]| {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, (key, label))| {
+                usize::from(index > 0) * 3
+                    + unicode_width::UnicodeWidthStr::width(*key)
+                    + usize::from(!label.is_empty())
+                    + unicode_width::UnicodeWidthStr::width(*label)
+            })
+            .sum::<usize>()
+    };
+    let (left_spans, filter_cursor_offset) =
+        if let StatusFooter::Filter(input) = &snapshot.status.footer {
+            (
+                vec![
+                    Span::styled("Filter: ", theme.style_breadcrumb()),
+                    Span::styled(input.clone(), theme.style_base()),
+                    Span::raw("   "),
+                    Span::styled("[Enter]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Confirm", theme.style_muted()),
+                    Span::raw("  "),
+                    Span::styled("[Esc]", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("Clear", theme.style_muted()),
+                ],
+                Some(
+                    unicode_width::UnicodeWidthStr::width("Filter: ") as u16
+                        + unicode_width::UnicodeWidthStr::width(input.as_str()) as u16,
+                ),
+            )
+        } else {
+            let shortcuts = shortcut_variants
+                .iter()
+                .copied()
+                .find(|items| shortcut_width(items) <= usize::from(left_width))
+                .unwrap_or(&[]);
+            let mut spans = Vec::new();
+            for (index, (key, label)) in shortcuts.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw("   "));
+                }
+                spans.push(Span::styled(*key, theme.style_footer_keys()));
+                if !label.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(*label, theme.style_muted()));
+                }
+            }
+            (spans, None)
+        };
+
+    let [left_area, _, right_area] = Layout::horizontal([
         Constraint::Length(left_width),
+        Constraint::Length(gap_width),
         Constraint::Min(right_width),
     ])
     .areas(area);
@@ -696,6 +723,12 @@ fn render_internet_footer(
         Paragraph::new(Line::from(right_spans)).alignment(ratatui::layout::Alignment::Right),
         right_area,
     );
+    if let Some(offset) = filter_cursor_offset {
+        let cursor_x = left_area
+            .x
+            .saturating_add(offset.min(left_area.width.saturating_sub(1)));
+        frame.set_cursor_position((cursor_x, left_area.y));
+    }
 }
 
 fn render_intranet_workspace(
@@ -936,7 +969,11 @@ fn render_intranet_workspace(
     );
 }
 
-fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>> {
+fn render_pending_working_marker(
+    marker: &str,
+    tick: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let (prefix, suffix) = if let Some(idx) = marker.rfind(" (") {
         (&marker[..idx], &marker[idx..])
     } else {
@@ -946,7 +983,7 @@ fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>
     let chars: Vec<char> = prefix.chars().collect();
     let char_count = chars.len();
     if char_count == 0 {
-        return vec![Span::styled(marker.to_string(), Style::default().fg(Color::DarkGray))];
+        return vec![Span::styled(marker.to_string(), theme.style_muted())];
     }
 
     let period = char_count + 4;
@@ -957,31 +994,29 @@ fn render_pending_working_marker(marker: &str, tick: usize) -> Vec<Span<'static>
         let dist = (i as isize - wave_pos).abs();
         let style = match dist {
             0 => Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary())
                 .add_modifier(Modifier::BOLD),
             1 => Style::default()
-                .fg(Color::Rgb(200, 200, 200))
+                .fg(theme.text_secondary())
                 .add_modifier(Modifier::BOLD),
-            2 => Style::default().fg(Color::Rgb(150, 150, 150)),
-            _ => Style::default().fg(Color::DarkGray),
+            2 => Style::default().fg(theme.text_muted()),
+            _ => theme.style_muted(),
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
     if !suffix.is_empty() {
         spans.push(Span::styled(
             suffix.to_string(),
-            Style::default().fg(Color::DarkGray),
+            theme.style_muted(),
         ));
     }
     spans
 }
 
-fn pending_candidate_style(bright: bool) -> Style {
+fn pending_candidate_style(bright: bool, theme: &Theme) -> Style {
     if bright {
-        Style::default()
-            .fg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD)
+        theme.style_warning().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.style_muted()
     }
 }

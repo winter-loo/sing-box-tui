@@ -432,6 +432,17 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let theme = crate::tui::ds::Theme::default();
+    if area.width < 80 || area.height < 24 {
+        crate::tui::ds::widgets::render_unsupported_guard(frame, area, &theme);
+        if app.show_help {
+            let snapshot = app.view_snapshot();
+            view::render_active_modals(frame, &snapshot);
+        }
+        return;
+    }
+
     if app.active_view == ActiveView::IdleDashboard {
         let snapshot = app.idle_dashboard_snapshot();
         view::render_idle_dashboard(frame, &snapshot);
@@ -441,34 +452,44 @@ fn draw(frame: &mut Frame, app: &mut App) {
             view::render_active_modals(frame, &view_snapshot);
         }
     } else {
-        let area = frame.area();
-        let header_height = if area.height >= 2 && area.width < 90 { 2 } else { 1 };
+        let internet =
+            app.operational_workspace == crate::tui_state::OperationalWorkspace::Internet;
+        let header_height = if internet {
+            if area.height >= 30 { 2 } else { 1 }
+        } else if area.width < 90 {
+            2
+        } else {
+            1
+        };
         let [header_area, body_area] = ratatui::layout::Layout::vertical([
             ratatui::layout::Constraint::Length(header_height),
             ratatui::layout::Constraint::Min(0),
         ])
         .areas(area);
 
-        let theme = crate::tui::ds::Theme::default();
-        let selector_name = if app.operational_workspace == crate::tui_state::OperationalWorkspace::PrivateAccess {
-            app.private_access.focused_opt().map(|p| p.id.as_str()).unwrap_or("—")
+        if internet {
+            let (provider, route_node) = app.current_route_labels();
+            crate::tui::ds::widgets::render_breadcrumb(
+                frame,
+                header_area,
+                &theme,
+                &["INTERNET", provider.as_str(), route_node.as_str()],
+            );
         } else {
-            app.selected_group().map(|g| g.name.as_str()).unwrap_or("—")
-        };
-        let tun_enabled = app.internet_tun.is_enabled();
-        let system_proxy_enabled = app.system_proxy.enabled();
-        let clash_mode = app.clash_mode.as_deref().unwrap_or("—");
-
-        if header_area.height > 0 && header_area.width > 0 {
+            let selector_name = app
+                .private_access
+                .focused_opt()
+                .map(|profile| profile.id.as_str())
+                .unwrap_or("—");
             crate::tui::ds::widgets::render_top_header(
                 frame,
                 header_area,
                 &theme,
                 app.operational_workspace,
                 selector_name,
-                tun_enabled,
-                system_proxy_enabled,
-                clash_mode,
+                app.internet_tun.is_enabled(),
+                app.system_proxy.enabled(),
+                app.clash_mode.as_deref().unwrap_or("—"),
             );
         }
 
@@ -1737,12 +1758,16 @@ mod navigation_tests {
     }
 
     #[test]
-    fn operational_view_draw_renders_top_header() {
+    fn internet_shell_uses_applied_route_not_browsed_candidate() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = test_support::test_app();
+        let mut app = test_support::internet_routes_app();
         app.active_view = ActiveView::NodeList;
+        app.groups[0].current = Some("AirTCP".to_string());
+        app.internet_route_index = 2;
+        app.member_index = 0;
+        app.last_active_traffic_rate = ("8.4M/s".to_string(), "612K/s".to_string());
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1757,12 +1782,102 @@ mod navigation_tests {
             text.push('\n');
         }
 
-        assert!(text.contains("SING-BOX TUI · INTERNET · select"));
-        assert!(text.contains("[Tab] Switch Workspace"));
-        assert!(text.contains("[Ctrl+K] Actions"));
-        assert!(text.contains("TUN: [OFF]"));
-        assert!(text.contains("SYS PROXY: [OFF]"));
-        assert!(text.contains("CLASH: [RULE]"));
+        assert!(text.contains("INTERNET / AirTCP / air-1"));
+        assert!(!text.contains("INTERNET / 宝贝云 / bby-1"));
+        assert!(!text.contains("Switch Workspace"));
+        assert!(!text.contains("Actions"));
+        assert!(!text.contains("TUN:"));
+        assert!(!text.contains("SYS PROXY:"));
+        assert!(!text.contains("CLASH:"));
+        assert!(text.contains("GLOBAL NET"));
+        assert!(text.contains("↓8.4M/s"));
+        assert!(text.contains("↑612K/s"));
+    }
+
+    #[test]
+    fn operational_shell_guards_viewports_below_80_by_24() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for (width, height) in [(79, 24), (80, 23)] {
+            let mut app = test_support::test_app();
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+            let mut text = String::new();
+            let buffer = terminal.backend().buffer();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+
+            assert!(text.contains("Resize terminal to at least 80x24"));
+            assert!(text.contains("q to quit"));
+            assert!(text.contains("? for help"));
+            assert!(!text.contains("node-a"));
+        }
+    }
+
+    #[test]
+    fn unsupported_viewport_still_opens_help() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_support::test_app();
+        app.handle_key(KeyCode::Char('?')).expect("help key handled");
+        let backend = TestBackend::new(79, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("KEYBOARD SHORTCUTS & HELP (?)"));
+        assert!(!app.handle_key(KeyCode::Char('q')).expect("quit key handled"));
+    }
+
+    #[test]
+    fn internet_shell_keeps_header_and_footer_at_runtime_edges() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for (width, height) in [(80, 24), (96, 27), (120, 30), (144, 40)] {
+            let mut app = test_support::test_app();
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let row = |y: u16| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            assert!(row(0).contains("INTERNET / select / node-a"));
+            let tabs_y = if height >= 30 { 2 } else { 1 };
+            assert!(row(tabs_y).contains("Current selector"));
+            if height >= 30 {
+                assert!(row(1).trim().is_empty());
+            }
+            let footer = row(height - 1);
+            assert!(footer.contains("Ctrl+K"));
+            assert!(footer.contains("[Tab]"));
+            assert!(footer.contains("GLOBAL NET"));
+            assert!(footer.trim_end().ends_with("↑0.0M/s"));
+            assert!(!row(0).contains("GLOBAL NET"));
+            assert!(!footer.contains("node-a"));
+        }
     }
 
     #[test]
@@ -2326,5 +2441,3 @@ mod navigation_tests {
         assert_eq!(app.active_view, ActiveView::NodeList);
     }
 }
-
-

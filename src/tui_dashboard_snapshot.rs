@@ -583,6 +583,13 @@ impl App {
             pending_animation_bright: (self.animation_started.elapsed().as_millis() / 500) % 2 == 0,
             intranet_detail,
             status,
+            network_status: if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
+                "STABLE"
+            } else {
+                "IDLE"
+            },
+            current_down_rate: &self.last_active_traffic_rate.0,
+            current_up_rate: &self.last_active_traffic_rate.1,
             flash,
             node_quality_detail: self.node_quality_detail.as_ref(),
             connections,

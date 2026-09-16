@@ -41,6 +41,33 @@ impl App {
         (!chain.is_empty()).then(|| chain.join(" -> "))
     }
 
+    pub(super) fn current_route_labels(&self) -> (String, String) {
+        let provider = if let Some(root) = self.implicit_root_group() {
+            root.current
+                .as_deref()
+                .and_then(|name| self.group_by_name(name))
+                .unwrap_or(root)
+        } else {
+            match self.groups.get(self.group_index) {
+                Some(group) => group,
+                None => return ("—".to_string(), "—".to_string()),
+            }
+        };
+
+        let mut current = provider;
+        let mut route_node = current.current.clone().unwrap_or_else(|| "—".to_string());
+        let mut visited = BTreeSet::from([current.name.clone()]);
+        while let Some(next) = self.group_by_name(&route_node) {
+            if !visited.insert(next.name.clone()) {
+                break;
+            }
+            current = next;
+            route_node = current.current.clone().unwrap_or_else(|| "—".to_string());
+        }
+
+        (provider.name.clone(), route_node)
+    }
+
     pub(super) fn internet_outbound_root_selector(&self) -> Option<String> {
         self.implicit_root_group()
             .or_else(|| self.selected_group())

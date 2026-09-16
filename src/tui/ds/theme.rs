@@ -74,7 +74,7 @@ impl Theme {
 
     pub(crate) fn bg_canvas(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(14, 17, 16),      // #0E1110
+            ColorCapability::TrueColor => Color::Rgb(7, 12, 9),        // #070C09
             ColorCapability::Ansi256 => Color::Indexed(233),           // very dark gray
             ColorCapability::Ansi16 => Color::Black,
             ColorCapability::NoColor => Color::Reset,
@@ -83,7 +83,7 @@ impl Theme {
 
     pub(crate) fn bg_surface(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(20, 25, 23),      // #141917
+            ColorCapability::TrueColor => Color::Rgb(7, 17, 13),       // #07110D
             ColorCapability::Ansi256 => Color::Indexed(234),
             ColorCapability::Ansi16 => Color::Black,
             ColorCapability::NoColor => Color::Reset,
@@ -92,7 +92,7 @@ impl Theme {
 
     pub(crate) fn bg_selected(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(19, 43, 43),      // #132B2B
+            ColorCapability::TrueColor => Color::Rgb(14, 30, 23),      // #0E1E17
             ColorCapability::Ansi256 => Color::Indexed(23),            // #005F5F
             ColorCapability::Ansi16 => Color::DarkGray,
             ColorCapability::NoColor => Color::Reset,
@@ -103,7 +103,7 @@ impl Theme {
 
     pub(crate) fn text_primary(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(240, 244, 242),   // #F0F4F2
+            ColorCapability::TrueColor => Color::Rgb(220, 232, 223),   // #DCE8DF
             ColorCapability::Ansi256 => Color::Indexed(255),
             ColorCapability::Ansi16 => Color::White,
             ColorCapability::NoColor => Color::Reset,
@@ -112,7 +112,7 @@ impl Theme {
 
     pub(crate) fn text_secondary(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(184, 196, 190),   // #B8C4BE
+            ColorCapability::TrueColor => Color::Rgb(169, 182, 174),   // #A9B6AE
             ColorCapability::Ansi256 => Color::Indexed(250),
             ColorCapability::Ansi16 => Color::Gray,
             ColorCapability::NoColor => Color::Reset,
@@ -130,7 +130,7 @@ impl Theme {
 
     pub(crate) fn text_accent(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(92, 225, 230),    // #5CE1E6 (Cyan)
+            ColorCapability::TrueColor => Color::Rgb(83, 216, 244),    // #53D8F4
             ColorCapability::Ansi256 => Color::Indexed(44),            // Cyan
             ColorCapability::Ansi16 => Color::Cyan,
             ColorCapability::NoColor => Color::Reset,
@@ -164,6 +164,33 @@ impl Theme {
         }
     }
 
+    pub(crate) fn text_transfer(&self) -> Color {
+        match self.capability {
+            ColorCapability::TrueColor => Color::Rgb(0, 255, 209),     // #00FFD1
+            ColorCapability::Ansi256 => Color::Indexed(49),
+            ColorCapability::Ansi16 => Color::Cyan,
+            ColorCapability::NoColor => Color::Reset,
+        }
+    }
+
+    pub(crate) fn text_status_active(&self) -> Color {
+        match self.capability {
+            ColorCapability::TrueColor => Color::Rgb(79, 255, 184),    // #4FFFB8
+            ColorCapability::Ansi256 => Color::Indexed(85),
+            ColorCapability::Ansi16 => Color::Green,
+            ColorCapability::NoColor => Color::Reset,
+        }
+    }
+
+    pub(crate) fn text_latency(&self) -> Color {
+        match self.capability {
+            ColorCapability::TrueColor => Color::Rgb(214, 111, 230),   // #D66FE6
+            ColorCapability::Ansi256 => Color::Indexed(170),
+            ColorCapability::Ansi16 => Color::Magenta,
+            ColorCapability::NoColor => Color::Reset,
+        }
+    }
+
     // --- Route Interval Colors (alternating Cyan and Yellow per Figma 05) ---
 
     pub(crate) fn route_color(&self, interval_index: usize) -> Color {
@@ -178,7 +205,7 @@ impl Theme {
 
     pub(crate) fn border_default(&self) -> Color {
         match self.capability {
-            ColorCapability::TrueColor => Color::Rgb(38, 50, 44),      // #26322C
+            ColorCapability::TrueColor => Color::Rgb(38, 50, 42),      // #26322A
             ColorCapability::Ansi256 => Color::Indexed(236),
             ColorCapability::Ansi16 => Color::DarkGray,
             ColorCapability::NoColor => Color::Reset,
@@ -235,5 +262,53 @@ impl Theme {
 
     pub(crate) fn style_footer_status(&self) -> Style {
         Style::default().fg(self.text_success()).add_modifier(Modifier::BOLD)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ColorCapability, Theme};
+    use ratatui::style::Color;
+
+    #[test]
+    fn truecolor_palette_matches_live_figma_foundations() {
+        let theme = Theme::new(ColorCapability::TrueColor);
+
+        assert_eq!(theme.bg_canvas(), Color::Rgb(7, 12, 9));
+        assert_eq!(theme.bg_surface(), Color::Rgb(7, 17, 13));
+        assert_eq!(theme.bg_selected(), Color::Rgb(14, 30, 23));
+        assert_eq!(theme.border_default(), Color::Rgb(38, 50, 42));
+        assert_eq!(theme.border_focus(), Color::Rgb(83, 216, 244));
+        assert_eq!(theme.text_primary(), Color::Rgb(220, 232, 223));
+        assert_eq!(theme.text_secondary(), Color::Rgb(169, 182, 174));
+        assert_eq!(theme.text_muted(), Color::Rgb(114, 128, 120));
+        assert_eq!(theme.text_accent(), Color::Rgb(83, 216, 244));
+        assert_eq!(theme.text_success(), Color::Rgb(98, 230, 167));
+        assert_eq!(theme.text_warning(), Color::Rgb(232, 212, 102));
+        assert_eq!(theme.text_error(), Color::Rgb(255, 96, 107));
+        assert_eq!(theme.text_transfer(), Color::Rgb(0, 255, 209));
+        assert_eq!(theme.text_status_active(), Color::Rgb(79, 255, 184));
+        assert_eq!(theme.text_latency(), Color::Rgb(214, 111, 230));
+    }
+
+    #[test]
+    fn no_color_palette_resets_every_semantic_token() {
+        let theme = Theme::new(ColorCapability::NoColor);
+
+        assert_eq!(theme.bg_canvas(), Color::Reset);
+        assert_eq!(theme.bg_surface(), Color::Reset);
+        assert_eq!(theme.bg_selected(), Color::Reset);
+        assert_eq!(theme.border_default(), Color::Reset);
+        assert_eq!(theme.border_focus(), Color::Reset);
+        assert_eq!(theme.text_primary(), Color::Reset);
+        assert_eq!(theme.text_secondary(), Color::Reset);
+        assert_eq!(theme.text_muted(), Color::Reset);
+        assert_eq!(theme.text_accent(), Color::Reset);
+        assert_eq!(theme.text_success(), Color::Reset);
+        assert_eq!(theme.text_warning(), Color::Reset);
+        assert_eq!(theme.text_error(), Color::Reset);
+        assert_eq!(theme.text_transfer(), Color::Reset);
+        assert_eq!(theme.text_status_active(), Color::Reset);
+        assert_eq!(theme.text_latency(), Color::Reset);
     }
 }

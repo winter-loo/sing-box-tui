@@ -38,38 +38,40 @@ use std::time::Instant;
 
 #[test]
 fn pending_candidate_animation_has_distinct_bright_and_dim_frames() {
-    let bright = pending_candidate_style(true);
-    let dim = pending_candidate_style(false);
+    let theme = Theme::new(crate::tui::ds::ColorCapability::TrueColor);
+    let bright = pending_candidate_style(true, &theme);
+    let dim = pending_candidate_style(false, &theme);
 
-    assert_eq!(bright.fg, Some(Color::LightYellow));
-    assert_eq!(dim.fg, Some(Color::DarkGray));
+    assert_eq!(bright.fg, Some(theme.text_warning()));
+    assert_eq!(dim.fg, Some(theme.text_muted()));
     assert_ne!(bright, dim);
 }
 
 #[test]
 fn latency_signal_uses_the_requested_color_thresholds() {
+    let theme = Theme::new(crate::tui::ds::ColorCapability::TrueColor);
     assert_eq!(
-        latency_signal_style(LatencySignalState::Untested).fg,
-        Some(Color::DarkGray)
+        latency_signal_style(LatencySignalState::Untested, &theme).fg,
+        Some(theme.text_muted())
     );
     assert_eq!(
-        latency_signal_style(LatencySignalState::Reachable { delay_ms: 199 }).fg,
-        Some(Color::Green)
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 199 }, &theme).fg,
+        Some(theme.text_success())
     );
     assert_eq!(
-        latency_signal_style(LatencySignalState::Reachable { delay_ms: 200 }).fg,
-        Some(Color::Yellow)
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 200 }, &theme).fg,
+        Some(theme.text_warning())
     );
     assert_eq!(
-        latency_signal_style(LatencySignalState::Reachable { delay_ms: 400 }).fg,
-        Some(Color::Rgb(184, 134, 11))
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 400 }, &theme).fg,
+        Some(theme.text_warning())
     );
     assert_eq!(
-        latency_signal_style(LatencySignalState::Reachable { delay_ms: 600 }).fg,
-        Some(Color::Rgb(205, 92, 92))
+        latency_signal_style(LatencySignalState::Reachable { delay_ms: 600 }, &theme).fg,
+        Some(theme.text_error())
     );
-    let unreachable = latency_signal_style(LatencySignalState::Unreachable);
-    assert_eq!(unreachable.fg, Some(Color::Rgb(139, 0, 0)));
+    let unreachable = latency_signal_style(LatencySignalState::Unreachable, &theme);
+    assert_eq!(unreachable.fg, Some(theme.text_error()));
     assert!(unreachable.add_modifier.contains(Modifier::BOLD));
 }
 
@@ -156,6 +158,9 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             sing_box: "sing-box: managed".to_string(),
             footer: StatusFooter::Status("ready".to_string()),
         },
+        network_status: "STABLE",
+        current_down_rate: "0.0M/s",
+        current_up_rate: "0.0M/s",
         flash: None,
         node_quality_detail: None,
         connections: None,
@@ -282,14 +287,17 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(!text.contains("avg"));
     assert!(!text.contains("stable reachable"));
     assert!(!text.contains("3/3"));
-    assert!(text.contains("dashboard"));
+    assert!(text.contains("Ctrl+K"));
+    assert!(text.contains("actions"));
     assert!(text.contains("connections"));
     assert!(text.contains("quality"));
-    assert!(text.contains("settings"));
     assert!(text.contains("help"));
-    assert!(text.contains("provider"));
+    assert!(text.contains("[Tab]"));
+    assert!(text.contains("Intranet"));
     assert!(text.contains("GLOBAL NET"));
     assert!(text.contains("STABLE"));
+    assert!(text.contains("↓0.0M/s"));
+    assert!(text.contains("↑0.0M/s"));
     assert!(!text.contains("Intranet Proxy"));
     assert!(has_help_binding("\\", "Toggle TUN mode"));
 }
@@ -325,7 +333,7 @@ fn status_footer_is_rendered_below_its_box() {
     let lines = rendered_lines(&dashboard_snapshot());
     let message_row = lines
         .iter()
-        .position(|line| line.contains("ready"))
+        .position(|line| line.contains("GLOBAL NET"))
         .expect("status footer row");
 
     assert_eq!(message_row, 29);
@@ -334,6 +342,23 @@ fn status_footer_is_rendered_below_its_box() {
     assert!(!lines[message_row - 1].contains('┘'));
     assert!(lines[message_row].contains("GLOBAL NET"));
     assert!(lines[message_row].contains("STABLE"));
+}
+
+#[test]
+fn filter_footer_keeps_network_status_and_live_rates_visible() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.status.footer = StatusFooter::Filter("edge".to_string());
+    snapshot.current_down_rate = "8.4M/s";
+    snapshot.current_up_rate = "612K/s";
+
+    for width in [80, 120] {
+        let lines = rendered_lines_at(&snapshot, width, 24);
+        let footer = lines.last().expect("footer row");
+        assert!(footer.contains("Filter: edge"));
+        assert!(footer.contains("GLOBAL NET"));
+        assert!(footer.contains("↓8.4M/s"));
+        assert!(footer.contains("↑612K/s"));
+    }
 }
 
 #[test]
@@ -660,7 +685,7 @@ fn candidate_row_renders_cold_start_ms_and_sustained_throughput_speed() {
 
 #[test]
 fn candidate_row_selected_focus_styling_matches_figma_accent() {
-    let theme = Theme::detect();
+    let theme = Theme::new(crate::tui::ds::ColorCapability::TrueColor);
     let focused = theme.style_focused_row();
     let breadcrumb = theme.style_breadcrumb();
 
@@ -843,18 +868,18 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
 
     // Bottom row (Row 29): Integrated Footer
     let footer_row = &lines[29];
-    assert!(footer_row.contains("dashboard"));
+    assert!(footer_row.contains("Ctrl+K"));
+    assert!(footer_row.contains("actions"));
     assert!(footer_row.contains("connections"));
     assert!(footer_row.contains("quality"));
-    assert!(footer_row.contains("settings"));
     assert!(footer_row.contains("help"));
-    assert!(footer_row.contains("provider"));
     assert!(footer_row.contains("Intranet →"));
     assert!(footer_row.contains("GLOBAL NET"));
     assert!(footer_row.contains("STABLE"));
+    assert!(footer_row.contains("↓0.0M/s"));
+    assert!(footer_row.contains("↑0.0M/s"));
 
     // Verify no legacy box borders anywhere in the 30 rows
     assert!(!lines.iter().any(|line| line.contains("Internet Proxy")));
     assert!(!lines.iter().any(|line| line.contains("Status") && line.contains("─")));
 }
-
