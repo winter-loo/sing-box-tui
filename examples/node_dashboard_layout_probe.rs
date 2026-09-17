@@ -323,7 +323,7 @@ fn export(b: &Buffer, path: &Path) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let out = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "artifacts/idle-dashboard-layout".into());
+        .unwrap_or_else(|| "artifacts/node-dashboard-layout".into());
     fs::create_dir_all(&out)?;
     for (w, h) in [
         (120, 30),
@@ -339,7 +339,7 @@ fn main() -> io::Result<()> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(render).unwrap();
         let b = t.backend().buffer();
-        export(b, &Path::new(&out).join(format!("idle-{w}x{h}")))?;
+        export(b, &Path::new(&out).join(format!("node-dashboard-{w}x{h}")))?;
         println!("rendered {w}x{h}: {} cells", b.content.len());
     }
     Ok(())

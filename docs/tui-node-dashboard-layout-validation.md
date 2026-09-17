@@ -1,7 +1,7 @@
-# Idle dashboard terminal layout validation
+# Node dashboard terminal layout validation
 
-Updated 2026-09-16 for the production Idle Dashboard renderer in
-`src/tui/view/idle_dashboard.rs`. The live Figma handoff is `1014:2`; the
+Updated 2026-09-17 for the production Node Dashboard renderer in
+`src/tui/view/node_dashboard.rs`. The live Figma handoff is `1014:2`; the
 editable reference frames are `1025:2` (120×30) and `1027:16` (80×24) in file
 `jGcpW9esdjzunUpuU3Aqu5`.
 
@@ -12,7 +12,7 @@ rows, then recomputed from the current `Rect` on every draw.
 ## Production checks
 
 ```powershell
-cargo test --locked test_render_idle_dashboard_
+cargo test --locked test_render_node_dashboard_
 cargo check --locked
 ```
 
@@ -58,11 +58,11 @@ At 96×30 the body is `x=1..94`: a 30-cell quality surface, one-cell gap, and
 hides connections, because both remaining regions still meet their cell
 budgets.
 
-To avoid awkwardly stretched plots, monitoring content is capped at 144
-columns and 30 rows and centered inside the available body. Tests pin 132×36
-to `130×30` at `(1,3)` and 160×45 to `144×30` at `(8,7)`. Panel widths still
-derive from the actual capped cell width; no Figma pixel coordinate is used at
-runtime.
+Monitoring content fills the available body between the fixed header and
+footer, with one-cell horizontal gutters. Tests cover 132×36, 160×45, and
+206×48 Windows Terminal-sized viewports and pin both outer gutters, the full
+connection-panel height, and proportional panel widths. No Figma pixel
+coordinate or fixed maximum canvas is used at runtime.
 
 ## Chart and footer contract
 
@@ -84,6 +84,6 @@ after reserving the complete right-aligned global status plus live rates. Both
 sides retain a one-cell outer inset, and the status is never replaced by rates
 alone at supported reference sizes.
 
-The standalone `examples/idle_dashboard_layout_probe.rs` remains a historical
+The standalone `examples/node_dashboard_layout_probe.rs` remains a historical
 artifact renderer. Production acceptance and geometry are defined by the
 renderer and buffer tests above.

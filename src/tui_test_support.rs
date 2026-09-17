@@ -82,6 +82,7 @@ pub(super) fn test_app() -> App {
             members: vec!["node-a".to_string()],
         }],
         group_index: 0,
+        applied_group_index: 0,
         internet_route_index: 0,
         member_index: 0,
         node_view_panel: super::NodeViewPanel::CurrentSelector,
@@ -171,8 +172,6 @@ pub(super) fn test_app() -> App {
         operational_workspace: crate::tui_state::OperationalWorkspace::Internet,
         command_palette: None,
         provider_modal: None,
-        last_user_activity: Instant::now(),
-        inactivity_paused_at: None,
         last_traffic_totals: None,
         last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
     }

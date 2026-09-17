@@ -4,8 +4,8 @@ Terms that define how sing-box-tui owns proxy runtime and network-access behavio
 
 ## Language
 
-**Idle dashboard**:
-A passive monitoring view shown while the user is not operating the TUI, with separate histories for current-route node quality and core traffic. It is distinct from the operational home page and contains no candidate-node list.
+**Node dashboard**:
+A passive monitoring view for the current route node, with separate histories for current-route node quality and core traffic. It is entered explicitly, is distinct from the operational node list, and contains no candidate-node list.
 _Avoid_: Home page, node browser, node selection page
 
 **Core traffic**:

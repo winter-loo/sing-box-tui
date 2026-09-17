@@ -258,6 +258,9 @@ impl App {
                 .switch_proxy(&parent, &route_group)
                 .with_context(|| format!("failed to switch {} to {}", parent, route_group))?;
         }
+        if !self.implicit_root_mode() {
+            self.applied_group_index = self.group_index;
+        }
         // The lease must cover membership validation and every selector write, but refresh uses
         // unleased projection reads that acquire the same cross-process lock. Release it before
         // refresh so a custom candidate-panel selection cannot deadlock itself re-entering that
@@ -305,6 +308,10 @@ impl App {
 
     pub(super) fn refresh(&mut self) -> Result<()> {
         let previous_group_name = self.selected_group().map(|group| group.name.clone());
+        let previous_applied_group_name = self
+            .groups
+            .get(self.applied_group_index)
+            .map(|group| group.name.clone());
         let previous_choice_name = self.selected_root_choice_name();
         let config = self.client.fetch_config()?;
         let groups = self.client.fetch_selector_groups()?;
@@ -329,6 +336,9 @@ impl App {
             self.group_index = previous_group_name
                 .and_then(|name| self.groups.iter().position(|group| group.name == name))
                 .unwrap_or(0);
+            self.applied_group_index = previous_applied_group_name
+                .and_then(|name| self.groups.iter().position(|group| group.name == name))
+                .unwrap_or(self.group_index);
             self.internet_route_index = 0;
         }
         self.sync_member_selection_to_current();

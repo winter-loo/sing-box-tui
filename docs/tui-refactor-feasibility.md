@@ -10,7 +10,7 @@
 
 120×30 的字符预算可以容纳完整监控页；当前渲染架构可增加独立的闲置页。2 秒采集、10 秒轻量探测和 30 分钟持久化也可以实现。主要前置缺口是**完整、可按 Internet Proxy 节点归属并单列探测流量的累计计数来源**：当前活动连接快照无法满足这一要求。
 
-后续授权的隔离验证已经执行，详见 [实际统计实验](tui-telemetry-contract-results.md) 和 [布局渲染验证](tui-idle-layout-validation.md)。当前核心明确拒绝 V2Ray API 配置；Clash 总量包括直连，却漏掉产生实际字节的失败 Delay 探测。两个独立实验复现了这一反例。因此统计前置门槛未通过，不能继续把现有接口包装成满足 ADR 0003 的完整账本。正确的 Figma Remote 连接已完成实时复查，120×30 和 80×24 已产生实际 TestBackend 图片；这仍是独立 fixture，不是已接入产品的监控页。
+后续授权的隔离验证已经执行，详见 [实际统计实验](tui-telemetry-contract-results.md) 和 [布局渲染验证](tui-node-dashboard-layout-validation.md)。当前核心明确拒绝 V2Ray API 配置；Clash 总量包括直连，却漏掉产生实际字节的失败 Delay 探测。两个独立实验复现了这一反例。因此统计前置门槛未通过，不能继续把现有接口包装成满足 ADR 0003 的完整账本。正确的 Figma Remote 连接已完成实时复查，120×30 和 80×24 已产生实际 TestBackend 图片；这仍是独立 fixture，不是已接入产品的监控页。
 
 本轮为只读代码与渲染库能力核查，未启动真实测速、改变网络配置或运行中的代理，未实现产品或执行新页面的渲染测试。子代理误用了另一套 Figma 连接：`mcp__codex_apps__figma_*` 的账号为 songli，文件请求报没有编辑权限。随后主代理使用本会话此前采用的 `mcp__figma__*` 核验：账号为 David Lu，`get_metadata` 成功读取 `1014:2`。因此不能概括为目标 Figma Remote MCP 不可访问；后续应明确使用 `mcp__figma__*`。布局预算仍基于此前完整读取的 [Implementation Handoff](https://www.figma.com/design/jGcpW9esdjzunUpuU3Aqu5?node-id=1014-2) 及其后用户确认的 ADR，本次元数据复查不等于新的视觉验证。
 
@@ -65,7 +65,7 @@
 
 ### 绘图实现约束
 
-- 当前 `src/tui/view/dashboard.rs:129,203` 是操作候选页的 snapshot 和左右布局。新增独立 `IdleDashboardSnapshot` 与 render，避免复用名称而混淆当前路由和浏览节点。
+- 当前 `src/tui/view/dashboard.rs:129,203` 是操作候选页的 snapshot 和左右布局。新增独立 `NodeDashboardSnapshot` 与 render，避免复用名称而混淆当前路由和浏览节点。
 - 本机 Ratatui 0.30 所使用的 `ratatui-widgets-0.3.0/src/chart.rs:158,320,732` 表明 GraphType 有 Scatter/Line/Bar，没有原生虚线。可用下载连线、上传散点；样式可读性需终端验证。
 - Chart 会按 y 轴标签宽度调整绘图区。两个相同外框不保证时间轴对齐，应固定 gutter、自绘公共轴和标签，统一时间投影。
 - 缺测和节点切换拆分 Dataset，不跨缺口连线。30 分钟投到 72 列约 25 秒/列，2 秒样本必须降采样，保留范围尖峰、缺测及边界信息，不伪造时间分辨率。
@@ -86,7 +86,7 @@
 
 1. **统计能力隔离契约实验。** 在可控本地端点和隔离 runtime 中检查目标构建、累计 counters、归属及探测覆盖，不操作用户当前代理。未满足时输出明确缺口，不能宣称完成 ADR 统计要求。
 2. **独立采集与历史模型。** 建立 runtime epoch、节点身份、覆盖状态、probe 子集、route interval、2/10 秒调度和 30 分钟存储；与节点质量清理生命周期分开。
-3. **工作区和闲置状态机。** 实现首次/恢复/回退、30 秒例外、直接快捷键、弹窗返回、当前路由详情绑定；保留现有 VPN 生命周期。
+3. **工作区和页面状态机。** 实现首次/恢复/回退、显式页面导航、弹窗返回、当前路由详情绑定；保留现有 VPN 生命周期。
 4. **纯布局和历史投影。** 独立闲置 snapshot、布局函数、分桶/分段、公共轴和图例；实现收起顺序并复用详情。
 5. **定向验证。** 先做状态与计数实验，再做 TestBackend 和真实终端视觉检查；通过后运行仓库所需 Rust 检查。此次仅文档核查，无新业务代码需要 cargo 测试。
 

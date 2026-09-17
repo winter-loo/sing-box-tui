@@ -66,7 +66,7 @@ impl GlobalNetworkStatus {
     }
 }
 
-pub(crate) struct IdleDashboardSnapshot<'a> {
+pub(crate) struct NodeDashboardSnapshot<'a> {
     pub(crate) active_provider: &'a str,
     pub(crate) active_node: &'a str,
     pub(crate) network_status: GlobalNetworkStatus,
@@ -79,7 +79,7 @@ pub(crate) struct IdleDashboardSnapshot<'a> {
     pub(crate) active_connections: Vec<ActiveConnectionSummary<'a>>,
 }
 
-impl<'a> IdleDashboardSnapshot<'a> {
+impl<'a> NodeDashboardSnapshot<'a> {
     #[allow(dead_code)]
     pub(crate) fn latency_history_points(&self) -> &[(f64, f64)] {
         self.node_quality
@@ -270,7 +270,7 @@ fn plot_braille_sparklines(f: &mut Frame, r: Rect, points: &[(f64, f64)], color:
     );
 }
 
-fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_>, theme: &Theme) {
+fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &NodeDashboardSnapshot<'_>, theme: &Theme) {
     surface(f, r, theme);
     let x = r.x + 1;
     let w = r.width.saturating_sub(2);
@@ -389,7 +389,7 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &IdleDashboardSnapshot<'_
 fn render_connections_panel(
     f: &mut Frame,
     r: Rect,
-    snapshot: &IdleDashboardSnapshot<'_>,
+    snapshot: &NodeDashboardSnapshot<'_>,
     theme: &Theme,
 ) {
     let title = format!(" 活动连接 · {} ", snapshot.active_connections.len());
@@ -455,7 +455,7 @@ fn render_connections_panel(
 fn render_aggregate_panel(
     f: &mut Frame,
     r: Rect,
-    snapshot: &IdleDashboardSnapshot<'_>,
+    snapshot: &NodeDashboardSnapshot<'_>,
     theme: &Theme,
 ) {
     surface(f, r, theme);
@@ -732,30 +732,26 @@ fn render_aggregate_panel(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct IdleDashboardLayout {
+struct NodeDashboardLayout {
     node: Option<Rect>,
     connections: Option<Rect>,
     aggregate: Rect,
 }
 
-impl IdleDashboardLayout {
+impl NodeDashboardLayout {
     const HEADER_HEIGHT: u16 = 2;
     const FOOTER_HEIGHT: u16 = 2;
-    const MAX_CONTENT_WIDTH: u16 = 144;
-    const MAX_CONTENT_HEIGHT: u16 = 30;
 
     fn from_area(area: Rect) -> Self {
         let body_y = area.y + Self::HEADER_HEIGHT;
         let body_height = area
             .height
             .saturating_sub(Self::HEADER_HEIGHT + Self::FOOTER_HEIGHT);
-        let content_width = area.width.saturating_sub(2).min(Self::MAX_CONTENT_WIDTH);
-        let content_height = body_height.min(Self::MAX_CONTENT_HEIGHT);
         let content = Rect::new(
-            area.x + (area.width.saturating_sub(content_width)) / 2,
-            body_y + (body_height.saturating_sub(content_height)) / 2,
-            content_width,
-            content_height,
+            area.x + 1,
+            body_y,
+            area.width.saturating_sub(2),
+            body_height,
         );
 
         let full = content.width >= 118 && content.height >= 26;
@@ -773,7 +769,7 @@ impl IdleDashboardLayout {
         } else {
             30
         }
-        .clamp(30, 42);
+        .max(30);
         let aggregate = Rect::new(
             content.x + left_width + 1,
             content.y,
@@ -798,8 +794,8 @@ impl IdleDashboardLayout {
     }
 }
 
-/// Main entry point for rendering the Idle Dashboard from the available terminal-cell budget.
-pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardSnapshot<'_>) {
+/// Main entry point for rendering the Node Dashboard from the available terminal-cell budget.
+pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardSnapshot<'_>) {
     let r = frame.area();
     let theme = Theme::detect();
     frame.render_widget(Block::default().style(theme.style_base()), r);
@@ -826,7 +822,7 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         frame,
         Rect::new(0, 0, r.width, 1),
         &theme,
-        &["DASHBOARD", provider, node],
+        &["NODE DASHBOARD", provider, node],
     );
     label(
         frame,
@@ -837,7 +833,7 @@ pub(crate) fn render_idle_dashboard(frame: &mut Frame, snapshot: &IdleDashboardS
         theme.border_default(),
     );
 
-    let layout = IdleDashboardLayout::from_area(r);
+    let layout = NodeDashboardLayout::from_area(r);
     if let Some(node_area) = layout.node {
         render_node_panel(frame, node_area, snapshot, &theme);
     }
@@ -932,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_standard_120x30() {
+    fn test_render_node_dashboard_standard_120x30() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -973,7 +969,7 @@ mod tests {
             interval_index: 0,
         }];
 
-        let snapshot = IdleDashboardSnapshot {
+        let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
             network_status: GlobalNetworkStatus::Stable,
@@ -1011,7 +1007,7 @@ mod tests {
         };
 
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 120);
@@ -1019,7 +1015,7 @@ mod tests {
 
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
-        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
+        assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("活动连接 · 1"));
@@ -1044,7 +1040,7 @@ mod tests {
         // one-cell outer gutters, a 37-cell left rail, a one-cell panel gap,
         // and an 80-cell global-history surface.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
         assert_ne!(buffer[(1, 2)].symbol(), "┌");
         assert_ne!(buffer[(39, 2)].symbol(), "┌");
@@ -1097,11 +1093,11 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_breakpoint_96x30() {
+    fn test_render_node_dashboard_breakpoint_96x30() {
         let backend = TestBackend::new(96, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let snapshot = IdleDashboardSnapshot {
+        let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
             network_status: GlobalNetworkStatus::Stable,
@@ -1139,7 +1135,7 @@ mod tests {
         };
 
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 96);
@@ -1147,7 +1143,7 @@ mod tests {
 
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
-        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
+        assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("28 ms"));
@@ -1160,7 +1156,7 @@ mod tests {
         // One-cell gutters and one-cell inter-panel gap remain at the
         // intermediate breakpoint; connections are hidden before quality.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
         assert_ne!(buffer[(1, 2)].symbol(), "┌");
         assert_eq!(buffer[(31, 2)].symbol(), " ");
@@ -1197,11 +1193,11 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_compact_80x24() {
+    fn test_render_node_dashboard_compact_80x24() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let snapshot = IdleDashboardSnapshot {
+        let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
             network_status: GlobalNetworkStatus::Stable,
@@ -1233,7 +1229,7 @@ mod tests {
         };
 
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 80);
@@ -1241,7 +1237,7 @@ mod tests {
 
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
-        assert!(t.contains("DASHBOARD / AirTCP / JP-Edge-03"));
+        assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
         assert!(t.contains("核心历史 · 30 分钟"));
         // Both node quality and active connections are omitted at width 80
         assert!(!t.contains("节点质量"));
@@ -1256,7 +1252,7 @@ mod tests {
         // Compact Figma 1027:16 keeps a one-cell outer gutter around the
         // global-history surface and moves the footer to the final two rows.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert_eq!(buffer[(1, 0)].symbol(), "D");
+        assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
         assert_ne!(buffer[(1, 2)].symbol(), "┌");
         assert_eq!(buffer[(3, 2)].symbol(), "核");
@@ -1271,8 +1267,8 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_caps_and_centers_large_windows_terminal_compositions() {
-        let snapshot = IdleDashboardSnapshot {
+    fn test_render_node_dashboard_fills_large_window_body() {
+        let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
             network_status: GlobalNetworkStatus::Stable,
@@ -1285,25 +1281,21 @@ mod tests {
             active_connections: vec![],
         };
 
-        for (width, height, content_x, content_y, aggregate_title_x) in
-            [(132, 36, 1, 3, 45), (160, 45, 8, 7, 53)]
-        {
+        for (width, height, aggregate_title_x) in [(132, 36, 45), (160, 45, 54), (206, 48, 68)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|f| render_idle_dashboard(f, &snapshot))
+                .draw(|f| render_node_dashboard(f, &snapshot))
                 .unwrap();
             let buffer = terminal.backend().buffer();
 
-            assert_eq!(buffer[(content_x + 1, content_y)].symbol(), "节");
-            assert_eq!(buffer[(aggregate_title_x, content_y)].symbol(), "核");
-            assert_eq!(buffer[(content_x, content_y + 16)].symbol(), "┌");
-            if content_x > 0 {
-                assert_eq!(buffer[(content_x - 1, content_y)].symbol(), " ");
-            }
-            if content_y > 2 {
-                assert_eq!(buffer[(content_x + 1, content_y - 1)].symbol(), " ");
-            }
+            assert_eq!(buffer[(2, 2)].symbol(), "节");
+            assert_eq!(buffer[(aggregate_title_x, 2)].symbol(), "核");
+            assert_eq!(buffer[(1, 18)].symbol(), "┌");
+            assert_eq!(buffer[(1, height - 3)].symbol(), "└");
+            assert_eq!(buffer[(0, 2)].symbol(), " ");
+            assert_eq!(buffer[(width - 1, 2)].symbol(), " ");
+            assert_eq!(buffer[(width - 2, 2)].bg, Theme::detect().bg_surface());
 
             let footer = buffer_to_text(buffer);
             let footer = footer.lines().nth(usize::from(height - 1)).unwrap();
@@ -1315,11 +1307,11 @@ mod tests {
         let backend = TestBackend::new(150, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text = buffer_to_text(buffer);
-        assert_eq!(buffer[(4, 2)].symbol(), "节");
+        assert_eq!(buffer[(2, 2)].symbol(), "节");
         assert!(text.contains("节点质量"));
         assert!(!text.contains("活动连接"));
         assert!(text.lines().nth(23).unwrap().contains("GLOBAL NET  STABLE"));
@@ -1327,7 +1319,7 @@ mod tests {
         let backend = TestBackend::new(120, 29);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let text = buffer_to_text(terminal.backend().buffer());
         assert!(text.contains("节点质量"));
@@ -1336,10 +1328,10 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_does_not_fabricate_missing_quality_measurements() {
+    fn test_render_node_dashboard_does_not_fabricate_missing_quality_measurements() {
         let backend = TestBackend::new(96, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        let snapshot = IdleDashboardSnapshot {
+        let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
             network_status: GlobalNetworkStatus::Idle,
@@ -1367,7 +1359,7 @@ mod tests {
         };
 
         terminal
-            .draw(|f| render_idle_dashboard(f, &snapshot))
+            .draw(|f| render_node_dashboard(f, &snapshot))
             .unwrap();
         let text = buffer_to_text(terminal.backend().buffer());
         assert!(!text.contains("28 ms"));
@@ -1391,12 +1383,12 @@ mod tests {
     }
 
     #[test]
-    fn test_render_idle_dashboard_unsupported_guard() {
+    fn test_render_node_dashboard_unsupported_guard() {
         for (w, h) in [(70, 20), (79, 24), (80, 23)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
 
-            let snapshot = IdleDashboardSnapshot {
+            let snapshot = NodeDashboardSnapshot {
                 active_provider: "AirTCP",
                 active_node: "JP-Edge-03",
                 network_status: GlobalNetworkStatus::Stable,
@@ -1410,7 +1402,7 @@ mod tests {
             };
 
             terminal
-                .draw(|f| render_idle_dashboard(f, &snapshot))
+                .draw(|f| render_node_dashboard(f, &snapshot))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer.area.width, w);

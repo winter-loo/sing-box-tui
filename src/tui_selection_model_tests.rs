@@ -267,6 +267,73 @@ fn space_on_candidate_panel_does_not_deadlock_the_ui() {
 }
 
 #[test]
+fn flat_space_selection_promotes_the_browsed_provider_to_applied() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind flat selection controller");
+    let address = listener.local_addr().expect("flat selection address");
+    let worker = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept flat selection request");
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap_or_default();
+            let request = String::from_utf8_lossy(&request[..count]);
+            let (status, body) = if request.starts_with("PUT ") {
+                ("204 No Content", "")
+            } else if request.contains(" /configs ") {
+                ("200 OK", r#"{"mode":"rule","mode-list":["rule"]}"#)
+            } else {
+                (
+                    "200 OK",
+                    r#"{"proxies":{"select":{"name":"select","type":"Selector","now":"node-a","all":["node-a"]},"backup-group":{"name":"backup-group","type":"Selector","now":"node-b","all":["node-b"]},"node-a":{"name":"node-a","type":"Direct"},"node-b":{"name":"node-b","type":"Direct"}}}"#,
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write flat selection response");
+        }
+    });
+
+    let mut app = test_app();
+    app.groups.push(ProxyGroup {
+        name: "backup-group".to_string(),
+        kind: "Selector".to_string(),
+        current: Some("node-b".to_string()),
+        members: vec!["node-b".to_string()],
+    });
+    app.group_index = 1;
+    app.member_index = 0;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("flat selection runtime");
+    app.client = ApiClient {
+        base_url: format!("http://{address}"),
+        runtime,
+        client: reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("flat selection HTTP client"),
+    };
+
+    assert_eq!(
+        app.current_route_labels(),
+        ("select".into(), "node-a".into())
+    );
+    app.activate_selection()
+        .expect("apply browsed provider node");
+
+    assert_eq!(app.groups[app.applied_group_index].name, "backup-group");
+    assert_eq!(
+        app.current_route_labels(),
+        ("backup-group".into(), "node-b".into())
+    );
+    worker.join().expect("flat selection controller exits");
+}
+
+#[test]
 fn live_usability_members_keep_pending_and_accepted_but_remove_rejected() {
     let members = ["accepted", "rejected", "checking", "untested"].map(str::to_string);
     let results = [

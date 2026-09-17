@@ -44,7 +44,7 @@ pub const CMD_VIEW_CONNECTIONS: &str = "view_connections";
 pub const CMD_VIEW_NODE_QUALITY: &str = "view_node_quality";
 pub const CMD_OPEN_SETTINGS: &str = "open_settings";
 pub const CMD_OPEN_HELP: &str = "open_help";
-pub const CMD_ENTER_IDLE_DASHBOARD: &str = "enter_idle_dashboard";
+pub const CMD_ENTER_NODE_DASHBOARD: &str = "enter_node_dashboard";
 pub const CMD_QUIT: &str = "quit";
 
 pub fn builtin_commands() -> Vec<CommandItem> {
@@ -128,8 +128,8 @@ pub fn builtin_commands() -> Vec<CommandItem> {
             Some("?"),
         ),
         CommandItem::new(
-            CMD_ENTER_IDLE_DASHBOARD,
-            "Enter Idle Dashboard",
+            CMD_ENTER_NODE_DASHBOARD,
+            "Enter Node Dashboard",
             "General",
             None,
         ),
@@ -357,7 +357,7 @@ mod tests {
         assert!(ids.contains(&CMD_VIEW_NODE_QUALITY));
         assert!(ids.contains(&CMD_OPEN_SETTINGS));
         assert!(ids.contains(&CMD_OPEN_HELP));
-        assert!(ids.contains(&CMD_ENTER_IDLE_DASHBOARD));
+        assert!(ids.contains(&CMD_ENTER_NODE_DASHBOARD));
         assert!(ids.contains(&CMD_QUIT));
 
         let tun_cmd = cmds.iter().find(|c| c.id == CMD_TOGGLE_TUN).unwrap();
@@ -365,10 +365,13 @@ mod tests {
         assert_eq!(tun_cmd.category, "Network capture");
         assert_eq!(tun_cmd.shortcut, Some("\\"));
 
-        let idle_cmd = cmds.iter().find(|c| c.id == CMD_ENTER_IDLE_DASHBOARD).unwrap();
-        assert_eq!(idle_cmd.title, "Enter Idle Dashboard");
-        assert_eq!(idle_cmd.category, "General");
-        assert_eq!(idle_cmd.shortcut, None);
+        let dashboard_cmd = cmds
+            .iter()
+            .find(|c| c.id == CMD_ENTER_NODE_DASHBOARD)
+            .unwrap();
+        assert_eq!(dashboard_cmd.title, "Enter Node Dashboard");
+        assert_eq!(dashboard_cmd.category, "General");
+        assert_eq!(dashboard_cmd.shortcut, None);
     }
 
     #[test]
@@ -421,9 +424,9 @@ mod tests {
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].id, CMD_SWITCH_INTERNET);
 
-        // Subsequence: "idle" matches "Enter Idle Dashboard"
-        let filtered_idle = filter_commands(&cmds, "idle");
-        assert_eq!(filtered_idle[0].id, CMD_ENTER_IDLE_DASHBOARD);
+        // Direct phrase: "node dashboard" matches "Enter Node Dashboard"
+        let filtered_dashboard = filter_commands(&cmds, "node dashboard");
+        assert_eq!(filtered_dashboard[0].id, CMD_ENTER_NODE_DASHBOARD);
     }
 
     #[test]

@@ -368,7 +368,16 @@ fn render_internet_workspace(
         return;
     }
 
-    let [tabs_area, candidate_area, footer_area] = if area.height >= 3 {
+    // Figma 8:2 uses a 30 px tab container around 16 px text, which maps most closely to two
+    // terminal rows. Only collapse it when the caller provides an unusually tiny body area.
+    let [tabs_area, candidate_area, footer_area] = if area.height >= 4 {
+        Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area)
+    } else if area.height == 3 {
         Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -486,6 +495,15 @@ fn render_candidate_table(
     }
 
     let total_width = candidate_list_area.width as usize;
+    // The 960 px Figma row keeps names and metrics in a 640 px content column, leaving the final
+    // third as breathing room. Compact terminals need the full width to keep details readable.
+    let content_width = if total_width >= 96 {
+        total_width.saturating_mul(2) / 3
+    } else {
+        total_width
+    };
+    let horizontal_padding = if total_width >= 8 { 2 } else { 0 };
+    let minimum_middle_gap = 2;
 
     let members = snapshot
         .candidate_rows
@@ -575,22 +593,36 @@ fn render_candidate_table(
                 .sum();
 
             let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
-            let name_budget = total_width.saturating_sub(prefix_width + right_width + 2);
+            let name_budget = content_width.saturating_sub(
+                horizontal_padding * 2
+                    + prefix_width
+                    + right_width
+                    + minimum_middle_gap,
+            );
             let name_str = truncate_for_width(&row.name, name_budget);
             let name_width = unicode_width::UnicodeWidthStr::width(name_str.as_str());
-            let left_width = prefix_width + name_width;
+            let left_width = horizontal_padding + prefix_width + name_width;
 
-            let padding_spaces = total_width.saturating_sub(left_width + right_width);
+            let padding_spaces = content_width.saturating_sub(
+                left_width + right_width + horizontal_padding,
+            );
 
             let mut spans = Vec::new();
+            spans.push(Span::raw(" ".repeat(horizontal_padding)));
             spans.push(Span::styled(prefix, prefix_style));
             spans.push(Span::styled(name_str, name_style));
             if padding_spaces > 0 {
                 spans.push(Span::raw(" ".repeat(padding_spaces)));
             }
             spans.extend(right_spans);
+            let rendered_width = content_width.saturating_sub(horizontal_padding);
+            if total_width > rendered_width {
+                spans.push(Span::raw(" ".repeat(total_width - rendered_width)));
+            }
 
-            ListItem::new(Line::from(spans))
+            // Terminal cells cannot express Figma's half-row padding, so an odd-height item keeps
+            // the node name and its trailing measurements on the true middle row.
+            ListItem::new(vec![Line::default(), Line::from(spans), Line::default()])
         })
         .collect::<Vec<_>>();
 

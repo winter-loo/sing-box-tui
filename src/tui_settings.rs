@@ -202,7 +202,6 @@ pub(super) fn normalize_optional_setting(value: Option<String>) -> Option<String
 
 impl App {
     pub(super) fn open_settings_panel(&mut self) {
-        self.pause_inactivity_timer();
         self.show_settings = true;
         self.settings_edit = None;
         let field_count = visible_settings_fields(self).len();
@@ -221,7 +220,6 @@ impl App {
             KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('s') => {
                 self.show_settings = false;
                 self.settings_error = None;
-                self.resume_inactivity_timer();
                 self.set_status_only("Settings closed");
             }
             KeyCode::Down | KeyCode::Char('j') => {

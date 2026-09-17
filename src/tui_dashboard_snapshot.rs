@@ -4,7 +4,7 @@ use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     ActiveConnectionSummary, ActiveNodeQualitySnapshot, CandidateNotice, CandidateRow,
-    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, IdleDashboardSnapshot,
+    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, NodeDashboardSnapshot,
     GlobalNetworkStatus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal,
     LatencySignalBar, LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow,
     SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
@@ -602,7 +602,7 @@ impl App {
         }
     }
 
-    pub(crate) fn idle_dashboard_snapshot(&self) -> IdleDashboardSnapshot<'_> {
+    pub(crate) fn node_dashboard_snapshot(&self) -> NodeDashboardSnapshot<'_> {
         let current_route = self.current_route_target();
         let selected_group = current_route.map(|(_, group, _)| group);
         let active_provider = current_route
@@ -739,7 +739,7 @@ impl App {
             GlobalNetworkStatus::Idle
         };
 
-        IdleDashboardSnapshot {
+        NodeDashboardSnapshot {
             active_provider,
             active_node,
             network_status,
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_dashboard_follows_applied_route_instead_of_browsed_group() {
+    fn node_dashboard_follows_applied_route_instead_of_browsed_group() {
         let mut app = internet_routes_app();
         app.internet_route_index = 0;
         let now_ms = crate::tui::metrics::now_unix_ms();
@@ -829,7 +829,7 @@ mod tests {
             ),
         );
 
-        let snapshot = app.idle_dashboard_snapshot();
+        let snapshot = app.node_dashboard_snapshot();
 
         assert_eq!(snapshot.active_provider, "宝贝云");
         assert_eq!(snapshot.active_node, "bby-2");
@@ -852,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_dashboard_collection_uses_applied_route_instead_of_browsed_group() {
+    fn node_dashboard_collection_uses_applied_route_instead_of_browsed_group() {
         let mut app = internet_routes_app();
         app.internet_route_index = 0;
         app.metric_store = Some(crate::tui::metrics::MetricStore::open_in_memory().unwrap());
@@ -1243,55 +1243,4 @@ mod tests {
         assert_eq!(streaming_row_a.compact_marker, "1.0M/s");
     }
 
-    #[test]
-    fn test_idle_dashboard_inactivity_and_wake_up() {
-        use std::time::Duration;
-        use super::super::ActiveView;
-
-        let mut app = test_app();
-        assert_eq!(app.active_view, ActiveView::NodeList);
-
-        // 1. Inactivity less than 30s does not trigger idle dashboard
-        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(10);
-        if !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
-        {
-            app.active_view = ActiveView::IdleDashboard;
-        }
-        assert_eq!(app.active_view, ActiveView::NodeList);
-
-        // 2. Inactivity >= 30s triggers idle dashboard
-        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(31);
-        if !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
-        {
-            app.active_view = ActiveView::IdleDashboard;
-        }
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
-
-        // 3. Waking up on keypress restores NodeList immediately
-        app.last_user_activity = std::time::Instant::now();
-        if app.active_view == ActiveView::IdleDashboard {
-            app.active_view = ActiveView::NodeList;
-        }
-        assert_eq!(app.active_view, ActiveView::NodeList);
-
-        // 4. If modal is active, inactivity >= 30s is suspended
-        app.show_help = true;
-        assert!(app.has_active_modal());
-        app.last_user_activity = std::time::Instant::now() - Duration::from_secs(35);
-        if !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
-        {
-            app.active_view = ActiveView::IdleDashboard;
-        }
-        assert_eq!(app.active_view, ActiveView::NodeList);
-
-        // 5. idle_dashboard_snapshot succeeds
-        let snapshot = app.idle_dashboard_snapshot();
-        assert_eq!(snapshot.active_provider, "select");
-    }
 }

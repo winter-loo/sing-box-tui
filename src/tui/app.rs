@@ -297,19 +297,6 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         app.maybe_refresh_connections();
         app.check_and_record_active_route();
 
-        if app.has_active_modal() {
-            app.pause_inactivity_timer();
-        } else {
-            app.resume_inactivity_timer();
-        }
-
-        if !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30)
-        {
-            app.active_view = ActiveView::IdleDashboard;
-        }
-
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -317,9 +304,6 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if !app.has_active_modal() {
-                    app.last_user_activity = Instant::now();
-                }
                 if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
                 {
@@ -338,7 +322,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                     continue;
                 }
-                if app.active_view == ActiveView::IdleDashboard && !app.has_active_modal() {
+                if app.active_view == ActiveView::NodeDashboard && !app.has_active_modal() {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('?') => {
@@ -443,9 +427,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    if app.active_view == ActiveView::IdleDashboard {
-        let snapshot = app.idle_dashboard_snapshot();
-        view::render_idle_dashboard(frame, &snapshot);
+    if app.active_view == ActiveView::NodeDashboard {
+        let snapshot = app.node_dashboard_snapshot();
+        view::render_node_dashboard(frame, &snapshot);
 
         if app.has_active_modal() {
             let view_snapshot = app.view_snapshot();
@@ -527,7 +511,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ActiveView {
     NodeList,
-    IdleDashboard,
+    NodeDashboard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -557,6 +541,7 @@ struct App {
     client: ApiClient,
     groups: Vec<ProxyGroup>,
     group_index: usize,
+    applied_group_index: usize,
     internet_route_index: usize,
     member_index: usize,
     node_view_panel: NodeViewPanel,
@@ -637,8 +622,6 @@ struct App {
     operational_workspace: OperationalWorkspace,
     pub(crate) command_palette: Option<CommandPaletteState>,
     pub(crate) provider_modal: Option<ProviderModalState>,
-    last_user_activity: Instant,
-    pub(crate) inactivity_paused_at: Option<Instant>,
     last_traffic_totals: Option<(Instant, u64, u64)>,
     last_active_traffic_rate: (String, String),
 }
@@ -783,6 +766,7 @@ impl App {
             client,
             groups: Vec::new(),
             group_index: 0,
+            applied_group_index: 0,
             internet_route_index: 0,
             member_index: 0,
             node_view_panel: NodeViewPanel::CurrentSelector,
@@ -869,8 +853,6 @@ impl App {
             operational_workspace: runtime_state.operational_workspace(),
             command_palette: None,
             provider_modal: None,
-            last_user_activity: Instant::now(),
-            inactivity_paused_at: None,
             last_traffic_totals: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
         };
@@ -953,18 +935,6 @@ impl App {
             || self.node_quality_detail.is_some()
             || self.command_palette.is_some()
             || self.provider_modal.is_some()
-    }
-
-    pub(crate) fn pause_inactivity_timer(&mut self) {
-        if self.inactivity_paused_at.is_none() {
-            self.inactivity_paused_at = Some(Instant::now());
-        }
-    }
-
-    pub(crate) fn resume_inactivity_timer(&mut self) {
-        if let Some(paused_at) = self.inactivity_paused_at.take() {
-            self.last_user_activity += paused_at.elapsed();
-        }
     }
 
     pub(crate) fn check_and_record_active_route(&mut self) {
@@ -1085,7 +1055,6 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
                     self.show_help = false;
-                    self.resume_inactivity_timer();
                     self.set_status_only("Help closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
@@ -1104,7 +1073,6 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') => {
                     self.show_connections = false;
-                    self.resume_inactivity_timer();
                     self.set_status_only("Connection details closed");
                 }
                 KeyCode::Char('r') => {
@@ -1121,7 +1089,6 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
                     self.node_quality_detail = None;
-                    self.resume_inactivity_timer();
                     self.set_status_only("Node quality detail closed");
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_node_quality_detail_down(),
@@ -1141,7 +1108,6 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Tab => {
-                self.last_user_activity = Instant::now();
                 self.cycle_operational_workspace()?;
             }
             KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
@@ -1191,9 +1157,7 @@ impl App {
     pub(crate) fn toggle_command_palette(&mut self) {
         if let Some(state) = self.command_palette.take() {
             self.active_view = state.origin_view;
-            self.resume_inactivity_timer();
         } else {
-            self.pause_inactivity_timer();
             self.command_palette = Some(CommandPaletteState::new(self.active_view));
         }
     }
@@ -1212,16 +1176,39 @@ impl App {
                 .collect();
             ("INTRANET PROFILE", items)
         } else {
+            let applied_provider = self
+                .current_route_target()
+                .map(|(provider, _, _)| provider.name.as_str());
             let items = self
-                .groups
+                .internet_provider_group_indices()
                 .iter()
-                .enumerate()
-                .map(|(i, g)| view::ProviderItem {
+                .filter_map(|index| self.groups.get(*index))
+                .map(|g| view::ProviderItem {
                     name: g.name.clone(),
-                    is_current: i == self.group_index,
+                    is_current: applied_provider == Some(g.name.as_str()),
                 })
                 .collect();
             ("INTERNET PROXY PROVIDER", items)
+        }
+    }
+
+    fn internet_provider_group_indices(&self) -> Vec<usize> {
+        let displayed_names = self.displayed_group_names();
+        displayed_names
+            .iter()
+            .filter_map(|name| {
+                self.groups.iter().position(|group| {
+                    group.name == *name && group.kind.eq_ignore_ascii_case("selector")
+                })
+            })
+            .collect()
+    }
+
+    fn provider_modal_item_count(&self) -> usize {
+        if self.operational_workspace == OperationalWorkspace::PrivateAccess {
+            self.private_access.profiles.len()
+        } else {
+            self.internet_provider_group_indices().len()
         }
     }
 
@@ -1231,7 +1218,13 @@ impl App {
                 .focused_index
                 .min(self.private_access.profiles.len().saturating_sub(1))
         } else {
-            self.group_index.min(self.groups.len().saturating_sub(1))
+            let selected_group_name = self.selected_group().map(|group| group.name.as_str());
+            self.internet_provider_group_indices()
+                .iter()
+                .position(|index| {
+                    self.groups.get(*index).map(|group| group.name.as_str()) == selected_group_name
+                })
+                .unwrap_or(0)
         }
     }
 
@@ -1240,19 +1233,42 @@ impl App {
             if chosen < self.private_access.profiles.len() {
                 self.private_access.focused_index = chosen;
                 let name = self.private_access.profiles[chosen].id.clone();
-                self.set_status_only(format!(
-                    "Private access profile switched to {}",
-                    name
-                ));
+                self.set_status_only(format!("Private access profile switched to {}", name));
             }
-        } else if chosen < self.groups.len() {
-            self.group_index = chosen;
+        } else if let Some(group_index) =
+            self.internet_provider_group_indices().get(chosen).copied()
+        {
+            let name = self.groups[group_index].name.clone();
+            if self.implicit_root_mode() {
+                if let Some(index) = self
+                    .displayed_group_names()
+                    .iter()
+                    .position(|provider| provider == &name)
+                {
+                    self.internet_route_index = index;
+                }
+            } else {
+                self.group_index = group_index;
+            }
+            let reset_node_view = self.node_view_panel != NodeViewPanel::CurrentSelector
+                && self.displayed_members().is_empty();
+            if reset_node_view {
+                self.node_view_panel = NodeViewPanel::CurrentSelector;
+                self.auto_select_node_view = NodeViewId::current_selector();
+                self.auto_select_ranking_policy = RankingPolicy::Balanced;
+                self.manual_candidate_navigation = false;
+                self.automatic_selection_state = Default::default();
+                self.active_node_traffic = Default::default();
+                self.last_auto_selection_explanation = None;
+                self.last_auto_select_benchmark = None;
+            }
             self.sync_member_selection_to_current();
-            let name = self.groups[chosen].name.clone();
-            self.set_status_only(format!(
-                "Provider switched to {}",
-                name
-            ));
+            let suffix = if reset_node_view {
+                "; node view reset to Current selector"
+            } else {
+                ""
+            };
+            self.set_status_only(format!("Browsing provider: {name}{suffix}"));
         }
     }
 
@@ -1262,11 +1278,7 @@ impl App {
         }
 
         let is_private = self.operational_workspace == OperationalWorkspace::PrivateAccess;
-        let count = if is_private {
-            self.private_access.profiles.len()
-        } else {
-            self.groups.len()
-        };
+        let count = self.provider_modal_item_count();
 
         if count == 0 {
             let msg = if is_private {
@@ -1277,8 +1289,15 @@ impl App {
             self.set_status_only(msg);
             return;
         }
+        if is_private && count == 1 {
+            let profile = self.private_access.profiles[0].id.clone();
+            self.private_access.focused_index = 0;
+            self.set_status_only(format!(
+                "Only one private access profile is configured: {profile}"
+            ));
+            return;
+        }
 
-        self.pause_inactivity_timer();
         self.provider_modal = Some(ProviderModalState {
             selected_index: self.provider_modal_selected_index(),
             origin_view: self.active_view,
@@ -1286,20 +1305,15 @@ impl App {
     }
 
     pub(crate) fn handle_provider_modal_key(&mut self, code: KeyCode) -> Result<bool> {
+        let count = self.provider_modal_item_count();
         let Some(modal) = &mut self.provider_modal else {
             return Ok(true);
         };
-        let count = if self.operational_workspace == OperationalWorkspace::PrivateAccess {
-            self.private_access.profiles.len()
-        } else {
-            self.groups.len()
-        };
         match code {
-            KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => {
+            KeyCode::Esc | KeyCode::Char('p') => {
                 let origin = modal.origin_view;
                 self.provider_modal = None;
                 self.active_view = origin;
-                self.resume_inactivity_timer();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if modal.selected_index > 0 {
@@ -1316,7 +1330,6 @@ impl App {
                 let origin = modal.origin_view;
                 self.apply_selected_provider(chosen);
                 self.provider_modal = None;
-                self.resume_inactivity_timer();
                 self.active_view = origin;
             }
             KeyCode::Char('q') => return Ok(false),
@@ -1328,7 +1341,6 @@ impl App {
     pub(crate) fn close_command_palette(&mut self) {
         if let Some(state) = self.command_palette.take() {
             self.active_view = state.origin_view;
-            self.resume_inactivity_timer();
         }
     }
 
@@ -1385,8 +1397,6 @@ impl App {
     }
 
     pub(crate) fn execute_command(&mut self, action_id: &str) -> Result<bool> {
-        self.inactivity_paused_at = None;
-        self.last_user_activity = Instant::now();
         match action_id {
             view::CMD_SWITCH_INTERNET => {
                 self.set_operational_workspace(OperationalWorkspace::Internet)?;
@@ -1439,8 +1449,8 @@ impl App {
             view::CMD_OPEN_HELP => {
                 self.open_help_panel();
             }
-            view::CMD_ENTER_IDLE_DASHBOARD => {
-                self.active_view = ActiveView::IdleDashboard;
+            view::CMD_ENTER_NODE_DASHBOARD => {
+                self.active_view = ActiveView::NodeDashboard;
             }
             view::CMD_QUIT => {
                 return Ok(false);
@@ -1502,7 +1512,6 @@ impl App {
     }
 
     fn open_help_panel(&mut self) {
-        self.pause_inactivity_timer();
         self.show_help = true;
         self.flash = None;
         self.set_status_only("Showing help");
@@ -1680,7 +1689,6 @@ mod persistent_path_tests {
 mod navigation_tests {
     use super::*;
     use std::fs;
-    use std::thread;
     use crossterm::event::KeyCode;
     use crate::tui_state::{OperationalWorkspace, TuiRuntimeState, TuiStateStore};
 
@@ -1698,25 +1706,17 @@ mod navigation_tests {
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
 
-        let initial_activity = app.last_user_activity;
-        thread::sleep(Duration::from_millis(5));
-
         // Tab -> PrivateAccess
         app.handle_key(KeyCode::Tab).expect("tab handled");
         assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
         assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
-        assert!(app.last_user_activity > initial_activity);
         let persisted = store.load().expect("load persisted state");
         assert_eq!(persisted.operational_workspace.as_deref(), Some("private_access"));
-
-        let next_activity = app.last_user_activity;
-        thread::sleep(Duration::from_millis(5));
 
         // Tab -> Internet
         app.handle_key(KeyCode::Tab).expect("tab handled");
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
-        assert!(app.last_user_activity > next_activity);
         let persisted = store.load().expect("load persisted state");
         assert_eq!(persisted.operational_workspace.as_deref(), Some("internet"));
 
@@ -1872,6 +1872,10 @@ mod navigation_tests {
             assert!(row(0).contains("INTERNET / select / node-a"));
             let tabs_y = if height >= 30 { 2 } else { 1 };
             assert!(row(tabs_y).contains("Current selector"));
+            assert!(row(tabs_y + 1).trim().is_empty());
+            assert!(row(tabs_y + 2).trim().is_empty());
+            assert!(row(tabs_y + 3).contains("node-a"));
+            assert!(row(tabs_y + 4).trim().is_empty());
             if height >= 30 {
                 assert!(row(1).trim().is_empty());
             }
@@ -1909,19 +1913,19 @@ mod navigation_tests {
         assert_eq!(app.active_view, ActiveView::NodeList);
         assert!(!app.has_active_modal());
 
-        // Open from IdleDashboard and close with Esc
-        app.active_view = ActiveView::IdleDashboard;
+        // Open from NodeDashboard and close with Esc
+        app.active_view = ActiveView::NodeDashboard;
         app.toggle_command_palette();
         assert!(app.command_palette.is_some());
         assert_eq!(
             app.command_palette.as_ref().unwrap().origin_view,
-            ActiveView::IdleDashboard
+            ActiveView::NodeDashboard
         );
 
         let res = app.handle_command_palette_key(KeyCode::Esc).unwrap();
         assert!(res);
         assert!(app.command_palette.is_none());
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
     }
 
     #[test]
@@ -2000,14 +2004,14 @@ mod navigation_tests {
         assert!(app.command_palette.is_none());
         assert!(app.show_connections);
 
-        // Enter idle dashboard
+        // Enter node dashboard
         app.toggle_command_palette();
-        for c in "idle".chars() {
+        for c in "node dashboard".chars() {
             app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
         }
         app.handle_command_palette_key(KeyCode::Enter).unwrap();
         assert!(app.command_palette.is_none());
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
         // Quit command returns Ok(false)
         app.toggle_command_palette();
@@ -2081,13 +2085,13 @@ mod navigation_tests {
             println!("{:02}: {}", y, line);
         }
 
-        // 3. Idle Dashboard 120x30
-        app.active_view = ActiveView::IdleDashboard;
+        // 3. Node Dashboard 120x30
+        app.active_view = ActiveView::NodeDashboard;
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        println!("=== SCREEN BUFFER 120x30 IDLE DASHBOARD ===");
+        println!("=== SCREEN BUFFER 120x30 NODE DASHBOARD ===");
         for y in 0..buffer.area.height {
             let mut line = String::new();
             for x in 0..buffer.area.width {
@@ -2145,13 +2149,13 @@ mod navigation_tests {
             println!("{:02}: {}", y, line);
         }
 
-        // 7. Compact 80x24 Idle Dashboard
-        app.active_view = ActiveView::IdleDashboard;
+        // 7. Compact 80x24 Node Dashboard
+        app.active_view = ActiveView::NodeDashboard;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        println!("=== SCREEN BUFFER 80x24 IDLE DASHBOARD ===");
+        println!("=== SCREEN BUFFER 80x24 NODE DASHBOARD ===");
         for y in 0..buffer.area.height {
             let mut line = String::new();
             for x in 0..buffer.area.width {
@@ -2162,17 +2166,17 @@ mod navigation_tests {
     }
 
     #[test]
-    fn test_modals_render_and_dismiss_on_idle_dashboard() {
+    fn test_modals_render_and_dismiss_on_node_dashboard() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = test_support::test_app();
-        app.active_view = ActiveView::IdleDashboard;
+        app.active_view = ActiveView::NodeDashboard;
 
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // 1. Connections modal over IdleDashboard
+        // 1. Connections modal over NodeDashboard
         app.show_connections = true;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let mut text = String::new();
@@ -2188,9 +2192,9 @@ mod navigation_tests {
         // Dismiss via 'c'
         app.handle_key(KeyCode::Char('c')).unwrap();
         assert!(!app.show_connections);
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
-        // 2. Node quality detail modal over IdleDashboard
+        // 2. Node quality detail modal over NodeDashboard
         app.open_node_quality_detail().unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let mut text = String::new();
@@ -2206,9 +2210,9 @@ mod navigation_tests {
         // Dismiss via Esc
         app.handle_key(KeyCode::Esc).unwrap();
         assert!(app.node_quality_detail.is_none());
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
-        // 3. Settings modal over IdleDashboard
+        // 3. Settings modal over NodeDashboard
         app.open_settings_panel();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let mut text = String::new();
@@ -2224,9 +2228,9 @@ mod navigation_tests {
         // Dismiss via 's'
         app.handle_settings_key(KeyCode::Char('s')).unwrap();
         assert!(!app.show_settings);
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
-        // 4. Help modal over IdleDashboard
+        // 4. Help modal over NodeDashboard
         app.open_help_panel();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let mut text = String::new();
@@ -2242,69 +2246,23 @@ mod navigation_tests {
         // Dismiss via '?'
         app.handle_key(KeyCode::Char('?')).unwrap();
         assert!(!app.show_help);
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
     }
 
     #[test]
-    fn test_inactivity_timer_paused_during_modals_and_resumes_after_dismissal() {
-        let mut app = test_support::test_app();
-        app.active_view = ActiveView::NodeList;
-        assert!(!app.has_active_modal());
-
-        // Inactivity triggers when no modal is active and >= 30s elapsed
-        app.last_user_activity = Instant::now() - Duration::from_secs(35);
-        let would_trigger = !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
-        assert!(would_trigger);
-
-        // Simulate user idle for 20s, then modal opened and active for 10s (total 30s since last user activity)
-        app.last_user_activity = Instant::now() - Duration::from_secs(30);
-
-        // Open modal (e.g. connections)
-        app.open_connections_panel();
-        assert!(app.has_active_modal());
-        assert!(app.inactivity_paused_at.is_some());
-
-        // Simulate 10s elapsed while modal was open
-        app.inactivity_paused_at = Some(Instant::now() - Duration::from_secs(10));
-
-        // Even though 30s elapsed from initial activity, the open modal prevents the transition
-        let would_trigger_with_modal = !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
-        assert!(!would_trigger_with_modal);
-
-        // Dismiss modal
-        app.handle_key(KeyCode::Esc).unwrap();
-        assert!(!app.show_connections);
-        assert!(!app.has_active_modal());
-        assert!(app.inactivity_paused_at.is_none());
-
-        // Timer resumed: the 10s spent inside the modal is excluded,
-        // so elapsed inactivity resumes at ~20s (neither 30s nor reset to 0s).
-        let elapsed = app.last_user_activity.elapsed();
-        assert!(elapsed >= Duration::from_secs(19) && elapsed < Duration::from_secs(22));
-        let would_trigger_after_close = !app.has_active_modal()
-            && app.active_view == ActiveView::NodeList
-            && app.last_user_activity.elapsed() >= Duration::from_secs(30);
-        assert!(!would_trigger_after_close);
-    }
-
-    #[test]
-    fn test_command_palette_from_idle_dashboard_lifecycle_and_actions() {
+    fn test_command_palette_from_node_dashboard_lifecycle_and_actions() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = test_support::test_app();
-        app.active_view = ActiveView::IdleDashboard;
+        app.active_view = ActiveView::NodeDashboard;
 
-        // Open palette from IdleDashboard
+        // Open palette from NodeDashboard
         app.toggle_command_palette();
         assert!(app.command_palette.is_some());
         assert_eq!(
             app.command_palette.as_ref().unwrap().origin_view,
-            ActiveView::IdleDashboard
+            ActiveView::NodeDashboard
         );
 
         let backend = TestBackend::new(120, 30);
@@ -2320,12 +2278,12 @@ mod navigation_tests {
         }
         assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
 
-        // Dismiss with Esc returns to IdleDashboard
+        // Dismiss with Esc returns to NodeDashboard
         app.handle_command_palette_key(KeyCode::Esc).unwrap();
         assert!(app.command_palette.is_none());
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
-        // Quick action: toggle TUN returns to IdleDashboard
+        // Quick action: toggle TUN returns to NodeDashboard
         app.toggle_command_palette();
         for c in "tun".chars() {
             app.handle_command_palette_key(KeyCode::Char(c)).unwrap();
@@ -2333,7 +2291,7 @@ mod navigation_tests {
         app.handle_command_palette_key(KeyCode::Enter).unwrap();
         assert!(app.command_palette.is_none());
         assert!(app.internet_tun.is_transitioning() || app.status.contains("TUN"));
-        assert_eq!(app.active_view, ActiveView::IdleDashboard);
+        assert_eq!(app.active_view, ActiveView::NodeDashboard);
 
         // Navigation action: switch to internet navigates to NodeList
         app.toggle_command_palette();
@@ -2359,8 +2317,8 @@ mod navigation_tests {
             members: vec!["node-b".to_string()],
         });
 
-        // 1. IdleDashboard: p must NOT open provider modal
-        app.active_view = ActiveView::IdleDashboard;
+        // 1. NodeDashboard: p must NOT open provider modal
+        app.active_view = ActiveView::NodeDashboard;
         app.open_provider_modal();
         assert!(app.provider_modal.is_none());
         assert!(!app.has_active_modal());
@@ -2392,6 +2350,10 @@ mod navigation_tests {
         assert!(text.contains("backup-group"));
         assert!(text.contains("[Enter]") && text.contains("Select"));
         assert!(text.contains("[Esc]") && text.contains("Close"));
+
+        // Uppercase P is a distinct global shortcut and must not dismiss this modal.
+        app.handle_provider_modal_key(KeyCode::Char('P')).unwrap();
+        assert!(app.provider_modal.is_some());
 
         // Moving focus alone must not apply a selection (Figma handoff 1014:2)
         app.handle_provider_modal_key(KeyCode::Down).unwrap();
@@ -2444,5 +2406,91 @@ mod navigation_tests {
         assert_eq!(app.private_access.focused_index, 1);
         assert!(app.status.contains("sonicwall"));
         assert_eq!(app.active_view, ActiveView::NodeList);
+    }
+
+    #[test]
+    fn provider_modal_uses_route_providers_and_keeps_applied_route_separate() {
+        let mut app = test_support::internet_routes_app();
+
+        let (_, items) = app.provider_modal_items();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.name.as_str(), item.is_current))
+                .collect::<Vec<_>>(),
+            vec![("AirTCP", false), ("宝贝云", true)]
+        );
+
+        app.open_provider_modal();
+        assert_eq!(app.provider_modal.as_ref().unwrap().selected_index, 1);
+
+        app.handle_provider_modal_key(KeyCode::Up).unwrap();
+        assert_eq!(app.internet_route_index, 1);
+        assert_eq!(
+            app.current_route_labels(),
+            ("宝贝云".into(), "bby-2".into())
+        );
+
+        app.handle_provider_modal_key(KeyCode::Enter).unwrap();
+        assert!(app.provider_modal.is_none());
+        assert_eq!(app.internet_route_index, 0);
+        assert_eq!(app.selected_group().unwrap().name, "AirTCP");
+        assert_eq!(app.selected_member_name().as_deref(), Some("air-1"));
+        assert_eq!(
+            app.current_route_labels(),
+            ("宝贝云".into(), "bby-2".into())
+        );
+    }
+
+    #[test]
+    fn provider_modal_resets_an_empty_node_view_after_provider_change() {
+        let mut app = test_support::internet_routes_app();
+        app.node_view_panel = NodeViewPanel::Streaming;
+        assert!(app.displayed_members().is_empty());
+
+        app.open_provider_modal();
+        app.handle_provider_modal_key(KeyCode::Up).unwrap();
+        app.handle_provider_modal_key(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.node_view_panel, NodeViewPanel::CurrentSelector);
+        assert_eq!(app.selected_member_name().as_deref(), Some("air-1"));
+    }
+
+    #[test]
+    fn flat_provider_browsing_does_not_change_the_applied_route() {
+        let mut app = test_support::test_app();
+        app.groups.push(ProxyGroup {
+            name: "backup-group".to_string(),
+            kind: "Selector".to_string(),
+            current: Some("node-b".to_string()),
+            members: vec!["node-b".to_string()],
+        });
+        assert_eq!(
+            app.current_route_labels(),
+            ("select".into(), "node-a".into())
+        );
+
+        app.open_provider_modal();
+        app.handle_provider_modal_key(KeyCode::Down).unwrap();
+        app.handle_provider_modal_key(KeyCode::Enter).unwrap();
+
+        assert_eq!(app.group_index, 1);
+        assert_eq!(
+            app.current_route_labels(),
+            ("select".into(), "node-a".into())
+        );
+    }
+
+    #[test]
+    fn single_private_access_profile_does_not_open_a_redundant_picker() {
+        let mut app = test_support::test_app();
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess)
+            .unwrap();
+        assert_eq!(app.private_access.profiles.len(), 1);
+
+        app.open_provider_modal();
+
+        assert!(app.provider_modal.is_none());
+        assert!(app.status.contains("Only one private access profile"));
     }
 }

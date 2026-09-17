@@ -16,7 +16,7 @@ The user accepted the 120×30 and 80×24 region layouts but requested less visua
 
 ## History and chart contract
 
-The idle dashboard retains an active-connections list and per-node quality history and adds core traffic history. The current editable Figma designs are frames 1025:2 (120×30) and 1027:16 (80×24); handoff 1014:2 records the updated contract. These design fixtures supersede the old dashboard 1:80 and do not imply production integration.
+The node dashboard retains an active-connections list and per-node quality history and adds core traffic history. The current editable Figma designs are frames 1025:2 (120×30) and 1027:16 (80×24); handoff 1014:2 records the updated contract. These design fixtures supersede the old dashboard 1:80 and do not imply production integration.
 
 Label the connections area Active connections and retain active snapshots rather than introducing records of ended connections. The 30-minute history persistence in this decision applies to metric series, not connection records. This resolves the handoff's ambiguous Connection History wording; the existing c panel remains an active-connections view.
 
@@ -26,6 +26,6 @@ Show aggregate latency and throughput in two vertically aligned charts with a sh
 
 Persist history and restore the most recent 30 minutes when the TUI restarts. Periods without collected data, including unobserved time while the TUI is closed, remain gaps: do not fabricate zeros or connect across missing periods. Persisted monitoring history avoids losing recent diagnostic evidence when restarting the interface; this decision does not introduce an always-running collector. These are agreed requirements for the upcoming refactor, not implemented behavior.
 
-Collect actual upload and download traffic every 2 seconds, following the current connection refresh cadence. Probe current-route latency every 10 seconds with a lightweight request, reusing an existing equivalent probe when available. Continue collection across all operational pages, independently of whether the idle dashboard is visible. Aggregate throughput uses actual traffic; drawing history must not trigger additional download benchmarks.
+Collect actual upload and download traffic every 2 seconds, following the current connection refresh cadence. Probe current-route latency every 10 seconds with a lightweight request, reusing an existing equivalent probe when available. Continue collection across all operational pages, independently of whether the node dashboard is visible. Aggregate throughput uses actual traffic; drawing history must not trigger additional download benchmarks.
 
 Per-node quality history shows existing sustained-quality probe results as measured throughput, distinct from actual traffic usage in the aggregate charts. Missing probe results remain gaps: do not trigger extra benchmarks to populate the chart or extend an old result into a continuous series. A measured result describes that probe's transfer performance, not a guaranteed node capacity.

@@ -847,24 +847,42 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
     assert!(!tabs_row.contains("┌"));
     assert!(!tabs_row.contains("Node views"));
 
-    // Candidate rows start at Row 1, full 120-column width without sidebar or box borders
-    let row1 = &lines[1];
-    assert!(row1.contains("* JP-Edge-03"));
-    assert!(row1.contains("8.0 MiB/s"));
-    assert!(row1.contains("Stable"));
-    assert!(row1.contains("⡆⡄⡀"));
-    assert!(row1.contains("42ms"));
-    assert!(!row1.contains("│")); // No 26-column sidebar divider!
+    // Figma 8:2 gives the tabs a 30 px container around 16 px text. At terminal scale,
+    // Row 1 preserves that second line of breathing room before the node list begins.
+    assert!(lines[1].trim().is_empty());
 
-    let row2 = &lines[2];
-    assert!(row2.contains("SG-Transit-07"));
-    assert!(row2.contains("68ms"));
-    assert!(!row2.contains("│"));
+    // Terminal cells cannot represent Figma's half-row vertical padding. Three terminal rows
+    // preserve a true middle line for the node name and trailing metrics.
+    assert!(lines[2].trim().is_empty());
+    let first_node_row = &lines[3];
+    assert!(first_node_row.contains("* JP-Edge-03"));
+    assert!(first_node_row.contains("8.0 MiB/s"));
+    assert!(first_node_row.contains("Stable"));
+    assert!(first_node_row.contains("⡆⡄⡀"));
+    assert!(first_node_row.contains("42ms"));
+    assert!(!first_node_row.contains("│"));
+    assert_eq!(first_node_row.find("* JP-Edge-03"), Some(2));
+    let latency_start = first_node_row.find("42ms").expect("latency");
+    let latency_end = unicode_width::UnicodeWidthStr::width(&first_node_row[..latency_start])
+        + unicode_width::UnicodeWidthStr::width("42ms");
+    assert!(
+        latency_end <= 80,
+        "Figma keeps node metrics inside the left two-thirds column"
+    );
+    assert!(lines[4].trim().is_empty());
 
-    let row3 = &lines[3];
-    assert!(row3.contains("JP-Backup-01"));
-    assert!(row3.contains("63ms"));
-    assert!(!row3.contains("│"));
+    assert!(lines[5].trim().is_empty());
+    let second_node_row = &lines[6];
+    assert!(second_node_row.contains("SG-Transit-07"));
+    assert!(second_node_row.contains("68ms"));
+    assert!(!second_node_row.contains("│"));
+    assert!(lines[7].trim().is_empty());
+
+    assert!(lines[8].trim().is_empty());
+    let third_node_row = &lines[9];
+    assert!(third_node_row.contains("JP-Backup-01"));
+    assert!(third_node_row.contains("63ms"));
+    assert!(!third_node_row.contains("│"));
 
     // Bottom row (Row 29): Integrated Footer
     let footer_row = &lines[29];

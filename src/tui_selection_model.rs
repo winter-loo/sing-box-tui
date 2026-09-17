@@ -23,7 +23,7 @@ impl App {
     pub(super) fn internet_outbound_context(&self) -> Option<String> {
         let mut current = self
             .implicit_root_group()
-            .or_else(|| self.selected_group())?;
+            .or_else(|| self.groups.get(self.applied_group_index))?;
         let mut chain = vec![current.name.clone()];
         let mut visited = BTreeSet::new();
         visited.insert(current.name.clone());
@@ -54,7 +54,7 @@ impl App {
                 .and_then(|name| self.group_by_name(name))
                 .unwrap_or(root)
         } else {
-            self.groups.get(self.group_index)?
+            self.groups.get(self.applied_group_index)?
         };
 
         let mut current = provider;
