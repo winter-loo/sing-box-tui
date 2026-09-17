@@ -10,6 +10,19 @@ use crate::controller::{ProxyGroup, matches_filter};
 use crate::defaults::DEFAULT_SELECTOR_TAG;
 use crate::private_access_session::PrivateAccessProfileRuntime;
 
+fn pin_current_member_first(mut members: Vec<String>, current_member: Option<&str>) -> Vec<String> {
+    let Some(index) =
+        current_member.and_then(|current| members.iter().position(|member| member == current))
+    else {
+        return members;
+    };
+    if index > 0 {
+        let current = members.remove(index);
+        members.insert(0, current);
+    }
+    members
+}
+
 impl App {
     pub(super) fn selected_group(&self) -> Option<&ProxyGroup> {
         if self.implicit_root_mode() {
@@ -257,10 +270,13 @@ impl App {
             if let Some((pending, results)) =
                 self.custom_usability_live_projection(&manifest_id, &group.name)
             {
-                return live_usability_members(
-                    &group.members,
-                    pending.as_ref().map(|(node, _, _)| node.as_str()),
-                    &results,
+                return pin_current_member_first(
+                    live_usability_members(
+                        &group.members,
+                        pending.as_ref().map(|(node, _, _)| node.as_str()),
+                        &results,
+                    ),
+                    group.current.as_deref(),
                 );
             }
             let projection =
@@ -294,9 +310,9 @@ impl App {
                     (None, None) => Ordering::Equal,
                 }
             });
-            return displayed;
+            return pin_current_member_first(displayed, group.current.as_deref());
         }
-        group.members.clone()
+        pin_current_member_first(group.members.clone(), group.current.as_deref())
     }
 
     pub(super) fn active_usability_manifest_id(

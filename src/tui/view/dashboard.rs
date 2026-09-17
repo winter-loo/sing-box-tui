@@ -626,9 +626,37 @@ fn render_candidate_table(
         })
         .collect::<Vec<_>>();
 
-    let members_widget = List::new(members).highlight_style(theme.style_focused_row());
-    let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
-    frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
+    if snapshot
+        .candidate_rows
+        .first()
+        .is_some_and(|row| row.is_current)
+    {
+        let mut members = members;
+        let scrolling_members = members.split_off(1);
+        let sticky_height = 3.min(candidate_list_area.height);
+        let [sticky_area, scrolling_area] =
+            Layout::vertical([Constraint::Length(sticky_height), Constraint::Min(0)])
+                .areas(candidate_list_area);
+
+        let sticky_widget = List::new(members).highlight_style(theme.style_focused_row());
+        let sticky_selected = (snapshot.candidate_selected == Some(0)).then_some(0);
+        let mut sticky_state = ListState::default().with_selected(sticky_selected);
+        frame.render_stateful_widget(sticky_widget, sticky_area, &mut sticky_state);
+
+        if scrolling_area.height > 0 {
+            let scrolling_widget =
+                List::new(scrolling_members).highlight_style(theme.style_focused_row());
+            let scrolling_selected = snapshot
+                .candidate_selected
+                .and_then(|index| index.checked_sub(1));
+            let mut scrolling_state = ListState::default().with_selected(scrolling_selected);
+            frame.render_stateful_widget(scrolling_widget, scrolling_area, &mut scrolling_state);
+        }
+    } else {
+        let members_widget = List::new(members).highlight_style(theme.style_focused_row());
+        let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
+        frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
+    }
 }
 
 fn render_internet_footer(

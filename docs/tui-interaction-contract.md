@@ -162,6 +162,7 @@ TUI 不启用 mouse capture。用户用鼠标拖选时由终端执行原生文�
 - 顶部 breadcrumb 显示 `INTERNET / <applied provider> / <current route node>`。
 - node-view tabs 显示在节点列表上方。
 - 当前 route node 使用 `*` 标记；当前 browsed node 使用 focused row 标记。
+- 当前 selector 已应用的节点显示在列表第一行；该行固定，不随下面的候选节点滚动。
 - browsed node 与 current route node 可以不是同一个节点。
 
 ### NL-02 打开并确认 Provider Select
@@ -212,6 +213,7 @@ TUI 不启用 mouse capture。用户用鼠标拖选时由终端执行原生文�
 | `Enter` | 不应用节点，不改变页面。 |
 
 移动过程中 breadcrumb、`*` 和 current route node 不变。
+当前 route node 的首行保持固定；其余候选节点在首行下方滚动。
 
 ### NL-04 应用 browsed node
 
@@ -224,9 +226,10 @@ TUI 不启用 mouse capture。用户用鼠标拖选时由终端执行原生文�
 1. 向对应 selector 应用该节点。
 2. 如果配置为 parent selector → provider selector → node，同时把 parent selector 指向该 provider。
 3. 成功后把 `*` 移到新节点。
-4. breadcrumb 更新为新的 applied provider 和 current route node。
-5. 保存该 selector 的选择。
-6. status 区显示成功信息。
+4. 把新节点移动到列表第一行并固定；其余节点从第二行开始滚动。
+5. breadcrumb 更新为新的 applied provider 和 current route node。
+6. 保存该 selector 的选择。
+7. status 区显示成功信息。
 
 **状态限制**：已有连接不被强制中断；新连接和重试使用新节点。
 

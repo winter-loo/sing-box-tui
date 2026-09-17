@@ -684,6 +684,32 @@ fn candidate_row_renders_cold_start_ms_and_sustained_throughput_speed() {
 }
 
 #[test]
+fn current_node_stays_visible_while_candidate_focus_scrolls_to_the_end() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows = (0..12)
+        .map(|index| CandidateRow {
+            name: if index == 0 {
+                "sticky-current".to_string()
+            } else {
+                format!("candidate-{index:02}")
+            },
+            is_current: index == 0,
+            latency_signal: None,
+            reachability: String::new(),
+            marker: String::new(),
+            compact_marker: String::new(),
+            tone: CandidateTone::Missing,
+        })
+        .collect();
+    snapshot.candidate_selected = Some(11);
+
+    let rendered = rendered_lines_at(&snapshot, 80, 24).join("\n");
+
+    assert!(rendered.contains("sticky-current"));
+    assert!(rendered.contains("candidate-11"));
+}
+
+#[test]
 fn candidate_row_selected_focus_styling_matches_figma_accent() {
     let theme = Theme::new(crate::tui::ds::ColorCapability::TrueColor);
     let focused = theme.style_focused_row();
