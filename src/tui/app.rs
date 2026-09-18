@@ -501,12 +501,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(modal) = &app.provider_modal {
         let theme = crate::tui::ds::Theme::default();
-        let (title, provider_items) = app.provider_modal_items();
+        let (kind, provider_items) = app.provider_modal_items();
         view::render_provider_modal(
             frame,
             frame.area(),
             &theme,
-            title,
+            kind,
             &provider_items,
             modal.selected_index,
         );
@@ -1263,7 +1263,7 @@ impl App {
         }
     }
 
-    fn provider_modal_items(&self) -> (&'static str, Vec<view::ProviderItem>) {
+    fn provider_modal_items(&self) -> (view::ProviderChooserKind, Vec<view::ProviderItem>) {
         if self.operational_workspace == OperationalWorkspace::PrivateAccess {
             let items = self
                 .private_access
@@ -1275,7 +1275,7 @@ impl App {
                     is_current: i == self.private_access.focused_index,
                 })
                 .collect();
-            ("INTRANET PROFILE", items)
+            (view::ProviderChooserKind::IntranetProfile, items)
         } else {
             let applied_provider = self
                 .current_route_target()
@@ -1289,7 +1289,7 @@ impl App {
                     is_current: applied_provider == Some(g.name.as_str()),
                 })
                 .collect();
-            ("INTERNET PROXY PROVIDER", items)
+            (view::ProviderChooserKind::InternetProvider, items)
         }
     }
 

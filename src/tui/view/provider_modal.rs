@@ -12,6 +12,28 @@ pub(crate) struct ProviderItem {
     pub(crate) is_current: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderChooserKind {
+    InternetProvider,
+    IntranetProfile,
+}
+
+impl ProviderChooserKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::InternetProvider => "INTERNET PROXY PROVIDER",
+            Self::IntranetProfile => "INTRANET PROFILE",
+        }
+    }
+
+    fn dialog_height(self, item_count: usize) -> u16 {
+        match self {
+            Self::InternetProvider => 10,
+            Self::IntranetProfile => (item_count as u16).saturating_mul(2).saturating_add(4),
+        }
+    }
+}
+
 /// Renders the centered Selector / Provider switching modal dialog.
 /// Matches Figma 796:352 (Internet / Provider selection popup) and 998:40 (Intranet profile selection popup).
 /// Standard dimensions: 50 cols x 10 rows (400x160 px in 8x16 terminal grid).
@@ -19,7 +41,7 @@ pub(crate) fn render_provider_modal(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
-    title: &str,
+    kind: ProviderChooserKind,
     providers: &[ProviderItem],
     selected_index: usize,
 ) {
@@ -29,17 +51,9 @@ pub(crate) fn render_provider_modal(
 
     // Figma 796:352: 400x160px = 50x10 cells in the reference 8x16 grid.
     // Each option gets a content row plus one rhythm row when the viewport permits it.
-    let modal_title = if title.is_empty() {
-        "INTERNET PROXY PROVIDER"
-    } else {
-        title
-    };
+    let modal_title = kind.title();
     let dialog_width = 50;
-    let dialog_height = if modal_title == "INTERNET PROXY PROVIDER" {
-        10
-    } else {
-        (providers.len() as u16).saturating_mul(2).saturating_add(4)
-    };
+    let dialog_height = kind.dialog_height(providers.len());
 
     render_dialog_frame(
         frame,
@@ -165,7 +179,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn rendered_provider_modal_lines_at(
-        title: &str,
+        kind: ProviderChooserKind,
         providers: &[ProviderItem],
         selected_index: usize,
         width: u16,
@@ -176,7 +190,7 @@ mod tests {
         let theme = Theme::default();
         terminal
             .draw(|frame| {
-                render_provider_modal(frame, frame.area(), &theme, title, providers, selected_index)
+                render_provider_modal(frame, frame.area(), &theme, kind, providers, selected_index)
             })
             .expect("provider modal renders");
         terminal
@@ -211,7 +225,13 @@ mod tests {
             },
         ];
 
-        let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 1, 120, 30);
+        let lines = rendered_provider_modal_lines_at(
+            ProviderChooserKind::InternetProvider,
+            &providers,
+            1,
+            120,
+            30,
+        );
         let text = lines.join("\n");
         assert!(text.contains("INTERNET PROXY PROVIDER"));
         assert!(text.contains("AirTCP"));
@@ -274,7 +294,13 @@ mod tests {
             },
         ];
 
-        let lines = rendered_provider_modal_lines_at("INTRANET PROFILE", &profiles, 0, 100, 25);
+        let lines = rendered_provider_modal_lines_at(
+            ProviderChooserKind::IntranetProfile,
+            &profiles,
+            0,
+            100,
+            25,
+        );
         let text = lines.join("\n");
         assert!(text.contains("INTRANET PROFILE"));
         assert!(text.contains("*> Corp-Production"));
@@ -307,7 +333,13 @@ mod tests {
             },
         ];
 
-        let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 2, 80, 24);
+        let lines = rendered_provider_modal_lines_at(
+            ProviderChooserKind::InternetProvider,
+            &providers,
+            2,
+            80,
+            24,
+        );
         let top = lines
             .iter()
             .position(|line| line.contains('┌'))
@@ -346,8 +378,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lines =
-            rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 4, 120, 30);
+        let lines = rendered_provider_modal_lines_at(
+            ProviderChooserKind::InternetProvider,
+            &providers,
+            4,
+            120,
+            30,
+        );
         let top = lines.iter().position(|line| line.contains('┌')).unwrap();
         let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
 
@@ -367,7 +404,14 @@ mod tests {
         }];
         terminal
             .draw(|frame| {
-                render_provider_modal(frame, frame.area(), &theme, "", &providers, 0)
+                render_provider_modal(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    ProviderChooserKind::InternetProvider,
+                    &providers,
+                    0,
+                )
             })
             .expect("renders zero area safely");
     }
