@@ -1,6 +1,6 @@
 use super::*;
 use crate::tui::ds::theme::Theme;
-use crate::tui::ds::widgets::render_dialog_frame;
+use crate::tui::ds::widgets::{dialog_content_area, render_dialog_frame};
 use ratatui::layout::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -414,12 +414,7 @@ pub(crate) fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAc
                 return;
             }
 
-            let content_area = Rect {
-                x: inner_area.x.saturating_add(1),
-                y: inner_area.y,
-                width: inner_area.width.saturating_sub(2),
-                height: inner_area.height,
-            };
+            let content_area = dialog_content_area(inner_area);
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     format!("{} / AUTHENTICATION", auth.title),
@@ -691,15 +686,28 @@ mod tests {
 
     #[test]
     fn authentication_dialog_keeps_fields_and_error_inside_a_compact_viewport() {
-        let (lines, cursor) = render_auth(48, 14);
+        let (lines, cursor) = render_auth(80, 24);
         let text = lines.join("\n");
+        let top = lines.iter().position(|line| line.contains('┌')).unwrap();
+        let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
+        let left = lines[top]
+            .chars()
+            .position(|character| character != ' ')
+            .unwrap();
+        let right = lines[top]
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|character| *character != ' ')
+            .unwrap();
 
         assert!(text.contains("AUTHENTICATION"));
         assert!(text.contains("Dynamic code"));
         assert!(text.contains("Dynamic code is required."));
-        assert!(cursor.0 < 48);
-        assert!(cursor.1 < 14);
-        assert!(lines.iter().any(|line| line.contains('└')));
+        assert_eq!(bottom - top + 1, 20);
+        assert_eq!(right - left + 1, 76);
+        assert!(cursor.0 < 80);
+        assert!(cursor.1 < 24);
     }
 
     #[test]

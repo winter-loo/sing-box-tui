@@ -345,6 +345,15 @@ pub(crate) fn render_dialog_frame<F>(
     render_inner(frame, inner);
 }
 
+/// Applies the one-cell horizontal content inset used by Figma modal dialogs.
+pub(crate) fn dialog_content_area(inner_area: Rect) -> Rect {
+    Rect {
+        x: inner_area.x.saturating_add(1),
+        width: inner_area.width.saturating_sub(2),
+        ..inner_area
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

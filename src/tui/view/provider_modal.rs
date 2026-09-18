@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::tui::ds::widgets::render_dialog_frame;
+use crate::tui::ds::widgets::{dialog_content_area, render_dialog_frame};
 use crate::tui::ds::Theme;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,13 +29,16 @@ pub(crate) fn render_provider_modal(
 
     // Figma 796:352: 400x160px = 50x10 cells in the reference 8x16 grid.
     // Each option gets a content row plus one rhythm row when the viewport permits it.
-    let dialog_width = 50;
-    let dialog_height = (providers.len() as u16).saturating_mul(2).saturating_add(4);
-
     let modal_title = if title.is_empty() {
         "INTERNET PROXY PROVIDER"
     } else {
         title
+    };
+    let dialog_width = 50;
+    let dialog_height = if modal_title == "INTERNET PROXY PROVIDER" {
+        10
+    } else {
+        (providers.len() as u16).saturating_mul(2).saturating_add(4)
     };
 
     render_dialog_frame(
@@ -50,12 +53,7 @@ pub(crate) fn render_provider_modal(
                 return;
             }
 
-            let content_area = Rect {
-                x: inner_area.x.saturating_add(1),
-                y: inner_area.y,
-                width: inner_area.width.saturating_sub(2),
-                height: inner_area.height,
-            };
+            let content_area = dialog_content_area(inner_area);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     modal_title,
@@ -70,13 +68,32 @@ pub(crate) fn render_provider_modal(
 
             let footer_y = inner_area.y.saturating_add(inner_area.height - 1);
             let option_rows = inner_area.height.saturating_sub(2);
-            let spaced_options = option_rows >= (providers.len() as u16).saturating_mul(2);
+            let spaced_options = option_rows >= 4;
             let first_option_offset = u16::from(spaced_options);
             let option_stride = if spaced_options { 2 } else { 1 };
+            let visible_capacity = if spaced_options {
+                option_rows / 2
+            } else {
+                option_rows
+            } as usize;
+            let focused_index = selected_index.min(providers.len().saturating_sub(1));
+            let visible_start = if providers.len() <= visible_capacity {
+                0
+            } else {
+                focused_index
+                    .saturating_sub(visible_capacity.saturating_sub(1))
+                    .min(providers.len().saturating_sub(visible_capacity))
+            };
 
-            for (index, provider) in providers.iter().enumerate() {
+            for (slot, (index, provider)) in providers
+                .iter()
+                .enumerate()
+                .skip(visible_start)
+                .take(visible_capacity)
+                .enumerate()
+            {
                 let row_offset = first_option_offset
-                    .saturating_add((index as u16).saturating_mul(option_stride));
+                    .saturating_add((slot as u16).saturating_mul(option_stride));
                 if row_offset >= option_rows {
                     break;
                 }
@@ -290,7 +307,7 @@ mod tests {
             },
         ];
 
-        let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 2, 32, 9);
+        let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 2, 80, 24);
         let top = lines
             .iter()
             .position(|line| line.contains('┌'))
@@ -300,7 +317,14 @@ mod tests {
             .position(|line| line.contains('└'))
             .expect("compact bottom border");
 
-        assert!(bottom > top);
+        assert_eq!(bottom - top + 1, 10);
+        assert_eq!(
+            lines[top]
+                .chars()
+                .filter(|character| *character != ' ')
+                .count(),
+            50
+        );
         assert!(lines[top + 1].contains("INTERNET PROXY"));
         assert!(lines
             .iter()
@@ -309,6 +333,27 @@ mod tests {
                 && line.contains('机')
                 && line.contains('场')));
         assert!(lines.iter().any(|line| line.contains("Esc close")));
+    }
+
+    #[test]
+    fn provider_modal_keeps_canonical_height_and_scrolls_focus_into_view() {
+        let providers = ["AirTCP", "宝贝云", "白嫖机场", "backup-a", "backup-b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ProviderItem {
+                name: name.to_string(),
+                is_current: index == 0,
+            })
+            .collect::<Vec<_>>();
+
+        let lines =
+            rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 4, 120, 30);
+        let top = lines.iter().position(|line| line.contains('┌')).unwrap();
+        let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
+
+        assert_eq!(bottom - top + 1, 10);
+        assert!(lines.iter().any(|line| line.contains("> backup-b")));
+        assert!(!lines.iter().any(|line| line.contains("AirTCP")));
     }
 
     #[test]
