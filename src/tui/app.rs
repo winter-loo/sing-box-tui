@@ -2464,8 +2464,7 @@ mod navigation_tests {
         assert!(text.contains("INTERNET PROXY PROVIDER"));
         assert!(text.contains("select"));
         assert!(text.contains("backup-group"));
-        assert!(text.contains("[Enter]") && text.contains("Select"));
-        assert!(text.contains("[Esc]") && text.contains("Close"));
+        assert!(text.contains("Esc") && text.contains("close"));
 
         // Uppercase P is a distinct global shortcut and must not dismiss this modal.
         app.handle_provider_modal_key(KeyCode::Char('P')).unwrap();

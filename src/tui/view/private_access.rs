@@ -1,6 +1,7 @@
 use super::*;
 use crate::tui::ds::theme::Theme;
 use crate::tui::ds::widgets::render_dialog_frame;
+use ratatui::layout::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum IntranetDetailSection {
@@ -400,66 +401,142 @@ pub(crate) fn draw_private_access_progress_panel(
 pub(crate) fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAccessAuthModal) {
     let theme = Theme::detect();
     let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(6).clamp(52, 82);
-    let message_rows = usize::from(!auth.message.trim().is_empty());
-    let height = (auth.fields.len() + message_rows + 6) as u16;
 
     render_dialog_frame(
         frame,
         frame_area,
         &theme,
-        &format!(" AUTHENTICATION · {} ", auth.title),
-        width,
-        height,
+        "",
+        82,
+        20,
         |frame, inner_area| {
-            let mut lines = vec![Line::from(vec![
-                Span::styled("[Enter]", theme.style_breadcrumb()),
-                Span::raw(" next/submit  "),
-                Span::styled("[Esc]", theme.style_muted()),
-                Span::raw(" cancel"),
-            ])];
-            if !auth.message.trim().is_empty() {
-                lines.push(Line::from(auth.message.as_str()));
+            if inner_area.width == 0 || inner_area.height == 0 {
+                return;
             }
-            lines.push(Line::raw(""));
-            let field_start = lines.len();
+
+            let content_area = Rect {
+                x: inner_area.x.saturating_add(1),
+                y: inner_area.y,
+                width: inner_area.width.saturating_sub(2),
+                height: inner_area.height,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("{} / AUTHENTICATION", auth.title),
+                    theme.style_breadcrumb(),
+                )),
+                Rect { height: 1, ..content_area },
+            );
+
+            let error_row = inner_area.height.saturating_sub(2);
+            let fields_height = auth.fields.len().min(u16::MAX as usize) as u16;
+            let latest_field_start = error_row.saturating_sub(fields_height);
+            let field_start = 6.min(latest_field_start).max(1);
+            let controls_row = if field_start >= 4 { 2 } else { 1 };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Enter", theme.style_footer_keys()),
+                    Span::raw(" next/submit   "),
+                    Span::styled("Tab", theme.style_footer_keys()),
+                    Span::raw(" field   "),
+                    Span::styled("Esc", theme.style_footer_keys()),
+                    Span::raw(" cancel"),
+                ])),
+                Rect {
+                    y: inner_area.y.saturating_add(controls_row),
+                    height: 1,
+                    ..content_area
+                },
+            );
+
+            if !auth.message.trim().is_empty() && field_start >= 3 {
+                let message_row = field_start.saturating_sub(2);
+                frame.render_widget(
+                    Paragraph::new(Line::from(truncate_for_width(
+                        auth.message.as_str(),
+                        content_area.width as usize,
+                    ))),
+                    Rect {
+                        y: inner_area.y.saturating_add(message_row),
+                        height: 1,
+                        ..content_area
+                    },
+                );
+            }
+
+            let max_label_width = auth
+                .fields
+                .iter()
+                .map(|field| unicode_width::UnicodeWidthStr::width(field.label.as_str()))
+                .max()
+                .unwrap_or(0);
+            let label_width = max_label_width.min(content_area.width.saturating_sub(5) as usize);
+            let value_offset = 2usize.saturating_add(label_width).saturating_add(2);
+
             for (index, field) in auth.fields.iter().enumerate() {
-                let selected = index == auth.field_index;
-                let marker = if selected { "> " } else { "  " };
-                let value = private_access_auth_display_value(field, &auth.inputs[index]);
-                let style = if selected {
+                let row = field_start.saturating_add(index as u16);
+                if row >= error_row {
+                    break;
+                }
+                let is_focused = index == auth.field_index;
+                let input = auth.inputs.get(index).map(String::as_str).unwrap_or_default();
+                let display = private_access_auth_display_value(field, input);
+                let label = truncate_for_width(field.label.as_str(), label_width);
+                let label_display_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+                let label_padding = " ".repeat(label_width.saturating_sub(label_display_width));
+                let value_width = content_area.width.saturating_sub(value_offset as u16) as usize;
+                let value = truncate_for_width(display.as_str(), value_width);
+                let style = if is_focused {
                     theme.style_focused_row()
                 } else {
                     Style::default()
                 };
-                lines.push(
-                    Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(field.label.as_str(), theme.style_breadcrumb()),
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(label, theme.style_breadcrumb()),
+                        Span::raw(label_padding),
                         Span::raw("  "),
                         Span::raw(value),
-                    ])
+                    ]))
                     .style(style),
+                    Rect {
+                        y: inner_area.y.saturating_add(row),
+                        height: 1,
+                        ..content_area
+                    },
                 );
             }
+
             if let Some(error) = auth.error.as_deref() {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(error, theme.style_danger()));
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        truncate_for_width(error, content_area.width as usize),
+                        theme.style_danger(),
+                    )),
+                    Rect {
+                        y: inner_area.y.saturating_add(error_row),
+                        height: 1,
+                        ..content_area
+                    },
+                );
             }
-            frame.render_widget(Paragraph::new(lines), inner_area);
 
             if let Some(field) = auth.fields.get(auth.field_index) {
-                let display = private_access_auth_display_value(field, &auth.inputs[auth.field_index]);
-                let cursor_x = inner_area
+                let input = auth
+                    .inputs
+                    .get(auth.field_index)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let display = private_access_auth_display_value(field, input);
+                let cursor_x = content_area
                     .x
-                    .saturating_add(2)
-                    .saturating_add(unicode_width::UnicodeWidthStr::width(field.label.as_str()) as u16)
-                    .saturating_add(2)
+                    .saturating_add(value_offset as u16)
                     .saturating_add(unicode_width::UnicodeWidthStr::width(display.as_str()) as u16)
-                    .min(inner_area.x.saturating_add(inner_area.width.saturating_sub(1)));
+                    .min(content_area.x.saturating_add(content_area.width.saturating_sub(1)));
                 let cursor_y = inner_area
                     .y
-                    .saturating_add(field_start as u16)
+                    .saturating_add(field_start)
                     .saturating_add(auth.field_index as u16)
                     .min(inner_area.y.saturating_add(inner_area.height.saturating_sub(1)));
                 frame.set_cursor_position((cursor_x, cursor_y));
@@ -513,7 +590,117 @@ pub(crate) fn private_access_auth_initial_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::private_access::PrivateAccessRoute;
+    use crate::private_access::{PrivateAccessAuthField, PrivateAccessRoute};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn auth_field(label: &str) -> PrivateAccessAuthField {
+        PrivateAccessAuthField {
+            id: label.to_ascii_lowercase().replace(' ', "-"),
+            label: label.to_string(),
+            kind: "text".to_string(),
+            sensitive: false,
+            required: true,
+            options: Vec::new(),
+        }
+    }
+
+    fn render_auth(width: u16, height: u16) -> (Vec<String>, (u16, u16)) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let auth = PrivateAccessAuthModal {
+            profile_index: 0,
+            service: "sonicwall".to_string(),
+            session_id: "session".to_string(),
+            challenge_id: "challenge".to_string(),
+            title: "SONICWALL-HQ".to_string(),
+            message: "Gateway requests a dynamic code.".to_string(),
+            fields: vec![
+                auth_field("Domain account"),
+                auth_field("Domain password"),
+                auth_field("Dynamic code"),
+                auth_field("Realm"),
+            ],
+            buttons: Vec::new(),
+            inputs: vec![
+                "demo-user".to_string(),
+                "example-secret".to_string(),
+                "123456".to_string(),
+                "Hundsun".to_string(),
+            ],
+            field_index: 2,
+            error: Some("Dynamic code is required.".to_string()),
+        };
+
+        terminal
+            .draw(|frame| draw_private_access_auth_panel(frame, &auth))
+            .expect("authentication dialog renders");
+        let cursor = terminal.get_cursor_position().expect("cursor position");
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+        (lines, (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn authentication_dialog_matches_canonical_geometry_and_fixed_value_column() {
+        let (lines, cursor) = render_auth(120, 30);
+        let top = lines
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("dialog top border");
+        let bottom = lines
+            .iter()
+            .position(|line| line.contains('└'))
+            .expect("dialog bottom border");
+        let left = lines[top]
+            .chars()
+            .position(|character| character != ' ')
+            .expect("left border");
+        let right = lines[top]
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|character| *character != ' ')
+            .expect("right border");
+
+        assert_eq!(bottom - top + 1, 20);
+        assert_eq!(right - left + 1, 82);
+        assert!(!lines[top].contains("AUTHENTICATION"));
+        assert!(lines[top + 1].contains("SONICWALL-HQ / AUTHENTICATION"));
+
+        let account = lines.iter().find(|line| line.contains("demo-user")).unwrap();
+        let password = lines
+            .iter()
+            .find(|line| line.contains("example-secret"))
+            .unwrap();
+        let code = lines.iter().find(|line| line.contains("123456")).unwrap();
+        assert_eq!(account.find("demo-user"), password.find("example-secret"));
+        assert_eq!(account.find("demo-user"), code.find("123456"));
+        let code_start = unicode_width::UnicodeWidthStr::width(
+            code.split_once("123456").expect("code value").0,
+        );
+        assert_eq!(cursor.0 as usize, code_start + 6);
+        assert_eq!(cursor.1 as usize, lines.iter().position(|line| line == code).unwrap());
+        assert!(lines[bottom - 2].contains("Dynamic code is required."));
+    }
+
+    #[test]
+    fn authentication_dialog_keeps_fields_and_error_inside_a_compact_viewport() {
+        let (lines, cursor) = render_auth(48, 14);
+        let text = lines.join("\n");
+
+        assert!(text.contains("AUTHENTICATION"));
+        assert!(text.contains("Dynamic code"));
+        assert!(text.contains("Dynamic code is required."));
+        assert!(cursor.0 < 48);
+        assert!(cursor.1 < 14);
+        assert!(lines.iter().any(|line| line.contains('└')));
+    }
 
     #[test]
     fn large_intranet_sections_are_folded_by_the_view_interface() {

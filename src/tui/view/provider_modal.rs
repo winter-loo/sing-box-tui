@@ -1,7 +1,7 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::tui::ds::widgets::render_dialog_frame;
 use crate::tui::ds::Theme;
@@ -27,11 +27,10 @@ pub(crate) fn render_provider_modal(
         return;
     }
 
-    // Figma 796:352: 400px = 50 columns in standard 8px/col grid
-    let dialog_width = 50.min(area.width.saturating_sub(4)).max(30);
-    let dialog_height = (providers.len() as u16 + 4)
-        .min(area.height.saturating_sub(2))
-        .max(6);
+    // Figma 796:352: 400x160px = 50x10 cells in the reference 8x16 grid.
+    // Each option gets a content row plus one rhythm row when the viewport permits it.
+    let dialog_width = 50;
+    let dialog_height = (providers.len() as u16).saturating_mul(2).saturating_add(4);
 
     let modal_title = if title.is_empty() {
         "INTERNET PROXY PROVIDER"
@@ -43,81 +42,101 @@ pub(crate) fn render_provider_modal(
         frame,
         area,
         theme,
-        modal_title,
+        "",
         dialog_width,
         dialog_height,
         |frame, inner_area| {
-            let [list_area, footer_area] = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .areas(inner_area);
+            if inner_area.width == 0 || inner_area.height == 0 {
+                return;
+            }
 
-            let items = providers
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let is_selected = i == selected_index;
-                    // Handoff 1014:2:
-                    // '*' marks the applied item; highlighted row marks keyboard focus.
-                    // '>' may reinforce focus in chooser lists. Moving focus alone must not apply a selection.
-                    let (marker_symbol, marker_style) = if p.is_current {
-                        (
-                            "*",
-                            if is_selected {
-                                theme.style_focused_row()
-                            } else {
-                                theme.style_success()
-                            },
-                        )
+            let content_area = Rect {
+                x: inner_area.x.saturating_add(1),
+                y: inner_area.y,
+                width: inner_area.width.saturating_sub(2),
+                height: inner_area.height,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    modal_title,
+                    theme.style_breadcrumb(),
+                ))),
+                Rect { height: 1, ..content_area },
+            );
+
+            if inner_area.height < 2 {
+                return;
+            }
+
+            let footer_y = inner_area.y.saturating_add(inner_area.height - 1);
+            let option_rows = inner_area.height.saturating_sub(2);
+            let spaced_options = option_rows >= (providers.len() as u16).saturating_mul(2);
+            let first_option_offset = u16::from(spaced_options);
+            let option_stride = if spaced_options { 2 } else { 1 };
+
+            for (index, provider) in providers.iter().enumerate() {
+                let row_offset = first_option_offset
+                    .saturating_add((index as u16).saturating_mul(option_stride));
+                if row_offset >= option_rows {
+                    break;
+                }
+                let row_area = Rect {
+                    y: inner_area.y.saturating_add(1).saturating_add(row_offset),
+                    height: 1,
+                    ..content_area
+                };
+                let is_focused = index == selected_index;
+                let applied_marker = if provider.is_current { "*" } else { " " };
+                let focus_marker = if is_focused { ">" } else { " " };
+                let line = Line::from(vec![
+                    Span::styled(
+                        applied_marker,
+                        if provider.is_current {
+                            theme.style_success()
+                        } else {
+                            theme.style_muted()
+                        },
+                    ),
+                    Span::styled(
+                        focus_marker,
+                        if is_focused {
+                            theme.style_selected_marker()
+                        } else {
+                            theme.style_muted()
+                        },
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        provider.name.clone(),
+                        if is_focused {
+                            theme.style_focused_row()
+                        } else {
+                            theme.style_base()
+                        },
+                    ),
+                ]);
+                frame.render_widget(
+                    Paragraph::new(line).style(if is_focused {
+                        theme.style_focused_row()
                     } else {
-                        (" ", theme.style_muted())
-                    };
+                        theme.style_base()
+                    }),
+                    row_area,
+                );
+            }
 
-                    let cursor_prefix = if is_selected { "> " } else { "  " };
-
-                    let spans = vec![
-                        Span::styled(marker_symbol, marker_style),
-                        Span::styled(
-                            cursor_prefix,
-                            if is_selected {
-                                theme.style_focused_row()
-                            } else {
-                                theme.style_muted()
-                            },
-                        ),
-                        Span::styled(
-                            p.name.clone(),
-                            if is_selected {
-                                theme.style_focused_row()
-                            } else {
-                                theme.style_base()
-                            },
-                        ),
-                    ];
-                    let line = Line::from(spans);
-                    if is_selected {
-                        ListItem::new(line).style(theme.style_focused_row())
-                    } else {
-                        ListItem::new(line)
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let list = List::new(items).highlight_style(theme.style_focused_row());
-            let mut state = ListState::default().with_selected(Some(selected_index));
-            frame.render_stateful_widget(list, list_area, &mut state);
-
-            let footer_spans = vec![
-                Span::styled("[Enter]", theme.style_footer_keys()),
-                Span::raw(" "),
-                Span::styled("Select", theme.style_muted()),
-                Span::raw("  "),
-                Span::styled("[Esc]", theme.style_footer_keys()),
-                Span::raw(" "),
-                Span::styled("Close", theme.style_muted()),
-            ];
-            frame.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Esc", theme.style_footer_keys()),
+                    Span::raw(" "),
+                    Span::styled("close", theme.style_muted()),
+                ])),
+                Rect {
+                    y: footer_y,
+                    height: 1,
+                    ..content_area
+                },
+            );
         },
     );
 }
@@ -152,6 +171,12 @@ mod tests {
             .collect()
     }
 
+    fn first_non_blank_column(line: &str) -> usize {
+        line.chars()
+            .position(|character| character != ' ')
+            .expect("rendered row has content")
+    }
+
     #[test]
     fn provider_modal_renders_internet_proxy_provider_with_focus_and_applied_markers() {
         let providers = vec![
@@ -163,6 +188,10 @@ mod tests {
                 name: "宝贝云".to_string(),
                 is_current: false,
             },
+            ProviderItem {
+                name: "白嫖机场".to_string(),
+                is_current: false,
+            },
         ];
 
         let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 1, 120, 30);
@@ -170,11 +199,49 @@ mod tests {
         assert!(text.contains("INTERNET PROXY PROVIDER"));
         assert!(text.contains("AirTCP"));
         assert!(text.contains("*"));
-        assert!(text.contains("> 宝") && text.contains("云"));
-        assert!(text.contains("[Enter]"));
-        assert!(text.contains("Select"));
-        assert!(text.contains("[Esc]"));
-        assert!(text.contains("Close"));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains(" > 宝") && line.contains('云')));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains('白')
+                && line.contains('嫖')
+                && line.contains('机')
+                && line.contains('场')));
+        assert!(text.contains("Esc close"));
+
+        let top = lines
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("dialog top border");
+        let bottom = lines
+            .iter()
+            .position(|line| line.contains('└'))
+            .expect("dialog bottom border");
+        let left = first_non_blank_column(&lines[top]);
+        let right = lines[top]
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|character| *character != ' ')
+            .expect("dialog right border");
+
+        assert_eq!(bottom - top + 1, 10, "canonical dialog height");
+        assert_eq!(right - left + 1, 50, "canonical dialog width");
+        assert!(!lines[top].contains("INTERNET PROXY PROVIDER"));
+        assert!(lines[top + 1].contains("INTERNET PROXY PROVIDER"));
+
+        let option_rows = ["AirTCP", "宝", "白"]
+            .iter()
+            .map(|provider| {
+                lines
+                    .iter()
+                    .position(|line| line.contains(provider))
+                    .expect("provider row")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(option_rows, vec![top + 3, top + 5, top + 7]);
+        assert!(lines[top + 8].contains("Esc close"));
     }
 
     #[test]
@@ -195,8 +262,53 @@ mod tests {
         assert!(text.contains("INTRANET PROFILE"));
         assert!(text.contains("*> Corp-Production"));
         assert!(text.contains("Corp-Staging"));
-        assert!(text.contains("[Enter]"));
-        assert!(text.contains("Select"));
+        assert!(text.contains("Esc close"));
+
+        let top = lines.iter().position(|line| line.contains('┌')).unwrap();
+        let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
+        assert_eq!(bottom - top + 1, 8);
+        assert!(lines[top + 1].contains("INTRANET PROFILE"));
+        assert!(lines[top + 3].contains("Corp-Production"));
+        assert!(lines[top + 5].contains("Corp-Staging"));
+        assert!(lines[top + 6].contains("Esc close"));
+    }
+
+    #[test]
+    fn provider_modal_clamps_to_a_compact_viewport_without_losing_its_border() {
+        let providers = vec![
+            ProviderItem {
+                name: "AirTCP".to_string(),
+                is_current: true,
+            },
+            ProviderItem {
+                name: "宝贝云".to_string(),
+                is_current: false,
+            },
+            ProviderItem {
+                name: "白嫖机场".to_string(),
+                is_current: false,
+            },
+        ];
+
+        let lines = rendered_provider_modal_lines_at("INTERNET PROXY PROVIDER", &providers, 2, 32, 9);
+        let top = lines
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("compact top border");
+        let bottom = lines
+            .iter()
+            .position(|line| line.contains('└'))
+            .expect("compact bottom border");
+
+        assert!(bottom > top);
+        assert!(lines[top + 1].contains("INTERNET PROXY"));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains('白')
+                && line.contains('嫖')
+                && line.contains('机')
+                && line.contains('场')));
+        assert!(lines.iter().any(|line| line.contains("Esc close")));
     }
 
     #[test]

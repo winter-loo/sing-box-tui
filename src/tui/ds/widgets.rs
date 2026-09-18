@@ -328,11 +328,16 @@ pub(crate) fn render_dialog_frame<F>(
 
     frame.render_widget(Clear, dialog_area);
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.style_focused_row())
-        .title(Span::styled(format!(" {} ", title), theme.style_breadcrumb()))
         .style(theme.style_base());
+    if !title.trim().is_empty() {
+        block = block.title(Span::styled(
+            format!(" {} ", title),
+            theme.style_breadcrumb(),
+        ));
+    }
 
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
