@@ -9,6 +9,7 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use super::{
     App, BenchmarkWorkflow, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
     GLOBAL_CLASH_MODE, LeftPaneSection, PrivateAccessRuntime, RULE_CLASH_MODE, SystemProxy,
+    IntranetDetailSection,
 };
 use crate::controller::{ApiClient, ConnectionsSnapshot, ProxyGroup};
 use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
@@ -89,6 +90,7 @@ pub(super) fn test_app() -> App {
         focus: Focus::Members,
         left_pane_section: LeftPaneSection::Internet,
         intranet_detail_scroll: 0,
+        intranet_detail_section: IntranetDetailSection::Dns,
         expanded_intranet_sections: BTreeSet::new(),
         status: String::new(),
         flash: None,

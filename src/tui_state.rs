@@ -79,6 +79,7 @@ impl OperationalWorkspace {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cycle(&self) -> Self {
         match self {
             Self::Internet => Self::PrivateAccess,

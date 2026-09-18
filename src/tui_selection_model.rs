@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::App;
 use super::view::{
     IntranetDetailSection, IntranetDetailView, LeftPaneSection, NodeViewPanel,
     private_access_detail_view,
 };
+use super::{App, Focus};
 use crate::controller::{ProxyGroup, matches_filter};
 use crate::defaults::DEFAULT_SELECTOR_TAG;
 use crate::private_access_session::PrivateAccessProfileRuntime;
@@ -161,20 +161,13 @@ impl App {
         };
         let profile_id = profile.id.clone();
         let view = self.intranet_detail_view(profile);
-        let cursor = self.intranet_detail_scroll as usize;
         let Some(range) = view
             .sections
             .iter()
-            .find(|range| range.foldable && cursor >= range.start && cursor < range.end)
-            .or_else(|| {
-                view.sections
-                    .iter()
-                    .find(|range| range.foldable && range.start >= cursor)
-            })
-            .or_else(|| view.sections.iter().rev().find(|range| range.foldable))
+            .find(|range| range.section == self.intranet_detail_section)
             .copied()
         else {
-            self.set_status_only("No detail section has more than 10 items");
+            self.set_status_only("Focused detail section is unavailable");
             return;
         };
         let key = Self::intranet_detail_section_key(&profile_id, range.section);
@@ -190,6 +183,36 @@ impl App {
             if expanded { "Expanded" } else { "Folded" },
             range.section.key(),
             profile_id
+        ));
+    }
+
+    pub(super) fn cycle_intranet_detail_section(&mut self) {
+        let Some(profile) = self.private_access.focused_opt() else {
+            return;
+        };
+        if !matches!(
+            profile.state,
+            crate::private_access::PrivateAccessState::Connected
+        ) {
+            return;
+        }
+        self.focus = Focus::Members;
+        self.intranet_detail_section = match self.intranet_detail_section {
+            IntranetDetailSection::Dns => IntranetDetailSection::Routes,
+            IntranetDetailSection::Routes | IntranetDetailSection::Domains => {
+                IntranetDetailSection::Dns
+            }
+        };
+        let view = self.intranet_detail_view(profile);
+        self.intranet_detail_scroll = view
+            .sections
+            .iter()
+            .find(|range| range.section == self.intranet_detail_section)
+            .map_or(0, |range| range.start as u16);
+        self.set_status_only(format!(
+            "Focused {} section for {}",
+            self.intranet_detail_section.key(),
+            profile.id
         ));
     }
 
@@ -516,7 +539,10 @@ pub(super) fn live_usability_members(
         if Some(member.as_str()) == current_node {
             continue;
         }
-        if results.get(member.as_str()).is_some_and(|result| result.usable) {
+        if results
+            .get(member.as_str())
+            .is_some_and(|result| result.usable)
+        {
             members.push(member.clone());
         }
     }

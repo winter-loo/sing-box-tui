@@ -74,6 +74,7 @@ fn large_intranet_sections_fold_and_toggle_with_enter() {
     assert!(route_range.foldable);
 
     app.intranet_detail_scroll = route_range.start as u16;
+    app.intranet_detail_section = IntranetDetailSection::Routes;
     app.handle_key(KeyCode::Enter).expect("expand routes");
     let section_key = App::intranet_detail_section_key(
         &app.private_access.focused().id,
@@ -83,6 +84,38 @@ fn large_intranet_sections_fold_and_toggle_with_enter() {
 
     app.handle_key(KeyCode::Enter).expect("fold routes");
     assert!(!app.expanded_intranet_sections.contains(&section_key));
+}
+
+#[test]
+fn tab_focuses_dns_and_routes_and_enter_toggles_only_the_focused_section() {
+    let mut app = test_app();
+    let profile = app.private_access.focused_mut();
+    profile.state = crate::private_access::PrivateAccessState::Connected;
+    profile.dns = vec!["10.20.0.1".to_owned()];
+    profile.routes = vec![PrivateAccessRoute {
+        cidr: "10.0.0.0/16".to_owned(),
+    }];
+    app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+    app.left_pane_section = LeftPaneSection::Intranet;
+
+    app.handle_key(KeyCode::Tab).expect("focus routes");
+    assert_eq!(app.intranet_detail_section, IntranetDetailSection::Routes);
+    assert_eq!(
+        app.private_access.focused().state,
+        crate::private_access::PrivateAccessState::Connected
+    );
+    app.handle_key(KeyCode::Enter).expect("expand routes");
+    assert!(app.expanded_intranet_sections.contains("hillstone:routes"));
+    assert!(!app.expanded_intranet_sections.contains("hillstone:dns"));
+
+    app.handle_key(KeyCode::Tab).expect("focus dns");
+    assert_eq!(app.intranet_detail_section, IntranetDetailSection::Dns);
+    app.handle_key(KeyCode::Enter).expect("expand dns");
+    assert!(app.expanded_intranet_sections.contains("hillstone:dns"));
+    assert_eq!(
+        app.private_access.focused().state,
+        crate::private_access::PrivateAccessState::Connected
+    );
 }
 
 #[test]

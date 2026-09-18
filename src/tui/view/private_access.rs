@@ -96,6 +96,7 @@ impl PrivateAccessProgressTone {
 pub(crate) struct IntranetDetailSnapshot<'a> {
     pub(crate) profile: &'a PrivateAccessProfileRuntime,
     pub(crate) expanded_sections: &'a BTreeSet<String>,
+    pub(crate) focused_section: IntranetDetailSection,
     pub(crate) scroll: u16,
     pub(crate) active: bool,
 }

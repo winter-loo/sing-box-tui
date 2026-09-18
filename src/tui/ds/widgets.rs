@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::theme::Theme;
+#[cfg(test)]
 use crate::tui_state::OperationalWorkspace;
 
 /// Renders the operational top header navigation bar
@@ -10,6 +11,7 @@ use crate::tui_state::OperationalWorkspace;
 /// - Left: SING-BOX TUI · <WORKSPACE> · <SELECTOR_NAME>
 /// - Center / Hints: [Tab] Switch Workspace  [Ctrl+K] Actions
 /// - Right: badges for TUN: [ON/OFF]  SYS PROXY: [ON/OFF]  CLASH: [RULE/GLOBAL/DIRECT]
+#[cfg(test)]
 pub(crate) fn render_top_header(
     frame: &mut Frame,
     area: Rect,

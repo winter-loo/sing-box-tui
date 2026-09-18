@@ -502,6 +502,7 @@ impl App {
                 .map(|profile| IntranetDetailSnapshot {
                     profile,
                     expanded_sections: &self.expanded_intranet_sections,
+                    focused_section: self.intranet_detail_section,
                     scroll: self.intranet_detail_scroll,
                     active: self.focus == Focus::Members,
                 })

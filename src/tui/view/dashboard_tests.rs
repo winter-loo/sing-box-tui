@@ -13,8 +13,10 @@ fn pending_candidate_renders_working_shimmer_animation() {
     snapshot.pending_animation_tick = 3;
 
     let lines = rendered_lines(&snapshot);
-    let text = lines.join("
-");
+    let text = lines.join(
+        "
+",
+    );
     assert!(text.contains("test-node"));
     assert!(text.contains("checking TCP 22 (2s)"));
 }
@@ -24,8 +26,10 @@ fn active_usability_probe_renders_braille_spinner_instead_of_tab_count() {
     let mut snapshot = dashboard_snapshot();
     snapshot.node_view_tabs[1].spinner = Some("⠋".to_string());
 
-    let rendered = rendered_lines(&snapshot).join("
-");
+    let rendered = rendered_lines(&snapshot).join(
+        "
+",
+    );
     assert!(rendered.contains("Streaming ⠋"));
     assert!(!rendered.contains("Streaming 1"));
 }
@@ -89,7 +93,10 @@ fn braille_signal_uses_thin_half_cell_bars_with_fixed_spacing() {
         .into_iter()
         .collect::<String>();
     assert_eq!(three_bars, "⡆⡄⡀");
-    assert_eq!(unicode_width::UnicodeWidthStr::width(three_bars.as_str()), 3);
+    assert_eq!(
+        unicode_width::UnicodeWidthStr::width(three_bars.as_str()),
+        3
+    );
 }
 
 fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
@@ -261,14 +268,18 @@ fn streaming_rows_adapt_without_losing_node_identity_or_reachability() {
     snapshot.candidate_rows[0].marker = "1.0 MiB/s".into();
     snapshot.candidate_rows[0].compact_marker = "1.0M/s".into();
 
-    let wide = rendered_lines_at(&snapshot, 130, 30).join("
-");
+    let wide = rendered_lines_at(&snapshot, 130, 30).join(
+        "
+",
+    );
     assert!(wide.contains("1.0 MiB/s"));
 
     snapshot.candidate_rows[0].name = "这是一个很长的中文流媒体节点名称".into();
     for width in [64, 52] {
-        let narrow = rendered_lines_at(&snapshot, width, 24).join("
-");
+        let narrow = rendered_lines_at(&snapshot, width, 24).join(
+            "
+",
+        );
         assert!(
             narrow.contains("这"),
             "node identity missing at width {width}"
@@ -447,20 +458,21 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
         expanded_sections: &expanded_sections,
+        focused_section: IntranetDetailSection::Dns,
         scroll: 0,
         active: true,
     });
 
     let text = rendered_lines(&snapshot).join("\n");
-    assert!(text.contains("Private Access · Profiles"));
-    assert!(text.contains("Private Access: hillstone"));
+    assert!(text.contains("INTRANET / HILLSTONE / CONNECTED"));
+    assert!(text.contains("PRIVATE ACCESS SESSION / SELECTED PROFILE: HILLSTONE"));
     assert!(text.contains("vpn.example.com:4433"));
     assert!(text.contains("10.20.0.0/16"));
-    assert!(text.contains("10.20.0.53"));
+    assert!(text.contains("DNS SERVERS / 1"));
     assert!(text.contains("portal.internal.example"));
     assert!(text.contains("*.corp.example"));
-    assert!(text.contains("[Tab] Internet →"));
-    assert!(text.contains("[V] Connect/Disconnect"));
+    assert!(text.contains("↑↓ profile"));
+    assert!(text.contains("V disconnect"));
     assert!(text.contains("CONNECTED"));
 }
 
@@ -496,6 +508,7 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
         expanded_sections: &expanded_sections,
+        focused_section: IntranetDetailSection::Dns,
         scroll: 0,
         active: true,
     });
@@ -503,24 +516,201 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
     // 120x30 standard workspace
     let lines_120 = rendered_lines_at(&snapshot, 120, 30);
     let text_120 = lines_120.join("\n");
-    assert!(text_120.contains("Private Access · Profiles"));
+    assert!(text_120.contains("INTRANET / HILLSTONE / CONNECTED"));
+    assert!(text_120.contains("ACTIVE PROFILE / 1 OF 2"));
     assert!(text_120.contains("hillstone"));
     assert!(text_120.contains("CONNECTED"));
-    assert!(text_120.contains("sonicwall"));
-    assert!(text_120.contains("DISCONNECTED"));
-    assert!(text_120.contains("vpn.corp.com:4433 · TUN · 2 routes"));
-    assert!(text_120.contains("portal.corp.com:443 · Bridge · 5 routes"));
-    assert!(text_120.contains("Private Access: hillstone"));
-    assert!(text_120.contains("[Tab] Internet →"));
-    assert!(text_120.contains("[V] Connect/Disconnect"));
-    assert!(text_120.contains("1 CONNECTED"));
+    assert!(text_120.contains("vpn.corp.com:4433"));
+    assert!(text_120.contains("PRIVATE ACCESS SESSION / SELECTED PROFILE: HILLSTONE"));
+    assert!(text_120.contains("↑↓ profile"));
+    assert!(text_120.contains("p choose"));
+    assert!(text_120.contains("V disconnect"));
+    assert!(text_120.contains("GLOBAL NET"));
 
     // 80x24 compact workspace
     let lines_80 = rendered_lines_at(&snapshot, 80, 24);
     let text_80 = lines_80.join("\n");
-    assert!(text_80.contains("Private Access · Profiles"));
+    assert!(text_80.contains("INTRANET / HILLSTONE / CONNECTED"));
     assert!(text_80.contains("hillstone"));
-    assert!(text_80.contains("Private Access: hillstone"));
+    assert!(text_80.contains("Gateway"));
+    assert!(text_80.contains("GLOBAL NET"));
+}
+
+#[test]
+fn intranet_expansion_reserves_a_detail_pane_and_collapse_restores_full_width() {
+    let mut profile = PrivateAccessProfileRuntime::default_hillstone().expect("hillstone profile");
+    profile.state = PrivateAccessState::Connected;
+    profile.dns = (1..=12).map(|n| format!("10.20.0.{n}")).collect();
+    profile.routes = (0..20)
+        .map(|n| PrivateAccessRoute {
+            cidr: format!("10.{n}.0.0/16"),
+        })
+        .collect();
+
+    let collapsed = BTreeSet::new();
+    let mut snapshot = dashboard_snapshot();
+    snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+    snapshot.left_pane_section = LeftPaneSection::Intranet;
+    snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &collapsed,
+        focused_section: IntranetDetailSection::Dns,
+        scroll: 0,
+        active: true,
+    });
+
+    let collapsed_lines = rendered_lines_at(&snapshot, 120, 30);
+    assert!(
+        collapsed_lines
+            .iter()
+            .any(|line| line.contains("DNS SERVERS / 12") && line.len() > 90)
+    );
+    assert!(
+        !collapsed_lines
+            .iter()
+            .any(|line| line.contains("INTRANET: HILLSTONE"))
+    );
+
+    let expanded = BTreeSet::from(["hillstone:dns".to_string()]);
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &expanded,
+        focused_section: IntranetDetailSection::Dns,
+        scroll: 0,
+        active: true,
+    });
+    let expanded_text = rendered_lines_at(&snapshot, 120, 30).join("\n");
+    assert!(expanded_text.contains("INTRANET: HILLSTONE / DNS"));
+    assert!(expanded_text.contains("▼ DNS servers (12)"));
+    assert!(expanded_text.contains("10.20.0.12"));
+
+    let route_start = private_access_detail_view(&profile, |section| {
+        section == IntranetDetailSection::Routes
+    })
+    .sections
+    .into_iter()
+    .find(|range| range.section == IntranetDetailSection::Routes)
+    .expect("routes range")
+    .start as u16;
+    let routes = BTreeSet::from(["hillstone:routes".to_string()]);
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &routes,
+        focused_section: IntranetDetailSection::Routes,
+        scroll: route_start,
+        active: true,
+    });
+    for (width, height) in [(80, 24), (120, 30), (160, 38), (101, 27)] {
+        let text = rendered_lines_at(&snapshot, width, height).join("\n");
+        assert!(text.contains("INTRANET: HILLSTONE / ROUTES"));
+        assert!(text.contains("▼ Routes (20)"), "{width}x{height}\n{text}");
+        assert!(!text.contains("▼ DNS servers (12)"));
+        let footer = text.lines().last().expect("footer");
+        assert!(footer.contains("GLOBAL NET"));
+        assert!(footer.contains("↓0.0M/s"));
+        assert!(footer.contains("↑0.0M/s"));
+    }
+
+    let both = BTreeSet::from([
+        "hillstone:dns".to_string(),
+        "hillstone:routes".to_string(),
+    ]);
+    let both_route_start = private_access_detail_view(&profile, |section| {
+        matches!(section, IntranetDetailSection::Dns | IntranetDetailSection::Routes)
+    })
+    .sections
+    .into_iter()
+    .find(|range| range.section == IntranetDetailSection::Routes)
+    .expect("expanded routes range")
+    .start as u16;
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &both,
+        focused_section: IntranetDetailSection::Routes,
+        scroll: both_route_start,
+        active: true,
+    });
+    let both_text = rendered_lines_at(&snapshot, 160, 38).join("\n");
+    assert!(both_text.contains("INTRANET: HILLSTONE / ROUTES"));
+    assert!(both_text.contains("▼ DNS servers (12)"));
+    assert!(both_text.contains("▼ Routes (20)"));
+}
+
+#[test]
+fn failed_intranet_session_hides_stale_granted_resources_at_all_supported_sizes() {
+    let mut profile = PrivateAccessProfileRuntime::default_hillstone().expect("hillstone profile");
+    profile.state = PrivateAccessState::Error;
+    profile.last_error = Some("gateway rejected authentication".to_string());
+    profile.dns = vec!["10.20.0.53".to_string()];
+    profile.routes = vec![PrivateAccessRoute {
+        cidr: "10.20.0.0/16".to_string(),
+    }];
+    let expanded = BTreeSet::from(["hillstone:dns".to_string(), "hillstone:routes".to_string()]);
+
+    let mut snapshot = dashboard_snapshot();
+    snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+    snapshot.left_pane_section = LeftPaneSection::Intranet;
+    snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
+    snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+        profile: &profile,
+        expanded_sections: &expanded,
+        focused_section: IntranetDetailSection::Dns,
+        scroll: 0,
+        active: true,
+    });
+
+    for (width, height) in [(80, 24), (120, 30), (160, 36), (101, 27)] {
+        let text = rendered_lines_at(&snapshot, width, height).join("\n");
+        assert!(text.contains("CONNECTION FAILED"));
+        assert!(text.contains("DNS and routes are unavailable until connected."));
+        assert!(!text.contains("10.20.0.53"));
+        assert!(!text.contains("10.20.0.0/16"));
+    }
+}
+
+#[test]
+fn intranet_lifecycle_states_keep_status_and_resource_copy_truthful() {
+    for state in [
+        PrivateAccessState::Disconnected,
+        PrivateAccessState::Connecting,
+        PrivateAccessState::Disconnecting,
+    ] {
+        let mut profile =
+            PrivateAccessProfileRuntime::default_hillstone().expect("hillstone profile");
+        profile.state = state.clone();
+        profile.dns = vec!["10.20.0.53".to_string()];
+        profile.routes = vec![PrivateAccessRoute {
+            cidr: "10.20.0.0/16".to_string(),
+        }];
+        let expanded = BTreeSet::from(["hillstone:dns".to_string()]);
+        let mut snapshot = dashboard_snapshot();
+        snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+        snapshot.left_pane_section = LeftPaneSection::Intranet;
+        snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
+        snapshot.intranet_detail = Some(IntranetDetailSnapshot {
+            profile: &profile,
+            expanded_sections: &expanded,
+            focused_section: IntranetDetailSection::Dns,
+            scroll: 0,
+            active: true,
+        });
+
+        for (width, height) in [(80, 24), (120, 30), (151, 33)] {
+            let text = rendered_lines_at(&snapshot, width, height).join("\n");
+            assert!(text.contains(private_access_state_badge(state.clone())));
+            assert!(text.contains(if matches!(
+                state,
+                PrivateAccessState::Connecting | PrivateAccessState::Disconnecting
+            ) {
+                "waiting for session result"
+            } else {
+                "available after connection"
+            }));
+            assert!(!text.contains("10.20.0.53"));
+            assert!(!text.contains("10.20.0.0/16"));
+        }
+    }
 }
 
 #[test]
@@ -925,5 +1115,9 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
 
     // Verify no legacy box borders anywhere in the 30 rows
     assert!(!lines.iter().any(|line| line.contains("Internet Proxy")));
-    assert!(!lines.iter().any(|line| line.contains("Status") && line.contains("─")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("Status") && line.contains("─"))
+    );
 }

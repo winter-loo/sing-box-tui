@@ -117,7 +117,7 @@ use verification::{VerifyJob, default_verification_targets_setting};
 #[cfg(test)]
 use view::private_access_auth_display_value;
 use view::{
-    Focus, LeftPaneSection, NodeQualityDetailState, NodeViewPanel, OnboardingState,
+    Focus, IntranetDetailSection, LeftPaneSection, NodeQualityDetailState, NodeViewPanel, OnboardingState,
     PrivateAccessAuthModal, PrivateAccessProgressEntry, PrivateAccessProgressModal,
     PrivateAccessProgressTone, SettingsEditState, help_item_count,
     private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
@@ -446,20 +446,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         let internet =
             app.operational_workspace == crate::tui_state::OperationalWorkspace::Internet;
-        let header_height = if internet {
-            if area.height >= 30 { 2 } else { 1 }
-        } else if area.width < 90 {
-            2
-        } else {
-            1
-        };
-        let [header_area, body_area] = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Length(header_height),
-            ratatui::layout::Constraint::Min(0),
-        ])
-        .areas(area);
-
         if internet {
+            let header_height = if area.height >= 30 { 2 } else { 1 };
+            let [header_area, body_area] = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(header_height),
+                ratatui::layout::Constraint::Min(0),
+            ])
+            .areas(area);
             let (provider, route_node) = app.current_route_labels();
             crate::tui::ds::widgets::render_breadcrumb(
                 frame,
@@ -467,26 +460,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 &theme,
                 &["INTERNET", provider.as_str(), route_node.as_str()],
             );
+            let snapshot = app.view_snapshot();
+            view::render_in_area(frame, body_area, &snapshot);
         } else {
-            let selector_name = app
-                .private_access
-                .focused_opt()
-                .map(|profile| profile.id.as_str())
-                .unwrap_or("—");
-            crate::tui::ds::widgets::render_top_header(
-                frame,
-                header_area,
-                &theme,
-                app.operational_workspace,
-                selector_name,
-                app.internet_tun.is_enabled(),
-                app.system_proxy.enabled(),
-                app.clash_mode.as_deref().unwrap_or("—"),
-            );
+            let snapshot = app.view_snapshot();
+            view::render_in_area(frame, area, &snapshot);
         }
-
-        let snapshot = app.view_snapshot();
-        view::render_in_area(frame, body_area, &snapshot);
     }
 
     if let Some(state) = &app.command_palette {
@@ -569,6 +548,7 @@ struct App {
     focus: Focus,
     left_pane_section: LeftPaneSection,
     intranet_detail_scroll: u16,
+    intranet_detail_section: IntranetDetailSection,
     expanded_intranet_sections: BTreeSet<String>,
     status: String,
     flash: Option<(String, Instant)>,
@@ -807,6 +787,7 @@ impl App {
             focus: Focus::Groups,
             left_pane_section: LeftPaneSection::Internet,
             intranet_detail_scroll: 0,
+            intranet_detail_section: IntranetDetailSection::Dns,
             expanded_intranet_sections: BTreeSet::new(),
             status: String::from("Loading proxy groups..."),
             flash: None,
@@ -1197,9 +1178,10 @@ impl App {
                 self.pause_active_probes();
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Tab => {
-                self.cycle_operational_workspace()?;
+            KeyCode::Tab if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
+                self.cycle_intranet_detail_section();
             }
+            KeyCode::Tab => {}
             KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
             KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
             KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
@@ -1573,6 +1555,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn cycle_operational_workspace(&mut self) -> Result<()> {
         let next = self.operational_workspace.cycle();
         self.set_operational_workspace(next)
@@ -1795,7 +1778,7 @@ mod navigation_tests {
     use crate::tui_state::{OperationalWorkspace, TuiRuntimeState, TuiStateStore};
 
     #[test]
-    fn tab_cycles_operational_workspace_and_persists() {
+    fn command_palette_workspace_switch_persists_while_tab_stays_local() {
         let mut app = test_support::test_app();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1808,15 +1791,17 @@ mod navigation_tests {
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
 
-        // Tab -> PrivateAccess
+        // Tab is local to operational pages; workspace switching is an explicit command.
         app.handle_key(KeyCode::Tab).expect("tab handled");
+        assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+        app.cycle_operational_workspace().expect("workspace switch");
         assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
         assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
         let persisted = store.load().expect("load persisted state");
         assert_eq!(persisted.operational_workspace.as_deref(), Some("private_access"));
 
-        // Tab -> Internet
-        app.handle_key(KeyCode::Tab).expect("tab handled");
+        // Explicit workspace command -> Internet
+        app.cycle_operational_workspace().expect("workspace switch");
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
         let persisted = store.load().expect("load persisted state");
