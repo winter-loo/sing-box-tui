@@ -186,7 +186,15 @@ impl App {
         ));
     }
 
-    pub(super) fn cycle_intranet_detail_section(&mut self) {
+    pub(super) fn select_next_intranet_detail_section(&mut self) {
+        self.select_intranet_detail_section(IntranetDetailSection::Routes);
+    }
+
+    pub(super) fn select_previous_intranet_detail_section(&mut self) {
+        self.select_intranet_detail_section(IntranetDetailSection::Dns);
+    }
+
+    fn select_intranet_detail_section(&mut self, section: IntranetDetailSection) {
         let Some(profile) = self.private_access.focused_opt() else {
             return;
         };
@@ -197,21 +205,16 @@ impl App {
             return;
         }
         self.focus = Focus::Members;
-        self.intranet_detail_section = match self.intranet_detail_section {
-            IntranetDetailSection::Dns => IntranetDetailSection::Routes,
-            IntranetDetailSection::Routes | IntranetDetailSection::Domains => {
-                IntranetDetailSection::Dns
-            }
-        };
+        self.intranet_detail_section = section;
         let view = self.intranet_detail_view(profile);
         self.intranet_detail_scroll = view
             .sections
             .iter()
-            .find(|range| range.section == self.intranet_detail_section)
+            .find(|range| range.section == section)
             .map_or(0, |range| range.start as u16);
         self.set_status_only(format!(
             "Focused {} section for {}",
-            self.intranet_detail_section.key(),
+            section.key(),
             profile.id
         ));
     }

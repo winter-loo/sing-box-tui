@@ -36,6 +36,7 @@ mod system_proxy;
 mod tui;
 mod tui_state;
 mod tun;
+mod ui_responsiveness;
 mod usability_probe;
 
 use cli::{BackgroundAction, CliCommand};

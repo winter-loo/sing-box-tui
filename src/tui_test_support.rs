@@ -138,6 +138,7 @@ pub(super) fn test_app() -> App {
         connections: ConnectionsSnapshot::default(),
         connection_error: None,
         last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+        connections_refresh_job: None,
         show_connections: false,
         show_help: false,
         help_index: 0,

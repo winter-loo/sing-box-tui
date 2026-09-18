@@ -874,6 +874,7 @@ fn render_intranet_workspace(
             profile,
             summary_inner.width,
             theme,
+            detail.active.then_some(detail.focused_section),
         ))
         .wrap(Wrap { trim: false }),
         summary_inner,
@@ -931,6 +932,7 @@ fn private_access_summary_lines(
     profile: &PrivateAccessProfileRuntime,
     width: u16,
     theme: &Theme,
+    focused_section: Option<IntranetDetailSection>,
 ) -> Vec<Line<'static>> {
     let connected = matches!(profile.state, PrivateAccessState::Connected);
     let gateway = if profile.server.trim().is_empty() {
@@ -971,6 +973,23 @@ fn private_access_summary_lines(
             theme.style_muted(),
         )));
         return lines;
+    }
+
+    if connected {
+        lines.push(private_access_collapsed_section_line(
+            "DNS SERVERS",
+            profile.dns.len(),
+            width,
+            theme,
+            focused_section == Some(IntranetDetailSection::Dns),
+        ));
+        lines.push(private_access_collapsed_section_line(
+            "ROUTES",
+            profile.routes.len(),
+            width,
+            theme,
+            focused_section == Some(IntranetDetailSection::Routes),
+        ));
     }
 
     lines.extend([
@@ -1031,18 +1050,6 @@ fn private_access_summary_lines(
         return lines;
     }
 
-    lines.push(private_access_collapsed_section_line(
-        "DNS SERVERS",
-        profile.dns.len(),
-        width,
-        theme,
-    ));
-    lines.push(private_access_collapsed_section_line(
-        "ROUTES",
-        profile.routes.len(),
-        width,
-        theme,
-    ));
     let preview = profile
         .routes
         .iter()
@@ -1091,18 +1098,24 @@ fn private_access_collapsed_section_line(
     count: usize,
     width: u16,
     theme: &Theme,
+    focused: bool,
 ) -> Line<'static> {
-    let title = format!("▸ {label} / {count}");
+    let title = format!("{} {label} / {count}", if focused { "▶" } else { "▸" });
     let hint = if width >= 32 { "Enter expand" } else { "Enter" };
     let padding = usize::from(width)
         .saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()))
         .saturating_sub(unicode_width::UnicodeWidthStr::width(hint))
         .max(1);
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::raw(title),
         Span::raw(" ".repeat(padding)),
         Span::styled(hint.to_string(), theme.style_muted()),
-    ])
+    ]);
+    if focused {
+        line.style(theme.style_focused_row())
+    } else {
+        line
+    }
 }
 
 fn render_intranet_footer(
@@ -1129,8 +1142,8 @@ fn render_intranet_footer(
         None => "o settings",
     };
     let variants = [
-        format!("↑↓ profile   p choose   Tab focus   Enter toggle   {action}   o settings   ? help"),
-        format!("↑↓ profile   p choose   {action}   o settings   ? help"),
+        format!("p profile   ↑↓/jk select   Enter open   {action}   o settings   ? help"),
+        format!("p profile   ↑↓ select   Enter open   {action}   ? help"),
         format!("p profile   {action}   ? help"),
         "?".to_string(),
     ];

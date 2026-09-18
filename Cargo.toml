@@ -3,6 +3,10 @@ name = "sing-box-tui"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = 1
+strip = false
+
 [dependencies]
 anyhow = "1.0.102"
 crossterm = "0.29.0"

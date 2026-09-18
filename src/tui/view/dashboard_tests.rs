@@ -471,7 +471,7 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     assert!(text.contains("DNS SERVERS / 1"));
     assert!(text.contains("portal.internal.example"));
     assert!(text.contains("*.corp.example"));
-    assert!(text.contains("↑↓ profile"));
+    assert!(text.contains("p profile"));
     assert!(text.contains("V disconnect"));
     assert!(text.contains("CONNECTED"));
 }
@@ -522,8 +522,8 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
     assert!(text_120.contains("CONNECTED"));
     assert!(text_120.contains("vpn.corp.com:4433"));
     assert!(text_120.contains("PRIVATE ACCESS SESSION / SELECTED PROFILE: HILLSTONE"));
-    assert!(text_120.contains("↑↓ profile"));
-    assert!(text_120.contains("p choose"));
+    assert!(text_120.contains("p profile"));
+    assert!(!text_120.contains("↑↓ profile"));
     assert!(text_120.contains("V disconnect"));
     assert!(text_120.contains("GLOBAL NET"));
 
@@ -567,6 +567,11 @@ fn intranet_expansion_reserves_a_detail_pane_and_collapse_restores_full_width() 
             .any(|line| line.contains("DNS SERVERS / 12") && line.len() > 90)
     );
     assert!(
+        collapsed_lines
+            .iter()
+            .any(|line| line.contains("▶ DNS SERVERS / 12"))
+    );
+    assert!(
         !collapsed_lines
             .iter()
             .any(|line| line.contains("INTRANET: HILLSTONE"))
@@ -603,6 +608,10 @@ fn intranet_expansion_reserves_a_detail_pane_and_collapse_restores_full_width() 
     });
     for (width, height) in [(80, 24), (120, 30), (160, 38), (101, 27)] {
         let text = rendered_lines_at(&snapshot, width, height).join("\n");
+        assert!(
+            text.contains("▶ ROUTES / 20"),
+            "{width}x{height}\n{text}"
+        );
         assert!(text.contains("INTRANET: HILLSTONE / ROUTES"));
         assert!(text.contains("▼ Routes (20)"), "{width}x{height}\n{text}");
         assert!(!text.contains("▼ DNS servers (12)"));

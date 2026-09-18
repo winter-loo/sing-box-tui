@@ -360,7 +360,12 @@ impl PrivateAccessProfileRuntime {
             tun_helper: (!self.tun_helper.is_empty()).then(|| self.tun_helper.clone()),
             tls_verify: self.tls_verify,
             use_internet_proxy: self.use_internet_proxy,
-            background_pid: self.background_pid.filter(|pid| process_exists(*pid)),
+            background_pid: self
+                .process
+                .as_ref()
+                .map(|process| process.pid())
+                .or(self.background_pid)
+                .filter(|pid| process_exists(*pid)),
         }
     }
 
@@ -1222,6 +1227,15 @@ mod tests {
         runtime.focused_mut().username = "alice".to_string();
         runtime.focused_mut().state = PrivateAccessState::Connecting;
         (runtime, stopped)
+    }
+
+    #[test]
+    fn owned_private_access_pid_is_persisted_for_ui_crash_recovery() {
+        let (runtime, _) = runtime_with_process(Vec::new());
+
+        let states = runtime.runtime_states(|pid| pid == 4242);
+
+        assert_eq!(states[0].background_pid, Some(4242));
     }
 
     #[test]

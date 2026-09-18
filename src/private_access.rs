@@ -8,7 +8,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -479,6 +479,7 @@ pub(crate) struct ExternalPrivateAccessService {
     child: Child,
     stdin: ChildStdin,
     event_rx: Receiver<Result<PrivateAccessEventEnvelope, String>>,
+    event_overflow: Arc<AtomicBool>,
     stdout_worker: Option<JoinHandle<()>>,
     stderr_worker: Option<JoinHandle<()>>,
 }
@@ -506,25 +507,35 @@ impl ExternalPrivateAccessService {
             .take()
             .context("service stderr was not piped")?;
         let (tx, rx) = mpsc::sync_channel(PRIVATE_ACCESS_EVENT_QUEUE_CAPACITY);
+        let event_overflow = Arc::new(AtomicBool::new(false));
         let service_id = manifest.id.clone();
         let stdout_tx = tx.clone();
+        let stdout_overflow = Arc::clone(&event_overflow);
         let stdout_worker = thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) if line.trim().is_empty() => {}
+                let event = match line {
+                    Ok(line) if line.trim().is_empty() => continue,
                     Ok(line) => {
-                        let event = serde_json::from_str::<PrivateAccessEventEnvelope>(&line)
-                            .map_err(|error| {
+                        serde_json::from_str::<PrivateAccessEventEnvelope>(&line).map_err(
+                            |error| {
                                 format!("failed to parse service event JSON: {error}; line={line}")
-                            });
-                        let _ = stdout_tx.send(event);
+                            },
+                        )
                     }
                     Err(error) => {
-                        let _ = stdout_tx.send(Err(format!(
+                        let event = Err(format!(
                             "failed to read service stdout for {service_id}: {error}"
-                        )));
-                        break;
+                        ));
+                        let _ = stdout_tx.try_send(event);
+                        return;
                     }
+                };
+                match stdout_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        stdout_overflow.store(true, Ordering::SeqCst);
+                    }
+                    Err(TrySendError::Disconnected(_)) => break,
                 }
             }
         });
@@ -550,7 +561,7 @@ impl ExternalPrivateAccessService {
                         let _ = stderr_tx.try_send(Ok(event));
                     }
                     Err(error) => {
-                        let _ = stderr_tx.send(Err(format!(
+                        let _ = stderr_tx.try_send(Err(format!(
                             "failed to read service stderr for {stderr_service_id}: {error}"
                         )));
                         break;
@@ -563,6 +574,7 @@ impl ExternalPrivateAccessService {
             child,
             stdin,
             event_rx: rx,
+            event_overflow,
             stdout_worker: Some(stdout_worker),
             stderr_worker: Some(stderr_worker),
         })
@@ -596,6 +608,11 @@ impl ExternalPrivateAccessService {
     }
 
     pub(crate) fn try_recv(&self) -> Result<Option<PrivateAccessEventEnvelope>, String> {
+        if self.event_overflow.swap(false, Ordering::SeqCst) {
+            return Err(format!(
+                "private access service event queue exceeded {PRIVATE_ACCESS_EVENT_QUEUE_CAPACITY} entries"
+            ));
+        }
         match self.event_rx.try_recv() {
             Ok(Ok(event)) => Ok(Some(event)),
             Ok(Err(error)) => Err(error),
@@ -823,6 +840,10 @@ fn sonicwall_session_should_shutdown_after_stdio(detached: bool) -> bool {
     !detached
 }
 
+fn stdio_eof_should_detach_active_session(session_active: bool) -> bool {
+    session_active
+}
+
 fn run_sonicwall_private_access_service_stdio() -> Result<()> {
     let detached = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(JsonLineEventSink::new(
@@ -942,6 +963,13 @@ fn run_sonicwall_private_access_service_stdio() -> Result<()> {
                 sink.state(state, "status requested")?;
             }
         }
+    }
+    if stdio_eof_should_detach_active_session(session.is_some()) {
+        detached.store(true, Ordering::SeqCst);
+        append_sonicwall_diagnostic(
+            "service",
+            "TUI stdio closed while the session was active; keeping the session in background",
+        );
     }
     if let Some(active) = session.take() {
         if sonicwall_session_should_shutdown_after_stdio(detached.load(Ordering::SeqCst)) {
@@ -2659,6 +2687,13 @@ fn run_hillstone_private_access_service_stdio() -> Result<()> {
             }
         }
     }
+    if stdio_eof_should_detach_active_session(session.is_some()) {
+        detached.store(true, Ordering::SeqCst);
+        append_hillstone_diagnostic(
+            "service",
+            "TUI stdio closed while the session was active; keeping the session in background",
+        );
+    }
     if let Some(session) = session.take() {
         if !detached.load(Ordering::SeqCst) {
             session.shutdown.store(true, Ordering::SeqCst);
@@ -3281,6 +3316,12 @@ mod tests {
     }
 
     #[test]
+    fn active_private_access_session_survives_unexpected_ui_stdio_eof() {
+        assert!(super::stdio_eof_should_detach_active_session(true));
+        assert!(!super::stdio_eof_should_detach_active_session(false));
+    }
+
+    #[test]
     fn private_access_auth_reply_serializes_without_debug_exposure() {
         let command = PrivateAccessCommand::AuthReply {
             id: "cmd-auth-1".to_string(),
@@ -3547,5 +3588,49 @@ mod tests {
 
         service.stop().expect("fake service stops");
         assert!(saw_log, "service stderr should become a log event");
+    }
+
+    #[test]
+    fn full_private_access_event_queue_cannot_deadlock_service_stop() {
+        #[cfg(windows)]
+        let (executable, args) = (
+            std::env::var("COMSPEC")
+                .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()),
+            vec![
+                "/C".to_string(),
+                "for /L %i in (1,1,400) do @echo invalid-json".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "i=0; while [ $i -lt 400 ]; do echo invalid-json; i=$((i+1)); done".to_string(),
+            ],
+        );
+        let manifest = PrivateAccessServiceManifest {
+            id: "queue-flood".to_string(),
+            name: "Queue Flood".to_string(),
+            kind: "private_access".to_string(),
+            protocol: "test".to_string(),
+            executable,
+            args,
+            version: "0.0.0".to_string(),
+            capabilities: PrivateAccessServiceCapabilities::default(),
+            config_schema: json!({}),
+        };
+        let service = ExternalPrivateAccessService::spawn(manifest).expect("fake service spawns");
+        std::thread::sleep(Duration::from_millis(100));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = service.stop();
+            let _ = done_tx.send(result);
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "service stop must not join a reader blocked on a full event queue"
+        );
     }
 }

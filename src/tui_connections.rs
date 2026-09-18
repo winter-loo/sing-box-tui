@@ -57,11 +57,38 @@ impl App {
     }
 
     pub(super) fn maybe_refresh_connections(&mut self) {
+        if self
+            .connections_refresh_job
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let job = self
+                .connections_refresh_job
+                .take()
+                .expect("finished connection refresh job exists");
+            let result = self
+                .client
+                .runtime
+                .block_on(job)
+                .map_err(|error| format!("connection refresh task failed: {error}"))
+                .and_then(|result| result);
+            self.apply_connections_refresh(result);
+        }
+        if self.connections_refresh_job.is_some() {
+            return;
+        }
         if self.last_connection_refresh.elapsed() < CONNECTION_REFRESH_INTERVAL {
             return;
         }
         self.last_connection_refresh = Instant::now();
-        match self.client.fetch_connections() {
+        self.connections_refresh_job = Some(self.client.start_connections_fetch());
+    }
+
+    fn apply_connections_refresh(
+        &mut self,
+        result: std::result::Result<crate::controller::ConnectionsSnapshot, String>,
+    ) {
+        match result {
             Ok(connections) => {
                 let now = Instant::now();
                 let now_ms = crate::tui::metrics::now_unix_ms();
@@ -137,8 +164,7 @@ impl App {
                 self.connections = connections;
                 self.connection_error = None;
             }
-            Err(error) => {
-                let detail = error.to_string();
+            Err(detail) => {
                 self.active_node_traffic.mark_unavailable(detail.clone());
                 self.connection_error = Some(detail);
             }
@@ -153,6 +179,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use crossterm::event::KeyCode;
 
     use super::super::test_support::test_app;
@@ -180,6 +210,27 @@ mod tests {
                 process_path: None,
             },
         }
+    }
+
+    #[test]
+    fn stalled_controller_connection_refresh_never_blocks_the_ui_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled controller");
+        let address = listener.local_addr().expect("stalled controller address");
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept controller request");
+            thread::sleep(Duration::from_millis(500));
+        });
+        let mut app = test_app();
+        app.client = crate::controller::ApiClient::new(format!("http://{address}"), None)
+            .expect("stalled controller client");
+        app.last_connection_refresh = Instant::now() - super::super::CONNECTION_REFRESH_INTERVAL;
+
+        let started = Instant::now();
+        app.maybe_refresh_connections();
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(app.connections_refresh_job.is_some());
+        server.join().expect("stalled controller server joins");
     }
 
     #[test]

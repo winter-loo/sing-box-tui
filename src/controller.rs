@@ -168,8 +168,27 @@ impl ApiClient {
         self.runtime.block_on(self.fetch_status_async())
     }
 
-    pub(crate) fn fetch_connections(&self) -> Result<ConnectionsSnapshot> {
-        self.runtime.block_on(self.fetch_connections_async())
+    pub(crate) fn start_connections_fetch(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<ConnectionsSnapshot, String>> {
+        let client = self.client.clone();
+        let url = format!("{}/connections", self.base_url);
+        self.runtime.spawn(async move {
+            let response = client
+                .get(url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+                .map_err(|error| format!("failed to query Clash API /connections: {error}"))?
+                .error_for_status()
+                .map_err(|error| format!("Clash API /connections returned an error: {error}"))?
+                .json::<ConnectionsResponse>()
+                .await
+                .map_err(|error| {
+                    format!("failed to decode Clash API /connections response: {error}")
+                })?;
+            Ok(connections_from_response(response))
+        })
     }
 
     async fn switch_proxy_async(&self, group: &str, proxy: &str) -> Result<()> {
@@ -242,12 +261,6 @@ impl ApiClient {
         let connections = self.fetch_connections_response_async().await?;
 
         Ok(status_from_parts(version.version, traffic, connections))
-    }
-
-    async fn fetch_connections_async(&self) -> Result<ConnectionsSnapshot> {
-        self.fetch_connections_response_async()
-            .await
-            .map(connections_from_response)
     }
 
     async fn fetch_connections_response_async(&self) -> Result<ConnectionsResponse> {

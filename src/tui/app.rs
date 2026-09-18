@@ -65,6 +65,7 @@ use crate::tui_state::{
     BypassRuleSetStore, OperationalWorkspace, TuiStateStore, default_tui_state_path,
     resolved_tui_bypass_rule_set_path,
 };
+use crate::ui_responsiveness::{UiWatchdog, ui_watchdog_log_path};
 use crate::usability_probe::{
     ManifestDiagnostic, UsabilityProbeDiscovery, UsabilityProbeManifest,
     discover_usability_probe_manifests, manifest_diagnostic, usability_probe_manifest_directory,
@@ -291,27 +292,44 @@ fn restore_terminal() -> Result<()> {
 }
 
 fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
+    let watchdog = UiWatchdog::start(ui_watchdog_log_path(&app.system_proxy_config_path));
     loop {
+        watchdog.progress("poll_benchmark_updates");
         app.poll_benchmark_updates()?;
+        watchdog.progress("poll_usability_probe_updates");
         app.poll_usability_probe_updates();
+        watchdog.progress("poll_subscription_refresh_updates");
         app.poll_subscription_refresh_updates()?;
+        watchdog.progress("poll_system_proxy_updates");
         app.poll_system_proxy_updates();
+        watchdog.progress("poll_tun_toggle_updates");
         app.poll_tun_toggle_updates();
+        watchdog.progress("poll_private_access_updates");
         app.poll_private_access_updates()?;
+        watchdog.progress("poll_verify_updates");
         app.poll_verify_updates();
+        watchdog.progress("poll_background_auto_pick_status");
         app.poll_background_auto_pick_status()?;
+        watchdog.progress("maybe_start_subscription_refresh");
         app.maybe_start_subscription_refresh();
+        watchdog.progress("maybe_refresh_node_quality_detail");
         app.maybe_refresh_node_quality_detail()?;
+        watchdog.progress("maybe_refresh_connections");
         app.maybe_refresh_connections();
+        watchdog.progress("check_and_record_active_route");
         app.check_and_record_active_route();
 
+        watchdog.progress("draw");
         terminal.draw(|frame| draw(frame, app))?;
+        watchdog.progress("event_poll");
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
 
+        watchdog.progress("event_read");
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                watchdog.progress(format!("handle_key:{:?}", key.code));
                 if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
                 {
@@ -593,6 +611,8 @@ struct App {
     connections: ConnectionsSnapshot,
     connection_error: Option<String>,
     last_connection_refresh: Instant,
+    connections_refresh_job:
+        Option<tokio::task::JoinHandle<std::result::Result<ConnectionsSnapshot, String>>>,
     show_connections: bool,
     show_help: bool,
     help_index: usize,
@@ -645,6 +665,7 @@ fn tui_persistent_path_registry(
         registry.push(("China routing rule-set", path));
     }
     registry.extend([
+        ("UI watchdog log", ui_watchdog_log_path(config_path)),
         ("SonicWall diagnostic log", sonicwall_diagnostic_log_path()),
         ("Hillstone diagnostic log", hillstone_diagnostic_log_path()),
         (
@@ -831,6 +852,7 @@ impl App {
             connections: ConnectionsSnapshot::default(),
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+            connections_refresh_job: None,
             show_connections: false,
             show_help: false,
             help_index: 0,
@@ -1178,16 +1200,23 @@ impl App {
                 self.pause_active_probes();
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Tab if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
-                self.cycle_intranet_detail_section();
-            }
             KeyCode::Tab => {}
             KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
             KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
             KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
+            KeyCode::Down | KeyCode::Char('j')
+                if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
+                    self.select_next_intranet_detail_section();
+                }
+            KeyCode::Up | KeyCode::Char('k')
+                if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
+                    self.select_previous_intranet_detail_section();
+                }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_previous(),
+            KeyCode::Char('g') | KeyCode::Char('G')
+                if self.operational_workspace == OperationalWorkspace::PrivateAccess => {}
             KeyCode::Char('g') => self.move_first(),
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
@@ -1547,7 +1576,7 @@ impl App {
                 if self.private_access.is_configured() {
                     self.left_pane_section = LeftPaneSection::Intranet;
                 }
-                self.focus = Focus::Groups;
+                self.focus = Focus::Members;
                 self.set_status_only("Switched to Private Access workspace");
             }
         }

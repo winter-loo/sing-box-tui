@@ -87,7 +87,7 @@ fn large_intranet_sections_fold_and_toggle_with_enter() {
 }
 
 #[test]
-fn tab_focuses_dns_and_routes_and_enter_toggles_only_the_focused_section() {
+fn arrows_select_dns_and_routes_while_tab_does_nothing() {
     let mut app = test_app();
     let profile = app.private_access.focused_mut();
     profile.state = crate::private_access::PrivateAccessState::Connected;
@@ -98,7 +98,10 @@ fn tab_focuses_dns_and_routes_and_enter_toggles_only_the_focused_section() {
     app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
     app.left_pane_section = LeftPaneSection::Intranet;
 
-    app.handle_key(KeyCode::Tab).expect("focus routes");
+    app.handle_key(KeyCode::Tab).expect("ignore tab");
+    assert_eq!(app.intranet_detail_section, IntranetDetailSection::Dns);
+
+    app.handle_key(KeyCode::Down).expect("focus routes");
     assert_eq!(app.intranet_detail_section, IntranetDetailSection::Routes);
     assert_eq!(
         app.private_access.focused().state,
@@ -108,7 +111,7 @@ fn tab_focuses_dns_and_routes_and_enter_toggles_only_the_focused_section() {
     assert!(app.expanded_intranet_sections.contains("hillstone:routes"));
     assert!(!app.expanded_intranet_sections.contains("hillstone:dns"));
 
-    app.handle_key(KeyCode::Tab).expect("focus dns");
+    app.handle_key(KeyCode::Char('k')).expect("focus dns");
     assert_eq!(app.intranet_detail_section, IntranetDetailSection::Dns);
     app.handle_key(KeyCode::Enter).expect("expand dns");
     assert!(app.expanded_intranet_sections.contains("hillstone:dns"));
@@ -116,6 +119,34 @@ fn tab_focuses_dns_and_routes_and_enter_toggles_only_the_focused_section() {
         app.private_access.focused().state,
         crate::private_access::PrivateAccessState::Connected
     );
+}
+
+#[test]
+fn private_access_profiles_are_selected_only_through_the_p_modal() {
+    let mut app = test_app();
+    app.private_access
+        .profiles
+        .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
+    app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
+    app.left_pane_section = LeftPaneSection::Intranet;
+    app.focus = Focus::Groups;
+
+    for key in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+        KeyCode::Char('g'),
+        KeyCode::Char('G'),
+    ] {
+        app.handle_key(key)
+            .expect("ignore workspace profile navigation");
+        assert_eq!(app.private_access.focused_index, 0);
+    }
+
+    app.handle_key(KeyCode::Char('p'))
+        .expect("open profile chooser");
+    assert!(app.provider_modal.is_some());
 }
 
 #[test]
