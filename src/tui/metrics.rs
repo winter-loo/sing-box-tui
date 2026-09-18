@@ -28,6 +28,14 @@ pub(crate) struct LatencySample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NodeThroughputSample {
+    pub(crate) recorded_at_ms: i64,
+    pub(crate) selector: String,
+    pub(crate) node_name: String,
+    pub(crate) bytes_per_sec: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RouteInterval {
     pub(crate) id: i64,
     pub(crate) selector: String,
@@ -43,6 +51,7 @@ pub(crate) struct MetricStore {
     // In-memory caches for fast frame rendering
     traffic_cache: Vec<TrafficSample>,
     latency_cache: Vec<LatencySample>,
+    node_throughput_cache: Vec<NodeThroughputSample>,
     route_intervals: Vec<RouteInterval>,
     last_prune_ms: i64,
 }
@@ -64,6 +73,7 @@ impl MetricStore {
             _db_path: db_path,
             traffic_cache: Vec::new(),
             latency_cache: Vec::new(),
+            node_throughput_cache: Vec::new(),
             route_intervals: Vec::new(),
             last_prune_ms: 0,
         };
@@ -80,6 +90,7 @@ impl MetricStore {
             _db_path: PathBuf::from(":memory:"),
             traffic_cache: Vec::new(),
             latency_cache: Vec::new(),
+            node_throughput_cache: Vec::new(),
             route_intervals: Vec::new(),
             last_prune_ms: 0,
         };
@@ -117,6 +128,16 @@ impl MetricStore {
                     latency_ms INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_latency_samples_time ON latency_samples(recorded_at_ms);
+
+                CREATE TABLE IF NOT EXISTS node_throughput_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    selector TEXT NOT NULL,
+                    node_name TEXT NOT NULL,
+                    bytes_per_sec INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_throughput_samples_time
+                    ON node_throughput_samples(recorded_at_ms);
                 "#,
             )
             .context("failed to initialize metric SQLite schema")?;
@@ -164,6 +185,25 @@ impl MetricStore {
         self.latency_cache.clear();
         for sample in latency_rows {
             self.latency_cache.push(sample?);
+        }
+
+        let mut throughput_stmt = self.conn.prepare(
+            "SELECT recorded_at_ms, selector, node_name, bytes_per_sec
+             FROM node_throughput_samples
+             WHERE recorded_at_ms >= ?1
+             ORDER BY recorded_at_ms ASC",
+        )?;
+        let throughput_rows = throughput_stmt.query_map(params![cutoff_ms], |row| {
+            Ok(NodeThroughputSample {
+                recorded_at_ms: row.get(0)?,
+                selector: row.get(1)?,
+                node_name: row.get(2)?,
+                bytes_per_sec: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        self.node_throughput_cache.clear();
+        for sample in throughput_rows {
+            self.node_throughput_cache.push(sample?);
         }
 
         // Load route intervals (overlapping the 30-minute window)
@@ -235,6 +275,29 @@ impl MetricStore {
             latency_ms,
         };
         self.latency_cache.push(sample);
+        self.maybe_prune(now_ms)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_node_throughput(
+        &mut self,
+        now_ms: i64,
+        selector: &str,
+        node_name: &str,
+        bytes_per_sec: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_throughput_samples
+                (recorded_at_ms, selector, node_name, bytes_per_sec)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![now_ms, selector, node_name, bytes_per_sec as i64],
+        )?;
+        self.node_throughput_cache.push(NodeThroughputSample {
+            recorded_at_ms: now_ms,
+            selector: selector.to_string(),
+            node_name: node_name.to_string(),
+            bytes_per_sec,
+        });
         self.maybe_prune(now_ms)?;
         Ok(())
     }
@@ -316,6 +379,10 @@ impl MetricStore {
             params![cutoff_ms],
         )?;
         self.conn.execute(
+            "DELETE FROM node_throughput_samples WHERE recorded_at_ms < ?1",
+            params![cutoff_ms],
+        )?;
+        self.conn.execute(
             "DELETE FROM route_intervals WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1",
             params![cutoff_ms],
         )?;
@@ -323,6 +390,8 @@ impl MetricStore {
         // Prune in-memory cache
         self.traffic_cache.retain(|s| s.recorded_at_ms >= cutoff_ms);
         self.latency_cache.retain(|s| s.recorded_at_ms >= cutoff_ms);
+        self.node_throughput_cache
+            .retain(|s| s.recorded_at_ms >= cutoff_ms);
         self.route_intervals
             .retain(|i| i.ended_at_ms.is_none() || i.ended_at_ms.unwrap_or(0) >= cutoff_ms);
 
@@ -335,6 +404,10 @@ impl MetricStore {
 
     pub(crate) fn latency_samples(&self) -> &[LatencySample] {
         &self.latency_cache
+    }
+
+    pub(crate) fn node_throughput_samples(&self) -> &[NodeThroughputSample] {
+        &self.node_throughput_cache
     }
 
     pub(crate) fn route_intervals(&self) -> &[RouteInterval] {
@@ -388,6 +461,24 @@ mod tests {
         assert!(MetricStore::has_traffic_gap(now, now + 10_000));
         assert!(!MetricStore::has_latency_gap(now, now + 10_000));
         assert!(MetricStore::has_latency_gap(now, now + 20_000));
+    }
+
+    #[test]
+    fn test_metric_store_records_current_node_throughput() {
+        let mut store = MetricStore::open_in_memory().expect("open in-memory");
+        store
+            .record_node_throughput(1_000_000, "select", "node-a", 3 * 1024 * 1024)
+            .unwrap();
+
+        assert_eq!(
+            store.node_throughput_samples(),
+            &[NodeThroughputSample {
+                recorded_at_ms: 1_000_000,
+                selector: "select".to_string(),
+                node_name: "node-a".to_string(),
+                bytes_per_sec: 3 * 1024 * 1024,
+            }]
+        );
     }
 
     #[test]

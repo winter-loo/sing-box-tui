@@ -38,8 +38,8 @@ pub(crate) struct ActiveNodeQualitySnapshot<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveConnectionSummary<'a> {
-    pub(crate) destination: &'a str,
-    pub(crate) rate_label: String,
+    pub(crate) destination: String,
+    pub(crate) transfer_label: String,
     #[allow(dead_code)]
     pub(crate) rule: &'a str,
 }
@@ -149,18 +149,18 @@ fn label(f: &mut Frame, x: u16, y: u16, w: u16, s: &str, color: Color) {
     );
 }
 
-fn panel(f: &mut Frame, r: Rect, title: &str, theme: &Theme) {
-    if r.width == 0 || r.height == 0 {
-        return;
+fn emphasized_panel(f: &mut Frame, r: Rect, title: &str, theme: &Theme) -> Rect {
+    if r.width < 2 || r.height < 2 {
+        return Rect::new(r.x, r.y, 0, 0);
     }
     surface(f, r, theme);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_default()))
-            .title(title),
-        r,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.text_secondary()))
+        .title(title);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    inner
 }
 
 fn surface(f: &mut Frame, r: Rect, theme: &Theme) {
@@ -183,9 +183,17 @@ fn plot(
     points: &[Vec<(f64, f64)>],
     colors: &[Color],
     kinds: &[GraphType],
+    min: f64,
     max: f64,
 ) {
-    if r.width == 0 || r.height == 0 || points.is_empty() {
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        r,
+    );
+    if points.is_empty() {
         return;
     }
     let sets = points
@@ -205,14 +213,24 @@ fn plot(
         .collect::<Vec<_>>();
     f.render_widget(
         Chart::new(sets)
+            .style(Style::default().bg(Color::Black))
             .x_axis(Axis::default().bounds([0., 30.]))
-            .y_axis(Axis::default().bounds([0., max]))
+            .y_axis(Axis::default().bounds([min, max]))
             .legend_position(None),
         r,
     );
 }
 
 const SPARKLINE_OBSERVATION_GAP_MINUTES: f64 = 2.5;
+
+fn separated_traffic_minutes(minute: f64, plot_width: u16) -> (f64, f64) {
+    let drawable_columns = f64::from(plot_width.saturating_sub(1).max(1));
+    let half_column_minutes = 30.0 / drawable_columns;
+    (
+        (minute - half_column_minutes).clamp(0.0, 30.0),
+        (minute + half_column_minutes).clamp(0.0, 30.0),
+    )
+}
 
 fn segment_sparkline_series(
     points: &[(f64, f64)],
@@ -246,7 +264,14 @@ fn segment_sparkline_series(
 }
 
 fn plot_braille_sparklines(f: &mut Frame, r: Rect, points: &[(f64, f64)], color: Color, max: f64) {
-    if r.width == 0 || r.height == 0 || points.is_empty() {
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        r,
+    );
+    if points.is_empty() {
         return;
     }
     let segments = segment_sparkline_series(points, SPARKLINE_OBSERVATION_GAP_MINUTES);
@@ -263,6 +288,7 @@ fn plot_braille_sparklines(f: &mut Frame, r: Rect, points: &[(f64, f64)], color:
 
     f.render_widget(
         Chart::new(sets)
+            .style(Style::default().bg(Color::Black))
             .x_axis(Axis::default().bounds([0., 30.]))
             .y_axis(Axis::default().bounds([0., max]))
             .legend_position(None),
@@ -270,23 +296,90 @@ fn plot_braille_sparklines(f: &mut Frame, r: Rect, points: &[(f64, f64)], color:
     );
 }
 
-fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &NodeDashboardSnapshot<'_>, theme: &Theme) {
-    surface(f, r, theme);
-    let x = r.x + 1;
-    let w = r.width.saturating_sub(2);
-    let y = r.y;
-
+fn render_node_metric(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    age: &str,
+    top_value: &str,
+    points: &[(f64, f64)],
+    color: Color,
+    max: f64,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     label(
         f,
-        x,
-        y,
-        w,
-        &format!("节点质量 · {}", snapshot.active_node),
-        theme.text_secondary(),
+        area.x,
+        area.y,
+        area.width.saturating_sub(7),
+        title,
+        color,
     );
+    label(
+        f,
+        area.x + area.width.saturating_sub(7),
+        area.y,
+        7,
+        age,
+        theme.text_muted(),
+    );
+    if area.height < 3 {
+        return;
+    }
+
+    let plot_height = area.height.saturating_sub(2);
+    label(f, area.x, area.y + 1, 4, top_value, theme.text_muted());
+    label(f, area.x, area.y + plot_height, 4, "0", theme.text_muted());
+    plot_braille_sparklines(
+        f,
+        Rect::new(
+            area.x + 5,
+            area.y + 1,
+            area.width.saturating_sub(5),
+            plot_height,
+        ),
+        points,
+        color,
+        max,
+    );
+    let axis_y = area.y + area.height - 1;
+    label(f, area.x + 5, axis_y, 4, "-30m", theme.text_muted());
+    label(
+        f,
+        area.x + area.width.saturating_sub(4),
+        axis_y,
+        4,
+        "现在",
+        theme.text_muted(),
+    );
+}
+
+fn node_metric_axis_max(points: &[(f64, f64)], minimum: f64, step: f64) -> f64 {
+    let observed_max = points
+        .iter()
+        .map(|(_, value)| *value)
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+    let padded = observed_max * 1.1;
+    minimum.max((padded / step).ceil() * step)
+}
+
+fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &NodeDashboardSnapshot<'_>, theme: &Theme) {
+    let inner = emphasized_panel(
+        f,
+        r,
+        &format!(" 节点质量 · {} ", snapshot.active_node),
+        theme,
+    );
+    let x = inner.x;
+    let w = inner.width;
+    let y = inner.y;
 
     let Some(q) = &snapshot.node_quality else {
-        label(f, x, y + 2, w, "无节点数据", theme.text_muted());
+        label(f, x, y + 1, w, "无节点数据", theme.text_muted());
         return;
     };
 
@@ -301,88 +394,48 @@ fn render_node_panel(f: &mut Frame, r: Rect, snapshot: &NodeDashboardSnapshot<'_
         format!("延迟 {latency_val}")
     };
     let latency_age = q.latency_sample_age.as_deref().unwrap_or("—");
-    label(
-        f,
-        x,
-        y + 2,
-        w.saturating_sub(7),
-        &latency_title,
-        theme.text_latency(),
-    );
-    label(
-        f,
-        x + w.saturating_sub(7),
-        y + 2,
-        7,
-        latency_age,
-        theme.text_muted(),
-    );
-    label(f, x, y + 3, 4, "120", theme.text_muted());
-    label(f, x, y + 6, 4, "0", theme.text_muted());
-
-    plot_braille_sparklines(
-        f,
-        Rect::new(x + 5, y + 3, w.saturating_sub(5), 4),
-        &q.latency_points,
-        theme.text_latency(),
-        120.,
-    );
-    label(f, x + 5, y + 7, 4, "-30m", theme.text_muted());
-    label(
-        f,
-        x + w.saturating_sub(4),
-        y + 7,
-        4,
-        "现在",
-        theme.text_muted(),
-    );
-
     let speed_raw = q
         .latest_sustained_speed
         .as_deref()
         .or(q.sustained_speed_label.as_deref())
         .unwrap_or("—");
-    let speed_title = if speed_raw.starts_with("实测") {
+    let speed_title = if speed_raw.starts_with("吞吐量") {
         speed_raw.to_string()
     } else {
-        format!("实测 {speed_raw}")
+        format!("吞吐量 {speed_raw}")
     };
     let speed_age = q.sustained_sample_age.as_deref().unwrap_or("—");
-    label(
+    let latency_max = node_metric_axis_max(&q.latency_points, 120.0, 10.0);
+    let speed_max = node_metric_axis_max(&q.sustained_points, 10.0, 1.0);
+    let latency_top = format!("{latency_max:.0}");
+    let speed_top = format!("{speed_max:.0}");
+    let latency_height = inner.height.div_ceil(2);
+    render_node_metric(
         f,
-        x,
-        y + 9,
-        w.saturating_sub(7),
+        Rect::new(x, y, w, latency_height),
+        &latency_title,
+        latency_age,
+        &latency_top,
+        &q.latency_points,
+        theme.text_latency(),
+        latency_max,
+        theme,
+    );
+    render_node_metric(
+        f,
+        Rect::new(
+            x,
+            y + latency_height,
+            w,
+            inner.height.saturating_sub(latency_height),
+        ),
         &speed_title,
-        theme.text_success(),
-    );
-    label(
-        f,
-        x + w.saturating_sub(7),
-        y + 9,
-        7,
         speed_age,
-        theme.text_muted(),
-    );
-    label(f, x, y + 10, 4, "10", theme.text_muted());
-    label(f, x, y + 13, 4, "0", theme.text_muted());
-
-    plot_braille_sparklines(
-        f,
-        Rect::new(x + 5, y + 10, w.saturating_sub(5), 4),
+        &speed_top,
         &q.sustained_points,
         theme.text_success(),
-        10.,
-    );
-
-    label(f, x + 5, y + 14, 4, "-30m", theme.text_muted());
-    label(
-        f,
-        x + w.saturating_sub(4),
-        y + 14,
-        4,
-        "现在",
-        theme.text_muted(),
+        speed_max,
+        theme,
     );
 }
 
@@ -393,23 +446,26 @@ fn render_connections_panel(
     theme: &Theme,
 ) {
     let title = format!(" 活动连接 · {} ", snapshot.active_connections.len());
-    panel(f, r, &title, theme);
-    let x = r.x + 1;
-    let w = r.width.saturating_sub(2);
+    let inner = emphasized_panel(f, r, &title, theme);
+    let x = inner.x;
+    let w = inner.width;
+    let desired_transfer_width = snapshot
+        .active_connections
+        .iter()
+        .map(|connection| connection.transfer_label.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .max("传输".width() as u16);
+    let transfer_width = desired_transfer_width.min(w.saturating_sub(8));
+    let destination_width = w.saturating_sub(transfer_width + 1);
+    let transfer_x = x + destination_width + 1;
+    label(f, x, r.y + 1, destination_width, "目标", theme.text_muted());
     label(
         f,
-        x,
+        transfer_x,
         r.y + 1,
-        w.saturating_sub(6),
-        "目标",
-        theme.text_muted(),
-    );
-    label(
-        f,
-        x + w.saturating_sub(6),
-        r.y + 1,
-        6,
-        "MiB/s",
+        transfer_width,
+        "传输",
         theme.text_muted(),
     );
 
@@ -426,16 +482,16 @@ fn render_connections_panel(
             f,
             x,
             r.y + 2 + i as u16,
-            w.saturating_sub(7),
-            conn.destination,
+            destination_width,
+            &conn.destination,
             theme.text_primary(),
         );
         label(
             f,
-            x + w.saturating_sub(6),
+            transfer_x,
             r.y + 2 + i as u16,
-            6,
-            &conn.rate_label,
+            transfer_width,
+            &conn.transfer_label,
             theme.text_primary(),
         );
     }
@@ -459,26 +515,47 @@ fn render_aggregate_panel(
     theme: &Theme,
 ) {
     surface(f, r, theme);
-    let x = r.x + 2;
-    let w = r.width.saturating_sub(4);
-    let top = r.y;
-    if r.height < 20 || w < 12 {
+    if r.height < 20 || r.width < 16 {
         return;
     }
-    label(f, x, top, w, "核心历史 · 30 分钟", theme.text_secondary());
+    let panels_height = r.height;
+    let latency_height = panels_height / 2;
+    let latency_area = Rect::new(r.x, r.y, r.width, latency_height);
+    let traffic_area = Rect::new(
+        r.x,
+        latency_area.y + latency_area.height,
+        r.width,
+        panels_height.saturating_sub(latency_height),
+    );
+    let latency_inner = emphasized_panel(f, latency_area, " 延迟 · ms ", theme);
+    let traffic_inner = emphasized_panel(f, traffic_area, " 总吞吐量 · MiB/s ", theme);
 
-    let plot_height = (r.height - 12) / 2;
-    let plot_x = x + 4;
-    let plot_width = w.saturating_sub(4);
-    let latency_title_y = top + 4;
-    let latency_plot_y = latency_title_y + 1;
+    let plot_x = latency_inner.x + 4;
+    let plot_width = latency_inner.width.saturating_sub(4);
+    let plot_height = latency_inner.height.saturating_sub(3);
+    let latency_plot_y = latency_inner.y + 1;
     let latency_axis_y = latency_plot_y + plot_height;
-    let traffic_title_y = latency_axis_y + 3;
-    let traffic_plot_y = traffic_title_y + 1;
-    let traffic_axis_y = traffic_plot_y + plot_height;
+    let traffic_plot_x = traffic_inner.x + 4;
+    let traffic_plot_width = traffic_inner.width.saturating_sub(4);
+    let traffic_plot_height = traffic_inner.height.saturating_sub(3);
+    let traffic_plot_y = traffic_inner.y + 1;
+    let traffic_axis_y = traffic_plot_y + traffic_plot_height;
 
     let now_ms = now_unix_ms();
     let cutoff_ms = now_ms.saturating_sub(METRIC_RETENTION_WINDOW_MS);
+    let aggregate_latency_points = snapshot
+        .latency_samples
+        .iter()
+        .map(|sample| (0.0, sample.latency_ms as f64))
+        .chain(
+            snapshot
+                .node_quality
+                .iter()
+                .flat_map(|quality| quality.latency_points.iter().copied()),
+        )
+        .collect::<Vec<_>>();
+    let latency_max = node_metric_axis_max(&aggregate_latency_points, 120.0, 10.0);
+    let latency_top = format!("{latency_max:.0}");
 
     // Route interval headers
     if !snapshot.route_intervals.is_empty() {
@@ -491,21 +568,27 @@ fn render_aggregate_panel(
                     as u16);
             let rem_w = (plot_x + plot_width).saturating_sub(bx).min(14);
             if rem_w > 0 {
-                label(f, bx, top + 2, rem_w, &interval.node_name, color);
+                label(
+                    f,
+                    bx,
+                    latency_inner.y,
+                    rem_w,
+                    &interval.node_name,
+                    color,
+                );
             }
         }
     } else {
         label(
             f,
             plot_x,
-            top + 2,
+            latency_inner.y,
             plot_width.min(14),
             snapshot.active_node,
             theme.route_color(0),
         );
     }
 
-    label(f, x, latency_title_y, w, "延迟 · ms", theme.text_muted());
     let latest_latency = snapshot
         .latency_samples
         .last()
@@ -515,43 +598,55 @@ fn render_aggregate_panel(
         let value = latency_ms.to_string();
         label(
             f,
-            x + w.saturating_sub(value.width() as u16),
-            latency_title_y,
+            latency_inner.x + latency_inner.width.saturating_sub(value.width() as u16),
+            latency_inner.y,
             value.width() as u16,
             &value,
             theme.text_muted(),
         );
     }
-    label(f, x, latency_plot_y, 3, "120", theme.text_muted());
     label(
         f,
-        x + 2,
+        latency_inner.x,
+        latency_plot_y,
+        latency_top.width() as u16,
+        &latency_top,
+        theme.text_muted(),
+    );
+    label(
+        f,
+        latency_inner.x + 2,
         latency_plot_y + plot_height - 1,
         1,
         "0",
         theme.text_muted(),
     );
+    let traffic_legend = Line::from(vec![
+        Span::styled("↓下载", Style::default().fg(theme.text_accent())),
+        Span::styled("  ", Style::default().fg(theme.text_muted())),
+        Span::styled("↑上传", Style::default().fg(theme.text_warning())),
+    ]);
+    f.render_widget(
+        Paragraph::new(traffic_legend),
+        Rect::new(
+            traffic_inner.x + traffic_inner.width.saturating_sub(12),
+            traffic_inner.y,
+            12,
+            1,
+        ),
+    );
     label(
         f,
-        x,
-        traffic_title_y,
-        w,
-        "核心流量 · MiB/s",
+        traffic_inner.x + 1,
+        traffic_plot_y,
+        2,
+        "10",
         theme.text_muted(),
     );
     label(
         f,
-        x + w.saturating_sub(12),
-        traffic_title_y,
-        12,
-        "↓ 线   ↑ 点",
-        theme.text_muted(),
-    );
-    label(f, x + 1, traffic_plot_y, 2, "10", theme.text_muted());
-    label(
-        f,
-        x + 2,
-        traffic_plot_y + plot_height - 1,
+        traffic_inner.x + 2,
+        traffic_plot_y + traffic_plot_height - 1,
         1,
         "0",
         theme.text_muted(),
@@ -572,7 +667,7 @@ fn render_aggregate_panel(
                 continue;
             }
             let minute = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
-            let lat = (s.latency_ms as f64).clamp(0.0, 120.0);
+            let lat = s.latency_ms as f64;
 
             let mut idx = 0;
             for iv in snapshot.route_intervals {
@@ -611,18 +706,27 @@ fn render_aggregate_panel(
             });
             latency_series.push(cur_seg);
         }
+    } else if let Some(quality) = &snapshot.node_quality {
+        let segments = segment_sparkline_series(
+            &quality.latency_points,
+            SPARKLINE_OBSERVATION_GAP_MINUTES,
+        );
+        for (segment, kind) in segments {
+            latency_series.push(segment);
+            latency_colors.push(theme.route_color(0));
+            latency_kinds.push(kind);
+        }
     }
 
-    if !latency_series.is_empty() {
-        plot(
-            f,
-            Rect::new(plot_x, latency_plot_y, plot_width, plot_height),
-            &latency_series,
-            &latency_colors,
-            &latency_kinds,
-            120.,
-        );
-    }
+    plot(
+        f,
+        Rect::new(plot_x, latency_plot_y, plot_width, plot_height),
+        &latency_series,
+        &latency_colors,
+        &latency_kinds,
+        0.0,
+        latency_max,
+    );
 
     // Group traffic samples into down (line) and up (scatter)
     let mut traffic_series: Vec<Vec<(f64, f64)>> = Vec::new();
@@ -640,6 +744,8 @@ fn render_aggregate_panel(
                 continue;
             }
             let minute = ((s.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+            let (down_minute, up_minute) =
+                separated_traffic_minutes(minute, traffic_plot_width);
             let down_mib = (s.down_bytes_per_sec as f64 / (1024.0 * 1024.0)).clamp(0.0, 10.0);
             let up_mib = (s.up_bytes_per_sec as f64 / (1024.0 * 1024.0)).clamp(0.0, 10.0);
 
@@ -657,8 +763,7 @@ fn render_aggregate_panel(
             let switched = last_ts > 0 && idx != cur_idx;
 
             if (gap || switched) && !down_seg.is_empty() {
-                let col = theme.route_color(cur_idx);
-                traffic_colors.push(col);
+                traffic_colors.push(theme.text_accent());
                 traffic_kinds.push(if down_seg.len() == 1 {
                     GraphType::Scatter
                 } else {
@@ -666,20 +771,23 @@ fn render_aggregate_panel(
                 });
                 traffic_series.push(std::mem::take(&mut down_seg));
 
-                traffic_colors.push(col);
-                traffic_kinds.push(GraphType::Scatter);
+                traffic_colors.push(theme.text_warning());
+                traffic_kinds.push(if up_seg.len() == 1 {
+                    GraphType::Scatter
+                } else {
+                    GraphType::Line
+                });
                 traffic_series.push(std::mem::take(&mut up_seg));
             }
 
             cur_idx = idx;
             last_ts = s.recorded_at_ms;
-            down_seg.push((minute, down_mib));
-            up_seg.push((minute, up_mib));
+            down_seg.push((down_minute, down_mib));
+            up_seg.push((up_minute, up_mib));
         }
 
         if !down_seg.is_empty() {
-            let col = theme.route_color(cur_idx);
-            traffic_colors.push(col);
+            traffic_colors.push(theme.text_accent());
             traffic_kinds.push(if down_seg.len() == 1 {
                 GraphType::Scatter
             } else {
@@ -687,41 +795,52 @@ fn render_aggregate_panel(
             });
             traffic_series.push(down_seg);
 
-            traffic_colors.push(col);
-            traffic_kinds.push(GraphType::Scatter);
+            traffic_colors.push(theme.text_warning());
+            traffic_kinds.push(if up_seg.len() == 1 {
+                GraphType::Scatter
+            } else {
+                GraphType::Line
+            });
             traffic_series.push(up_seg);
         }
     }
 
-    if !traffic_series.is_empty() {
-        plot(
-            f,
-            Rect::new(plot_x, traffic_plot_y, plot_width, plot_height),
-            &traffic_series,
-            &traffic_colors,
-            &traffic_kinds,
-            10.,
-        );
-    }
+    plot(
+        f,
+        Rect::new(
+            traffic_plot_x,
+            traffic_plot_y,
+            traffic_plot_width,
+            traffic_plot_height,
+        ),
+        &traffic_series,
+        &traffic_colors,
+        &traffic_kinds,
+        -1.0,
+        10.,
+    );
 
-    if plot_width > 0 {
-        for axis in [latency_axis_y, traffic_axis_y] {
+    for (axis_x, axis_y, axis_width) in [
+        (plot_x, latency_axis_y, plot_width),
+        (traffic_plot_x, traffic_axis_y, traffic_plot_width),
+    ] {
+        if axis_width > 0 {
             label(
                 f,
-                plot_x,
-                axis,
-                plot_width,
-                &"─".repeat(usize::from(plot_width)),
+                axis_x,
+                axis_y,
+                axis_width,
+                &"─".repeat(usize::from(axis_width)),
                 theme.text_muted(),
             );
             for (fraction, text) in [(0., "-30m"), (0.5, "-15m"), (1., "现在")] {
                 let offset =
-                    ((f64::from(plot_width.saturating_sub(1)) * fraction).round() as u16)
-                        .min(plot_width.saturating_sub(text.width() as u16));
+                    ((f64::from(axis_width.saturating_sub(1)) * fraction).round() as u16)
+                        .min(axis_width.saturating_sub(text.width() as u16));
                 label(
                     f,
-                    plot_x + offset,
-                    axis + 1,
+                    axis_x + offset,
+                    axis_y + 1,
                     text.width() as u16,
                     text,
                     theme.text_muted(),
@@ -776,13 +895,14 @@ impl NodeDashboardLayout {
             content.width.saturating_sub(left_width + 1),
             content.height,
         );
-        let node = Some(Rect::new(content.x, content.y, left_width, 15));
+        let node_height = if full { content.height / 2 } else { 15 };
+        let node = Some(Rect::new(content.x, content.y, left_width, node_height));
         let connections = full.then(|| {
             Rect::new(
                 content.x,
-                content.y + 16,
+                content.y + node_height,
                 left_width,
-                content.height.saturating_sub(16),
+                content.height.saturating_sub(node_height),
             )
         });
 
@@ -910,6 +1030,7 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::ds::ColorCapability;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -925,6 +1046,78 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn plot_glyph_count(buffer: &ratatui::buffer::Buffer, area: Rect) -> usize {
+        let mut count = 0;
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if !buffer[(x, y)].symbol().trim().is_empty() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn assert_visible_border(buffer: &ratatui::buffer::Buffer, area: Rect) {
+        let right = area.x + area.width - 1;
+        let bottom = area.y + area.height - 1;
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
+        assert_eq!(buffer[(right, area.y)].symbol(), "┐");
+        assert_eq!(buffer[(area.x, bottom)].symbol(), "└");
+        assert_eq!(buffer[(right, bottom)].symbol(), "┘");
+    }
+
+    #[test]
+    fn close_download_and_upload_values_keep_distinct_colors() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::new(ColorCapability::TrueColor);
+        let separated_points = (0..=30)
+            .map(|minute| separated_traffic_minutes(f64::from(minute), 20))
+            .collect::<Vec<_>>();
+        let download_points = separated_points
+            .iter()
+            .map(|(down_minute, _)| (*down_minute, 1.0))
+            .collect::<Vec<_>>();
+        let upload_points = separated_points
+            .iter()
+            .map(|(_, up_minute)| (*up_minute, 1.1))
+            .collect::<Vec<_>>();
+
+        terminal
+            .draw(|frame| {
+                plot(
+                    frame,
+                    Rect::new(0, 0, 20, 6),
+                    &[download_points.clone(), upload_points.clone()],
+                    &[theme.text_accent(), theme.text_warning()],
+                    &[GraphType::Line, GraphType::Line],
+                    -1.0,
+                    10.0,
+                );
+            })
+            .unwrap();
+
+        let visible_colors = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| !cell.symbol().trim().is_empty())
+            .map(|cell| cell.fg)
+            .collect::<Vec<_>>();
+        let download_cells = visible_colors
+            .iter()
+            .filter(|&&color| color == theme.text_accent())
+            .count();
+        let upload_cells = visible_colors
+            .iter()
+            .filter(|&&color| color == theme.text_warning())
+            .count();
+        assert!(download_cells > 0, "the download line must remain cyan");
+        assert!(upload_cells > 0, "the upload line must remain yellow");
     }
 
     #[test]
@@ -950,13 +1143,13 @@ mod tests {
                 recorded_at_ms: now_unix_ms() - 25 * 60_000,
                 selector: "Proxy".to_string(),
                 node_name: "JP-Edge-03".to_string(),
-                latency_ms: 28,
+                latency_ms: 386,
             },
             LatencySample {
                 recorded_at_ms: now_unix_ms() - 5 * 60_000,
                 selector: "Proxy".to_string(),
                 node_name: "JP-Edge-03".to_string(),
-                latency_ms: 26,
+                latency_ms: 420,
             },
         ];
 
@@ -980,28 +1173,22 @@ mod tests {
             route_intervals: &intervals,
             node_quality: Some(ActiveNodeQualitySnapshot {
                 node_name: "JP-Edge-03",
-                current_latency_ms: Some(28),
+                current_latency_ms: Some(386),
                 warm_median_ms: Some(28),
                 p95_ms: Some(35),
                 cold_start_ms: Some(42),
-                sustained_speed_label: Some("8.0 MiB/s".to_string()),
+                sustained_speed_label: Some("18.0 MiB/s".to_string()),
                 reachability_label: "Stable Reachable",
-                latency_points: vec![
-                    (2.0, 45.0),
-                    (9.0, 55.0),
-                    (21.0, 35.0),
-                    (29.0, 50.0),
-                    (30.0, 28.0),
-                ],
-                sustained_points: vec![(3.0, 7.0), (13.0, 5.0), (28.0, 8.0)],
-                latest_latency: Some("28 ms".to_string()),
+                latency_points: vec![(30.0, 386.0)],
+                sustained_points: vec![(28.0, 18.0)],
+                latest_latency: Some("386 ms".to_string()),
                 latency_sample_age: Some("刚测".to_string()),
-                latest_sustained_speed: Some("8.0 MiB/s".to_string()),
+                latest_sustained_speed: Some("18.0 MiB/s".to_string()),
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
             active_connections: vec![ActiveConnectionSummary {
-                destination: "chat.openai.com",
-                rate_label: "1.2M/s".to_string(),
+                destination: "chat.openai.com".to_string(),
+                transfer_label: "152.3MiB".to_string(),
                 rule: "Proxy",
             }],
         };
@@ -1012,18 +1199,48 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.area.width, 120);
         assert_eq!(buffer.area.height, 30);
+        assert_visible_border(buffer, Rect::new(1, 2, 37, 13));
+        assert_visible_border(buffer, Rect::new(1, 15, 37, 13));
+        assert_visible_border(buffer, Rect::new(39, 2, 80, 13));
+        assert_visible_border(buffer, Rect::new(39, 15, 80, 13));
+        assert_eq!(buffer[(1, 15)].fg, buffer[(39, 15)].fg);
+        assert!(plot_glyph_count(buffer, Rect::new(7, 4, 30, 4)) > 0);
+        assert!(plot_glyph_count(buffer, Rect::new(7, 10, 30, 3)) > 0);
+        assert!(plot_glyph_count(buffer, Rect::new(45, 7, 72, 7)) > 0);
+        assert!(plot_glyph_count(buffer, Rect::new(45, 18, 72, 7)) > 0);
+        let traffic_area = Rect::new(45, 18, 72, 7);
+        let traffic_glyph_colors = traffic_area.rows().flat_map(|row| {
+            row.columns().filter_map(|position| {
+                let cell = &buffer[position];
+                (!cell.symbol().trim().is_empty()).then_some(cell.fg)
+            })
+        });
+        let traffic_glyph_colors = traffic_glyph_colors.collect::<Vec<_>>();
+        let theme = Theme::detect();
+        assert!(
+            traffic_glyph_colors.contains(&theme.text_accent()),
+            "download series must use the Figma cyan token"
+        );
+        assert!(
+            traffic_glyph_colors.contains(&theme.text_warning()),
+            "upload series must use the Figma yellow token"
+        );
 
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("核心历史 · 30 分钟"));
+        assert!(!t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("活动连接 · 1"));
         assert!(t.contains("chat.openai.com"));
-        assert!(t.contains("120"));
+        assert!(t.contains("152.3MiB"));
+        assert!(t.contains("430"));
+        assert!(t.contains("470"));
         assert!(t.contains("10"));
-        assert!(t.contains("28 ms"));
-        assert!(t.contains("8.0 MiB/s"));
+        assert!(t.contains("386 ms"));
+        assert!(t.contains("18.0 MiB/s"));
+        assert!(t.contains("↓下载  ↑上传"));
+        assert!(!t.contains("↑ 点"));
         assert!(t.contains("刚测"));
         assert!(t.contains("2分钟前"));
         assert!(t.contains("Ctrl+K 导航"));
@@ -1036,18 +1253,17 @@ mod tests {
         assert!(!t.contains("探测流量"));
         assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
 
-        // Figma 1025:2 maps its 8x16 design grid to terminal cells: the body has
-        // one-cell outer gutters, a 37-cell left rail, a one-cell panel gap,
-        // and an 80-cell global-history surface.
+        // The body keeps one-cell outer gutters, a 37-cell left rail, a one-cell
+        // panel gap, and an 80-cell global-history surface. Each visible group
+        // now owns an explicit border inside that budget.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
-        assert_ne!(buffer[(1, 2)].symbol(), "┌");
-        assert_ne!(buffer[(39, 2)].symbol(), "┌");
-        assert_eq!(buffer[(41, 2)].symbol(), "核");
-        assert_eq!(buffer[(1, 18)].symbol(), "┌");
-        assert_eq!(buffer[(38, 18)].symbol(), " ");
-        assert_eq!(buffer[(119, 18)].symbol(), " ");
+        assert_eq!(buffer[(1, 2)].symbol(), "┌");
+        assert_eq!(buffer[(39, 2)].symbol(), "┌");
+        assert_eq!(buffer[(1, 15)].symbol(), "┌");
+        assert_eq!(buffer[(38, 15)].symbol(), " ");
+        assert_eq!(buffer[(119, 15)].symbol(), " ");
 
         // Verify that 3-row mini Braille sparklines are rendered in node quality panel
         let mut node_panel_has_braille = false;
@@ -1128,8 +1344,8 @@ mod tests {
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
             active_connections: vec![ActiveConnectionSummary {
-                destination: "chat.openai.com",
-                rate_label: "1.2M/s".to_string(),
+                destination: "chat.openai.com".to_string(),
+                transfer_label: "1.2MiB".to_string(),
                 rule: "Proxy",
             }],
         };
@@ -1144,7 +1360,7 @@ mod tests {
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("核心历史 · 30 分钟"));
+        assert!(!t.contains("核心历史 · 30 分钟"));
         assert!(t.contains("节点质量"));
         assert!(t.contains("28 ms"));
         assert!(t.contains("8.0 MiB/s"));
@@ -1158,9 +1374,9 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
-        assert_ne!(buffer[(1, 2)].symbol(), "┌");
+        assert_eq!(buffer[(1, 2)].symbol(), "┌");
         assert_eq!(buffer[(31, 2)].symbol(), " ");
-        assert_ne!(buffer[(32, 2)].symbol(), "┌");
+        assert_eq!(buffer[(32, 2)].symbol(), "┌");
 
         // Verify 3-row mini Braille sparklines are rendered in 30-column node quality panel
         let mut node_panel_has_braille = false;
@@ -1179,7 +1395,7 @@ mod tests {
         );
 
         // Verify connections panel is not rendered in left column below node panel
-        for y in 2..28 {
+        for y in 17..28 {
             let s = buffer[(1, y)].symbol();
             assert_ne!(s, "┌", "Active connections panel must be omitted at 96x30");
         }
@@ -1222,8 +1438,8 @@ mod tests {
                 sustained_sample_age: Some("2分钟前".to_string()),
             }),
             active_connections: vec![ActiveConnectionSummary {
-                destination: "chat.openai.com",
-                rate_label: "1.2M/s".to_string(),
+                destination: "chat.openai.com".to_string(),
+                transfer_label: "1.2MiB".to_string(),
                 rule: "Proxy",
             }],
         };
@@ -1238,7 +1454,7 @@ mod tests {
         let t = buffer_to_text(buffer);
         assert!(!t.contains("监控"));
         assert!(t.contains("NODE DASHBOARD / AirTCP / JP-Edge-03"));
-        assert!(t.contains("核心历史 · 30 分钟"));
+        assert!(!t.contains("核心历史 · 30 分钟"));
         // Both node quality and active connections are omitted at width 80
         assert!(!t.contains("节点质量"));
         assert!(!t.contains("活动连接"));
@@ -1246,16 +1462,15 @@ mod tests {
         assert!(!t.contains("8.0 MiB/s"));
         assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
         assert!(t.contains("延迟 · ms"));
-        assert!(t.contains("核心流量 · MiB/s"));
+        assert!(t.contains("总吞吐量 · MiB/s"));
         assert!(t.contains("-30m") && t.contains("-15m") && t.contains("现在"));
 
-        // Compact Figma 1027:16 keeps a one-cell outer gutter around the
-        // global-history surface and moves the footer to the final two rows.
+        // The compact layout keeps a one-cell outer gutter around the
+        // aggregate charts and moves the footer to the final two rows.
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 0)].symbol(), "N");
         assert_eq!(buffer[(0, 2)].symbol(), " ");
-        assert_ne!(buffer[(1, 2)].symbol(), "┌");
-        assert_eq!(buffer[(3, 2)].symbol(), "核");
+        assert_eq!(buffer[(1, 2)].symbol(), "┌");
         assert_eq!(buffer[(79, 2)].symbol(), " ");
         assert!(
             buffer_to_text(buffer)
@@ -1281,7 +1496,7 @@ mod tests {
             active_connections: vec![],
         };
 
-        for (width, height, aggregate_title_x) in [(132, 36, 45), (160, 45, 54), (206, 48, 68)] {
+        for (width, height, left_width) in [(132, 36, 41), (160, 45, 50), (206, 48, 64)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
@@ -1289,10 +1504,21 @@ mod tests {
                 .unwrap();
             let buffer = terminal.backend().buffer();
 
-            assert_eq!(buffer[(2, 2)].symbol(), "节");
-            assert_eq!(buffer[(aggregate_title_x, 2)].symbol(), "核");
-            assert_eq!(buffer[(1, 18)].symbol(), "┌");
-            assert_eq!(buffer[(1, height - 3)].symbol(), "└");
+            assert_eq!(buffer[(3, 2)].symbol(), "节");
+            assert_eq!(buffer[(left_width + 2, 2)].symbol(), "┌");
+            let left_content_height = height - 4;
+            let node_height = left_content_height / 2;
+            let connections_y = 2 + node_height;
+            assert_visible_border(buffer, Rect::new(1, 2, left_width, node_height));
+            assert_visible_border(
+                buffer,
+                Rect::new(
+                    1,
+                    connections_y,
+                    left_width,
+                    left_content_height - node_height,
+                ),
+            );
             assert_eq!(buffer[(0, 2)].symbol(), " ");
             assert_eq!(buffer[(width - 1, 2)].symbol(), " ");
             assert_eq!(buffer[(width - 2, 2)].bg, Theme::detect().bg_surface());
@@ -1311,7 +1537,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text = buffer_to_text(buffer);
-        assert_eq!(buffer[(2, 2)].symbol(), "节");
+        assert_eq!(buffer[(3, 2)].symbol(), "节");
         assert!(text.contains("节点质量"));
         assert!(!text.contains("活动连接"));
         assert!(text.lines().nth(23).unwrap().contains("GLOBAL NET  STABLE"));
@@ -1324,7 +1550,7 @@ mod tests {
         let text = buffer_to_text(terminal.backend().buffer());
         assert!(text.contains("节点质量"));
         assert!(!text.contains("活动连接"));
-        assert!(text.contains("核心历史 · 30 分钟"));
+        assert!(!text.contains("核心历史 · 30 分钟"));
     }
 
     #[test]
@@ -1348,7 +1574,7 @@ mod tests {
                 cold_start_ms: None,
                 sustained_speed_label: None,
                 reachability_label: "Untested",
-                latency_points: vec![],
+                latency_points: vec![(28.0, 50.0)],
                 sustained_points: vec![],
                 latest_latency: None,
                 latency_sample_age: None,
@@ -1367,7 +1593,11 @@ mod tests {
         assert!(!text.contains("刚测"));
         assert!(!text.contains("2分钟前"));
         assert!(text.contains("延迟 —"));
-        assert!(text.contains("实测 —"));
+        assert!(text.contains("吞吐量 —"));
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(10, 5)].bg, Color::Black);
+        assert_eq!(buffer[(10, 12)].bg, Color::Black);
 
         let footer = text.lines().nth(29).unwrap();
         let idle_offset = footer.find("IDLE").unwrap();

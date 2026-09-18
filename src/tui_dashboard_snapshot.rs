@@ -7,7 +7,8 @@ use super::view::{
     CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, NodeDashboardSnapshot,
     GlobalNetworkStatus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal,
     LatencySignalBar, LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow,
-    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, pick_mode_badge, settings_field_label,
+    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, format_connection_target,
+    pick_mode_badge, settings_field_label,
 };
 use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::ActiveQuickProbe;
@@ -612,10 +613,15 @@ impl App {
             .map(|(_, _, node)| node)
             .unwrap_or("Direct");
 
-        let (traffic_samples, latency_samples, route_intervals) = if let Some(store) = &self.metric_store {
-            (store.traffic_samples(), store.latency_samples(), store.route_intervals())
+        let (traffic_samples, latency_samples, node_throughput_samples, route_intervals) = if let Some(store) = &self.metric_store {
+            (
+                store.traffic_samples(),
+                store.latency_samples(),
+                store.node_throughput_samples(),
+                store.route_intervals(),
+            )
         } else {
-            (&[][..], &[][..], &[][..])
+            (&[][..], &[][..], &[][..], &[][..])
         };
 
         let node_quality = selected_group.and_then(|group| {
@@ -688,10 +694,35 @@ impl App {
             };
 
             let mut sustained_points = Vec::new();
-            let latest_sustained_speed = sustained_speed_label.clone();
+            let mut latest_sustained_speed = sustained_speed_label.clone();
             let mut sustained_sample_age = None;
 
-            if let Some(s) = sustained {
+            let mut latest_throughput_ts = None;
+            for sample in node_throughput_samples {
+                if sample.selector == group.name && sample.node_name == active_node {
+                    let minute = ((sample.recorded_at_ms - cutoff_ms) as f64 / 60_000.0)
+                        .clamp(0.0, 30.0);
+                    sustained_points.push((
+                        minute,
+                        sample.bytes_per_sec as f64 / (1024.0 * 1024.0),
+                    ));
+                    latest_throughput_ts = Some(sample.recorded_at_ms);
+                    latest_sustained_speed = Some(format!(
+                        "{:.1} MiB/s",
+                        sample.bytes_per_sec as f64 / (1024.0 * 1024.0)
+                    ));
+                }
+            }
+            if let Some(ts) = latest_throughput_ts {
+                let age_ms = now_ms.saturating_sub(ts);
+                sustained_sample_age = Some(if age_ms < 60_000 {
+                    "刚测".to_string()
+                } else {
+                    format!("{}分钟前", (age_ms / 60_000).max(1))
+                });
+            }
+
+            if sustained_points.is_empty() && let Some(s) = sustained {
                 if let SustainedProbeOutcome::Completed(c) = &s.outcome {
                     let mib = c.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
                     sustained_points.push((28.0, mib));
@@ -716,18 +747,18 @@ impl App {
             })
         });
 
-        let active_connections = self.connections.connections
+        let active_connections = self
+            .connections
+            .connections
             .iter()
             .take(10)
             .map(|c| {
-                let dest = c.metadata.host.as_deref()
-                    .or(c.metadata.destination_ip.as_deref())
-                    .unwrap_or(&c.id);
-                let rate = super::view::format_bytes_opt(Some(c.download + c.upload));
+                let destination = format_connection_target(c);
+                let transfer = super::view::format_bytes_opt(Some(c.download + c.upload));
                 let rule = c.rule.as_deref().unwrap_or("Direct");
                 ActiveConnectionSummary {
-                    destination: dest,
-                    rate_label: rate,
+                    destination,
+                    transfer_label: transfer,
                     rule,
                 }
             })
@@ -786,9 +817,29 @@ fn pending_candidate_marker(stage: &str, elapsed_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{internet_routes_app, test_app};
-    use super::super::view::{CandidateTone, LatencySignalState};
+    use super::super::view::{CandidateTone, LatencySignalState, render_node_dashboard};
     use super::{format_custom_probe_progress, pending_candidate_marker};
-    use crate::controller::{NodeReachabilityAssessment, ProbeOutcome, ReachabilityAssessment};
+    use crate::controller::{
+        ConnectionInfo, ConnectionMetadata, NodeReachabilityAssessment, ProbeOutcome,
+        ReachabilityAssessment,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn rendered_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area;
+        let mut output = String::new();
+        for y in area.y..area.y + area.height {
+            let mut x = area.x;
+            while x < area.x + area.width {
+                let symbol = buffer[(x, y)].symbol();
+                output.push_str(symbol);
+                x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+            }
+            output.push('\n');
+        }
+        output
+    }
 
     #[test]
     fn custom_probe_title_uses_explicit_stage_metrics() {
@@ -820,6 +871,9 @@ mod tests {
         store
             .record_latency(now_ms, "宝贝云", "bby-2", 92)
             .unwrap();
+        store
+            .record_node_throughput(now_ms, "宝贝云", "bby-2", 3 * 1024 * 1024)
+            .unwrap();
         app.metric_store = Some(store);
         app.benchmark_workflow.set_reachability_assessment(
             "宝贝云",
@@ -849,6 +903,49 @@ mod tests {
                 .iter()
                 .all(|(_, latency)| *latency == 92.0)
         );
+        let throughput_points = &snapshot.node_quality.as_ref().unwrap().sustained_points;
+        assert_eq!(throughput_points.len(), 1);
+        assert!((throughput_points[0].0 - 30.0).abs() < 0.01);
+        assert_eq!(throughput_points[0].1, 3.0);
+        assert_eq!(
+            snapshot
+                .node_quality
+                .as_ref()
+                .unwrap()
+                .latest_sustained_speed
+                .as_deref(),
+            Some("3.0 MiB/s")
+        );
+    }
+
+    #[test]
+    fn node_dashboard_falls_back_to_destination_ip_for_empty_host() {
+        let mut app = internet_routes_app();
+        app.connections.connections = vec![ConnectionInfo {
+            id: "connection-with-empty-host".to_string(),
+            download: 1024,
+            upload: 0,
+            start: None,
+            chains: vec![],
+            rule: None,
+            rule_payload: None,
+            metadata: ConnectionMetadata {
+                host: Some(String::new()),
+                destination_ip: Some("142.250.72.36".to_string()),
+                ..ConnectionMetadata::default()
+            },
+        }];
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_node_dashboard(frame, &app.node_dashboard_snapshot()))
+            .unwrap();
+        let rendered = rendered_text(terminal.backend().buffer());
+
+        assert!(rendered.contains("142.250.72.36"));
+        assert!(rendered.contains("传输"));
+        assert!(rendered.contains("1.0KiB"));
     }
 
     #[test]

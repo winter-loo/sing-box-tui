@@ -173,6 +173,8 @@ pub(super) fn test_app() -> App {
         command_palette: None,
         provider_modal: None,
         last_traffic_totals: None,
+        active_route_connection_baseline: None,
+        active_route_latency_probe: None,
         last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
     }
 }

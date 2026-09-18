@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::view::{format_bytes_opt, truncate_for_width};
@@ -13,6 +14,23 @@ fn connection_is_direct(connection: &ConnectionInfo) -> bool {
 
 fn is_direct_chain_name(value: &str) -> bool {
     value.eq_ignore_ascii_case("direct") || value == "国内直连"
+}
+
+fn connection_totals_for_node(
+    connections: &crate::controller::ConnectionsSnapshot,
+    node_name: &str,
+) -> BTreeMap<String, u64> {
+    connections
+        .connections
+        .iter()
+        .filter(|connection| connection.chains.iter().any(|chain| chain == node_name))
+        .map(|connection| {
+            (
+                connection.id.clone(),
+                connection.download.saturating_add(connection.upload),
+            )
+        })
+        .collect()
 }
 
 impl App {
@@ -47,6 +65,49 @@ impl App {
             Ok(connections) => {
                 let now = Instant::now();
                 let now_ms = crate::tui::metrics::now_unix_ms();
+                let current_route = self
+                    .current_route_target()
+                    .map(|(_, group, node)| (group.name.clone(), node.to_string()));
+                if let Some((selector, node_name)) = current_route {
+                    let totals_by_connection = connection_totals_for_node(&connections, &node_name);
+                    if let Some(previous) = &self.active_route_connection_baseline {
+                        if previous.selector == selector && previous.node_name == node_name {
+                            let elapsed = now
+                                .saturating_duration_since(previous.observed_at)
+                                .as_secs_f64();
+                            if elapsed > 0.1 {
+                                let growth_bytes = totals_by_connection
+                                    .iter()
+                                    .map(|(id, total)| {
+                                        previous
+                                            .totals_by_connection
+                                            .get(id)
+                                            .map_or(0, |old| total.saturating_sub(*old))
+                                    })
+                                    .sum::<u64>();
+                                let bytes_per_sec = (growth_bytes as f64 / elapsed) as u64;
+                                if let Some(store) = &mut self.metric_store {
+                                    let _ = store.record_node_throughput(
+                                        now_ms,
+                                        &selector,
+                                        &node_name,
+                                        bytes_per_sec,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.active_route_connection_baseline = Some(
+                        super::ActiveRouteConnectionBaseline {
+                            observed_at: now,
+                            selector,
+                            node_name,
+                            totals_by_connection,
+                        },
+                    );
+                } else {
+                    self.active_route_connection_baseline = None;
+                }
                 if let (Some(down_total), Some(up_total)) = (connections.download_total, connections.upload_total) {
                     if let Some((prev_time, prev_down, prev_up)) = self.last_traffic_totals {
                         let elapsed = now.saturating_duration_since(prev_time).as_secs_f64();
@@ -96,6 +157,7 @@ mod tests {
 
     use super::super::test_support::test_app;
     use super::connection_is_direct;
+    use super::connection_totals_for_node;
     use crate::controller::{ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot};
 
     fn test_connection(host: &str, chains: Vec<&str>) -> ConnectionInfo {
@@ -146,5 +208,25 @@ mod tests {
         app.handle_key(KeyCode::Char('c')).unwrap();
         assert!(app.show_connections);
         assert_eq!(app.status, "Showing active connections");
+    }
+
+    #[test]
+    fn node_throughput_totals_only_include_exact_current_node_chain() {
+        let mut current = test_connection("www.google.com", vec!["node-a", "select"]);
+        current.id = "current".to_string();
+        current.download = 3_000;
+        current.upload = 2_000;
+        let mut other = test_connection("example.com", vec!["node-a-backup", "select"]);
+        other.id = "other".to_string();
+        other.download = 9_000;
+        let snapshot = ConnectionsSnapshot {
+            connections: vec![current, other],
+            ..ConnectionsSnapshot::default()
+        };
+
+        assert_eq!(
+            connection_totals_for_node(&snapshot, "node-a"),
+            [("current".to_string(), 5_000)].into_iter().collect()
+        );
     }
 }

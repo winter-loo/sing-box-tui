@@ -32,7 +32,7 @@ fn format_connection_source(connection: &ConnectionInfo) -> String {
     format!("{kind}/{network}")
 }
 
-fn format_connection_target(connection: &ConnectionInfo) -> String {
+pub(crate) fn format_connection_target(connection: &ConnectionInfo) -> String {
     let target = connection
         .metadata
         .host

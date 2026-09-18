@@ -47,6 +47,9 @@ impl App {
     }
 
     pub(super) fn shutdown_runtime_environment(&mut self) -> Result<()> {
+        if let Some(probe) = self.active_route_latency_probe.take() {
+            probe.task.abort();
+        }
         // A declared program may own isolated node-runtime-manager descendants. Stop it before
         // deciding whether the live sing-box stays up; the custom probe never inherits the TUI's
         // background ownership permission for the user's main proxy runtime.

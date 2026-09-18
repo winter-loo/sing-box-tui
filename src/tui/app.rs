@@ -125,6 +125,14 @@ use view::{
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const METRIC_HISTORY_DATABASE_FILENAME: &str = "sing-box-tui-metrics.sqlite3";
+
+fn metric_history_database_path(config_path: &std::path::Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(METRIC_HISTORY_DATABASE_FILENAME)
+}
 const NODE_QUALITY_DETAIL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DIRECT_CLASH_MODE: &str = "直连";
@@ -537,6 +545,19 @@ pub(crate) struct ProviderModalState {
     pub(crate) origin_view: ActiveView,
 }
 
+struct ActiveRouteConnectionBaseline {
+    observed_at: Instant,
+    selector: String,
+    node_name: String,
+    totals_by_connection: BTreeMap<String, u64>,
+}
+
+struct ActiveRouteLatencyProbe {
+    selector: String,
+    node_name: String,
+    task: tokio::task::JoinHandle<crate::controller::ProbeOutcome>,
+}
+
 struct App {
     client: ApiClient,
     groups: Vec<ProxyGroup>,
@@ -623,6 +644,8 @@ struct App {
     pub(crate) command_palette: Option<CommandPaletteState>,
     pub(crate) provider_modal: Option<ProviderModalState>,
     last_traffic_totals: Option<(Instant, u64, u64)>,
+    active_route_connection_baseline: Option<ActiveRouteConnectionBaseline>,
+    active_route_latency_probe: Option<ActiveRouteLatencyProbe>,
     last_active_traffic_rate: (String, String),
 }
 
@@ -709,11 +732,11 @@ impl App {
             ("background task state", background_state),
             ("background task log", background_log),
         ];
-        let cache_db_path = system_proxy_config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("cache.db");
-        persistent_paths.push(("metric history database", cache_db_path.clone()));
+        let metric_history_db_path = metric_history_database_path(&system_proxy_config_path);
+        persistent_paths.push((
+            "metric history database",
+            metric_history_db_path.clone(),
+        ));
         if !paths_refer_to_same_target(
             &subscription_refresh_options.input,
             &onboarding_subscription,
@@ -727,10 +750,21 @@ impl App {
             &node_quality_db_path,
             &persistent_paths,
         )?;
-        let mut metric_store = crate::tui::metrics::MetricStore::open(&cache_db_path).ok();
-        if let Some(store) = &mut metric_store {
-            let _ = store.load_recent_history(crate::tui::metrics::now_unix_ms());
-        }
+        let mut metric_store = crate::tui::metrics::MetricStore::open(&metric_history_db_path)
+            .with_context(|| {
+                format!(
+                    "failed to open metric history database at {}",
+                    metric_history_db_path.display()
+                )
+            })?;
+        metric_store
+            .load_recent_history(crate::tui::metrics::now_unix_ms())
+            .with_context(|| {
+                format!(
+                    "failed to load metric history database at {}",
+                    metric_history_db_path.display()
+                )
+            })?;
         let state_store = TuiStateStore::new(state_path);
         let existing_state_file = state_store.exists();
         let mut runtime_state = state_store.load()?;
@@ -848,12 +882,14 @@ impl App {
             private_access: PrivateAccessRuntime::new()?,
             private_access_progress: None,
             private_access_auth: None,
-            metric_store,
+            metric_store: Some(metric_store),
             active_view: ActiveView::NodeList,
             operational_workspace: runtime_state.operational_workspace(),
             command_palette: None,
             provider_modal: None,
             last_traffic_totals: None,
+            active_route_connection_baseline: None,
+            active_route_latency_probe: None,
             last_active_traffic_rate: ("0.0M/s".to_string(), "0.0M/s".to_string()),
         };
         let initialization = (|| {
@@ -939,6 +975,26 @@ impl App {
 
     pub(crate) fn check_and_record_active_route(&mut self) {
         let now_ms = crate::tui::metrics::now_unix_ms();
+        if self
+            .active_route_latency_probe
+            .as_ref()
+            .is_some_and(|probe| probe.task.is_finished())
+        {
+            let probe = self.active_route_latency_probe.take().unwrap();
+            if let Ok(crate::controller::ProbeOutcome::Reachable { delay_ms }) =
+                self.client.runtime.block_on(probe.task)
+            {
+                if let Some(store) = &mut self.metric_store {
+                    let _ = store.record_latency(
+                        now_ms,
+                        &probe.selector,
+                        &probe.node_name,
+                        delay_ms,
+                    );
+                }
+            }
+        }
+
         let current_route = self
             .current_route_target()
             .map(|(_, group, node)| (group.name.clone(), node.to_string()));
@@ -950,11 +1006,10 @@ impl App {
                     .map_or(true, |i| i.selector != selector || i.node_name != current_node);
                 let _ = store.record_route_switch(now_ms, &selector, &current_node);
 
-                let should_record_latency = route_changed
-                    || store
-                        .latency_samples()
-                        .last()
-                        .map_or(true, |l| (now_ms - l.recorded_at_ms) >= 10_000);
+                let latest_route_sample = store.latency_samples().iter().rev().find(|sample| {
+                    sample.selector == selector && sample.node_name == current_node
+                });
+                let should_record_latency = latest_route_sample.is_none() && route_changed;
 
                 if should_record_latency {
                     let latency_ms = self
@@ -980,6 +1035,41 @@ impl App {
                         let _ = store.record_latency(now_ms, &selector, &current_node, ms);
                     }
                 }
+            }
+
+            let probe_due = self.metric_store.as_ref().is_some_and(|store| {
+                store
+                    .latency_samples()
+                    .iter()
+                    .rev()
+                    .find(|sample| {
+                        sample.selector == selector && sample.node_name == current_node
+                    })
+                    .is_none_or(|sample| now_ms.saturating_sub(sample.recorded_at_ms) >= 10_000)
+            });
+            if probe_due && self.active_route_latency_probe.is_none() {
+                let client = self.client.client.clone();
+                let base_url = self.client.base_url.clone();
+                let node_name = current_node.clone();
+                let url = self.benchmark_url.clone();
+                let controller_timeout_ms = self.benchmark_timeout_ms;
+                let request_timeout = Duration::from_secs_f64(self.benchmark_request_timeout);
+                let task = self.client.runtime.spawn(async move {
+                    crate::controller::measure_probe_outcome(
+                        client,
+                        &base_url,
+                        &node_name,
+                        &url,
+                        controller_timeout_ms,
+                        request_timeout,
+                    )
+                    .await
+                });
+                self.active_route_latency_probe = Some(ActiveRouteLatencyProbe {
+                    selector,
+                    node_name: current_node,
+                    task,
+                });
             }
         }
     }
@@ -1536,7 +1626,9 @@ mod runtime_integration_tests;
 
 #[cfg(test)]
 mod persistent_path_tests {
-    use super::{tui_persistent_path_registry, validate_tui_persistent_paths};
+    use super::{
+        metric_history_database_path, tui_persistent_path_registry, validate_tui_persistent_paths,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1547,6 +1639,16 @@ mod persistent_path_tests {
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("sing-box-tui-app-paths-{nonce}"))
+    }
+
+    #[test]
+    fn metric_history_uses_a_dedicated_database_name() {
+        let config = PathBuf::from(r"C:\proxy\config.json");
+
+        assert_eq!(
+            metric_history_database_path(&config),
+            PathBuf::from(r"C:\proxy\sing-box-tui-metrics.sqlite3")
+        );
     }
 
     #[test]
