@@ -118,9 +118,9 @@ use verification::{VerifyJob, default_verification_targets_setting};
 #[cfg(test)]
 use view::private_access_auth_display_value;
 use view::{
-    Focus, IntranetDetailSection, LeftPaneSection, NodeQualityDetailState, NodeViewPanel, OnboardingState,
-    PrivateAccessAuthModal, PrivateAccessProgressEntry, PrivateAccessProgressModal,
-    PrivateAccessProgressTone, SettingsEditState, help_item_count,
+    Focus, IntranetDetailSection, LeftPaneSection, NodeQualityDetailState, NodeViewPanel,
+    OnboardingState, PrivateAccessAuthModal, PrivateAccessProgressEntry,
+    PrivateAccessProgressModal, PrivateAccessProgressTone, SettingsEditState, help_item_count,
     private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
 };
 
@@ -330,7 +330,9 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 watchdog.progress(format!("handle_key:{:?}", key.code));
-                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
                 {
                     app.toggle_command_palette();
@@ -356,7 +358,7 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             continue;
                         }
                         KeyCode::Char('c') => {
-                            app.show_connections = true;
+                            app.open_connections_panel();
                             continue;
                         }
                         KeyCode::Char('i') => {
@@ -611,9 +613,11 @@ struct App {
     connections: ConnectionsSnapshot,
     connection_error: Option<String>,
     last_connection_refresh: Instant,
+    last_connection_success: Option<Instant>,
     connections_refresh_job:
         Option<tokio::task::JoinHandle<std::result::Result<ConnectionsSnapshot, String>>>,
     show_connections: bool,
+    connections_scroll: usize,
     show_help: bool,
     help_index: usize,
     onboarding_complete: bool,
@@ -734,10 +738,7 @@ impl App {
             ("background task log", background_log),
         ];
         let metric_history_db_path = metric_history_database_path(&system_proxy_config_path);
-        persistent_paths.push((
-            "metric history database",
-            metric_history_db_path.clone(),
-        ));
+        persistent_paths.push(("metric history database", metric_history_db_path.clone()));
         if !paths_refer_to_same_target(
             &subscription_refresh_options.input,
             &onboarding_subscription,
@@ -852,8 +853,10 @@ impl App {
             connections: ConnectionsSnapshot::default(),
             connection_error: None,
             last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+            last_connection_success: None,
             connections_refresh_job: None,
             show_connections: false,
+            connections_scroll: 0,
             show_help: false,
             help_index: 0,
             onboarding_complete,
@@ -988,12 +991,8 @@ impl App {
                 self.client.runtime.block_on(probe.task)
             {
                 if let Some(store) = &mut self.metric_store {
-                    let _ = store.record_latency(
-                        now_ms,
-                        &probe.selector,
-                        &probe.node_name,
-                        delay_ms,
-                    );
+                    let _ =
+                        store.record_latency(now_ms, &probe.selector, &probe.node_name, delay_ms);
                 }
             }
         }
@@ -1003,15 +1002,15 @@ impl App {
             .map(|(_, group, node)| (group.name.clone(), node.to_string()));
         if let Some((selector, current_node)) = current_route {
             if let Some(store) = &mut self.metric_store {
-                let route_changed = store
-                    .route_intervals()
-                    .last()
-                    .map_or(true, |i| i.selector != selector || i.node_name != current_node);
+                let route_changed = store.route_intervals().last().map_or(true, |i| {
+                    i.selector != selector || i.node_name != current_node
+                });
                 let _ = store.record_route_switch(now_ms, &selector, &current_node);
 
-                let latest_route_sample = store.latency_samples().iter().rev().find(|sample| {
-                    sample.selector == selector && sample.node_name == current_node
-                });
+                let latest_route_sample =
+                    store.latency_samples().iter().rev().find(|sample| {
+                        sample.selector == selector && sample.node_name == current_node
+                    });
                 let should_record_latency = latest_route_sample.is_none() && route_changed;
 
                 if should_record_latency {
@@ -1045,9 +1044,7 @@ impl App {
                     .latency_samples()
                     .iter()
                     .rev()
-                    .find(|sample| {
-                        sample.selector == selector && sample.node_name == current_node
-                    })
+                    .find(|sample| sample.selector == selector && sample.node_name == current_node)
                     .is_none_or(|sample| now_ms.saturating_sub(sample.recorded_at_ms) >= 10_000)
             });
             if probe_due && self.active_route_latency_probe.is_none() {
@@ -1173,6 +1170,19 @@ impl App {
                     self.maybe_refresh_connections();
                     self.set_status_only("Connection details refreshed");
                 }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.connections_scroll = self
+                        .connections_scroll
+                        .saturating_add(1)
+                        .min(self.connections.connections.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.connections_scroll = self.connections_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('g') => self.connections_scroll = 0,
+                KeyCode::Char('G') => {
+                    self.connections_scroll = self.connections.connections.len().saturating_sub(1);
+                }
                 KeyCode::Char('q') => return Ok(false),
                 _ => {}
             }
@@ -1206,13 +1216,15 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
             KeyCode::Down | KeyCode::Char('j')
-                if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
-                    self.select_next_intranet_detail_section();
-                }
+                if self.operational_workspace == OperationalWorkspace::PrivateAccess =>
+            {
+                self.select_next_intranet_detail_section();
+            }
             KeyCode::Up | KeyCode::Char('k')
-                if self.operational_workspace == OperationalWorkspace::PrivateAccess => {
-                    self.select_previous_intranet_detail_section();
-                }
+                if self.operational_workspace == OperationalWorkspace::PrivateAccess =>
+            {
+                self.select_previous_intranet_detail_section();
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_previous(),
             KeyCode::Char('g') | KeyCode::Char('G')
@@ -1590,14 +1602,15 @@ impl App {
         self.set_operational_workspace(next)
     }
 
-        pub(super) fn is_any_probe_running(&self) -> bool {
+    pub(super) fn is_any_probe_running(&self) -> bool {
         self.usability_probe_job.is_some() || self.benchmark_workflow.is_running()
     }
 
     pub(super) fn pause_active_probes(&mut self) {
         let mut stopped = false;
         if self.usability_probe_job.is_some() {
-            if let Err(error) = self.cancel_active_usability_probe_with_reason("User paused probe") {
+            if let Err(error) = self.cancel_active_usability_probe_with_reason("User paused probe")
+            {
                 self.set_status_only(format!("Cannot pause usability probe: {error:#}"));
             } else {
                 stopped = true;
@@ -1802,9 +1815,9 @@ mod persistent_path_tests {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
-    use std::fs;
-    use crossterm::event::KeyCode;
     use crate::tui_state::{OperationalWorkspace, TuiRuntimeState, TuiStateStore};
+    use crossterm::event::KeyCode;
+    use std::fs;
 
     #[test]
     fn command_palette_workspace_switch_persists_while_tab_stays_local() {
@@ -1824,10 +1837,16 @@ mod navigation_tests {
         app.handle_key(KeyCode::Tab).expect("tab handled");
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         app.cycle_operational_workspace().expect("workspace switch");
-        assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
+        assert_eq!(
+            app.operational_workspace,
+            OperationalWorkspace::PrivateAccess
+        );
         assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
         let persisted = store.load().expect("load persisted state");
-        assert_eq!(persisted.operational_workspace.as_deref(), Some("private_access"));
+        assert_eq!(
+            persisted.operational_workspace.as_deref(),
+            Some("private_access")
+        );
 
         // Explicit workspace command -> Internet
         app.cycle_operational_workspace().expect("workspace switch");
@@ -1849,19 +1868,33 @@ mod navigation_tests {
         // Simulate state with PrivateAccess restored
         let mut state = app.runtime_state();
         state.operational_workspace = Some("private_access".to_string());
-        state.current_selected_nodes.insert("select".to_string(), "node-a".to_string());
+        state
+            .current_selected_nodes
+            .insert("select".to_string(), "node-a".to_string());
 
         app.apply_runtime_state(state).expect("apply runtime state");
 
         // Workspace restored
-        assert_eq!(app.operational_workspace, OperationalWorkspace::PrivateAccess);
+        assert_eq!(
+            app.operational_workspace,
+            OperationalWorkspace::PrivateAccess
+        );
         // Selector must NOT have changed
         assert_eq!(app.groups[0].current.as_deref(), Some("node-a"));
         // VPN must NOT be connected or connecting
         for profile in &app.private_access.profiles {
-            assert_eq!(profile.state, crate::private_access::PrivateAccessState::Disconnected);
-            assert_ne!(profile.state, crate::private_access::PrivateAccessState::Connected);
-            assert_ne!(profile.state, crate::private_access::PrivateAccessState::Connecting);
+            assert_eq!(
+                profile.state,
+                crate::private_access::PrivateAccessState::Disconnected
+            );
+            assert_ne!(
+                profile.state,
+                crate::private_access::PrivateAccessState::Connected
+            );
+            assert_ne!(
+                profile.state,
+                crate::private_access::PrivateAccessState::Connecting
+            );
         }
     }
 
@@ -1880,8 +1913,8 @@ mod navigation_tests {
 
     #[test]
     fn internet_shell_uses_applied_route_not_browsed_candidate() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::internet_routes_app();
         app.active_view = ActiveView::NodeList;
@@ -1917,8 +1950,8 @@ mod navigation_tests {
 
     #[test]
     fn operational_shell_guards_viewports_below_80_by_24() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         for (width, height) in [(79, 24), (80, 23)] {
             let mut app = test_support::test_app();
@@ -1949,7 +1982,8 @@ mod navigation_tests {
         use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
-        app.handle_key(KeyCode::Char('?')).expect("help key handled");
+        app.handle_key(KeyCode::Char('?'))
+            .expect("help key handled");
         let backend = TestBackend::new(79, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1964,13 +1998,16 @@ mod navigation_tests {
             text.push('\n');
         }
         assert!(text.contains("KEYBOARD SHORTCUTS & HELP (?)"));
-        assert!(!app.handle_key(KeyCode::Char('q')).expect("quit key handled"));
+        assert!(
+            !app.handle_key(KeyCode::Char('q'))
+                .expect("quit key handled")
+        );
     }
 
     #[test]
     fn internet_shell_keeps_header_and_footer_at_runtime_edges() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         for (width, height) in [(80, 24), (96, 27), (120, 30), (144, 40)] {
             let mut app = test_support::test_app();
@@ -2141,8 +2178,8 @@ mod navigation_tests {
 
     #[test]
     fn command_palette_draw_over_view() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
         app.toggle_command_palette();
@@ -2167,11 +2204,11 @@ mod navigation_tests {
 
     #[test]
     fn test_dump_operational_views() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
-        
+
         // 1. Internet 120x30
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2187,7 +2224,8 @@ mod navigation_tests {
         }
 
         // 2. PrivateAccess 120x30
-        app.set_operational_workspace(OperationalWorkspace::PrivateAccess).unwrap();
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess)
+            .unwrap();
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -2250,7 +2288,8 @@ mod navigation_tests {
 
         // 6. Compact 80x24 Operational Internet
         app.show_connections = false;
-        app.set_operational_workspace(OperationalWorkspace::Internet).unwrap();
+        app.set_operational_workspace(OperationalWorkspace::Internet)
+            .unwrap();
         app.active_view = ActiveView::NodeList;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2283,8 +2322,8 @@ mod navigation_tests {
 
     #[test]
     fn test_modals_render_and_dismiss_on_node_dashboard() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
         app.active_view = ActiveView::NodeDashboard;
@@ -2303,8 +2342,8 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("ACTIVE CONNECTIONS (c)"));
-        assert!(text.contains("[Esc/c] Close  [r] Refresh"));
+        assert!(text.contains("ACTIVE CONNECTIONS"));
+        assert!(text.contains("[Esc/c/Enter] Close  [r] Refresh"));
         // Dismiss via 'c'
         app.handle_key(KeyCode::Char('c')).unwrap();
         assert!(!app.show_connections);
@@ -2321,8 +2360,8 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("NODE QUALITY DETAIL (i)"));
-        assert!(text.contains("[Esc/i] Close"));
+        assert!(text.contains("NODE QUALITY · node-a"));
+        assert!(text.contains("[Esc/i/Enter] Close"));
         // Dismiss via Esc
         app.handle_key(KeyCode::Esc).unwrap();
         assert!(app.node_quality_detail.is_none());
@@ -2367,8 +2406,8 @@ mod navigation_tests {
 
     #[test]
     fn test_command_palette_from_node_dashboard_lifecycle_and_actions() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
         app.active_view = ActiveView::NodeDashboard;
@@ -2422,8 +2461,8 @@ mod navigation_tests {
 
     #[test]
     fn test_provider_modal_lifecycle_and_switching() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = test_support::test_app();
         app.groups.push(ProxyGroup {
@@ -2491,10 +2530,13 @@ mod navigation_tests {
         assert!(app.status.contains("backup-group"));
 
         // 3. Private Access workspace modal (NodeList)
-        app.set_operational_workspace(OperationalWorkspace::PrivateAccess).unwrap();
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess)
+            .unwrap();
         app.private_access.profiles = vec![
-            crate::private_access_session::PrivateAccessProfileRuntime::default_hillstone().unwrap(),
-            crate::private_access_session::PrivateAccessProfileRuntime::default_sonicwall().unwrap(),
+            crate::private_access_session::PrivateAccessProfileRuntime::default_hillstone()
+                .unwrap(),
+            crate::private_access_session::PrivateAccessProfileRuntime::default_sonicwall()
+                .unwrap(),
         ];
         app.private_access.focused_index = 0;
 

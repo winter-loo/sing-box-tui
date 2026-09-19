@@ -124,18 +124,19 @@ impl App {
                             }
                         }
                     }
-                    self.active_route_connection_baseline = Some(
-                        super::ActiveRouteConnectionBaseline {
+                    self.active_route_connection_baseline =
+                        Some(super::ActiveRouteConnectionBaseline {
                             observed_at: now,
                             selector,
                             node_name,
                             totals_by_connection,
-                        },
-                    );
+                        });
                 } else {
                     self.active_route_connection_baseline = None;
                 }
-                if let (Some(down_total), Some(up_total)) = (connections.download_total, connections.upload_total) {
+                if let (Some(down_total), Some(up_total)) =
+                    (connections.download_total, connections.upload_total)
+                {
                     if let Some((prev_time, prev_down, prev_up)) = self.last_traffic_totals {
                         let elapsed = now.saturating_duration_since(prev_time).as_secs_f64();
                         if elapsed > 0.1 {
@@ -163,6 +164,7 @@ impl App {
                 }
                 self.connections = connections;
                 self.connection_error = None;
+                self.last_connection_success = Some(now);
             }
             Err(detail) => {
                 self.active_node_traffic.mark_unavailable(detail.clone());
@@ -173,6 +175,7 @@ impl App {
 
     pub(super) fn open_connections_panel(&mut self) {
         self.show_connections = true;
+        self.connections_scroll = 0;
         self.set_status_only("Showing active connections");
     }
 }
@@ -259,6 +262,25 @@ mod tests {
         app.handle_key(KeyCode::Char('c')).unwrap();
         assert!(app.show_connections);
         assert_eq!(app.status, "Showing active connections");
+    }
+
+    #[test]
+    fn connection_scroll_survives_refresh_and_clamps_to_available_rows() {
+        let mut app = test_app();
+        app.connections.connections = vec![
+            test_connection("one.example", vec!["node-a"]),
+            test_connection("two.example", vec!["node-a"]),
+            test_connection("three.example", vec!["node-a"]),
+        ];
+        app.open_connections_panel();
+
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        app.handle_key(KeyCode::Char('j')).unwrap();
+        assert_eq!(app.connections_scroll, 2);
+
+        app.handle_key(KeyCode::Char('r')).unwrap();
+        assert_eq!(app.connections_scroll, 2);
     }
 
     #[test]

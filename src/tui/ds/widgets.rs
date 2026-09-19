@@ -1,10 +1,10 @@
+use super::theme::Theme;
+#[cfg(test)]
+use crate::tui_state::OperationalWorkspace;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use super::theme::Theme;
-#[cfg(test)]
-use crate::tui_state::OperationalWorkspace;
 
 /// Renders the operational top header navigation bar
 /// Layout:
@@ -32,9 +32,16 @@ pub(crate) fn render_top_header(
     let mut left_spans = Vec::new();
     left_spans.push(Span::styled("SING-BOX TUI", theme.style_breadcrumb()));
     left_spans.push(Span::styled(" · ", theme.style_muted()));
-    left_spans.push(Span::styled(workspace.header_label(), theme.style_breadcrumb()));
+    left_spans.push(Span::styled(
+        workspace.header_label(),
+        theme.style_breadcrumb(),
+    ));
     left_spans.push(Span::styled(" · ", theme.style_muted()));
-    let sel = if selector_name.is_empty() { "—" } else { selector_name };
+    let sel = if selector_name.is_empty() {
+        "—"
+    } else {
+        selector_name
+    };
     left_spans.push(Span::styled(sel, theme.style_breadcrumb()));
 
     let mut hint_spans = Vec::new();
@@ -77,15 +84,20 @@ pub(crate) fn render_top_header(
     let left_width = area.width.saturating_sub(right_width);
 
     if area.height >= 2 && area.width < 90 {
-        let [row0, row1] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        let [row0, row1] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
         let ctrl_k_width = 18.min(area.width);
         let row0_left_width = area.width.saturating_sub(ctrl_k_width);
         let [row0_left, row0_right] = Layout::horizontal([
             Constraint::Length(row0_left_width),
             Constraint::Min(ctrl_k_width),
-        ]).areas(row0);
+        ])
+        .areas(row0);
 
-        frame.render_widget(Paragraph::new(Line::from(left_spans)).style(theme.style_base()), row0_left);
+        frame.render_widget(
+            Paragraph::new(Line::from(left_spans)).style(theme.style_base()),
+            row0_left,
+        );
         let ctrl_k_spans = vec![
             Span::styled("[Ctrl+K]", theme.style_footer_keys()),
             Span::raw(" "),
@@ -98,17 +110,19 @@ pub(crate) fn render_top_header(
             row0_right,
         );
 
-        let [row1_left, row1_right] = Layout::horizontal([
-            Constraint::Length(left_width),
-            Constraint::Min(right_width),
-        ]).areas(row1);
+        let [row1_left, row1_right] =
+            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(right_width)])
+                .areas(row1);
 
         let tab_spans = vec![
             Span::styled("[Tab]", theme.style_footer_keys()),
             Span::raw(" "),
             Span::styled("Switch Workspace", theme.style_muted()),
         ];
-        frame.render_widget(Paragraph::new(Line::from(tab_spans)).style(theme.style_base()), row1_left);
+        frame.render_widget(
+            Paragraph::new(Line::from(tab_spans)).style(theme.style_base()),
+            row1_left,
+        );
         frame.render_widget(
             Paragraph::new(Line::from(right_spans))
                 .alignment(Alignment::Right)
@@ -116,33 +130,39 @@ pub(crate) fn render_top_header(
             row1_right,
         );
     } else if area.height >= 2 {
-        let [row0, row1] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        let [row0_left, row0_right] = Layout::horizontal([
-            Constraint::Length(left_width),
-            Constraint::Min(right_width),
-        ])
-        .areas(row0);
+        let [row0, row1] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        let [row0_left, row0_right] =
+            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(right_width)])
+                .areas(row0);
 
-        frame.render_widget(Paragraph::new(Line::from(left_spans)).style(theme.style_base()), row0_left);
+        frame.render_widget(
+            Paragraph::new(Line::from(left_spans)).style(theme.style_base()),
+            row0_left,
+        );
         frame.render_widget(
             Paragraph::new(Line::from(right_spans))
                 .alignment(Alignment::Right)
                 .style(theme.style_base()),
             row0_right,
         );
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)).style(theme.style_base()), row1);
+        frame.render_widget(
+            Paragraph::new(Line::from(hint_spans)).style(theme.style_base()),
+            row1,
+        );
     } else {
         if left_width >= 60 {
             left_spans.push(Span::raw("   "));
             left_spans.extend(hint_spans);
         }
-        let [left_area, right_area] = Layout::horizontal([
-            Constraint::Length(left_width),
-            Constraint::Min(right_width),
-        ])
-        .areas(area);
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Length(left_width), Constraint::Min(right_width)])
+                .areas(area);
 
-        frame.render_widget(Paragraph::new(Line::from(left_spans)).style(theme.style_base()), left_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(left_spans)).style(theme.style_base()),
+            left_area,
+        );
         frame.render_widget(
             Paragraph::new(Line::from(right_spans))
                 .alignment(Alignment::Right)
@@ -159,12 +179,7 @@ pub(crate) fn render_top_header(
 /// - Horizontal optical padding (12px / ~1.5 columns -> pad_x: 1)
 /// - Slash delimiters (" / ") styled in muted tone
 /// - Segment labels styled in bold accent cyan
-pub(crate) fn render_breadcrumb(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    segments: &[&str],
-) {
+pub(crate) fn render_breadcrumb(frame: &mut Frame, area: Rect, theme: &Theme, segments: &[&str]) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -225,13 +240,13 @@ pub(crate) fn render_footer(
     let right_line = Line::from(right_spans);
 
     let left_width = area.width.saturating_sub(35);
-    let [left_area, right_area] = Layout::horizontal([
-        Constraint::Length(left_width),
-        Constraint::Min(35),
-    ])
-    .areas(area);
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Length(left_width), Constraint::Min(35)]).areas(area);
 
-    frame.render_widget(Paragraph::new(left_line).style(theme.style_base()), left_area);
+    frame.render_widget(
+        Paragraph::new(left_line).style(theme.style_base()),
+        left_area,
+    );
     frame.render_widget(
         Paragraph::new(right_line)
             .alignment(Alignment::Right)
@@ -261,9 +276,13 @@ pub(crate) fn render_unsupported_guard(frame: &mut Frame, area: Rect, theme: &Th
             Span::styled("Resize terminal to at least ", theme.style_warning()),
             Span::styled("80x24", theme.style_success()),
         ]),
-        Line::from(vec![
-            Span::styled(format!("Current viewport: {} cols x {} rows", area.width, area.height), theme.style_muted()),
-        ]),
+        Line::from(vec![Span::styled(
+            format!(
+                "Current viewport: {} cols x {} rows",
+                area.width, area.height
+            ),
+            theme.style_muted(),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Press ", theme.style_muted()),
@@ -309,8 +328,16 @@ pub(crate) fn render_dialog_frame<F>(
 ) where
     F: FnOnce(&mut Frame, Rect),
 {
-    let target_width = width.min(area.width.saturating_sub(4));
-    let target_height = height.min(area.height.saturating_sub(2));
+    let target_width = if width == u16::MAX {
+        area.width
+    } else {
+        width.min(area.width.saturating_sub(4))
+    };
+    let target_height = if height == u16::MAX {
+        area.height
+    } else {
+        height.min(area.height.saturating_sub(2))
+    };
 
     let [_, center_row, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -357,8 +384,8 @@ pub(crate) fn dialog_content_area(inner_area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
@@ -461,4 +488,3 @@ mod tests {
         }
     }
 }
-

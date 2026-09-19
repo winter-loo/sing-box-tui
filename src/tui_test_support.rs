@@ -8,8 +8,8 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 use super::{
     App, BenchmarkWorkflow, CONNECTION_REFRESH_INTERVAL, DIRECT_CLASH_MODE, Focus,
-    GLOBAL_CLASH_MODE, LeftPaneSection, PrivateAccessRuntime, RULE_CLASH_MODE, SystemProxy,
-    IntranetDetailSection,
+    GLOBAL_CLASH_MODE, IntranetDetailSection, LeftPaneSection, PrivateAccessRuntime,
+    RULE_CLASH_MODE, SystemProxy,
 };
 use crate::controller::{ApiClient, ConnectionsSnapshot, ProxyGroup};
 use crate::defaults::{DEFAULT_BENCHMARK_MAX_CONCURRENCY, DEFAULT_CONTROLLER};
@@ -138,8 +138,10 @@ pub(super) fn test_app() -> App {
         connections: ConnectionsSnapshot::default(),
         connection_error: None,
         last_connection_refresh: Instant::now() - CONNECTION_REFRESH_INTERVAL,
+        last_connection_success: None,
         connections_refresh_job: None,
         show_connections: false,
+        connections_scroll: 0,
         show_help: false,
         help_index: 0,
         onboarding_complete: true,

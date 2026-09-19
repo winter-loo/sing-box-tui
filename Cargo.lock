@@ -2452,6 +2452,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
+ "time",
  "tokio",
  "tun-rs",
  "unicode-segmentation",

@@ -15,6 +15,8 @@ pub(crate) fn centered_rect(
 }
 
 pub(crate) fn truncate_for_width(value: &str, max_width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
     if max_width == 0 {
         return String::new();
     }
@@ -24,14 +26,25 @@ pub(crate) fn truncate_for_width(value: &str, max_width: usize) -> String {
     }
     let mut output = String::new();
     let mut current_width = 0;
-    for ch in value.chars() {
-        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + char_width + 1 > max_width {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = unicode_width::UnicodeWidthStr::width(grapheme);
+        if current_width + grapheme_width + 1 > max_width {
             break;
         }
-        output.push(ch);
-        current_width += char_width;
+        output.push_str(grapheme);
+        current_width += grapheme_width;
     }
     output.push('…');
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_for_width;
+
+    #[test]
+    fn truncation_keeps_zwj_emoji_graphemes_intact() {
+        assert_eq!(truncate_for_width("alpha 👩‍💻 beta", 9), "alpha 👩‍💻…");
+        assert_eq!(truncate_for_width("👩‍💻-service", 5), "👩‍💻-s…");
+    }
 }

@@ -972,6 +972,47 @@ impl BenchmarkStore {
         self.latest_sustained_quality_while_locked(target_identity)
     }
 
+    pub(crate) fn sustained_throughput_history(
+        &self,
+        selector: &str,
+        node: &str,
+        target_identity: &str,
+        since_ms: i64,
+    ) -> Result<Vec<(i64, u64)>> {
+        let _cross_process_guard = lock_node_quality_reconciliation(&self.database_path)?;
+        if !self.quality_session_current_while_locked()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT recorded_at_ms, first_byte_ms, completion_ms, bytes_read
+            FROM sustained_probe_results
+            WHERE selector = ?1
+              AND node_tag = ?2
+              AND target_identity = ?3
+              AND outcome_kind = 'completed'
+              AND recorded_at_ms >= ?4
+              AND first_byte_ms IS NOT NULL
+              AND completion_ms IS NOT NULL
+              AND bytes_read IS NOT NULL
+            ORDER BY recorded_at_ms, id
+            "#,
+        )?;
+        let rows =
+            statement.query_map(params![selector, node, target_identity, since_ms], |row| {
+                let recorded_at_ms: i64 = row.get(0)?;
+                let first_byte_ms: i64 = row.get(1)?;
+                let completion_ms: i64 = row.get(2)?;
+                let bytes_read: i64 = row.get(3)?;
+                let transfer_ms = completion_ms.saturating_sub(first_byte_ms).max(1) as u64;
+                let bytes_per_second =
+                    (bytes_read.max(0) as u64).saturating_mul(1_000) / transfer_ms;
+                Ok((recorded_at_ms, bytes_per_second))
+            })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read sustained throughput history")
+    }
+
     fn latest_sustained_quality_while_locked(
         &self,
         target_identity: &str,

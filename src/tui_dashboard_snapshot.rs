@@ -4,11 +4,11 @@ use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     ActiveConnectionSummary, ActiveNodeQualitySnapshot, CandidateNotice, CandidateRow,
-    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, NodeDashboardSnapshot,
-    GlobalNetworkStatus, InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal,
-    LatencySignalBar, LatencySignalState, NodeViewPanel, NodeViewTab, SettingRow,
-    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, format_connection_target,
-    pick_mode_badge, settings_field_label,
+    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, GlobalNetworkStatus,
+    InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
+    LatencySignalState, NodeDashboardSnapshot, NodeViewPanel, NodeViewTab, SettingRow,
+    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, format_connection_target, pick_mode_badge,
+    settings_field_label,
 };
 use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::ActiveQuickProbe;
@@ -416,9 +416,9 @@ impl App {
             }
             _ => None,
         };
-        let spinner_frame = BRAILLE_SPINNER_FRAMES[
-            (self.animation_started.elapsed().as_millis() / 80) as usize % BRAILLE_SPINNER_FRAMES.len()
-        ];
+        let spinner_frame = BRAILLE_SPINNER_FRAMES[(self.animation_started.elapsed().as_millis()
+            / 80) as usize
+            % BRAILLE_SPINNER_FRAMES.len()];
         let all_count = selected_group.map_or(0, |group| group.members.len());
         let mut node_view_tabs = vec![NodeViewTab {
             label: "Current selector".to_string(),
@@ -427,7 +427,8 @@ impl App {
         }];
         if let Some(group) = selected_group {
             node_view_tabs.extend(self.visible_usability_manifests().map(|manifest| {
-                let is_probing = self.is_usability_probe_active_for(&manifest.id, Some(&group.name));
+                let is_probing =
+                    self.is_usability_probe_active_for(&manifest.id, Some(&group.name));
                 let projection = self.cached_custom_node_view_projection(
                     &manifest.id,
                     &group.name,
@@ -446,17 +447,14 @@ impl App {
                 }
             }));
         } else {
-            node_view_tabs.extend(
-                self.visible_usability_manifests()
-                    .map(|manifest| {
-                        let is_probing = self.is_usability_probe_active_for(&manifest.id, None);
-                        NodeViewTab {
-                            label: manifest.label.clone(),
-                            count: 0,
-                            spinner: is_probing.then(|| spinner_frame.to_string()),
-                        }
-                    }),
-            );
+            node_view_tabs.extend(self.visible_usability_manifests().map(|manifest| {
+                let is_probing = self.is_usability_probe_active_for(&manifest.id, None);
+                NodeViewTab {
+                    label: manifest.label.clone(),
+                    count: 0,
+                    spinner: is_probing.then(|| spinner_frame.to_string()),
+                }
+            }));
         }
         let active_node_view_tab = match &self.node_view_panel {
             NodeViewPanel::CurrentSelector => 0,
@@ -477,9 +475,9 @@ impl App {
         };
 
         let is_active_probing = usability_manifest_id.as_ref().is_some_and(|id| {
-            selected_group.as_ref().is_some_and(|g| {
-                self.is_usability_probe_active_for(id, Some(&g.name))
-            })
+            selected_group
+                .as_ref()
+                .is_some_and(|g| self.is_usability_probe_active_for(id, Some(&g.name)))
         });
 
         let candidate_selected = if is_active_probing && !self.manual_candidate_navigation {
@@ -540,6 +538,10 @@ impl App {
             summary: self.connections_summary_line(),
             connections: &self.connections,
             error: self.connection_error.as_deref(),
+            last_success_age: self
+                .last_connection_success
+                .map(|instant| instant.elapsed()),
+            scroll_offset: self.connections_scroll,
         });
         let settings = self.show_settings.then(|| {
             let fields = visible_settings_fields(self);
@@ -610,25 +612,28 @@ impl App {
         let active_provider = current_route
             .map(|(provider, _, _)| provider.name.as_str())
             .unwrap_or("Internet");
-        let active_node = current_route
-            .map(|(_, _, node)| node)
-            .unwrap_or("Direct");
+        let active_node = current_route.map(|(_, _, node)| node).unwrap_or("Direct");
 
-        let (traffic_samples, latency_samples, node_throughput_samples, route_intervals) = if let Some(store) = &self.metric_store {
-            (
-                store.traffic_samples(),
-                store.latency_samples(),
-                store.node_throughput_samples(),
-                store.route_intervals(),
-            )
-        } else {
-            (&[][..], &[][..], &[][..], &[][..])
-        };
+        let (traffic_samples, latency_samples, node_throughput_samples, route_intervals) =
+            if let Some(store) = &self.metric_store {
+                (
+                    store.traffic_samples(),
+                    store.latency_samples(),
+                    store.node_throughput_samples(),
+                    store.route_intervals(),
+                )
+            } else {
+                (&[][..], &[][..], &[][..], &[][..])
+            };
 
         let node_quality = selected_group.and_then(|group| {
             let member = active_node;
-            let sustained = self.benchmark_workflow.sustained_quality(&group.name, member);
-            let assessment = self.benchmark_workflow.reachability_assessment(&group.name, member);
+            let sustained = self
+                .benchmark_workflow
+                .sustained_quality(&group.name, member);
+            let assessment = self
+                .benchmark_workflow
+                .reachability_assessment(&group.name, member);
             let quick_history = self.benchmark_workflow.quick_history(&group.name, member);
 
             let sustained_speed_label = sustained.and_then(|s| {
@@ -641,7 +646,9 @@ impl App {
             });
 
             let reachability_label = match assessment.as_ref().and_then(|a| a.assessment.as_ref()) {
-                Some(crate::controller::ReachabilityAssessment::StableReachable) => "Stable Reachable",
+                Some(crate::controller::ReachabilityAssessment::StableReachable) => {
+                    "Stable Reachable"
+                }
                 Some(crate::controller::ReachabilityAssessment::Reachable) => "Reachable",
                 Some(crate::controller::ReachabilityAssessment::Degraded) => "Degraded",
                 Some(crate::controller::ReachabilityAssessment::Unreachable) => "Unreachable",
@@ -649,10 +656,13 @@ impl App {
             };
 
             let current_latency_ms = assessment.as_ref().and_then(|a| {
-                a.attempts.iter().filter_map(|att| match att {
-                    ProbeOutcome::Reachable { delay_ms, .. } => Some(*delay_ms),
-                    _ => None,
-                }).last()
+                a.attempts
+                    .iter()
+                    .filter_map(|att| match att {
+                        ProbeOutcome::Reachable { delay_ms, .. } => Some(*delay_ms),
+                        _ => None,
+                    })
+                    .last()
             });
 
             let now_ms = crate::tui::metrics::now_unix_ms();
@@ -701,12 +711,10 @@ impl App {
             let mut latest_throughput_ts = None;
             for sample in node_throughput_samples {
                 if sample.selector == group.name && sample.node_name == active_node {
-                    let minute = ((sample.recorded_at_ms - cutoff_ms) as f64 / 60_000.0)
-                        .clamp(0.0, 30.0);
-                    sustained_points.push((
-                        minute,
-                        sample.bytes_per_sec as f64 / (1024.0 * 1024.0),
-                    ));
+                    let minute =
+                        ((sample.recorded_at_ms - cutoff_ms) as f64 / 60_000.0).clamp(0.0, 30.0);
+                    sustained_points
+                        .push((minute, sample.bytes_per_sec as f64 / (1024.0 * 1024.0)));
                     latest_throughput_ts = Some(sample.recorded_at_ms);
                     latest_sustained_speed = Some(format!(
                         "{:.1} MiB/s",
@@ -723,7 +731,9 @@ impl App {
                 });
             }
 
-            if sustained_points.is_empty() && let Some(s) = sustained {
+            if sustained_points.is_empty()
+                && let Some(s) = sustained
+            {
                 if let SustainedProbeOutcome::Completed(c) = &s.outcome {
                     let mib = c.throughput_bytes_per_second as f64 / (1024.0 * 1024.0);
                     sustained_points.push((28.0, mib));
@@ -869,9 +879,7 @@ mod tests {
         store
             .record_latency(now_ms - 5_000, "AirTCP", "bby-2", 12)
             .unwrap();
-        store
-            .record_latency(now_ms, "宝贝云", "bby-2", 92)
-            .unwrap();
+        store.record_latency(now_ms, "宝贝云", "bby-2", 92).unwrap();
         store
             .record_node_throughput(now_ms, "宝贝云", "bby-2", 3 * 1024 * 1024)
             .unwrap();
@@ -976,7 +984,10 @@ mod tests {
 
     #[test]
     fn pending_tcp_candidate_marker_matches_working_animation_copy() {
-        assert_eq!(pending_candidate_marker("TCP 22", 3), "• checking TCP 22 (3s)");
+        assert_eq!(
+            pending_candidate_marker("TCP 22", 3),
+            "• checking TCP 22 (3s)"
+        );
     }
 
     #[test]
@@ -1168,10 +1179,12 @@ mod tests {
 
         let signal = row.latency_signal.as_ref().unwrap();
         assert_eq!(signal.bars.map(|bar| bar.height), [2, 2, 2]);
-        assert!(signal
-            .bars
-            .iter()
-            .all(|bar| bar.state == LatencySignalState::Untested));
+        assert!(
+            signal
+                .bars
+                .iter()
+                .all(|bar| bar.state == LatencySignalState::Untested)
+        );
         assert_eq!(signal.average_ms, None);
         assert_eq!(row.tone, CandidateTone::Pending);
     }
@@ -1234,12 +1247,12 @@ mod tests {
 
     #[test]
     fn snapshot_candidate_row_for_agy_panel_prefers_agy_elapsed_over_shared_throughput() {
+        use super::super::view::NodeViewPanel;
         use crate::automatic_selection::NodeViewId;
         use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
         use crate::sustained_quality::{
             NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
         };
-        use super::super::view::NodeViewPanel;
 
         let mut app = test_app();
         app.benchmark_filter.clear();
@@ -1340,5 +1353,4 @@ mod tests {
         assert_eq!(streaming_row_a.marker, "1.0 MiB/s");
         assert_eq!(streaming_row_a.compact_marker, "1.0M/s");
     }
-
 }

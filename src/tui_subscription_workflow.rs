@@ -330,6 +330,8 @@ mod tests {
             reachability_assessment: None,
             quick_history: Default::default(),
             sustained_quality: None,
+            latency_history: Vec::new(),
+            throughput_history: Vec::new(),
             auto_selection_detail: None,
             usability_details: Vec::new(),
             evidence_scroll: 0,

@@ -5,7 +5,7 @@ use anyhow::Result;
 use super::view::{
     NodeQualityDetailState, UsabilityCriterionDetail, node_quality_detail_line_count,
 };
-use super::{App, NODE_QUALITY_DETAIL_REFRESH_INTERVAL};
+use super::{ActiveView, App, NODE_QUALITY_DETAIL_REFRESH_INTERVAL};
 
 impl App {
     pub(super) fn open_node_quality_detail(&mut self) -> Result<()> {
@@ -13,21 +13,32 @@ impl App {
             self.set_status_only("Node quality is available for Internet Proxy nodes only");
             return Ok(());
         }
-        let Some(group_name) = self
-            .selected_member_panel_group()
-            .map(|group| group.name.clone())
-        else {
-            self.set_status_only("No selector group available for node quality");
-            return Ok(());
+        let (group_name, node, selector_members) = if self.active_view == ActiveView::NodeDashboard
+        {
+            let Some((_, route_group, route_node)) = self.current_route_target() else {
+                self.set_status_only("No current route available for node quality");
+                return Ok(());
+            };
+            (
+                route_group.name.clone(),
+                route_node.to_string(),
+                route_group.members.clone(),
+            )
+        } else {
+            let Some(group) = self.selected_member_panel_group() else {
+                self.set_status_only("No selector group available for node quality");
+                return Ok(());
+            };
+            let group_name = group.name.clone();
+            let selector_members = group.members.clone();
+            let Some(node) = self.selected_member_name() else {
+                self.set_status_only("No node selected for node quality");
+                return Ok(());
+            };
+            (group_name, node, selector_members)
         };
-        let Some(node) = self.selected_member_name() else {
-            self.set_status_only("No node selected for node quality");
-            return Ok(());
-        };
-        let selector_members = self
-            .selected_member_panel_group()
-            .map(|group| group.members.clone())
-            .unwrap_or_default();
+        let (latency_history, throughput_history) =
+            self.node_quality_history(&group_name, &node)?;
         self.node_quality_detail = Some(NodeQualityDetailState {
             selector: group_name.clone(),
             node: node.clone(),
@@ -41,6 +52,8 @@ impl App {
                 .benchmark_workflow
                 .sustained_quality(&group_name, &node)
                 .cloned(),
+            latency_history,
+            throughput_history,
             auto_selection_detail: self
                 .last_auto_selection_explanation
                 .as_ref()
@@ -91,6 +104,7 @@ impl App {
             .benchmark_workflow
             .sustained_quality(&selector, &node)
             .cloned();
+        let (latency_history, throughput_history) = self.node_quality_history(&selector, &node)?;
         let auto_selection_detail = self
             .last_auto_selection_explanation
             .as_ref()
@@ -104,10 +118,33 @@ impl App {
         detail.reachability_assessment = reachability_assessment;
         detail.quick_history = quick_history;
         detail.sustained_quality = sustained_quality;
+        detail.latency_history = latency_history;
+        detail.throughput_history = throughput_history;
         detail.auto_selection_detail = auto_selection_detail;
         detail.usability_details = usability_details;
         detail.last_refresh = Instant::now();
         Ok(())
+    }
+
+    fn node_quality_history(
+        &self,
+        selector: &str,
+        node: &str,
+    ) -> Result<(Vec<crate::tui::metrics::LatencySample>, Vec<(i64, u64)>)> {
+        let latency = self.metric_store.as_ref().map_or_else(Vec::new, |store| {
+            store
+                .latency_samples()
+                .iter()
+                .filter(|sample| sample.selector == selector && sample.node_name == node)
+                .cloned()
+                .collect()
+        });
+        let cutoff_ms = crate::tui::metrics::now_unix_ms()
+            .saturating_sub(crate::tui::metrics::METRIC_RETENTION_WINDOW_MS);
+        let throughput = self
+            .benchmark_workflow
+            .sustained_throughput_history(selector, node, cutoff_ms)?;
+        Ok((latency, throughput))
     }
 
     fn node_usability_details(
@@ -161,6 +198,34 @@ mod tests {
             .expect("node-quality detail");
         assert_eq!(detail.node, "node-a");
         assert_eq!(app.status, "Showing node quality for node-a");
+    }
+
+    #[test]
+    fn quality_detail_uses_current_route_when_another_node_is_browsed() {
+        let mut app = test_app();
+        app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+        app.groups[0].current = Some("node-a".into());
+        app.member_index = 1;
+        assert_eq!(app.selected_member_name().as_deref(), Some("node-b"));
+        app.active_view = super::super::ActiveView::NodeDashboard;
+
+        app.open_node_quality_detail().unwrap();
+
+        let detail = app.node_quality_detail.as_ref().unwrap();
+        assert_eq!(detail.selector, "select");
+        assert_eq!(detail.node, "node-a");
+    }
+
+    #[test]
+    fn node_list_quality_detail_uses_the_browsed_node() {
+        let mut app = test_app();
+        app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+        app.groups[0].current = Some("node-a".into());
+        app.member_index = 1;
+
+        app.open_node_quality_detail().unwrap();
+
+        assert_eq!(app.node_quality_detail.as_ref().unwrap().node, "node-b");
     }
 
     #[test]

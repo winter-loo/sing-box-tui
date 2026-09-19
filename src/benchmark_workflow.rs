@@ -246,7 +246,6 @@ impl BenchmarkWorkflow {
         }
     }
 
-
     pub(crate) fn open(
         base_url: String,
         client: AsyncClient,
@@ -576,6 +575,25 @@ impl BenchmarkWorkflow {
     ) -> Option<&NodeSustainedQuality> {
         self.sustained_quality
             .get(&(group.to_string(), node.to_string()))
+    }
+
+    pub(crate) fn sustained_throughput_history(
+        &self,
+        group: &str,
+        node: &str,
+        since_ms: i64,
+    ) -> Result<Vec<(i64, u64)>> {
+        self.store.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |store| {
+                store.sustained_throughput_history(
+                    group,
+                    node,
+                    &self.sustained_target_identity,
+                    since_ms,
+                )
+            },
+        )
     }
 
     /// Commits an attributable transfer produced by the built-in Streaming custom adapter.
@@ -2729,7 +2747,11 @@ mod tests {
             [BenchmarkUpdate::Progress { group, best_label }]
                 if group == "select" && best_label == "node-a attempt 1/3 (1 reachable)"
         ));
-        assert!(workflow.reachability_assessment("select", "node-a").is_none());
+        assert!(
+            workflow
+                .reachability_assessment("select", "node-a")
+                .is_none()
+        );
         assert!(matches!(
             workflow.active_quick_probe("select", "node-a"),
             Some(ActiveQuickProbe::IncompleteAssessment(assessment))

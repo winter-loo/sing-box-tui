@@ -478,7 +478,7 @@ fn foreground_reloads_background_quality_from_shared_sqlite_for_streaming_and_de
     );
     foreground
         .handle_key(KeyCode::Char('i'))
-        .expect("open public quality detail");
+        .expect("open browsed-node quality detail");
     let detail = foreground
         .node_quality_detail
         .as_ref()
