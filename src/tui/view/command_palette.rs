@@ -1,7 +1,7 @@
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 use crate::tui::ds::{render_dialog_frame, Theme};
 
@@ -133,12 +133,7 @@ pub fn builtin_commands() -> Vec<CommandItem> {
             "General",
             None,
         ),
-        CommandItem::new(
-            CMD_QUIT,
-            "Quit sing-box-tui",
-            "General",
-            Some("q"),
-        ),
+        CommandItem::new(CMD_QUIT, "Quit sing-box-tui", "General", Some("q")),
     ]
 }
 
@@ -201,124 +196,93 @@ pub fn render_command_palette(
     selected_index: usize,
     items: &[CommandItem],
 ) {
-    render_dialog_frame(
-        frame,
-        area,
-        theme,
-        " COMMAND PALETTE (Ctrl+K) ",
-        74,
-        18,
-        |frame, inner_area| {
-            if inner_area.height == 0 || inner_area.width == 0 {
-                return;
-            }
-
-            let (input_area, list_area, footer_area) = if inner_area.height >= 3 {
-                let [input, list, footer] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .areas(inner_area);
-                (input, list, Some(footer))
-            } else {
-                (inner_area, inner_area, None)
-            };
-
-            // First row: text input box `> {query}` with active cursor `█`
-            let input_line = Line::from(vec![
-                Span::styled("> ", theme.style_breadcrumb()),
-                Span::styled(query, theme.style_base()),
+    use unicode_width::UnicodeWidthStr;
+    let height = (items.len() as u16 + 7).clamp(8, 18);
+    render_dialog_frame(frame, area, theme, "", 48, height, |frame, inner| {
+        let inner = crate::tui::ds::dialog_content_area(inner);
+        if inner.width == 0 || inner.height < 4 {
+            return;
+        }
+        let title = format!("MENU  ·  {} COMMANDS", items.len());
+        frame.render_widget(
+            Paragraph::new(title).style(theme.style_muted()),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        let input = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+        let max_query_width = input.width.saturating_sub(4) as usize;
+        let tail = super::tail_for_width(query, max_query_width);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", theme.style_footer_keys()),
+                Span::styled(tail, theme.style_base()),
                 Span::styled("█", theme.style_selected_marker()),
-            ]);
-            frame.render_widget(Paragraph::new(input_line).style(theme.style_base()), input_area);
+            ]))
+            .style(theme.style_base()),
+            input,
+        );
 
-            // Below: list of filtered command items
-            let mut lines = Vec::new();
-            if items.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("  No matching commands", theme.style_muted()),
-                ]));
-            } else {
-                let visible_rows = list_area.height as usize;
-                let selected = selected_index.min(items.len().saturating_sub(1));
-                let first = if items.len() <= visible_rows {
-                    0
-                } else if selected >= visible_rows {
-                    selected.saturating_sub(visible_rows.saturating_sub(1))
+        let list = Rect::new(
+            inner.x,
+            inner.y + 4,
+            inner.width,
+            inner.height.saturating_sub(5),
+        );
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matching commands").style(theme.style_muted()),
+                list,
+            );
+        } else {
+            let visible = list.height as usize;
+            let selected = selected_index.min(items.len().saturating_sub(1));
+            let first = selected.saturating_sub(visible.saturating_sub(1));
+            for (display, (index, item)) in items
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(visible)
+                .enumerate()
+            {
+                let badge = item.shortcut.map(|s| format!("  {s}")).unwrap_or_default();
+                let badge_width = UnicodeWidthStr::width(badge.as_str());
+                let title_width = list.width.saturating_sub(badge_width as u16 + 2) as usize;
+                let title = super::truncate_for_width(&item.title, title_width);
+                let selected_row = index == selected;
+                let style = if selected_row {
+                    theme.style_focused_row()
                 } else {
-                    0
+                    theme.style_base()
                 };
-                let last = (first + visible_rows).min(items.len());
-
-                for index in first..last {
-                    let item = &items[index];
-                    let is_selected = index == selected;
-
-                    let marker = if is_selected { "> " } else { "  " };
-                    let cat_badge = format!("[{}]", item.category);
-                    let cat_col = format!("{:<25}", cat_badge);
-                    let title = &item.title;
-                    let shortcut_badge = item
-                        .shortcut
-                        .map(|s| format!("[{s}]"))
-                        .unwrap_or_default();
-                    let shortcut_len = shortcut_badge.chars().count();
-
-                    let prefix_len = marker.chars().count()
-                        + cat_col.chars().count()
-                        + 1
-                        + title.chars().count();
-                    let total_width = list_area.width as usize;
-
-                    let padding = total_width.saturating_sub(prefix_len + shortcut_len);
-                    let spaces = " ".repeat(padding.max(1));
-
-                    let spans = if is_selected {
-                        vec![
-                            Span::styled(marker, theme.style_focused_row()),
-                            Span::styled(cat_col, theme.style_focused_row()),
-                            Span::styled(" ", theme.style_focused_row()),
-                            Span::styled(title.clone(), theme.style_focused_row()),
-                            Span::styled(spaces, theme.style_focused_row()),
-                            Span::styled(shortcut_badge, theme.style_focused_row()),
-                        ]
-                    } else {
-                        vec![
-                            Span::styled(marker, theme.style_muted()),
-                            Span::styled(cat_col, theme.style_muted()),
-                            Span::raw(" "),
-                            Span::styled(title.clone(), theme.style_base()),
-                            Span::raw(spaces),
-                            Span::styled(shortcut_badge, theme.style_footer_keys()),
-                        ]
-                    };
-
-                    lines.push(Line::from(spans).style(if is_selected {
-                        theme.style_focused_row()
-                    } else {
-                        theme.style_base()
-                    }));
-                }
+                let marker = if selected_row { "› " } else { "  " };
+                let used = UnicodeWidthStr::width(title.as_str()) + badge_width + 2;
+                let spaces = " ".repeat((list.width as usize).saturating_sub(used));
+                let line = Line::from(vec![
+                    Span::styled(marker, style),
+                    Span::styled(title, style),
+                    Span::raw(spaces),
+                    Span::styled(
+                        badge,
+                        if selected_row {
+                            style
+                        } else {
+                            theme.style_footer_keys()
+                        },
+                    ),
+                ])
+                .style(style);
+                frame.render_widget(
+                    Paragraph::new(line),
+                    Rect::new(list.x, list.y + display as u16, list.width, 1),
+                );
             }
-
-            frame.render_widget(Paragraph::new(lines).style(theme.style_base()), list_area);
-
-            // Footer hint: `[Enter] Execute  [Esc] Dismiss`
-            if let Some(footer) = footer_area {
-                let footer_line = Line::from(vec![
-                    Span::styled("[Enter]", theme.style_footer_keys()),
-                    Span::raw(" "),
-                    Span::styled("Execute", theme.style_muted()),
-                    Span::raw("  "),
-                    Span::styled("[Esc]", theme.style_footer_keys()),
-                    Span::raw(" "),
-                    Span::styled("Dismiss", theme.style_muted()),
-                ]);
-                frame.render_widget(Paragraph::new(footer_line).style(theme.style_base()), footer);
-            }
-        },
-    );
+        }
+        let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        frame.render_widget(
+            Paragraph::new("↑ ↓ select   Enter execute   Esc close").style(theme.style_muted()),
+            footer,
+        );
+    });
+    super::render_context_footer_hint(frame, "Ctrl+K close   Enter execute   ↑↓ select", theme);
 }
 
 #[cfg(test)]
@@ -326,6 +290,82 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn palette_centers_search_results_and_dismissal_at_multiple_sizes() {
+        let items = builtin_commands();
+        for (width, height) in [(120, 30), (80, 24), (140, 26)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let theme = Theme::default();
+            terminal
+                .draw(|f| render_command_palette(f, f.area(), &theme, "node", 0, &items))
+                .unwrap();
+            let lines: Vec<String> = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect()
+                })
+                .collect();
+            let menu = lines
+                .iter()
+                .position(|line| line.contains("COMMANDS"))
+                .unwrap();
+            assert!(menu > 0 && menu < height as usize / 2);
+            assert!(!lines[menu].contains("Ctrl+K"));
+            assert!(lines.iter().any(|line| line.contains("> node█")));
+            assert!(lines.iter().any(|line| line.contains("Esc close")));
+            assert!(lines
+                .iter()
+                .any(|line| line.contains("Switch to Internet Workspace")));
+        }
+    }
+
+    #[test]
+    fn palette_keeps_long_unicode_query_cursor_and_last_result_visible() {
+        for (width, height) in [(80, 24), (120, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let theme = Theme::default();
+            let items = builtin_commands();
+            let query = format!("{}東京", "x".repeat(100));
+            terminal
+                .draw(|f| {
+                    render_command_palette(f, f.area(), &theme, &query, items.len() - 1, &items)
+                })
+                .unwrap();
+            let text = buffer_to_text(terminal.backend().buffer());
+            assert!(text
+                .lines()
+                .any(|line| line.contains('東') && line.contains('京') && line.contains('█')));
+            assert!(text.contains("Quit sing-box-tui"));
+            assert!(text.contains("Esc close"));
+        }
+    }
+
+    #[test]
+    fn palette_footer_replaces_page_shortcuts_and_preserves_global_status() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("c connections   i quality"),
+                    Rect::new(0, 29, 60, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new("GLOBAL NET STABLE  ↓0.0M/s  ↑0.0M/s"),
+                    Rect::new(80, 29, 40, 1),
+                );
+                render_command_palette(frame, frame.area(), &theme, "", 0, &builtin_commands());
+            })
+            .unwrap();
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 29)].symbol())
+            .collect::<String>();
+        assert!(footer.contains("Ctrl+K close"));
+        assert!(!footer.contains("c connections"));
+        assert!(footer.contains("GLOBAL NET STABLE"));
+    }
 
     fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
@@ -450,11 +490,11 @@ mod tests {
             .unwrap();
 
         let text = buffer_to_text(terminal.backend().buffer());
-        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+        assert!(text.contains("COMMANDS"));
         assert!(text.contains("> █"));
         assert!(text.contains("Switch to Internet Workspace"));
-        assert!(text.contains("[Tab]"));
-        assert!(text.contains("[Enter] Execute  [Esc] Dismiss"));
+        assert!(text.contains("Tab"));
+        assert!(text.contains("Enter execute   Esc close"));
     }
 
     #[test]
@@ -470,9 +510,9 @@ mod tests {
             .unwrap();
 
         let text = buffer_to_text(terminal.backend().buffer());
-        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+        assert!(text.contains("COMMANDS"));
         assert!(text.contains("> unknown█"));
         assert!(text.contains("No matching commands"));
-        assert!(text.contains("[Enter] Execute  [Esc] Dismiss"));
+        assert!(text.contains("Enter execute   Esc close"));
     }
 }

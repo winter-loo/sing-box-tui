@@ -548,6 +548,7 @@ impl App {
             let rows = fields
                 .iter()
                 .map(|field| SettingRow {
+                    field: *field,
                     label: settings_field_label(*field),
                     value: settings_field_display_value(self, *field),
                 })

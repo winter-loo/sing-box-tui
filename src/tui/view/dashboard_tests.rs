@@ -377,6 +377,7 @@ fn settings_overlay_uses_typed_rows() {
     let mut snapshot = dashboard_snapshot();
     snapshot.settings = Some(SettingsPanelSnapshot {
         rows: vec![SettingRow {
+            field: SettingsField::BenchmarkUrl,
             label: "Quick probe HTTPS target",
             value: "https://example.test/ping".to_string(),
         }],
@@ -386,8 +387,8 @@ fn settings_overlay_uses_typed_rows() {
     });
 
     let text = rendered_lines(&snapshot).join("\n");
-    assert!(text.contains("Settings"));
-    assert!(text.contains("Quick probe HTTPS target"));
+    assert!(text.contains("SETTINGS"));
+    assert!(text.contains("QUICK PROBE HTTPS TARGET"));
     assert!(text.contains("https://example.test/ping"));
 }
 

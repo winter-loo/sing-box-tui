@@ -2000,7 +2000,7 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("KEYBOARD SHORTCUTS & HELP (?)"));
+        assert!(text.contains("KEYBINDINGS"));
         assert!(
             !app.handle_key(KeyCode::Char('q'))
                 .expect("quit key handled")
@@ -2200,9 +2200,9 @@ mod navigation_tests {
             text.push('\n');
         }
 
-        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+        assert!(text.contains("COMMANDS"));
         assert!(text.contains("> █"));
-        assert!(text.contains("[Enter] Execute  [Esc] Dismiss"));
+        assert!(text.contains("Enter execute   Esc close"));
     }
 
     #[test]
@@ -2381,8 +2381,8 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("SETTINGS (s)"));
-        assert!(text.contains("[Esc/s] Close  [Enter] Save"));
+        assert!(text.contains("SETTINGS"));
+        assert!(text.contains("Enter edit"));
         // Dismiss via 's'
         app.handle_settings_key(KeyCode::Char('s')).unwrap();
         assert!(!app.show_settings);
@@ -2399,8 +2399,8 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("KEYBOARD SHORTCUTS & HELP (?)"));
-        assert!(text.contains("[Esc/?] Close"));
+        assert!(text.contains("KEYBINDINGS"));
+        assert!(text.contains("Esc/? close"));
         // Dismiss via '?'
         app.handle_key(KeyCode::Char('?')).unwrap();
         assert!(!app.show_help);
@@ -2434,7 +2434,7 @@ mod navigation_tests {
             }
             text.push('\n');
         }
-        assert!(text.contains("COMMAND PALETTE (Ctrl+K)"));
+        assert!(text.contains("COMMANDS"));
 
         // Dismiss with Esc returns to NodeDashboard
         app.handle_command_palette_key(KeyCode::Esc).unwrap();
