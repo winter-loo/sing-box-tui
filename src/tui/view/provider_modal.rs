@@ -28,7 +28,7 @@ impl ProviderChooserKind {
 
     fn dialog_height(self, item_count: usize) -> u16 {
         match self {
-            Self::InternetProvider => 10,
+            Self::InternetProvider => 12,
             Self::IntranetProfile => (item_count as u16).saturating_mul(2).saturating_add(4),
         }
     }
@@ -36,7 +36,7 @@ impl ProviderChooserKind {
 
 /// Renders the centered Selector / Provider switching modal dialog.
 /// Matches Figma 796:352 (Internet / Provider selection popup) and 998:40 (Intranet profile selection popup).
-/// Standard dimensions: 50 cols x 10 rows (400x160 px in 8x16 terminal grid).
+/// Internet dimensions: 50 cols x 12 rows to preserve row spacing and footer hierarchy.
 pub(crate) fn render_provider_modal(
     frame: &mut Frame,
     area: Rect,
@@ -49,8 +49,9 @@ pub(crate) fn render_provider_modal(
         return;
     }
 
-    // Figma 796:352: 400x160px = 50x10 cells in the reference 8x16 grid.
-    // Each option gets a content row plus one rhythm row when the viewport permits it.
+    // Figma 796:352 uses 8px option gaps and a 16px footer gap. Terminal text
+    // baselines snap to 16px rows, so keep one blank row between options and
+    // two blank rows before the footer.
     let modal_title = kind.title();
     let dialog_width = 50;
     let dialog_height = kind.dialog_height(providers.len());
@@ -84,12 +85,14 @@ pub(crate) fn render_provider_modal(
             let option_rows = inner_area.height.saturating_sub(2);
             let spaced_options = option_rows >= 4;
             let first_option_offset = u16::from(spaced_options);
-            let option_stride = if spaced_options { 2 } else { 1 };
-            let visible_capacity = if spaced_options {
-                option_rows / 2
-            } else {
-                option_rows
-            } as usize;
+            let (option_stride, visible_capacity) = match (kind, spaced_options) {
+                (ProviderChooserKind::InternetProvider, true) => {
+                    (2, option_rows.saturating_sub(2) / 2)
+                }
+                (ProviderChooserKind::IntranetProfile, true) => (2, option_rows / 2),
+                (_, false) => (1, option_rows),
+            };
+            let visible_capacity = visible_capacity as usize;
             let focused_index = selected_index.min(providers.len().saturating_sub(1));
             let visible_start = if providers.len() <= visible_capacity {
                 0
@@ -264,7 +267,7 @@ mod tests {
             .rposition(|character| *character != ' ')
             .expect("dialog right border");
 
-        assert_eq!(bottom - top + 1, 10, "canonical dialog height");
+        assert_eq!(bottom - top + 1, 12, "dialog height preserves spacing");
         assert_eq!(right - left + 1, 50, "canonical dialog width");
         assert!(!lines[top].contains("INTERNET PROXY PROVIDER"));
         assert!(lines[top + 1].contains("INTERNET PROXY PROVIDER"));
@@ -279,7 +282,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(option_rows, vec![top + 3, top + 5, top + 7]);
-        assert!(lines[top + 8].contains("Esc close"));
+        assert!(lines[top + 10].contains("Esc close"));
+        assert!(option_rows[1] - option_rows[0] > 1);
+        assert!(top + 10 - option_rows[2] > option_rows[1] - option_rows[0]);
     }
 
     #[test]
@@ -350,7 +355,7 @@ mod tests {
             .position(|line| line.contains('└'))
             .expect("compact bottom border");
 
-        assert_eq!(bottom - top + 1, 10);
+        assert_eq!(bottom - top + 1, 12);
         assert_eq!(
             lines[top]
                 .chars()
@@ -389,7 +394,7 @@ mod tests {
         let top = lines.iter().position(|line| line.contains('┌')).unwrap();
         let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
 
-        assert_eq!(bottom - top + 1, 10);
+        assert_eq!(bottom - top + 1, 12);
         assert!(lines.iter().any(|line| line.contains("> backup-b")));
         assert!(!lines.iter().any(|line| line.contains("AirTCP")));
     }
