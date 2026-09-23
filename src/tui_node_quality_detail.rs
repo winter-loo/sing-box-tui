@@ -3,7 +3,7 @@ use std::time::Instant;
 use anyhow::Result;
 
 use super::view::{
-    NodeQualityDetailState, UsabilityCriterionDetail, node_quality_detail_line_count,
+    NodeQualityDetailState, UsabilityCriterionDetail, node_quality_detail_max_scroll,
 };
 use super::{ActiveView, App, NODE_QUALITY_DETAIL_REFRESH_INTERVAL};
 
@@ -70,7 +70,7 @@ impl App {
         let Some(detail) = self.node_quality_detail.as_mut() else {
             return;
         };
-        let max_scroll = node_quality_detail_line_count(detail).saturating_sub(8) as u16;
+        let max_scroll = node_quality_detail_max_scroll(detail, self.last_frame_area);
         detail.evidence_scroll = detail.evidence_scroll.saturating_add(1).min(max_scroll);
     }
 
@@ -226,6 +226,54 @@ mod tests {
         app.open_node_quality_detail().unwrap();
 
         assert_eq!(app.node_quality_detail.as_ref().unwrap().node, "node-b");
+    }
+
+    #[test]
+    fn compact_quality_dialog_scrolls_to_last_evidence_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (width, height) in [(80, 24), (120, 30), (137, 35), (100, 40)] {
+            let mut app = test_app();
+            app.open_node_quality_detail().unwrap();
+            let detail = app.node_quality_detail.as_mut().unwrap();
+            detail.usability_details = (0..12)
+                .map(|index| super::UsabilityCriterionDetail {
+                    label: format!("Criterion {index}"),
+                    usable: None,
+                    detail: None,
+                    expired: false,
+                    latest_failure: Some(if index == 11 {
+                        "TAIL MARKER".into()
+                    } else {
+                        format!("failure {index}")
+                    }),
+                })
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| super::super::draw(frame, &mut app))
+                .unwrap();
+            for _ in 0..60 {
+                app.handle_key(KeyCode::Down).unwrap();
+            }
+            terminal
+                .draw(|frame| super::super::draw(frame, &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains("TAIL") && text.contains("MARKER"),
+                "{width}x{height}\n{text}"
+            );
+        }
     }
 
     #[test]

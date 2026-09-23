@@ -50,20 +50,7 @@ pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDe
                 return;
             }
 
-            let content_area = dialog_content_area(inner_area);
-            let (header_area, body_area, footer_area) = if content_area.height >= 5 {
-                let gap = u16::from(content_area.height >= 14);
-                let [h, _, b, f] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(gap),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .areas(content_area);
-                (Some(h), b, Some(f))
-            } else {
-                (None, content_area, None)
-            };
+            let (header_area, body_area, footer_area) = quality_dialog_regions(inner_area);
 
             if let Some(header) = header_area {
                 let refresh = measurement_age_label(detail);
@@ -116,6 +103,22 @@ pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDe
     );
 }
 
+fn quality_dialog_regions(inner_area: Rect) -> (Option<Rect>, Rect, Option<Rect>) {
+    let content_area = dialog_content_area(inner_area);
+    if content_area.height < 5 {
+        return (None, content_area, None);
+    }
+    let gap = u16::from(content_area.height >= 14);
+    let [header, _, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(gap),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(content_area);
+    (Some(header), body, Some(footer))
+}
+
 fn measurement_age_label(detail: &NodeQualityDetailState) -> String {
     let latest = detail
         .latency_history
@@ -150,6 +153,18 @@ fn render_node_quality_body(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let (reachability, sustained, evidence, right) = quality_body_regions(area);
+    render_reachability_card(frame, theme, reachability, detail);
+    if sustained.height > 0 {
+        render_sustained_card(frame, theme, sustained, detail);
+    }
+    if evidence.height >= 3 {
+        render_detail_evidence(frame, theme, evidence, detail);
+    }
+    render_latency_chart(frame, theme, right, detail);
+}
+
+fn quality_body_regions(area: Rect) -> (Rect, Rect, Rect, Rect) {
     let left_width = (area.width * 35 / 100).clamp(24, 38).min(area.width);
     let [left, _, right] = Layout::horizontal([
         Constraint::Length(left_width),
@@ -160,21 +175,14 @@ fn render_node_quality_body(
 
     let reachability_height = left.height.min(7);
     let sustained_height = left.height.saturating_sub(reachability_height + 1).min(7);
-    let [reachability, _, sustained, remaining] = Layout::vertical([
+    let [reachability, _, sustained, evidence] = Layout::vertical([
         Constraint::Length(reachability_height),
         Constraint::Length(u16::from(left.height > reachability_height)),
         Constraint::Length(sustained_height),
         Constraint::Min(0),
     ])
     .areas(left);
-    render_reachability_card(frame, theme, reachability, detail);
-    if sustained.height > 0 {
-        render_sustained_card(frame, theme, sustained, detail);
-    }
-    if remaining.height >= 3 {
-        render_detail_evidence(frame, theme, remaining, detail);
-    }
-    render_latency_chart(frame, theme, right, detail);
+    (reachability, sustained, evidence, right)
 }
 
 fn quality_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
@@ -380,7 +388,7 @@ fn render_latency_chart(
         cutoff_ms,
         |sample| sample.0,
         |sample| sample.1 as f64 / 1_048_576.0,
-        crate::tui::metrics::TRAFFIC_OBSERVATION_GAP_THRESHOLD_MS,
+        0,
     );
     if latency.is_empty() && throughput.is_empty() {
         frame.render_widget(
@@ -741,14 +749,36 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
     lines
 }
 
-pub(crate) fn node_quality_detail_line_count(detail: &NodeQualityDetailState) -> usize {
-    node_quality_evidence_lines(detail)
+pub(crate) fn node_quality_detail_max_scroll(
+    detail: &NodeQualityDetailState,
+    viewport: Rect,
+) -> u16 {
+    use ratatui::widgets::Widget;
+
+    let dialog_inner = Block::default().borders(Borders::ALL).inner(viewport);
+    let (_, body, _) = quality_dialog_regions(dialog_inner);
+    let (_, _, evidence, _) = quality_body_regions(body);
+    if evidence.height < 3 {
+        return 0;
+    }
+    let inner = Block::default().borders(Borders::ALL).inner(evidence);
+    let lines = node_quality_evidence_lines(detail);
+    let render_height = lines
         .iter()
-        .map(|line| {
-            let width = unicode_width::UnicodeWidthStr::width(line.to_string().as_str());
-            width.max(1).div_ceil(22)
-        })
-        .sum()
+        .map(|line| line.to_string().chars().count().max(1))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
+    let scratch_area = Rect::new(0, 0, inner.width, render_height);
+    let mut scratch = ratatui::buffer::Buffer::empty(scratch_area);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(scratch_area, &mut scratch);
+    let line_count = (0..render_height)
+        .rfind(|&y| (0..inner.width).any(|x| !scratch[(x, y)].symbol().trim().is_empty()))
+        .map_or(0, |last_row| last_row as usize + 1);
+    line_count
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16
 }
 
 fn probe_outcome_label(outcome: &ProbeOutcome) -> String {

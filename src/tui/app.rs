@@ -445,6 +445,7 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.last_frame_area = area;
     let theme = crate::tui::ds::Theme::default();
     if area.width < 80 || area.height < 24 {
         crate::tui::ds::widgets::render_unsupported_guard(frame, area, &theme);
@@ -608,6 +609,7 @@ struct App {
     state_store: Option<TuiStateStore>,
     bypass_rule_set_store: Option<BypassRuleSetStore>,
     node_quality_detail: Option<NodeQualityDetailState>,
+    last_frame_area: ratatui::layout::Rect,
     clash_mode: Option<String>,
     clash_modes: Vec<String>,
     connections: ConnectionsSnapshot,
@@ -848,6 +850,7 @@ impl App {
             state_store: Some(state_store),
             bypass_rule_set_store: Some(BypassRuleSetStore::new(bypass_rule_set_path)),
             node_quality_detail: None,
+            last_frame_area: ratatui::layout::Rect::new(0, 0, 120, 30),
             clash_mode: None,
             clash_modes: Vec::new(),
             connections: ConnectionsSnapshot::default(),

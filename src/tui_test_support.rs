@@ -129,6 +129,7 @@ pub(super) fn test_app() -> App {
         state_store: None,
         bypass_rule_set_store: None,
         node_quality_detail: None,
+        last_frame_area: ratatui::layout::Rect::new(0, 0, 120, 30),
         clash_mode: Some(RULE_CLASH_MODE.to_string()),
         clash_modes: vec![
             GLOBAL_CLASH_MODE.to_string(),

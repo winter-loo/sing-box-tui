@@ -34,6 +34,27 @@ fn format_connection_chain_rule(connection: &ConnectionInfo) -> String {
 }
 
 fn format_connection_source(connection: &ConnectionInfo) -> String {
+    let Some(source_ip) = connection
+        .metadata
+        .source_ip
+        .as_deref()
+        .filter(|ip| !ip.is_empty())
+    else {
+        return format_connection_inbound(connection);
+    };
+    match connection
+        .metadata
+        .source_port
+        .as_deref()
+        .filter(|port| !port.is_empty())
+    {
+        Some(port) if source_ip.contains(':') => format!("[{source_ip}]:{port}"),
+        Some(port) => format!("{source_ip}:{port}"),
+        None => source_ip.to_string(),
+    }
+}
+
+fn format_connection_inbound(connection: &ConnectionInfo) -> String {
     let kind = connection.metadata.kind.as_deref().unwrap_or("-");
     let network = connection.metadata.network.as_deref().unwrap_or("-");
     format!("{kind}/{network}")
@@ -201,7 +222,7 @@ pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPa
                     .enumerate()
                 {
                     let y = data_area.y.saturating_add(index as u16 * row_stride);
-                    render_connection_row(frame, &theme, &columns, y, connection);
+                    render_connection_row(frame, &theme, &columns, y, row_stride == 2, connection);
                 }
                 let hidden = snapshot
                     .connections
@@ -253,7 +274,6 @@ struct ConnectionColumns {
 }
 
 fn connection_columns(area: Rect, connections: &ConnectionsSnapshot) -> ConnectionColumns {
-    let source_width = if area.width >= 90 { 12 } else { 9 };
     let transfer_width = connections
         .connections
         .iter()
@@ -265,6 +285,20 @@ fn connection_columns(area: Rect, connections: &ConnectionsSnapshot) -> Connecti
         .max("Down / Up".len()) as u16;
     let age_width = 7;
     let gaps = 4;
+    let source_budget = area
+        .width
+        .saturating_sub(transfer_width + age_width + gaps + 16);
+    let source_width = connections
+        .connections
+        .iter()
+        .map(|connection| {
+            unicode_width::UnicodeWidthStr::width(format_connection_source(connection).as_str())
+        })
+        .max()
+        .unwrap_or(0)
+        .max(if area.width >= 90 { 12 } else { 9 })
+        .min(28)
+        .min(source_budget as usize) as u16;
     let flexible = area
         .width
         .saturating_sub(source_width + transfer_width + age_width + gaps);
@@ -315,6 +349,7 @@ fn render_connection_row(
     theme: &Theme,
     columns: &ConnectionColumns,
     y: u16,
+    show_inbound: bool,
     connection: &ConnectionInfo,
 ) {
     let row_area = |column: Rect| Rect::new(column.x, y, column.width, 1);
@@ -351,6 +386,22 @@ fn render_connection_row(
             .style(theme.style_muted()),
         row_area(columns.age),
     );
+    if show_inbound
+        && connection
+            .metadata
+            .source_ip
+            .as_deref()
+            .is_some_and(|ip| !ip.is_empty())
+    {
+        frame.render_widget(
+            Paragraph::new(truncate_for_width(
+                &format_connection_inbound(connection),
+                columns.source.width as usize,
+            ))
+            .style(theme.style_muted()),
+            Rect::new(columns.source.x, y + 1, columns.source.width, 1),
+        );
+    }
 }
 
 fn format_connection_age(start: Option<&str>) -> String {
@@ -408,6 +459,7 @@ mod tests {
 
         assert_eq!(format_bytes(512), "512B");
         assert_eq!(format_bytes(2048), "2.0KiB");
+        assert_eq!(format_connection_source(&connection), "172.19.0.1");
         assert_eq!(format_connection_target(&connection), "www.google.com:443");
         assert_eq!(
             format_connection_chain_rule(&connection),
@@ -622,6 +674,45 @@ mod tests {
             .unwrap();
         let text = buffer_to_text(terminal.backend().buffer());
         assert!(text.contains("↓16.0EiB / ↑16.0EiB"), "{text}");
+    }
+
+    #[test]
+    fn compact_connections_show_source_endpoint_and_inbound() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let connections_data = ConnectionsSnapshot {
+            connections: vec![ConnectionInfo {
+                id: "source".into(),
+                upload: 0,
+                download: 0,
+                start: None,
+                chains: vec!["node-a".into()],
+                rule: Some("MATCH".into()),
+                rule_payload: None,
+                metadata: ConnectionMetadata {
+                    kind: Some("tun".into()),
+                    network: Some("tcp".into()),
+                    source_ip: Some("172.19.0.1".into()),
+                    source_port: Some("52345".into()),
+                    ..ConnectionMetadata::default()
+                },
+            }],
+            ..ConnectionsSnapshot::default()
+        };
+        let snapshot = ConnectionsPanelSnapshot {
+            summary: "connections active=1".into(),
+            connections: &connections_data,
+            error: None,
+            last_success_age: None,
+            scroll_offset: 0,
+        };
+
+        terminal
+            .draw(|f| draw_connections_panel(f, &snapshot))
+            .unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        assert!(text.contains("172.19.0.1:52345"), "{text}");
+        assert!(text.contains("tun/tcp"), "{text}");
     }
 
     #[test]
