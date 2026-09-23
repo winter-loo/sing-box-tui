@@ -58,7 +58,7 @@ pub(crate) fn format_bytes_opt(bytes: Option<u64>) -> String {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut value = bytes as f64;
     let mut unit_index = 0;
     while value >= 1024.0 && unit_index + 1 < UNITS.len() {
@@ -262,8 +262,7 @@ fn connection_columns(area: Rect, connections: &ConnectionsSnapshot) -> Connecti
         })
         .max()
         .unwrap_or(0)
-        .max("Down / Up".len())
-        .min(18) as u16;
+        .max("Down / Up".len()) as u16;
     let age_width = 7;
     let gaps = 4;
     let flexible = area
@@ -588,6 +587,41 @@ mod tests {
         assert!(text.contains("👩‍💻"));
         assert!(!text.contains('\u{fffd}'));
         assert!(text.contains("[Esc/c/Enter] Close"));
+    }
+
+    #[test]
+    fn compact_connections_keep_large_transfer_values_visible() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let connections_data = ConnectionsSnapshot {
+            connections: vec![ConnectionInfo {
+                id: "large".into(),
+                upload: u64::MAX,
+                download: u64::MAX,
+                start: None,
+                chains: vec!["very-long-👩‍💻-超长-node-name".into()],
+                rule: Some("MATCH".into()),
+                rule_payload: None,
+                metadata: ConnectionMetadata {
+                    host: Some("very-long-👩‍💻-超长-destination.example".into()),
+                    ..ConnectionMetadata::default()
+                },
+            }],
+            ..ConnectionsSnapshot::default()
+        };
+        let snapshot = ConnectionsPanelSnapshot {
+            summary: "connections active=1".into(),
+            connections: &connections_data,
+            error: None,
+            last_success_age: None,
+            scroll_offset: 0,
+        };
+
+        terminal
+            .draw(|frame| draw_connections_panel(frame, &snapshot))
+            .unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        assert!(text.contains("↓16.0EiB / ↑16.0EiB"), "{text}");
     }
 
     #[test]

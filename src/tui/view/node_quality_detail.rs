@@ -230,18 +230,26 @@ fn render_reachability_card(
             "Assessment",
             format!("{completed} / {attempts} complete"),
             theme,
+            inner.width,
         ),
         metric_row(
             "Cold-start med.",
             spaced_metric(detail.quick_history.cold_start_ms),
             theme,
+            inner.width,
         ),
         metric_row(
             "Warm median",
             spaced_metric(detail.quick_history.warm_median_ms),
             theme,
+            inner.width,
         ),
-        metric_row("P95", spaced_metric(detail.quick_history.p95_ms), theme),
+        metric_row(
+            "P95",
+            spaced_metric(detail.quick_history.p95_ms),
+            theme,
+            inner.width,
+        ),
     ];
     frame.render_widget(Paragraph::new(lines).style(theme.style_base()), inner);
 }
@@ -269,11 +277,13 @@ fn render_sustained_card(
                 "First byte",
                 format!("{} ms", completion.first_byte_ms),
                 theme,
+                inner.width,
             ),
             metric_row(
                 "Completion",
                 format!("{} ms", completion.completion_ms),
                 theme,
+                inner.width,
             ),
             metric_row(
                 "Throughput",
@@ -282,11 +292,13 @@ fn render_sustained_card(
                     completion.throughput_bytes_per_second as f64 / 1_048_576.0
                 ),
                 theme,
+                inner.width,
             ),
             metric_row(
                 "Transferred",
                 format_bytes_opt(Some(completion.bytes_read)),
                 theme,
+                inner.width,
             ),
         ],
         Some(SustainedProbeOutcome::TransferFailed { detail }) => vec![
@@ -314,9 +326,16 @@ fn render_sustained_card(
     frame.render_widget(Paragraph::new(lines).style(theme.style_base()), inner);
 }
 
-fn metric_row(label: &str, value: String, theme: &Theme) -> Line<'static> {
+fn metric_row(label: &str, value: String, theme: &Theme, width: u16) -> Line<'static> {
+    let value_width = unicode_width::UnicodeWidthStr::width(value.as_str());
+    let label_width = (width as usize).saturating_sub(value_width);
+    let label = truncate_for_width(&format!("{label}:"), label_width.saturating_sub(1));
+    let padding = label_width.saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()));
     Line::from(vec![
-        Span::styled(format!("{label}: "), theme.style_muted()),
+        Span::styled(
+            format!("{label}{}", " ".repeat(padding)),
+            theme.style_muted(),
+        ),
         Span::styled(value, theme.style_base()),
     ])
 }
@@ -960,6 +979,47 @@ mod tests {
         assert!(text.contains("68 ms"));
         assert!(text.contains("412 ms"));
         assert!(text.contains("[Esc/i/Enter] Close"));
+    }
+
+    #[test]
+    fn compact_quality_card_reserves_space_for_large_metric_values() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let detail = NodeQualityDetailState {
+            selector: "select".into(),
+            node: "node-a".into(),
+            last_refresh: Instant::now(),
+            reachability_assessment: None,
+            quick_history: NodeQuickHistory {
+                cold_start_ms: Some(123_456),
+                warm_median_ms: Some(2_345),
+                p95_ms: Some(67),
+                ..NodeQuickHistory::default()
+            },
+            sustained_quality: None,
+            latency_history: Vec::new(),
+            throughput_history: Vec::new(),
+            auto_selection_detail: None,
+            usability_details: Vec::new(),
+            evidence_scroll: 0,
+        };
+
+        terminal
+            .draw(|frame| draw_node_quality_detail(frame, &detail))
+            .unwrap();
+        let text = buffer_to_text(terminal.backend().buffer());
+        assert!(text.contains("123456 ms"), "{text}");
+        assert!(text.contains("2345 ms"), "{text}");
+        assert!(text.contains("67 ms"), "{text}");
+        let metric_rows = ["123456 ms", "2345 ms", "67 ms"].map(|metric| {
+            let row = text.lines().find(|row| row.contains(metric)).unwrap();
+            let end = row.find(metric).unwrap() + metric.len();
+            unicode_width::UnicodeWidthStr::width(&row[..end])
+        });
+        assert_eq!(metric_rows, [metric_rows[0]; 3]);
     }
 
     #[test]
