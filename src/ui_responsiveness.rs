@@ -2,6 +2,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -165,6 +167,9 @@ fn request_windows_process_dump(log_path: &Path) {
     match Command::new(executable)
         .args(["-accepteula", "-ma", &std::process::id().to_string()])
         .arg(&dump_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(_) => append_watchdog_note(

@@ -53,13 +53,13 @@ pub fn builtin_commands() -> Vec<CommandItem> {
             CMD_SWITCH_INTERNET,
             "Switch to Internet Workspace",
             "Navigation",
-            Some("Tab"),
+            None,
         ),
         CommandItem::new(
             CMD_SWITCH_PRIVATE_ACCESS,
             "Switch to Private Access Workspace",
             "Navigation",
-            Some("Tab"),
+            None,
         ),
         CommandItem::new(
             CMD_SWITCH_PROVIDER,
@@ -400,6 +400,10 @@ mod tests {
         assert!(ids.contains(&CMD_ENTER_NODE_DASHBOARD));
         assert!(ids.contains(&CMD_QUIT));
 
+        for id in [CMD_SWITCH_INTERNET, CMD_SWITCH_PRIVATE_ACCESS] {
+            assert_eq!(cmds.iter().find(|c| c.id == id).unwrap().shortcut, None);
+        }
+
         let tun_cmd = cmds.iter().find(|c| c.id == CMD_TOGGLE_TUN).unwrap();
         assert_eq!(tun_cmd.title, "Toggle Internet TUN Mode");
         assert_eq!(tun_cmd.category, "Network capture");
@@ -448,7 +452,7 @@ mod tests {
 
         // Substring on shortcut
         let filtered_sc = filter_commands(&cmds, "Tab");
-        assert_eq!(filtered_sc.len(), 2);
+        assert!(filtered_sc.iter().all(|item| item.shortcut != Some("Tab")));
 
         let filtered_slash = filter_commands(&cmds, "\\");
         assert_eq!(filtered_slash.len(), 1);
@@ -493,7 +497,7 @@ mod tests {
         assert!(text.contains("COMMANDS"));
         assert!(text.contains("> █"));
         assert!(text.contains("Switch to Internet Workspace"));
-        assert!(text.contains("Tab"));
+        assert!(!text.contains("Tab"));
         assert!(text.contains("Enter execute   Esc close"));
     }
 

@@ -396,6 +396,12 @@ pub(crate) fn draw_private_access_progress_panel(
             frame.render_widget(Paragraph::new(lines), inner_area);
         },
     );
+    let footer_hint = if progress.done {
+        "Enter/Esc close"
+    } else {
+        "Enter/Esc close   Private Access running"
+    };
+    super::render_context_footer_hint(frame, footer_hint, &theme);
 }
 
 pub(crate) fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAccessAuthModal) {
@@ -538,6 +544,7 @@ pub(crate) fn draw_private_access_auth_panel(frame: &mut Frame, auth: &PrivateAc
             }
         },
     );
+    super::render_context_footer_hint(frame, "Enter next/submit   Tab field   Esc cancel", &theme);
 }
 
 pub(crate) fn private_access_auth_display_value(

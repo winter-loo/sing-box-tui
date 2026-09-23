@@ -303,8 +303,7 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(text.contains("connections"));
     assert!(text.contains("quality"));
     assert!(text.contains("help"));
-    assert!(text.contains("[Tab]"));
-    assert!(text.contains("Intranet"));
+    assert!(!text.contains("[Tab] Intranet"));
     assert!(text.contains("GLOBAL NET"));
     assert!(text.contains("STABLE"));
     assert!(text.contains("↓0.0M/s"));
@@ -1114,7 +1113,7 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
     assert!(footer_row.contains("connections"));
     assert!(footer_row.contains("quality"));
     assert!(footer_row.contains("help"));
-    assert!(footer_row.contains("Intranet →"));
+    assert!(!footer_row.contains("[Tab] Intranet"));
     assert!(footer_row.contains("GLOBAL NET"));
     assert!(footer_row.contains("STABLE"));
     assert!(footer_row.contains("↓0.0M/s"));

@@ -7,6 +7,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::shared::global_network_footer_spans;
 use crate::tui::ds::{Theme, render_breadcrumb, render_unsupported_guard};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
@@ -55,13 +56,6 @@ impl GlobalNetworkStatus {
         match self {
             Self::Stable => "STABLE",
             Self::Idle => "IDLE",
-        }
-    }
-
-    fn color(self, theme: &Theme) -> Color {
-        match self {
-            Self::Stable => theme.text_status_active(),
-            Self::Idle => theme.text_muted(),
         }
     }
 }
@@ -999,24 +993,13 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
         theme.text_accent(),
     );
     if r.width >= shortcuts_width + status_width + 3 {
-        let mut status_spans = Vec::new();
-        status_spans.push(Span::styled("GLOBAL NET  ", theme.style_muted()));
-        status_spans.push(Span::styled(
-            snapshot.network_status.label(),
-            Style::default().fg(snapshot.network_status.color(&theme)),
-        ));
-        status_spans.push(Span::raw("  "));
-        status_spans.push(Span::styled(
-            format!("↓{}", snapshot.current_down_rate),
-            Style::default().fg(theme.text_transfer()),
-        ));
-        status_spans.push(Span::raw("  "));
-        status_spans.push(Span::styled(
-            format!("↑{}", snapshot.current_up_rate),
-            Style::default().fg(theme.text_transfer()),
-        ));
         frame.render_widget(
-            Paragraph::new(Line::from(status_spans)),
+            Paragraph::new(Line::from(global_network_footer_spans(
+                snapshot.network_status.label(),
+                snapshot.current_down_rate,
+                snapshot.current_up_rate,
+                &theme,
+            ))),
             Rect::new(
                 r.width.saturating_sub(status_width + 1),
                 footer_y,

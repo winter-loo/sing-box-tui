@@ -66,7 +66,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         category: "Navigation",
         section: HelpSection::Navigation,
         summary: "Switch pane",
-        detail: "Move focus between the selector/group pane and the candidate node pane.",
+        detail: "In Internet Proxy, move focus between the selector/group pane and the candidate node pane.",
     },
     HelpBinding {
         key: "h",

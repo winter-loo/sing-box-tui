@@ -9,7 +9,7 @@ use super::{ActiveView, App, NODE_QUALITY_DETAIL_REFRESH_INTERVAL};
 
 impl App {
     pub(super) fn open_node_quality_detail(&mut self) -> Result<()> {
-        if self.showing_intranet_details() {
+        if self.active_view != ActiveView::NodeDashboard && self.showing_intranet_details() {
             self.set_status_only("Node quality is available for Internet Proxy nodes only");
             return Ok(());
         }
@@ -212,6 +212,20 @@ mod tests {
         app.open_node_quality_detail().unwrap();
 
         let detail = app.node_quality_detail.as_ref().unwrap();
+        assert_eq!(detail.selector, "select");
+        assert_eq!(detail.node, "node-a");
+    }
+
+    #[test]
+    fn dashboard_quality_uses_current_route_after_private_access_workspace() {
+        let mut app = test_app();
+        app.set_operational_workspace(crate::tui_state::OperationalWorkspace::PrivateAccess)
+            .unwrap();
+        app.active_view = super::super::ActiveView::NodeDashboard;
+
+        app.open_node_quality_detail().unwrap();
+
+        let detail = app.node_quality_detail.as_ref().expect("dashboard quality");
         assert_eq!(detail.selector, "select");
         assert_eq!(detail.node, "node-a");
     }

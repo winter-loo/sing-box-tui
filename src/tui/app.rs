@@ -80,6 +80,9 @@ mod benchmark_actions;
 mod connections;
 #[path = "../tui_dashboard_snapshot.rs"]
 mod dashboard_snapshot;
+#[cfg(test)]
+#[path = "global_conformance_tests.rs"]
+mod global_conformance_tests;
 #[path = "../tui_input_workflow.rs"]
 mod input_workflow;
 #[path = "../tui_managed_process.rs"]
@@ -1213,6 +1216,12 @@ impl App {
                 self.pause_active_probes();
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+            KeyCode::Tab if self.operational_workspace == OperationalWorkspace::Internet => {
+                self.focus = match self.focus {
+                    Focus::Groups => Focus::Members,
+                    Focus::Members => Focus::Groups,
+                };
+            }
             KeyCode::Tab => {}
             KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
             KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
@@ -1837,8 +1846,12 @@ mod navigation_tests {
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
 
         // Tab is local to operational pages; workspace switching is an explicit command.
+        assert_eq!(app.focus, Focus::Members);
         app.handle_key(KeyCode::Tab).expect("tab handled");
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
+        assert_eq!(app.focus, Focus::Groups);
+        app.handle_key(KeyCode::Tab).expect("tab handled again");
+        assert_eq!(app.focus, Focus::Members);
         app.cycle_operational_workspace().expect("workspace switch");
         assert_eq!(
             app.operational_workspace,
@@ -2037,7 +2050,7 @@ mod navigation_tests {
             }
             let footer = row(height - 1);
             assert!(footer.contains("Ctrl+K"));
-            assert!(footer.contains("[Tab]"));
+            assert!(!footer.contains("[Tab]"));
             assert!(footer.contains("GLOBAL NET"));
             assert!(footer.trim_end().ends_with("↑0.0M/s"));
             assert!(!row(0).contains("GLOBAL NET"));

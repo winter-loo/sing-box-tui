@@ -1,5 +1,34 @@
 use super::*;
 
+pub(crate) fn global_network_footer_spans(
+    status: &str,
+    down_rate: &str,
+    up_rate: &str,
+    theme: &crate::tui::ds::Theme,
+) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("GLOBAL NET  ", theme.style_muted()),
+        Span::styled(
+            status.to_owned(),
+            if status == "STABLE" {
+                Style::default().fg(theme.text_status_active())
+            } else {
+                theme.style_muted()
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("↓{down_rate}"),
+            Style::default().fg(theme.text_transfer()),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("↑{up_rate}"),
+            Style::default().fg(theme.text_transfer()),
+        ),
+    ]
+}
+
 /// Full-width workbench overlay used by the Settings and Help reference frames.
 /// The last terminal row belongs to the underlying global footer.
 pub(crate) fn render_workbench_shell(
@@ -75,10 +104,21 @@ pub(crate) fn render_context_footer_hint(
     if area.height == 0 {
         return;
     }
+    let status_start = {
+        let buffer = frame.buffer_mut();
+        let marker = ["G", "L", "O", "B", "A", "L", " ", "N", "E", "T"];
+        (area.x..area.right().saturating_sub(9))
+            .find(|&x| {
+                marker.iter().enumerate().all(|(offset, symbol)| {
+                    buffer[(x + offset as u16, area.bottom() - 1)].symbol() == *symbol
+                })
+            })
+            .unwrap_or_else(|| area.right().saturating_sub(50))
+    };
     let footer = Rect::new(
         area.x,
         area.bottom() - 1,
-        area.width.saturating_sub(50).min(area.width / 2),
+        status_start.saturating_sub(area.x),
         1,
     );
     frame.render_widget(Clear, footer);

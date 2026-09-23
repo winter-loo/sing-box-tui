@@ -33,4 +33,5 @@ pub(crate) fn draw_onboarding_panel(frame: &mut Frame, onboarding: &OnboardingSt
         ),
         area,
     );
+    render_context_footer_hint(frame, "Enter save   s skip   Esc later", &theme);
 }

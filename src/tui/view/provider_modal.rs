@@ -170,6 +170,7 @@ pub(crate) fn render_provider_modal(
             );
         },
     );
+    super::render_context_footer_hint(frame, "Esc/p close   ↑↓ select   Enter choose", theme);
 }
 
 #[cfg(test)]

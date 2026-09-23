@@ -648,27 +648,12 @@ fn render_internet_footer(
         return;
     }
 
-    let mut right_spans = Vec::new();
-    right_spans.push(Span::styled("GLOBAL NET", theme.style_muted()));
-    right_spans.push(Span::raw("  "));
-    right_spans.push(Span::styled(
+    let right_spans = global_network_footer_spans(
         snapshot.network_status,
-        if snapshot.network_status == "STABLE" {
-            Style::default().fg(theme.text_status_active())
-        } else {
-            theme.style_muted()
-        },
-    ));
-    right_spans.push(Span::raw("  "));
-    right_spans.push(Span::styled(
-        format!("↓{}", snapshot.current_down_rate),
-        Style::default().fg(theme.text_transfer()),
-    ));
-    right_spans.push(Span::raw("  "));
-    right_spans.push(Span::styled(
-        format!("↑{}", snapshot.current_up_rate),
-        Style::default().fg(theme.text_transfer()),
-    ));
+        snapshot.current_down_rate,
+        snapshot.current_up_rate,
+        theme,
+    );
 
     let total_right: usize = right_spans
         .iter()
@@ -686,17 +671,15 @@ fn render_internet_footer(
             ("o", "settings"),
             ("?", "help"),
             ("p", "provider"),
-            ("[Tab]", "Intranet →"),
         ],
         &[
             ("Ctrl+K", "actions"),
             ("c", "connections"),
             ("i", "quality"),
             ("?", "help"),
-            ("[Tab]", "Intranet →"),
         ],
-        &[("Ctrl+K", "actions"), ("?", "help"), ("[Tab]", "Intranet")],
-        &[("Ctrl+K", ""), ("?", ""), ("[Tab]", "")],
+        &[("Ctrl+K", "actions"), ("?", "help")],
+        &[("Ctrl+K", ""), ("?", "")],
     ];
     let shortcut_width = |items: &[(&str, &str)]| {
         items
@@ -1141,12 +1124,21 @@ fn render_intranet_footer(
         Some(_) => "V connect",
         None => "o settings",
     };
-    let variants = [
-        format!("p profile   ↑↓/jk select   Enter open   {action}   o settings   ? help"),
-        format!("p profile   ↑↓ select   Enter open   {action}   ? help"),
-        format!("p profile   {action}   ? help"),
-        "?".to_string(),
-    ];
+    let variants = if state.is_none() {
+        [
+            "o settings   ? help".to_string(),
+            "o settings".to_string(),
+            "? help".to_string(),
+            "?".to_string(),
+        ]
+    } else {
+        [
+            format!("p profile   ↑↓/jk select   Enter open   {action}   o settings   ? help"),
+            format!("p profile   ↑↓ select   Enter open   {action}   ? help"),
+            format!("p profile   {action}   ? help"),
+            "?".to_string(),
+        ]
+    };
     let left = variants
         .into_iter()
         .find(|value| unicode_width::UnicodeWidthStr::width(value.as_str()) <= left_width as usize)
@@ -1162,9 +1154,13 @@ fn render_intranet_footer(
         left_area,
     );
     frame.render_widget(
-        Paragraph::new(right)
-            .alignment(ratatui::layout::Alignment::Right)
-            .style(theme.style_success()),
+        Paragraph::new(Line::from(global_network_footer_spans(
+            snapshot.network_status,
+            snapshot.current_down_rate,
+            snapshot.current_up_rate,
+            theme,
+        )))
+        .alignment(ratatui::layout::Alignment::Right),
         right_area,
     );
 }

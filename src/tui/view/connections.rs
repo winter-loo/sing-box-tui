@@ -102,7 +102,10 @@ pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPa
     let theme = Theme::detect();
     render_dialog_frame(
         frame,
-        area,
+        Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        },
         &theme,
         " ACTIVE CONNECTIONS ",
         u16::MAX,
@@ -262,6 +265,7 @@ pub(crate) fn draw_connections_panel(frame: &mut Frame, snapshot: &ConnectionsPa
             }
         },
     );
+    super::render_context_footer_hint(frame, "Esc/c close   r refresh   j/k scroll", &theme);
 }
 
 #[derive(Clone, Copy)]
@@ -716,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn connections_dialog_fills_supported_reference_and_non_standard_viewports() {
+    fn connections_dialog_reserves_status_row_at_supported_viewports() {
         for (width, height) in [(80, 24), (120, 30), (137, 35)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -736,9 +740,10 @@ mod tests {
 
             assert_eq!(buffer[(0, 0)].symbol(), "┌");
             assert_eq!(buffer[(width - 1, 0)].symbol(), "┐");
-            assert_eq!(buffer[(0, height - 1)].symbol(), "└");
-            assert_eq!(buffer[(width - 1, height - 1)].symbol(), "┘");
-            assert!(row_text(buffer, height - 2).contains("[Esc/c/Enter] Close"));
+            assert_eq!(buffer[(0, height - 2)].symbol(), "└");
+            assert_eq!(buffer[(width - 1, height - 2)].symbol(), "┘");
+            assert!(row_text(buffer, height - 3).contains("[Esc/c/Enter] Close"));
+            assert!(row_text(buffer, height - 1).contains("Esc/c close"));
         }
     }
 

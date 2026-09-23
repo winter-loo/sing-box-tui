@@ -40,7 +40,10 @@ pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDe
     );
     render_dialog_frame(
         frame,
-        area,
+        Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        },
         &theme,
         &title,
         u16::MAX,
@@ -101,6 +104,7 @@ pub(crate) fn draw_node_quality_detail(frame: &mut Frame, detail: &NodeQualityDe
             }
         },
     );
+    super::render_context_footer_hint(frame, "Esc/i close   j/k scroll", &theme);
 }
 
 fn quality_dialog_regions(inner_area: Rect) -> (Option<Rect>, Rect, Option<Rect>) {
@@ -558,7 +562,7 @@ fn render_detail_evidence(
     frame.render_widget(block, area);
     if inner.height > 0 {
         frame.render_widget(
-            Paragraph::new(node_quality_evidence_lines(detail))
+            Paragraph::new(node_quality_evidence_lines(detail, inner.width))
                 .scroll((detail.evidence_scroll, 0))
                 .wrap(Wrap { trim: false })
                 .style(theme.style_base()),
@@ -567,7 +571,7 @@ fn render_detail_evidence(
     }
 }
 
-fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'static>> {
+fn node_quality_evidence_lines(detail: &NodeQualityDetailState, width: u16) -> Vec<Line<'static>> {
     let theme = Theme::detect();
     let mut lines = Vec::new();
     if let Some(explanation) = &detail.auto_selection_detail {
@@ -591,7 +595,14 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             None => (assessment.compact_evidence(), theme.style_muted()),
         };
         lines.push(Line::from(vec![
-            Span::styled("Reachability assessment: ", theme.style_breadcrumb()),
+            Span::styled(
+                if width <= 30 {
+                    "Reachability: "
+                } else {
+                    "Reachability assessment: "
+                },
+                theme.style_breadcrumb(),
+            ),
             Span::styled(assess_text, assess_style),
         ]));
         for (index, outcome) in assessment.attempts.iter().enumerate() {
@@ -619,18 +630,39 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
         }
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Reachability assessment: ", theme.style_breadcrumb()),
+            Span::styled(
+                if width <= 30 {
+                    "Reachability: "
+                } else {
+                    "Reachability assessment: "
+                },
+                theme.style_breadcrumb(),
+            ),
             Span::styled("untested", theme.style_muted()),
         ]));
     }
     if detail.quick_history.rounds == 0 {
         lines.push(Line::from(vec![
-            Span::styled("Recent quick success: ", theme.style_muted()),
+            Span::styled(
+                if width <= 30 {
+                    "Recent quick: "
+                } else {
+                    "Recent quick success: "
+                },
+                theme.style_muted(),
+            ),
             Span::styled("untested", theme.style_muted()),
         ]));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Recent quick success: ", theme.style_muted()),
+            Span::styled(
+                if width <= 30 {
+                    "Recent quick: "
+                } else {
+                    "Recent quick success: "
+                },
+                theme.style_muted(),
+            ),
             Span::styled(
                 format!(
                     "{}/{} rounds",
@@ -656,7 +688,14 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
         match &sustained.outcome {
             SustainedProbeOutcome::Completed(completion) => {
                 lines.push(Line::from(vec![
-                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        if width <= 30 {
+                            "Sustained: "
+                        } else {
+                            "Sustained quality: "
+                        },
+                        theme.style_breadcrumb(),
+                    ),
                     Span::styled(
                         format!(
                             "{:.1} MiB/s, {} bytes",
@@ -676,7 +715,14 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             }
             SustainedProbeOutcome::TransferFailed { detail } => {
                 lines.push(Line::from(vec![
-                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        if width <= 30 {
+                            "Sustained: "
+                        } else {
+                            "Sustained quality: "
+                        },
+                        theme.style_breadcrumb(),
+                    ),
                     Span::styled(
                         format!("transfer failed ({})", truncate_for_width(detail, 72)),
                         theme.style_danger(),
@@ -685,7 +731,14 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             }
             SustainedProbeOutcome::RuntimeFailed { detail } => {
                 lines.push(Line::from(vec![
-                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        if width <= 30 {
+                            "Sustained: "
+                        } else {
+                            "Sustained quality: "
+                        },
+                        theme.style_breadcrumb(),
+                    ),
                     Span::styled(
                         format!("runtime failed ({})", truncate_for_width(detail, 72)),
                         theme.style_danger(),
@@ -694,14 +747,28 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             }
             SustainedProbeOutcome::Cancelled => {
                 lines.push(Line::from(vec![
-                    Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+                    Span::styled(
+                        if width <= 30 {
+                            "Sustained: "
+                        } else {
+                            "Sustained quality: "
+                        },
+                        theme.style_breadcrumb(),
+                    ),
                     Span::styled("cancelled", theme.style_warning()),
                 ]));
             }
         }
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Sustained quality: ", theme.style_breadcrumb()),
+            Span::styled(
+                if width <= 30 {
+                    "Sustained: "
+                } else {
+                    "Sustained quality: "
+                },
+                theme.style_breadcrumb(),
+            ),
             Span::styled("untested", theme.style_muted()),
         ]));
     }
@@ -737,13 +804,29 @@ fn node_quality_evidence_lines(detail: &NodeQualityDetailState) -> Vec<Line<'sta
             }
         }
         if let Some(failure) = &criterion.latest_failure {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} latest probe attempt: ", criterion.label),
-                    theme.style_muted(),
-                ),
-                Span::styled(truncate_for_width(failure, 72), theme.style_danger()),
-            ]));
+            if width <= 30 {
+                let label = truncate_for_width(
+                    &criterion.label,
+                    usize::from(width).saturating_sub(2).min(10),
+                );
+                let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+                let value_width = usize::from(width).saturating_sub(label_width + 2);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{label}: "), theme.style_muted()),
+                    Span::styled(
+                        truncate_for_width(failure, value_width),
+                        theme.style_danger(),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} latest probe attempt: ", criterion.label),
+                        theme.style_muted(),
+                    ),
+                    Span::styled(truncate_for_width(failure, 72), theme.style_danger()),
+                ]));
+            }
         }
     }
     lines
@@ -755,6 +838,10 @@ pub(crate) fn node_quality_detail_max_scroll(
 ) -> u16 {
     use ratatui::widgets::Widget;
 
+    let viewport = Rect {
+        height: viewport.height.saturating_sub(1),
+        ..viewport
+    };
     let dialog_inner = Block::default().borders(Borders::ALL).inner(viewport);
     let (_, body, _) = quality_dialog_regions(dialog_inner);
     let (_, _, evidence, _) = quality_body_regions(body);
@@ -762,7 +849,7 @@ pub(crate) fn node_quality_detail_max_scroll(
         return 0;
     }
     let inner = Block::default().borders(Borders::ALL).inner(evidence);
-    let lines = node_quality_evidence_lines(detail);
+    let lines = node_quality_evidence_lines(detail, inner.width);
     let render_height = lines
         .iter()
         .map(|line| line.to_string().chars().count().max(1))
@@ -854,7 +941,7 @@ mod tests {
             usability_details: Vec::new(),
             evidence_scroll: 0,
         };
-        let lines = node_quality_evidence_lines(&detail)
+        let lines = node_quality_evidence_lines(&detail, 96)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -1083,8 +1170,9 @@ mod tests {
         assert!(text.contains("30 MIN HISTORY"));
         assert!(text.contains("No recorded 30-minute history"));
         assert_eq!(buffer[(0, 0)].symbol(), "┌");
-        assert_eq!(buffer[(136, 34)].symbol(), "┘");
-        assert!(row_text(buffer, 33).contains("[Esc/i/Enter] Close"));
+        assert_eq!(buffer[(136, 33)].symbol(), "┘");
+        assert!(row_text(buffer, 32).contains("[Esc/i/Enter] Close"));
+        assert!(row_text(buffer, 34).contains("Esc/i close"));
     }
 
     fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
