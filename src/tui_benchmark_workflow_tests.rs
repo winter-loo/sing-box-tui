@@ -1,12 +1,19 @@
-use super::super::test_support::{install_streaming_probe_run, internet_routes_app, test_app};
+use super::super::test_support::{
+    install_streaming_probe_run, internet_routes_app, test_app, test_db_path,
+};
 use crate::automatic_selection::{NodeViewId, RankingPolicy, SelectionScope};
-use crate::benchmark_workflow::{BenchmarkCompletion, BenchmarkUpdate, SustainedKind};
+use crate::benchmark_workflow::{
+    BenchmarkCompletion, BenchmarkUpdate, BenchmarkWorkflow, ManagedRuntimeObservation,
+    SustainedKind,
+};
 use crate::controller::{
     ApiClient, BenchmarkRequest, ConnectionInfo, ConnectionMetadata, ConnectionsSnapshot,
     NodeReachabilityAssessment, ProbeOutcome, ProxyGroup,
 };
 use crate::storage::{StoredUsabilityProbeRun, UsabilityProbeFactRecord};
-use crate::sustained_quality::{NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome};
+use crate::sustained_quality::{
+    DEFAULT_SUSTAINED_TARGET_URL, NodeSustainedQuality, SustainedCompletion, SustainedProbeOutcome,
+};
 use crate::usability_probe::{UsabilityProbeManifest, UsabilityProbeSource};
 use crossterm::event::KeyCode;
 use std::io::{Read, Write};
@@ -331,6 +338,87 @@ fn auto_select_requires_two_public_completion_rounds_before_controller_write() {
             .detail
             .contains("node-b won two complete rounds")
     );
+}
+
+#[test]
+fn auto_select_releases_persisted_quality_lease_before_refresh() {
+    let controller = FakeController::start("node-b");
+    let database_path = test_db_path();
+    let config_path = database_path.with_extension("auto-select-config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"outbounds":[{"type":"selector","tag":"select","outbounds":["node-a","node-b"]},{"type":"direct","tag":"node-a"},{"type":"direct","tag":"node-b"}]}"#,
+    )
+    .expect("write active config");
+    let mut app = test_app();
+    app.client = ApiClient::new(controller.base_url.clone(), None).expect("test API client");
+    let mut workflow = BenchmarkWorkflow::open(
+        controller.base_url.clone(),
+        app.client.client.clone(),
+        &config_path,
+        &database_path,
+        DEFAULT_SUSTAINED_TARGET_URL,
+    )
+    .expect("open persisted quality workflow");
+    workflow
+        .confirm_managed_runtime_reload(&config_path, &database_path, || {
+            Ok(ManagedRuntimeObservation::new(
+                (),
+                &config_path,
+                controller.base_url.clone(),
+                Some(std::process::id()),
+            ))
+        })
+        .expect("confirm managed runtime");
+    let generation = workflow
+        .acquire_auto_selection_read_lease()
+        .expect("acquire persisted quality lease")
+        .generation();
+    app.benchmark_workflow = workflow;
+    app.groups[0].members = vec!["node-a".into(), "node-b".into()];
+    app.benchmark_filter.clear();
+    let current = reachability("node-a", [100, 100, 100]);
+    let candidate = reachability("node-b", [70, 70, 70]);
+    app.benchmark_workflow
+        .set_reachability_assessment("select", current.clone());
+    app.benchmark_workflow
+        .set_reachability_assessment("select", candidate.clone());
+    let mut scope = auto_selection_scope();
+    scope.quality_generation = generation;
+    let now = Instant::now();
+    app.active_node_traffic.observe(
+        scope.clone(),
+        now - Duration::from_secs(10),
+        &ConnectionsSnapshot::default(),
+    );
+    app.active_node_traffic
+        .observe(scope, now, &ConnectionsSnapshot::default());
+
+    for round_id in [41, 42] {
+        app.apply_benchmark_update(BenchmarkUpdate::Finished(BenchmarkCompletion::AutoSelect {
+            group: "select".into(),
+            round_id,
+            assessments: vec![current.clone(), candidate.clone()],
+            quality_current: true,
+        }))
+        .expect("auto selection completes without waiting on its own quality lease");
+    }
+    assert!(
+        app.status
+            .contains("Automatic selection switched select to node-b")
+    );
+    drop(app);
+    drop(controller);
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&database_path);
+    for suffix in ["-wal", "-shm", ".node-quality-reconciliation.lock"] {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(path));
+    }
+    let mut config_lock = config_path.as_os_str().to_os_string();
+    config_lock.push(".sing-box-tui-config-mutation.lock");
+    let _ = std::fs::remove_file(PathBuf::from(config_lock));
 }
 
 #[test]

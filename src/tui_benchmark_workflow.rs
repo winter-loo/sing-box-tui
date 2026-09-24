@@ -459,34 +459,44 @@ impl App {
         let parent_switch = decision.activate_route.then_some(parent_switch).flatten();
         let plan = AutoSelectionPlan::new(decision, parent_switch, quality_lease);
         let detail = plan.decision.reason.detail();
-        let mut status = if plan.decision.target_node.is_none() && plan.parent_switch.is_none() {
-            format!(
-                "Automatic selection {} [{}]: {detail}",
-                group_name, panel.label
-            )
-        } else {
-            // Keep `plan` intact until both controller writes return: its read lease is the proof
-            // that ranked facts cannot be reconciled between selection and route activation.
-            if let Some(target) = &plan.decision.target_node {
+        let duplicate_round = matches!(
+            plan.decision.reason,
+            AutoSelectionReason::DuplicateRound { .. }
+        );
+        let target_node = plan.decision.target_node.clone();
+        let parent_switch = plan.parent_switch.clone();
+        let has_action = target_node.is_some() || parent_switch.is_some();
+        if has_action {
+            // The lease protects the ranked facts through both controller writes.
+            if let Some(target) = &target_node {
                 self.client
                     .switch_proxy(group_name, target)
                     .with_context(|| {
                         format!("auto-pick failed to switch {} to {}", group_name, target)
                     })?;
             }
-            if let Some((parent, route_group)) = &plan.parent_switch {
+            if let Some((parent, route_group)) = &parent_switch {
                 self.client
                     .switch_proxy(parent, route_group)
                     .with_context(|| {
                         format!("auto-pick failed to switch {} to {}", parent, route_group)
                     })?;
             }
+        }
+        // Refresh reads the quality store again, so release its non-reentrant file lock first.
+        drop(plan);
+        let mut status = if !has_action {
+            format!(
+                "Automatic selection {} [{}]: {detail}",
+                group_name, panel.label
+            )
+        } else {
             if REFRESH_DEBOUNCE > Duration::ZERO {
                 std::thread::sleep(REFRESH_DEBOUNCE);
             }
             self.refresh()?;
             self.save_runtime_state()?;
-            match (&plan.decision.target_node, &plan.parent_switch) {
+            match (&target_node, &parent_switch) {
                 (Some(target), Some((_, route_group))) => format!(
                     "Automatic selection switched {} to {} and selected {}: {}",
                     group_name, target, route_group, detail
@@ -506,11 +516,6 @@ impl App {
             }
         };
 
-        let duplicate_round = matches!(
-            plan.decision.reason,
-            AutoSelectionReason::DuplicateRound { .. }
-        );
-        drop(plan);
         if !duplicate_round {
             let sustained_members = self.auto_selection_evidence_members_for_group(&group);
             let nodes = self.benchmark_workflow.automatic_sustained_candidates(
