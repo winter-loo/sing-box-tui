@@ -366,8 +366,9 @@ Settings 分为：
 
 **Settings 内操作**：
 
-- `Up/Down` 或 `j/k`：移动字段焦点。
-- `Enter`：进入当前字段编辑。
+- 打开时聚焦左侧分组；`Up/Down` 或 `j/k` 在当前焦点区内选择分组或字段，字段选择不跨组。
+- `Enter` 或 `Right/l`：从分组进入该组字段；字段区 `Enter` 编辑当前字段。
+- `Left/h`：从字段区返回分组；`Tab` 在分组与字段之间切换。
 - 编辑时字符键和 `Backspace`：修改值。
 - 编辑时 `Enter`：校验并保存。
 - 编辑时 `Esc`：放弃当前字段修改，仍停留在 Settings。
@@ -650,7 +651,7 @@ Help 必须显示实际 handler 使用的快捷键，并按当前上下文标明
 
 ### HP-02 操作
 
-`Up/Down`、`j/k` 移动；`g/G` 首尾；`?`、`Esc`、`Enter` 关闭；`q` 退出程序。
+打开时聚焦章节标题；`Up/Down` 或 `j/k` 切换章节，`Enter`、`Right/l` 或 `Tab` 进入该章节命令。命令区 `Up/Down` 或 `j/k` 只在当前章节内移动；`Left/h` 或 `Tab` 返回章节。`g/G` 跳到当前层级的首尾；章节区无 Diagnostics 时跳过该空章节。`?`、`Esc` 关闭；命令区 `Enter` 也关闭；`q` 退出程序。
 
 ### HP-03 Diagnostics
 
@@ -660,11 +661,11 @@ Help 必须显示实际 handler 使用的快捷键，并按当前上下文标明
 
 ### SE-01 选择字段
 
-打开后 focused row 位于上次选择的仍可见字段；`Up/Down` 或 `j/k` 移动；列表自动滚动保证 focused row 可见。
+打开后聚焦上次选择字段所属的分组。分组区 `Up/Down` 或 `j/k` 选择有可见字段的分组，并显示该组字段；`Enter`、`Right/l` 或 `Tab` 进入字段区。字段区 `Up/Down` 或 `j/k` 只在当前分组内移动，列表自动滚动保证 focused row 可见；`Left/h` 或 `Tab` 返回分组区。
 
 ### SE-02 编辑字段
 
-`Enter` 进入编辑；输入和 `Backspace` 修改；`Enter` 校验保存；`Esc` 取消本字段修改。
+字段区 `Enter` 进入编辑；输入和 `Backspace` 修改；`Enter` 校验保存；`Esc` 取消本字段修改。
 
 保存失败时输入不丢失。保存成功后退出编辑态，但 Settings 保持打开。
 

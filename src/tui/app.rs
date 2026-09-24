@@ -123,8 +123,9 @@ use view::private_access_auth_display_value;
 use view::{
     Focus, IntranetDetailSection, LeftPaneSection, NodeQualityDetailState, NodeViewPanel,
     OnboardingState, PrivateAccessAuthModal, PrivateAccessProgressEntry,
-    PrivateAccessProgressModal, PrivateAccessProgressTone, SettingsEditState, help_item_count,
-    private_access_auth_initial_value, private_access_progress_title, truncate_for_width,
+    PrivateAccessProgressModal, PrivateAccessProgressTone, SettingsEditState, SettingsPane,
+    HelpPane, jump_help_selection, move_help_selection, private_access_auth_initial_value,
+    private_access_progress_title, truncate_for_width,
 };
 
 const AUTO_SELECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -625,10 +626,12 @@ struct App {
     connections_scroll: usize,
     show_help: bool,
     help_index: usize,
+    help_pane: HelpPane,
     onboarding_complete: bool,
     onboarding: Option<OnboardingState>,
     show_settings: bool,
     settings_index: usize,
+    settings_pane: SettingsPane,
     settings_edit: Option<SettingsEditState>,
     settings_error: Option<String>,
     subscription_refresh: Option<SubscriptionRefreshState>,
@@ -811,7 +814,7 @@ impl App {
             internet_route_index: 0,
             member_index: 0,
             node_view_panel: NodeViewPanel::CurrentSelector,
-            focus: Focus::Groups,
+            focus: Focus::Members,
             left_pane_section: LeftPaneSection::Internet,
             intranet_detail_scroll: 0,
             intranet_detail_section: IntranetDetailSection::Dns,
@@ -865,6 +868,7 @@ impl App {
             connections_scroll: 0,
             show_help: false,
             help_index: 0,
+            help_pane: HelpPane::Sections,
             onboarding_complete,
             onboarding: (!onboarding_complete).then(|| OnboardingState {
                 input: String::new(),
@@ -872,6 +876,7 @@ impl App {
             }),
             show_settings: false,
             settings_index: 0,
+            settings_pane: SettingsPane::Categories,
             settings_edit: None,
             settings_error: None,
             subscription_refresh,
@@ -1149,16 +1154,42 @@ impl App {
         }
         if self.show_help {
             match code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                KeyCode::Esc | KeyCode::Char('?') => {
                     self.show_help = false;
                     self.set_status_only("Help closed");
                 }
+                KeyCode::Enter if self.help_pane == HelpPane::Sections => {
+                    self.help_pane = HelpPane::Commands;
+                }
+                KeyCode::Enter => {
+                    self.show_help = false;
+                    self.set_status_only("Help closed");
+                }
+                KeyCode::Tab => {
+                    self.help_pane = match self.help_pane {
+                        HelpPane::Sections => HelpPane::Commands,
+                        HelpPane::Commands => HelpPane::Sections,
+                    };
+                }
+                KeyCode::Left | KeyCode::Char('h') => self.help_pane = HelpPane::Sections,
+                KeyCode::Right | KeyCode::Char('l') => self.help_pane = HelpPane::Commands,
                 KeyCode::Down | KeyCode::Char('j') => self.move_help_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_help_previous(),
-                KeyCode::Char('g') => self.help_index = 0,
+                KeyCode::Char('g') => {
+                    self.help_index = jump_help_selection(
+                        self.help_index,
+                        self.usability_probe_diagnostics.len(),
+                        self.help_pane,
+                        false,
+                    );
+                }
                 KeyCode::Char('G') => {
-                    self.help_index =
-                        help_item_count(self.usability_probe_diagnostics.len()).saturating_sub(1)
+                    self.help_index = jump_help_selection(
+                        self.help_index,
+                        self.usability_probe_diagnostics.len(),
+                        self.help_pane,
+                        true,
+                    );
                 }
                 KeyCode::Char('q') => return Ok(false),
                 _ => {}
@@ -1216,17 +1247,17 @@ impl App {
                 self.pause_active_probes();
             }
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Tab if self.operational_workspace == OperationalWorkspace::Internet => {
-                self.focus = match self.focus {
-                    Focus::Groups => Focus::Members,
-                    Focus::Members => Focus::Groups,
-                };
-            }
             KeyCode::Tab => {}
-            KeyCode::Right if self.focus == Focus::Members => self.move_node_view_next(),
-            KeyCode::Left if self.focus == Focus::Members => self.move_node_view_previous(),
-            KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Members,
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Groups,
+            KeyCode::Right | KeyCode::Char('l')
+                if self.operational_workspace == OperationalWorkspace::Internet =>
+            {
+                self.move_node_view_next();
+            }
+            KeyCode::Left | KeyCode::Char('h')
+                if self.operational_workspace == OperationalWorkspace::Internet =>
+            {
+                self.move_node_view_previous();
+            }
             KeyCode::Down | KeyCode::Char('j')
                 if self.operational_workspace == OperationalWorkspace::PrivateAccess =>
             {
@@ -1640,17 +1671,27 @@ impl App {
 
     fn open_help_panel(&mut self) {
         self.show_help = true;
+        self.help_pane = HelpPane::Sections;
         self.flash = None;
         self.set_status_only("Showing help");
     }
 
     fn move_help_next(&mut self) {
-        self.help_index = (self.help_index + 1)
-            .min(help_item_count(self.usability_probe_diagnostics.len()).saturating_sub(1));
+        self.help_index = move_help_selection(
+            self.help_index,
+            self.usability_probe_diagnostics.len(),
+            self.help_pane,
+            true,
+        );
     }
 
     fn move_help_previous(&mut self) {
-        self.help_index = self.help_index.saturating_sub(1);
+        self.help_index = move_help_selection(
+            self.help_index,
+            self.usability_probe_diagnostics.len(),
+            self.help_pane,
+            false,
+        );
     }
 }
 
@@ -1845,11 +1886,11 @@ mod navigation_tests {
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
         assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
 
-        // Tab is local to operational pages; workspace switching is an explicit command.
+        // The Internet workspace has no selector pane; Tab cannot change focus.
         assert_eq!(app.focus, Focus::Members);
         app.handle_key(KeyCode::Tab).expect("tab handled");
         assert_eq!(app.operational_workspace, OperationalWorkspace::Internet);
-        assert_eq!(app.focus, Focus::Groups);
+        assert_eq!(app.focus, Focus::Members);
         app.handle_key(KeyCode::Tab).expect("tab handled again");
         assert_eq!(app.focus, Focus::Members);
         app.cycle_operational_workspace().expect("workspace switch");
@@ -2395,7 +2436,7 @@ mod navigation_tests {
             text.push('\n');
         }
         assert!(text.contains("SETTINGS"));
-        assert!(text.contains("Enter edit"));
+        assert!(text.contains("Enter/Right fields"));
         // Dismiss via 's'
         app.handle_settings_key(KeyCode::Char('s')).unwrap();
         assert!(!app.show_settings);

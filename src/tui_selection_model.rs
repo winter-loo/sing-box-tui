@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::view::{
-    IntranetDetailSection, IntranetDetailView, LeftPaneSection, NodeViewPanel,
+    IntranetDetailSection, IntranetDetailView, NodeViewPanel,
     private_access_detail_view,
 };
 use super::{App, Focus};
@@ -128,7 +128,8 @@ impl App {
     }
 
     pub(super) fn showing_intranet_details(&self) -> bool {
-        self.left_pane_section == LeftPaneSection::Intranet && self.private_access.is_configured()
+        self.operational_workspace == crate::tui_state::OperationalWorkspace::PrivateAccess
+            && self.private_access.is_configured()
     }
 
     pub(super) fn intranet_detail_section_key(

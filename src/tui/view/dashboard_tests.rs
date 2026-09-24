@@ -103,7 +103,6 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
     DashboardSnapshot {
         operational_workspace: crate::tui_state::OperationalWorkspace::Internet,
         focus: Focus::Groups,
-        left_pane_section: LeftPaneSection::Internet,
         internet_rows: vec![InternetRow {
             name: "select".to_string(),
             current: "node-a".to_string(),
@@ -172,6 +171,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
         node_quality_detail: None,
         connections: None,
         help_index: None,
+        help_pane: HelpPane::Sections,
         usability_probe_diagnostics: &[],
         settings: None,
         onboarding: None,
@@ -381,6 +381,7 @@ fn settings_overlay_uses_typed_rows() {
             value: "https://example.test/ping".to_string(),
         }],
         selected: 0,
+        pane: SettingsPane::Categories,
         editing: None,
         error: None,
     });
@@ -452,7 +453,7 @@ fn intranet_detail_is_rendered_from_the_typed_profile_snapshot() {
     profile.domain_suffixes = vec!["corp.example".to_string()];
     let expanded_sections = BTreeSet::new();
     let mut snapshot = dashboard_snapshot();
-    snapshot.left_pane_section = LeftPaneSection::Intranet;
+    snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
     snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
@@ -484,7 +485,6 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
 
     let mut snapshot = dashboard_snapshot();
     snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
-    snapshot.left_pane_section = LeftPaneSection::Intranet;
     snapshot.intranet_rows = vec![
         IntranetRow {
             id: "hillstone".to_string(),
@@ -549,7 +549,6 @@ fn intranet_expansion_reserves_a_detail_pane_and_collapse_restores_full_width() 
     let collapsed = BTreeSet::new();
     let mut snapshot = dashboard_snapshot();
     snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
-    snapshot.left_pane_section = LeftPaneSection::Intranet;
     snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
@@ -654,7 +653,6 @@ fn failed_intranet_session_hides_stale_granted_resources_at_all_supported_sizes(
 
     let mut snapshot = dashboard_snapshot();
     snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
-    snapshot.left_pane_section = LeftPaneSection::Intranet;
     snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
     snapshot.intranet_detail = Some(IntranetDetailSnapshot {
         profile: &profile,
@@ -690,7 +688,6 @@ fn intranet_lifecycle_states_keep_status_and_resource_copy_truthful() {
         let expanded = BTreeSet::from(["hillstone:dns".to_string()]);
         let mut snapshot = dashboard_snapshot();
         snapshot.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
-        snapshot.left_pane_section = LeftPaneSection::Intranet;
         snapshot.intranet_rows = vec![IntranetRow::from_profile(&profile)];
         snapshot.intranet_detail = Some(IntranetDetailSnapshot {
             profile: &profile,

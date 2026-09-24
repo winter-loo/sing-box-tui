@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use super::view::{Focus, LeftPaneSection, NodeViewPanel};
 use super::{App, DIRECT_CLASH_MODE, GLOBAL_CLASH_MODE, REFRESH_DEBOUNCE, RULE_CLASH_MODE};
+use crate::tui_state::OperationalWorkspace;
 
 fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
     let modes = if mode_list.is_empty() {
@@ -26,7 +27,15 @@ fn next_clash_mode(current: Option<&str>, mode_list: &[String]) -> String {
 mod tests;
 
 impl App {
+    fn focus_internet_candidates(&mut self) {
+        if self.operational_workspace == OperationalWorkspace::Internet {
+            self.focus = Focus::Members;
+            self.left_pane_section = LeftPaneSection::Internet;
+        }
+    }
+
     pub(super) fn move_next(&mut self) {
+        self.focus_internet_candidates();
         match self.focus {
             Focus::Groups => match self.left_pane_section {
                 LeftPaneSection::Internet => {
@@ -77,6 +86,7 @@ impl App {
     }
 
     pub(super) fn move_previous(&mut self) {
+        self.focus_internet_candidates();
         match self.focus {
             Focus::Groups => match self.left_pane_section {
                 LeftPaneSection::Internet => {
@@ -128,6 +138,7 @@ impl App {
     }
 
     pub(super) fn move_first(&mut self) {
+        self.focus_internet_candidates();
         match self.focus {
             Focus::Groups => {
                 self.left_pane_section = LeftPaneSection::Internet;
@@ -152,6 +163,7 @@ impl App {
     }
 
     pub(super) fn move_last(&mut self) {
+        self.focus_internet_candidates();
         match self.focus {
             Focus::Groups => {
                 if self.private_access.is_configured() {
@@ -185,6 +197,7 @@ impl App {
     }
 
     pub(super) fn activate_selection(&mut self) -> Result<()> {
+        self.focus_internet_candidates();
         if self.showing_intranet_details() {
             let profile_id = self.private_access.focused().id.clone();
             self.focus = Focus::Members;

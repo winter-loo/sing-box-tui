@@ -16,7 +16,10 @@ use crate::ruleset::download_china_ip_routing_rulesets;
 
 use super::App;
 use super::verification::parse_verification_targets;
-use super::view::{SETTINGS_FIELDS, SettingsEditState, SettingsField, settings_field_label};
+use super::view::{
+    SETTINGS_CATEGORIES, SETTINGS_FIELDS, SettingsEditState, SettingsField, SettingsPane,
+    settings_category, settings_field_label,
+};
 
 #[cfg(test)]
 #[path = "tui_settings_tests.rs"]
@@ -41,6 +44,57 @@ pub(super) fn visible_settings_fields(app: &App) -> Vec<SettingsField> {
                     .is_some_and(|profile| profile.manifest.id == "sonicwall")
         })
         .collect()
+}
+
+fn move_settings_selection(
+    fields: &[SettingsField],
+    selected: usize,
+    pane: SettingsPane,
+    forward: bool,
+) -> usize {
+    let Some(&field) = fields.get(selected) else {
+        return 0;
+    };
+    let category = settings_category(field);
+    match pane {
+        SettingsPane::Categories => {
+            let categories = 0..SETTINGS_CATEGORIES.len();
+            let next = if forward {
+                categories.filter(|next| *next > category).find(|next| {
+                    fields
+                        .iter()
+                        .any(|field| settings_category(*field) == *next)
+                })
+            } else {
+                categories
+                    .rev()
+                    .filter(|next| *next < category)
+                    .find(|next| {
+                        fields
+                            .iter()
+                            .any(|field| settings_category(*field) == *next)
+                    })
+            };
+            next.and_then(|category| {
+                fields
+                    .iter()
+                    .position(|field| settings_category(*field) == category)
+            })
+            .unwrap_or(selected)
+        }
+        SettingsPane::Fields => {
+            let next = if forward {
+                selected.saturating_add(1)
+            } else {
+                selected.saturating_sub(1)
+            };
+            fields
+                .get(next)
+                .filter(|next_field| settings_category(**next_field) == category)
+                .map(|_| next)
+                .unwrap_or(selected)
+        }
+    }
 }
 
 pub(super) fn is_private_access_settings_field(field: SettingsField) -> bool {
@@ -204,6 +258,7 @@ impl App {
     pub(super) fn open_settings_panel(&mut self) {
         self.show_settings = true;
         self.settings_edit = None;
+        self.settings_pane = SettingsPane::Categories;
         let field_count = visible_settings_fields(self).len();
         self.settings_index = self.settings_index.min(field_count.saturating_sub(1));
         self.flash = None;
@@ -224,14 +279,38 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_error = None;
-                self.settings_index = (self.settings_index + 1).min(fields.len().saturating_sub(1));
+                self.settings_index =
+                    move_settings_selection(&fields, self.settings_index, self.settings_pane, true);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_error = None;
-                self.settings_index = self.settings_index.saturating_sub(1);
+                self.settings_index = move_settings_selection(
+                    &fields,
+                    self.settings_index,
+                    self.settings_pane,
+                    false,
+                );
             }
-            KeyCode::Enter => {
-                let field = fields[self.settings_index];
+            KeyCode::Tab => {
+                self.settings_error = None;
+                self.settings_pane = match self.settings_pane {
+                    SettingsPane::Categories => SettingsPane::Fields,
+                    SettingsPane::Fields => SettingsPane::Categories,
+                };
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.settings_error = None;
+                self.settings_pane = SettingsPane::Categories;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.settings_error = None;
+                self.settings_pane = SettingsPane::Fields;
+            }
+            KeyCode::Enter if self.settings_pane == SettingsPane::Categories => {
+                self.settings_error = None;
+                self.settings_pane = SettingsPane::Fields;
+            }
+            KeyCode::Enter if let Some(&field) = fields.get(self.settings_index) => {
                 self.settings_error = None;
                 self.settings_edit = Some(SettingsEditState {
                     field,

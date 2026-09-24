@@ -11,13 +11,20 @@ struct HelpBinding {
     detail: &'static str,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HelpSection {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelpSection {
     Navigation,
-    Probes,
     Panels,
-    NetworkApp,
     General,
+    Probes,
+    NetworkApp,
+    Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelpPane {
+    Sections,
+    Commands,
 }
 
 impl HelpSection {
@@ -28,17 +35,27 @@ impl HelpSection {
             Self::Panels => "PANELS",
             Self::NetworkApp => "NETWORK / APP",
             Self::General => "GENERAL",
+            Self::Diagnostics => "DIAGNOSTICS",
         }
     }
 }
+
+const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection::Navigation,
+    HelpSection::Panels,
+    HelpSection::General,
+    HelpSection::Probes,
+    HelpSection::NetworkApp,
+    HelpSection::Diagnostics,
+];
 
 const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         key: "up",
         category: "Navigation",
         section: HelpSection::Navigation,
-        summary: "Move up / scroll details",
-        detail: "Move the highlighted row up, or scroll Intranet Proxy details when the right pane is focused.",
+        summary: "Move up / select details",
+        detail: "Move up the Internet node list, or select the previous Private Access detail section.",
     },
     HelpBinding {
         key: "k",
@@ -51,8 +68,8 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         key: "down",
         category: "Navigation",
         section: HelpSection::Navigation,
-        summary: "Move down / scroll details",
-        detail: "Move the highlighted row down, crossing from Internet Proxy into Intranet Proxy, or scroll right-pane details.",
+        summary: "Move down / select details",
+        detail: "Move down the Internet node list, or select the next Private Access detail section.",
     },
     HelpBinding {
         key: "j",
@@ -62,46 +79,39 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Vim-style shortcut for moving the highlighted row down.",
     },
     HelpBinding {
-        key: "tab",
-        category: "Navigation",
-        section: HelpSection::Navigation,
-        summary: "Switch pane",
-        detail: "In Internet Proxy, move focus between the selector/group pane and the candidate node pane.",
-    },
-    HelpBinding {
         key: "h",
         category: "Navigation",
         section: HelpSection::Navigation,
-        summary: "Switch to left pane",
-        detail: "Move focus to the pane on the left.",
+        summary: "Previous node-view tab",
+        detail: "In Internet Proxy, move to the previous node-view tab.",
     },
     HelpBinding {
         key: "l",
         category: "Navigation",
         section: HelpSection::Navigation,
-        summary: "Switch to right pane",
-        detail: "Move focus to the pane on the right.",
+        summary: "Next node-view tab",
+        detail: "In Internet Proxy, move to the next node-view tab.",
     },
     HelpBinding {
         key: "left/right",
         category: "Navigation",
         section: HelpSection::Navigation,
         summary: "Switch node-view tab",
-        detail: "When the candidate pane is focused, move between built-in and discovered custom views without changing the live selector.",
+        detail: "Move between Internet node-view tabs without changing the live selector.",
     },
     HelpBinding {
         key: "g",
         category: "Navigation",
         section: HelpSection::Navigation,
         summary: "Move to first item",
-        detail: "Jump to the first item in the focused list.",
+        detail: "Jump to the first Internet node.",
     },
     HelpBinding {
         key: "G",
         category: "Navigation",
         section: HelpSection::Navigation,
         summary: "Move to last item",
-        detail: "Jump to the last item in the focused list.",
+        detail: "Jump to the last Internet node.",
     },
     HelpBinding {
         key: "space",
@@ -227,7 +237,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         category: "Actions",
         section: HelpSection::Panels,
         summary: "Open settings",
-        detail: "Edit quick assessment, sustained quality, automatic selection, and system proxy settings.",
+        detail: "Choose a settings category with j/k, enter its fields with Enter/Right, and return with Left/Tab.",
     },
     HelpBinding {
         key: "r",
@@ -254,8 +264,29 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         key: "enter",
         category: "General",
         section: HelpSection::General,
-        summary: "Close help",
-        detail: "Close this keybindings panel.",
+        summary: "Browse / close help",
+        detail: "When Help is open, enter the selected section's commands; press again on a command to close Help.",
+    },
+    HelpBinding {
+        key: "left/h",
+        category: "General",
+        section: HelpSection::General,
+        summary: "Select help sections",
+        detail: "When Help is open, move focus from commands back to section headings.",
+    },
+    HelpBinding {
+        key: "right/l",
+        category: "General",
+        section: HelpSection::General,
+        summary: "Browse help commands",
+        detail: "When Help is open, move focus into the selected section's commands.",
+    },
+    HelpBinding {
+        key: "tab",
+        category: "General",
+        section: HelpSection::General,
+        summary: "Switch help focus",
+        detail: "When Help is open, switch between section headings and their commands.",
     },
     HelpBinding {
         key: "q",
@@ -270,6 +301,96 @@ pub(crate) fn help_item_count(diagnostic_count: usize) -> usize {
     HELP_BINDINGS.len().saturating_add(diagnostic_count)
 }
 
+pub(crate) fn help_section_at(index: usize, diagnostic_count: usize) -> HelpSection {
+    if diagnostic_count > 0 && index >= HELP_BINDINGS.len() {
+        HelpSection::Diagnostics
+    } else {
+        HELP_BINDINGS[index.min(HELP_BINDINGS.len() - 1)].section
+    }
+}
+
+fn help_indices_in_section(section: HelpSection, diagnostic_count: usize) -> Vec<usize> {
+    if section == HelpSection::Diagnostics {
+        return (HELP_BINDINGS.len()..help_item_count(diagnostic_count)).collect();
+    }
+    HELP_BINDINGS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, binding)| (binding.section == section).then_some(index))
+        .collect()
+}
+
+pub(crate) fn move_help_selection(
+    selected: usize,
+    diagnostic_count: usize,
+    pane: HelpPane,
+    forward: bool,
+) -> usize {
+    let selected = selected.min(help_item_count(diagnostic_count).saturating_sub(1));
+    let section = help_section_at(selected, diagnostic_count);
+    match pane {
+        HelpPane::Sections => {
+            let sections = HELP_SECTIONS
+                .iter()
+                .copied()
+                .filter(|section| !help_indices_in_section(*section, diagnostic_count).is_empty())
+                .collect::<Vec<_>>();
+            let position = sections
+                .iter()
+                .position(|candidate| *candidate == section)
+                .unwrap_or(0);
+            let next = if forward {
+                (position + 1).min(sections.len().saturating_sub(1))
+            } else {
+                position.saturating_sub(1)
+            };
+            help_indices_in_section(sections[next], diagnostic_count)[0]
+        }
+        HelpPane::Commands => {
+            let indices = help_indices_in_section(section, diagnostic_count);
+            let position = indices
+                .iter()
+                .position(|index| *index == selected)
+                .unwrap_or(0);
+            let next = if forward {
+                (position + 1).min(indices.len().saturating_sub(1))
+            } else {
+                position.saturating_sub(1)
+            };
+            indices[next]
+        }
+    }
+}
+
+pub(crate) fn jump_help_selection(
+    selected: usize,
+    diagnostic_count: usize,
+    pane: HelpPane,
+    to_end: bool,
+) -> usize {
+    let selected = selected.min(help_item_count(diagnostic_count).saturating_sub(1));
+    let section = if pane == HelpPane::Sections {
+        let sections = HELP_SECTIONS
+            .iter()
+            .copied()
+            .filter(|section| !help_indices_in_section(*section, diagnostic_count).is_empty())
+            .collect::<Vec<_>>();
+        if to_end {
+            *sections.last().unwrap_or(&HelpSection::Navigation)
+        } else {
+            *sections.first().unwrap_or(&HelpSection::Navigation)
+        }
+    } else {
+        help_section_at(selected, diagnostic_count)
+    };
+    let indices = help_indices_in_section(section, diagnostic_count);
+    if to_end {
+        *indices.last().unwrap_or(&selected)
+    } else {
+        *indices.first().unwrap_or(&selected)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn has_help_binding(key: &str, summary: &str) -> bool {
     HELP_BINDINGS
@@ -280,16 +401,18 @@ pub(crate) fn has_help_binding(key: &str, summary: &str) -> bool {
 pub(crate) fn draw_help_panel(
     frame: &mut Frame,
     help_index: usize,
+    help_pane: HelpPane,
     diagnostics: &[ManifestDiagnostic],
 ) {
     use ratatui::layout::Rect;
     let theme = Theme::detect();
     let selected = help_index.min(help_item_count(diagnostics.len()).saturating_sub(1));
+    let selected_section = help_section_at(selected, diagnostics.len());
     let (body, helper) = render_workbench_shell(
         frame,
         "KEYBINDINGS",
         &format!("{} COMMANDS", HELP_BINDINGS.len()),
-        "Esc/? close   j/k navigate   Ctrl+K actions",
+        "Esc/? close   Ctrl+K actions   h/l pane   j/k select",
         &theme,
     );
     if body.width == 0 || body.height == 0 {
@@ -344,19 +467,38 @@ pub(crate) fn draw_help_panel(
     };
     for column in 0..column_count {
         let x = command_inner.x + column as u16 * (column_width + 2);
-        let mut rows: Vec<(Option<usize>, String)> = Vec::new();
-        if two_columns {
-            let sections: &[HelpSection] = if column == 0 {
+        let mut rows: Vec<(Option<usize>, HelpSection, String)> = Vec::new();
+        let sections: &[HelpSection] = if two_columns {
+            if column == 0 {
                 &[
                     HelpSection::Navigation,
                     HelpSection::Panels,
                     HelpSection::General,
                 ]
             } else {
-                &[HelpSection::Probes, HelpSection::NetworkApp]
-            };
-            for section in sections {
-                rows.push((None, section.label().to_string()));
+                &[
+                    HelpSection::Probes,
+                    HelpSection::NetworkApp,
+                    HelpSection::Diagnostics,
+                ]
+            }
+        } else {
+            HELP_SECTIONS
+        };
+        for section in sections {
+            if *section == HelpSection::Diagnostics && diagnostics.is_empty() {
+                continue;
+            }
+            rows.push((None, *section, section.label().to_string()));
+            if *section == HelpSection::Diagnostics {
+                for (index, diagnostic) in diagnostics.iter().enumerate() {
+                    rows.push((
+                        Some(HELP_BINDINGS.len() + index),
+                        *section,
+                        format!("! {}: {}", diagnostic.path, diagnostic.message),
+                    ));
+                }
+            } else {
                 for (index, binding) in HELP_BINDINGS
                     .iter()
                     .enumerate()
@@ -364,40 +506,36 @@ pub(crate) fn draw_help_panel(
                 {
                     rows.push((
                         Some(index),
+                        *section,
                         format!("{:<10} {}", binding.key, binding.summary),
                     ));
                 }
             }
-        } else {
-            let mut previous_category = "";
-            for (index, binding) in HELP_BINDINGS.iter().enumerate() {
-                if binding.category != previous_category {
-                    rows.push((None, binding.category.to_ascii_uppercase()));
-                    previous_category = binding.category;
-                }
-                rows.push((
-                    Some(index),
-                    format!("{:<10} {}", binding.key, binding.summary),
-                ));
-            }
-        }
-        if column == column_count - 1 && !diagnostics.is_empty() {
-            rows.push((None, "DIAGNOSTICS".into()));
-            for (index, diagnostic) in diagnostics.iter().enumerate() {
-                rows.push((
-                    Some(HELP_BINDINGS.len() + index),
-                    format!("! {}: {}", diagnostic.path, diagnostic.message),
-                ));
-            }
         }
         let visible = command_inner.height.saturating_sub(2) as usize;
-        let selected_position = rows.iter().position(|(index, _)| *index == Some(selected));
+        let selected_position = rows.iter().position(|(index, section, _)| {
+            if help_pane == HelpPane::Sections {
+                index.is_none() && *section == selected_section
+            } else {
+                *index == Some(selected)
+            }
+        });
         let first = selected_position
             .map(|position| position.saturating_sub(visible.saturating_sub(1)))
             .unwrap_or(0);
-        for (display, (index, text)) in rows.iter().skip(first).take(visible).enumerate() {
+        for (display, (index, section, text)) in rows.iter().skip(first).take(visible).enumerate() {
             let y = command_inner.y + 2 + display as u16;
-            let style = if *index == Some(selected) {
+            let focused = if help_pane == HelpPane::Sections {
+                index.is_none() && *section == selected_section
+            } else {
+                *index == Some(selected)
+            };
+            let marker = if focused {
+                if index.is_none() { "* " } else { "> " }
+            } else {
+                "  "
+            };
+            let style = if focused {
                 theme.style_focused_row()
             } else if index.is_none() {
                 theme.style_muted()
@@ -405,7 +543,11 @@ pub(crate) fn draw_help_panel(
                 theme.style_base()
             };
             frame.render_widget(
-                Paragraph::new(truncate_for_width(text, column_width as usize)).style(style),
+                Paragraph::new(truncate_for_width(
+                    &format!("{marker}{text}"),
+                    column_width as usize,
+                ))
+                .style(style),
                 Rect::new(x, y, column_width, 1),
             );
         }
@@ -486,17 +628,19 @@ pub(crate) fn draw_help_panel(
             ),
         );
     }
-    frame.render_widget(
-        Paragraph::new("Ctrl+K actions   j/k navigate   Esc/? close").style(theme.style_muted()),
-        helper,
-    );
+    let hint = if help_pane == HelpPane::Sections {
+        "Ctrl+K actions   j/k section   Enter/Right commands"
+    } else {
+        "Ctrl+K actions   j/k command   Left/Tab sections"
+    };
+    frame.render_widget(Paragraph::new(hint).style(theme.style_muted()), helper);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
@@ -513,7 +657,9 @@ mod tests {
     fn help_reference_layout_keeps_sections_detail_and_close_visible() {
         for (width, height) in [(120, 30), (80, 24), (140, 26)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| draw_help_panel(f, 19, &[])).unwrap();
+            terminal
+                .draw(|f| draw_help_panel(f, 19, HelpPane::Commands, &[]))
+                .unwrap();
             let buffer = terminal.backend().buffer();
             let row = |y| {
                 (0..width)
@@ -552,7 +698,14 @@ mod tests {
         for (width, height) in [(80, 24), (120, 30)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|f| draw_help_panel(f, help_item_count(diagnostics.len()) - 1, &diagnostics))
+                .draw(|f| {
+                    draw_help_panel(
+                        f,
+                        help_item_count(diagnostics.len()) - 1,
+                        HelpPane::Commands,
+                        &diagnostics,
+                    )
+                })
                 .unwrap();
             let text = buffer_text(terminal.backend().buffer());
             for expected in [
@@ -574,7 +727,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                draw_help_panel(f, 0, &[]);
+                draw_help_panel(f, 0, HelpPane::Sections, &[]);
             })
             .unwrap();
 
@@ -592,5 +745,27 @@ mod tests {
         assert!(text.contains("NAVIGATION"));
         assert!(text.contains("SELECTED COMMAND"));
         assert!(text.contains("Esc/? close"));
+    }
+
+    #[test]
+    fn help_marks_the_focused_section_or_command() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let panels_index = HELP_BINDINGS
+            .iter()
+            .position(|binding| binding.section == HelpSection::Panels)
+            .unwrap();
+        terminal
+            .draw(|frame| draw_help_panel(frame, panels_index, HelpPane::Sections, &[]))
+            .unwrap();
+        let sections = buffer_text(terminal.backend().buffer());
+        assert!(sections.contains("* PANELS"));
+        assert!(sections.contains("j/k section"));
+
+        terminal
+            .draw(|frame| draw_help_panel(frame, panels_index, HelpPane::Commands, &[]))
+            .unwrap();
+        let commands = buffer_text(terminal.backend().buffer());
+        assert!(commands.contains("> i"));
+        assert!(commands.contains("j/k command"));
     }
 }

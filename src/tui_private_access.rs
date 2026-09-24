@@ -990,6 +990,7 @@ mod tests {
             .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
 
         app.focus = Focus::Groups;
+        app.operational_workspace = OperationalWorkspace::PrivateAccess;
         app.left_pane_section = LeftPaneSection::Intranet;
         app.private_access.focused_index = 0;
 

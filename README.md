@@ -547,10 +547,10 @@ Detached auto-pick worker commands are available separately:
 - `i`: show node-quality evidence and the latest automatic-selection explanation; use `j` / `k` to scroll
 - `c`: show active sing-box connections, including inbound type, destination, outbound chain, and route rule; press `r` in this panel to refresh immediately
 - `v`: immediately start configured background verification checks
-- `o`: open TUI settings for quick assessment, sustained quality, automatic selection, and system proxy values
+- `o`: open TUI settings; select a category with `j`/`k`, enter its fields with `Enter` or `Right`, and return with `Left` or `Tab`
 - `/`: change the node-name filter; comma-separated include values match any value, and `!` or `-` prefixes exclude values, for example `美国,香港,!倍率`
 - `r`: refresh groups
-- `?`: show the help modal; use `Up` / `Down` or `j` / `k` to browse it
+- `?`: show Help; use `j`/`k` to select a section, `Enter` or `Right` to browse its commands, and `Left` or `Tab` to return
 
 The TUI deliberately leaves terminal mouse capture disabled. Drag with the mouse to select text using your terminal's native selection and copy behavior.
 - `q`: quit

@@ -566,7 +566,7 @@ fn streaming_panel_filters_ranks_and_preserves_selector_members() {
 }
 
 #[test]
-fn arrow_keys_switch_tabs_only_while_candidate_pane_is_focused() {
+fn arrow_and_vim_keys_switch_internet_node_view_tabs() {
     let mut app = test_app();
     assert_eq!(
         app.node_view_panel,
@@ -581,9 +581,9 @@ fn arrow_keys_switch_tabs_only_while_candidate_pane_is_focused() {
         super::super::NodeViewPanel::CurrentSelector
     );
 
+    app.handle_key(KeyCode::Char('l')).unwrap();
+    assert_eq!(app.node_view_panel, super::super::NodeViewPanel::Streaming);
     app.handle_key(KeyCode::Char('h')).unwrap();
-    assert_eq!(app.focus, super::super::Focus::Groups);
-    app.handle_key(KeyCode::Right).unwrap();
     assert_eq!(app.focus, super::super::Focus::Members);
     assert_eq!(
         app.node_view_panel,

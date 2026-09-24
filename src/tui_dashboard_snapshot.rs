@@ -564,6 +564,7 @@ impl App {
                 .or_else(|| self.settings_error.clone());
             SettingsPanelSnapshot {
                 selected: self.settings_index.min(rows.len().saturating_sub(1)),
+                pane: self.settings_pane,
                 rows,
                 editing,
                 error,
@@ -573,7 +574,6 @@ impl App {
         DashboardSnapshot {
             operational_workspace: self.operational_workspace,
             focus: self.focus,
-            left_pane_section: self.left_pane_section,
             internet_rows,
             internet_selected: self.displayed_group_index(),
             intranet_rows,
@@ -599,6 +599,7 @@ impl App {
             node_quality_detail: self.node_quality_detail.as_ref(),
             connections,
             help_index: self.show_help.then_some(self.help_index),
+            help_pane: self.help_pane,
             usability_probe_diagnostics: &self.usability_probe_diagnostics,
             settings,
             onboarding: self.onboarding.as_ref(),

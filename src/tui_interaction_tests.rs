@@ -7,6 +7,7 @@ use crate::private_access::PrivateAccessAuthField;
 use crate::private_access_session::PrivateAccessRuntime;
 use crate::tui_state::{PrivateAccessProfileState, TuiRuntimeState};
 use crossterm::event::KeyCode;
+use super::view::{HelpPane, HelpSection, help_section_at};
 
 #[test]
 fn tun_toggle_is_documented_in_help_and_status_bar() {
@@ -43,6 +44,7 @@ fn status_header_tracks_filter_clash_and_pick_mode() {
 fn status_header_keeps_empty_filter_label_in_intranet_details() {
     let mut app = test_app();
     app.benchmark_filter.clear();
+    app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
     app.left_pane_section = LeftPaneSection::Intranet;
 
     let snapshot = app.view_snapshot();
@@ -81,18 +83,55 @@ fn question_mark_opens_and_closes_help() {
 fn help_panel_moves_selection_with_keyboard() {
     let mut app = test_app();
     app.handle_key(KeyCode::Char('?')).expect("open help");
+    assert_eq!(app.help_pane, HelpPane::Sections);
 
-    app.handle_key(KeyCode::Down).expect("move down");
-    assert_eq!(app.help_index, 1);
+    app.handle_key(KeyCode::Down).expect("next section");
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::Panels);
 
-    app.handle_key(KeyCode::Char('j')).expect("move down");
-    assert_eq!(app.help_index, 2);
+    app.handle_key(KeyCode::Char('j')).expect("next section");
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::General);
 
-    app.handle_key(KeyCode::Up).expect("move up");
-    assert_eq!(app.help_index, 1);
+    app.handle_key(KeyCode::Up).expect("previous section");
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::Panels);
 
-    app.handle_key(KeyCode::Char('k')).expect("move up");
-    assert_eq!(app.help_index, 0);
+    app.handle_key(KeyCode::Right).expect("enter commands");
+    assert_eq!(app.help_pane, HelpPane::Commands);
+    let first_command = app.help_index;
+    app.handle_key(KeyCode::Char('j')).expect("next command");
+    assert_ne!(app.help_index, first_command);
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::Panels);
+    for _ in 0..20 {
+        app.handle_key(KeyCode::Down).expect("stay within section");
+    }
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::Panels);
+    app.handle_key(KeyCode::Char('g')).expect("first command");
+    assert_eq!(app.help_index, first_command);
+
+    app.handle_key(KeyCode::Char('h')).expect("return to sections");
+    assert_eq!(app.help_pane, HelpPane::Sections);
+    app.handle_key(KeyCode::Char('G')).expect("last section");
+    assert_eq!(help_section_at(app.help_index, 0), HelpSection::NetworkApp);
+    app.handle_key(KeyCode::Char('l')).expect("enter commands");
+    assert_eq!(app.help_pane, HelpPane::Commands);
+    app.handle_key(KeyCode::Tab).expect("switch back to sections");
+    assert_eq!(app.help_pane, HelpPane::Sections);
+}
+
+#[test]
+fn help_diagnostics_are_the_last_browsable_section() {
+    let mut app = test_app();
+    app.usability_probe_diagnostics.push(super::ManifestDiagnostic {
+        path: "bad-probe.json".into(),
+        message: "invalid manifest".into(),
+    });
+    app.open_help_panel();
+    app.handle_key(KeyCode::Char('G')).expect("last section");
+    assert_eq!(help_section_at(app.help_index, 1), HelpSection::Diagnostics);
+    app.handle_key(KeyCode::Enter).expect("enter diagnostics");
+    assert_eq!(app.help_pane, HelpPane::Commands);
+    assert!(app.show_help);
+    app.handle_key(KeyCode::Enter).expect("close from command");
+    assert!(!app.show_help);
 }
 
 #[test]

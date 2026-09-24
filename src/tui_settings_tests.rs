@@ -1,6 +1,7 @@
 use super::super::test_support::{install_streaming_probe_run, test_app};
 use crossterm::event::KeyCode;
 
+use super::super::view::SettingsPane;
 use super::{
     SettingsEditState, SettingsField, settings_field_display_value, settings_field_value,
     visible_settings_fields,
@@ -28,6 +29,81 @@ fn china_ip_routing_settings_field_reflects_enabled_state() {
         "true"
     );
     assert!(visible_settings_fields(&app).contains(&SettingsField::ChinaIpRouting));
+}
+
+#[test]
+fn settings_keyboard_selects_category_then_field_without_crossing_categories() {
+    let mut app = test_app();
+    app.open_settings_panel();
+    assert_eq!(app.settings_pane, SettingsPane::Categories);
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::BenchmarkUrl
+    );
+
+    app.handle_settings_key(KeyCode::Down).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::SystemProxyServer
+    );
+    app.handle_settings_key(KeyCode::Enter).unwrap();
+    assert_eq!(app.settings_pane, SettingsPane::Fields);
+    assert!(app.settings_edit.is_none());
+
+    app.handle_settings_key(KeyCode::Down).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::ChinaIpRouting
+    );
+    app.handle_settings_key(KeyCode::Down).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::ChinaIpRouting
+    );
+    app.handle_settings_key(KeyCode::Enter).unwrap();
+    assert_eq!(
+        app.settings_edit.as_ref().map(|edit| edit.field),
+        Some(SettingsField::ChinaIpRouting)
+    );
+    app.handle_settings_key(KeyCode::Esc).unwrap();
+    assert!(app.settings_edit.is_none());
+
+    app.handle_settings_key(KeyCode::Left).unwrap();
+    assert_eq!(app.settings_pane, SettingsPane::Categories);
+    app.handle_settings_key(KeyCode::Down).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::TailscaleEnabled
+    );
+    app.handle_settings_key(KeyCode::Tab).unwrap();
+    assert_eq!(app.settings_pane, SettingsPane::Fields);
+    app.handle_settings_key(KeyCode::Up).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::TailscaleEnabled
+    );
+}
+
+#[test]
+fn settings_category_navigation_skips_groups_without_visible_fields() {
+    let mut app = test_app();
+    app.private_access.profiles.clear();
+    app.open_settings_panel();
+
+    for _ in 0..4 {
+        app.handle_settings_key(KeyCode::Char('j')).unwrap();
+    }
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::TailscaleEnabled
+    );
+    app.handle_settings_key(KeyCode::Char('l')).unwrap();
+    assert_eq!(app.settings_pane, SettingsPane::Fields);
+    app.handle_settings_key(KeyCode::Char('k')).unwrap();
+    assert_eq!(
+        visible_settings_fields(&app)[app.settings_index],
+        SettingsField::TailscaleEnabled
+    );
 }
 
 #[test]

@@ -59,6 +59,12 @@ pub(crate) struct SettingsEditState {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsPane {
+    Categories,
+    Fields,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SettingRow {
     pub(crate) field: SettingsField,
@@ -70,13 +76,17 @@ pub(crate) struct SettingRow {
 pub(crate) struct SettingsPanelSnapshot {
     pub(crate) rows: Vec<SettingRow>,
     pub(crate) selected: usize,
+    pub(crate) pane: SettingsPane,
     pub(crate) editing: Option<(&'static str, String)>,
     pub(crate) error: Option<String>,
 }
 
 use crate::tui::ds::Theme;
 
-fn settings_category(field: SettingsField) -> usize {
+pub(crate) const SETTINGS_CATEGORIES: [&str; 4] =
+    ["PROBES", "NETWORK", "TAILSCALE", "PRIVATE ACCESS"];
+
+pub(crate) fn settings_category(field: SettingsField) -> usize {
     match field {
         SettingsField::BenchmarkUrl
         | SettingsField::SustainedTargetUrl
@@ -120,7 +130,11 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
             selected + usize::from(!settings.rows.is_empty()),
             settings.rows.len()
         ),
-        "Esc close   Enter edit   j/k navigate",
+        if settings.editing.is_some() {
+            "Esc cancel edit   Enter save"
+        } else {
+            "Esc close   Tab pane   j/k select   Enter open/edit"
+        },
         &theme,
     );
     if body.width == 0 || body.height == 0 {
@@ -139,17 +153,23 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
         body.width.saturating_sub(rail_width + gap),
         body.height,
     );
-    for pane in [rail, fields] {
+    for (pane, focused) in [
+        (rail, settings.pane == SettingsPane::Categories),
+        (fields, settings.pane == SettingsPane::Fields),
+    ] {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme.style_muted())
+                .border_style(if focused {
+                    ratatui::style::Style::default().fg(theme.border_focus())
+                } else {
+                    theme.style_muted()
+                })
                 .style(theme.style_base()),
             pane,
         );
     }
-    let categories = ["PROBES", "NETWORK", "TAILSCALE", "PRIVATE ACCESS"];
-    let counts: Vec<usize> = (0..4)
+    let counts: Vec<usize> = (0..SETTINGS_CATEGORIES.len())
         .map(|category| {
             settings
                 .rows
@@ -163,7 +183,7 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
             Paragraph::new("CATEGORIES").style(theme.style_muted()),
             Rect::new(rail.x + 2, rail.y + 1, rail.width.saturating_sub(3), 1),
         );
-        for (index, category) in categories.iter().enumerate() {
+        for (index, category) in SETTINGS_CATEGORIES.iter().enumerate() {
             let y = rail.y + 3 + (index as u16) * 2;
             if y >= rail.bottom().saturating_sub(1) {
                 break;
@@ -172,11 +192,13 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
             let label = truncate_for_width(category, rail.width.saturating_sub(7) as usize);
             let line = format!("{marker} {label}  {:02}", counts[index]);
             frame.render_widget(
-                Paragraph::new(line).style(if index == active_category {
-                    theme.style_focused_row()
-                } else {
-                    theme.style_base()
-                }),
+                Paragraph::new(line).style(
+                    if index == active_category && settings.pane == SettingsPane::Categories {
+                        theme.style_focused_row()
+                    } else {
+                        theme.style_base()
+                    },
+                ),
                 Rect::new(rail.x + 1, y, rail.width.saturating_sub(2), 1),
             );
         }
@@ -208,7 +230,7 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
         let remaining = rows.len().saturating_sub(first + visible);
         let heading = format!(
             "{}  ·  {} SHOWN · SCROLL FOR {}",
-            categories[active_category],
+            SETTINGS_CATEGORIES[active_category],
             visible.min(rows.len().saturating_sub(first)),
             remaining
         );
@@ -241,11 +263,13 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
                 Span::raw("  "),
                 Span::styled(value, theme.style_base()),
             ])
-            .style(if *index == selected {
-                theme.style_focused_row()
-            } else {
-                theme.style_base()
-            });
+            .style(
+                if *index == selected && settings.pane == SettingsPane::Fields {
+                    theme.style_focused_row()
+                } else {
+                    theme.style_base()
+                },
+            );
             frame.render_widget(
                 Paragraph::new(line),
                 Rect::new(field_inner.x, y, field_inner.width, 1),
@@ -279,9 +303,11 @@ pub(crate) fn draw_settings_panel(frame: &mut Frame, settings: &SettingsPanelSna
         }
     }
     let hint = if settings.editing.is_some() {
-        "Enter save   Esc cancel edit   j/k navigate"
+        "Enter save   Esc cancel edit"
+    } else if settings.pane == SettingsPane::Categories {
+        "Esc close   j/k category   Enter/Right fields   Tab pane"
     } else {
-        "Enter edit   j/k navigate   Esc close / return to the same screen"
+        "Esc close   j/k field   Enter edit   Left/Tab categories"
     };
     frame.render_widget(Paragraph::new(hint).style(theme.style_muted()), helper);
 }
@@ -317,8 +343,8 @@ pub(crate) fn settings_field_label(field: SettingsField) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut text = String::new();
@@ -345,6 +371,7 @@ mod tests {
                     })
                     .collect(),
                 selected: SETTINGS_FIELDS.len() - 1,
+                pane: SettingsPane::Fields,
                 editing: None,
                 error: None,
             };
@@ -374,6 +401,7 @@ mod tests {
             let mut snapshot = SettingsPanelSnapshot {
                 rows: vec![],
                 selected: 0,
+                pane: SettingsPane::Categories,
                 editing: None,
                 error: None,
             };
@@ -404,7 +432,7 @@ mod tests {
                 && line.contains('█')));
             assert!(text.contains("Error: Invalid target"));
             assert!(text.contains("Enter save"));
-            assert!(text.contains("Esc close"));
+            assert!(text.contains("Esc cancel edit"));
         }
     }
 
@@ -427,6 +455,7 @@ mod tests {
                 },
             ],
             selected: 0,
+            pane: SettingsPane::Fields,
             editing: None,
             error: None,
         };
@@ -451,5 +480,42 @@ mod tests {
         assert!(text.contains("https://example.test/ping"));
         assert!(text.contains("NETWORK"));
         assert!(text.contains("Enter edit"));
+    }
+
+    #[test]
+    fn settings_focus_hints_follow_category_and_field_panes() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut snapshot = SettingsPanelSnapshot {
+            rows: vec![
+                SettingRow {
+                    field: SettingsField::BenchmarkUrl,
+                    label: "Quick probe HTTPS target",
+                    value: "https://example.test/ping".into(),
+                },
+                SettingRow {
+                    field: SettingsField::SystemProxyServer,
+                    label: "System proxy server",
+                    value: "127.0.0.1:6780".into(),
+                },
+            ],
+            selected: 1,
+            pane: SettingsPane::Categories,
+            editing: None,
+            error: None,
+        };
+        terminal
+            .draw(|frame| draw_settings_panel(frame, &snapshot))
+            .unwrap();
+        let category_text = buffer_text(terminal.backend().buffer());
+        assert!(category_text.contains("* NETWORK"));
+        assert!(category_text.contains("j/k category"));
+
+        snapshot.pane = SettingsPane::Fields;
+        terminal
+            .draw(|frame| draw_settings_panel(frame, &snapshot))
+            .unwrap();
+        let field_text = buffer_text(terminal.backend().buffer());
+        assert!(field_text.contains("j/k field"));
+        assert!(field_text.contains("Enter edit"));
     }
 }

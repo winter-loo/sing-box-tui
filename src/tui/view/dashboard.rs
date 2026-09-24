@@ -197,7 +197,6 @@ pub(crate) struct CandidateNotice {
 pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) operational_workspace: crate::tui_state::OperationalWorkspace,
     pub(crate) focus: Focus,
-    pub(crate) left_pane_section: LeftPaneSection,
     #[allow(dead_code)]
     pub(crate) internet_rows: Vec<InternetRow>,
     #[allow(dead_code)]
@@ -221,6 +220,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) node_quality_detail: Option<&'a NodeQualityDetailState>,
     pub(crate) connections: Option<ConnectionsPanelSnapshot<'a>>,
     pub(crate) help_index: Option<usize>,
+    pub(crate) help_pane: HelpPane,
     pub(crate) usability_probe_diagnostics: &'a [ManifestDiagnostic],
     pub(crate) settings: Option<SettingsPanelSnapshot>,
     pub(crate) onboarding: Option<&'a OnboardingState>,
@@ -285,8 +285,7 @@ pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &Dashboard
     frame.render_widget(Block::default().style(theme.style_base()), area);
 
     let is_private_access = snapshot.operational_workspace
-        == crate::tui_state::OperationalWorkspace::PrivateAccess
-        || snapshot.left_pane_section == LeftPaneSection::Intranet;
+        == crate::tui_state::OperationalWorkspace::PrivateAccess;
 
     if !is_private_access {
         render_internet_workspace(frame, area, snapshot, &theme);
@@ -334,7 +333,7 @@ pub(crate) fn render_active_modals(frame: &mut Frame, snapshot: &DashboardSnapsh
         draw_connections_panel(frame, connections);
     }
     if let Some(help_index) = snapshot.help_index {
-        draw_help_panel(frame, help_index, snapshot.usability_probe_diagnostics);
+        draw_help_panel(frame, help_index, snapshot.help_pane, snapshot.usability_probe_diagnostics);
     }
     if let Some(settings) = snapshot.settings.as_ref() {
         draw_settings_panel(frame, settings);

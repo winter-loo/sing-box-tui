@@ -45,6 +45,7 @@ fn intranet_detail_navigation_scrolls() {
         cidr: "10.20.0.0/16".to_string(),
     }];
     app.focus = Focus::Members;
+    app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
     app.left_pane_section = LeftPaneSection::Intranet;
 
     app.move_next();
@@ -62,6 +63,7 @@ fn large_intranet_sections_fold_and_toggle_with_enter() {
         })
         .collect();
     app.focus = Focus::Members;
+    app.operational_workspace = crate::tui_state::OperationalWorkspace::PrivateAccess;
     app.left_pane_section = LeftPaneSection::Intranet;
 
     let route_range = app
@@ -150,24 +152,27 @@ fn private_access_profiles_are_selected_only_through_the_p_modal() {
 }
 
 #[test]
-fn left_pane_navigation_crosses_between_internet_and_intranet_sections() {
-    let mut app = test_app();
-    app.private_access
-        .profiles
-        .push(PrivateAccessProfileRuntime::default_sonicwall().expect("SonicWall profile"));
-    app.focus = Focus::Groups;
-    app.left_pane_section = LeftPaneSection::Internet;
+fn internet_navigation_cannot_enter_provider_or_private_access_sections() {
+    for (focus_key, navigation_key) in [
+        (KeyCode::Tab, KeyCode::Down),
+        (KeyCode::Tab, KeyCode::Up),
+        (KeyCode::Left, KeyCode::Down),
+        (KeyCode::Char('h'), KeyCode::Down),
+        (KeyCode::Tab, KeyCode::Char('g')),
+        (KeyCode::Tab, KeyCode::Char('G')),
+    ] {
+        let mut app = test_app();
+        app.focus = Focus::Members;
+        app.left_pane_section = LeftPaneSection::Internet;
+        let group_index = app.group_index;
+        let profile_index = app.private_access.focused_index;
 
-    app.move_next();
-    assert_eq!(app.left_pane_section, LeftPaneSection::Intranet);
-    assert_eq!(app.private_access.focused_index, 0);
+        app.handle_key(focus_key).expect("focus key");
+        app.handle_key(navigation_key).expect("navigation key");
 
-    app.move_next();
-    assert_eq!(app.private_access.focused_index, 1);
-
-    app.move_previous();
-    assert_eq!(app.private_access.focused_index, 0);
-    app.move_previous();
-    assert_eq!(app.left_pane_section, LeftPaneSection::Internet);
-    assert_eq!(app.displayed_group_index(), 0);
+        assert_eq!(app.focus, Focus::Members, "{focus_key:?}");
+        assert_eq!(app.left_pane_section, LeftPaneSection::Internet, "{focus_key:?}");
+        assert_eq!(app.group_index, group_index, "{focus_key:?}");
+        assert_eq!(app.private_access.focused_index, profile_index, "{focus_key:?}");
+    }
 }

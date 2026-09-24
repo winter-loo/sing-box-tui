@@ -5,7 +5,7 @@ use anyhow::Result;
 use super::network_mode::apply_internet_tun_persistence;
 use super::private_access_workflow::private_access_process_exists;
 use super::settings::normalize_optional_setting;
-use super::view::{LeftPaneSection, NodeViewPanel, truncate_for_width};
+use super::view::{Focus, LeftPaneSection, NodeViewPanel, truncate_for_width};
 use super::{App, REFRESH_DEBOUNCE, process_exists};
 use crate::config::{
     TailscaleConfigOptions, config_has_china_ip_routing, inspect_tailscale_config,
@@ -92,6 +92,7 @@ impl App {
             self.left_pane_section = LeftPaneSection::Internet;
             self.intranet_detail_scroll = 0;
         }
+        self.focus = Focus::Members;
         self.benchmark_filter = state.benchmark_filter;
         self.auto_select_enabled = state.auto_pick_enabled;
         self.auto_select_selector = state.auto_pick_selector;
