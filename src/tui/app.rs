@@ -451,15 +451,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.last_frame_area = area;
     let theme = crate::tui::ds::Theme::default();
-    if area.width < 80 || area.height < 24 {
-        crate::tui::ds::widgets::render_unsupported_guard(frame, area, &theme);
-        if app.show_help {
-            let snapshot = app.view_snapshot();
-            view::render_active_modals(frame, &snapshot);
-        }
-        return;
-    }
-
     if app.active_view == ActiveView::NodeDashboard {
         let snapshot = app.node_dashboard_snapshot();
         view::render_node_dashboard(frame, &snapshot);
@@ -2006,11 +1997,11 @@ mod navigation_tests {
     }
 
     #[test]
-    fn operational_shell_guards_viewports_below_80_by_24() {
+    fn operational_shell_renders_below_80_by_24() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        for (width, height) in [(79, 24), (80, 23)] {
+        for (width, height) in [(79, 24), (80, 23), (40, 12), (20, 8)] {
             let mut app = test_support::test_app();
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -2026,15 +2017,13 @@ mod navigation_tests {
                 text.push('\n');
             }
 
-            assert!(text.contains("Resize terminal to at least 80x24"));
-            assert!(text.contains("q to quit"));
-            assert!(text.contains("? for help"));
-            assert!(!text.contains("node-a"));
+            assert!(text.contains("node-a"), "{width}x{height}");
+            assert!(!text.contains("Resize terminal"), "{width}x{height}");
         }
     }
 
     #[test]
-    fn unsupported_viewport_still_opens_help() {
+    fn compact_viewport_still_opens_help() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 

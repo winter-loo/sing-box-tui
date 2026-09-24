@@ -18,7 +18,7 @@ cargo check --locked
 
 The buffer tests cover the reference sizes, an intermediate breakpoint,
 representative larger Windows Terminal sizes, a wide/short non-standard
-aspect ratio, and the below-minimum guard.
+aspect ratio, and smaller viewports without a minimum-size gate.
 
 ## 120×30 reference budget
 
@@ -50,7 +50,7 @@ footer, and outer gutters are reserved.
 | 120×30 reference and larger readable layouts | quality, connections, global history |
 | At least 94 usable columns and 20 usable rows | quality and global history; connections hidden first |
 | Narrower supported viewports, including 80×24 | global history only |
-| Below 80 columns or 24 rows | resize notice with quit/help |
+| Below the chart's 16-column or 20-row body budget | current route, provider, and transfer-rate summary |
 
 At 96×30 the body is `x=1..94`: a 30-cell quality surface, one-cell gap, and
 63-cell global-history surface. At 80×24 the global surface is `x=1..78`,

@@ -9,5 +9,4 @@ pub(crate) use theme::{ColorCapability, Theme};
 #[allow(unused_imports)]
 pub(crate) use widgets::{
     dialog_content_area, render_breadcrumb, render_dialog_frame, render_footer,
-    render_unsupported_guard,
 };

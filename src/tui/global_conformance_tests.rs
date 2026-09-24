@@ -10,10 +10,9 @@ use super::{
 use crate::private_access::PrivateAccessAuthField;
 use crate::private_access_session::PrivateAccessProfileRuntime;
 
-// The terminal contract starts at 80x24. Exercise both independent compact
-// dimensions, the 120x30 design reference, and non-reference aspect ratios.
+// Exercise the 80x24 design breakpoint, the 120x30 reference, and larger sizes.
 const VIEWPORTS: &[(u16, u16)] = &[
-    (80, 24),  // minimum
+    (80, 24),  // compact reference
     (96, 27),  // intermediate
     (120, 30), // Figma reference
     (160, 30), // wide
@@ -21,6 +20,53 @@ const VIEWPORTS: &[(u16, u16)] = &[
     (107, 35), // non-standard aspect ratio
     (106, 32), // observed Windows Terminal window
 ];
+
+#[test]
+fn smaller_viewports_render_without_a_minimum_size_gate() {
+    for (width, height) in [
+        (1, 1),
+        (2, 2),
+        (10, 4),
+        (20, 8),
+        (40, 12),
+        (60, 18),
+        (79, 23),
+    ] {
+        let mut app = test_support::test_app();
+        let internet = rows(&mut app, width, height).join("\n");
+        assert!(
+            !internet.contains("Resize terminal"),
+            "Internet at {width}x{height}"
+        );
+
+        app.set_operational_workspace(OperationalWorkspace::PrivateAccess)
+            .unwrap();
+        let intranet = rows(&mut app, width, height).join("\n");
+        assert!(
+            !intranet.contains("Resize terminal"),
+            "Intranet at {width}x{height}"
+        );
+
+        app.active_view = ActiveView::NodeDashboard;
+        let dashboard = rows(&mut app, width, height).join("\n");
+        assert!(
+            !dashboard.contains("Resize terminal"),
+            "Dashboard at {width}x{height}"
+        );
+
+        app.open_help_panel();
+        rows(&mut app, width, height);
+        app.show_help = false;
+        app.open_settings_panel();
+        rows(&mut app, width, height);
+        app.show_settings = false;
+        app.toggle_command_palette();
+        rows(&mut app, width, height);
+        app.command_palette = None;
+        app.open_provider_modal();
+        rows(&mut app, width, height);
+    }
+}
 
 fn rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

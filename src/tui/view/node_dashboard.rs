@@ -8,7 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::shared::global_network_footer_spans;
-use crate::tui::ds::{Theme, render_breadcrumb, render_unsupported_guard};
+use crate::tui::ds::{Theme, render_breadcrumb};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
     now_unix_ms,
@@ -510,6 +510,15 @@ fn render_aggregate_panel(
 ) {
     surface(f, r, theme);
     if r.height < 20 || r.width < 16 {
+        let summary = vec![
+            Line::from(format!("ROUTE  {}", snapshot.active_node)),
+            Line::from(format!("PROVIDER  {}", snapshot.active_provider)),
+            Line::from(format!(
+                "↓{}  ↑{}",
+                snapshot.current_down_rate, snapshot.current_up_rate
+            )),
+        ];
+        f.render_widget(Paragraph::new(summary).style(theme.style_base()), r);
         return;
     }
     let panels_height = r.height;
@@ -911,13 +920,11 @@ impl NodeDashboardLayout {
 /// Main entry point for rendering the Node Dashboard from the available terminal-cell budget.
 pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardSnapshot<'_>) {
     let r = frame.area();
-    let theme = Theme::detect();
-    frame.render_widget(Block::default().style(theme.style_base()), r);
-
-    if r.width < 80 || r.height < 24 {
-        render_unsupported_guard(frame, r, &theme);
+    if r.width == 0 || r.height == 0 {
         return;
     }
+    let theme = Theme::detect();
+    frame.render_widget(Block::default().style(theme.style_base()), r);
 
     let provider = if snapshot.active_provider.is_empty() {
         "—"
@@ -938,14 +945,16 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
         &theme,
         &["NODE DASHBOARD", provider, node],
     );
-    label(
-        frame,
-        0,
-        1,
-        r.width,
-        &"─".repeat(usize::from(r.width)),
-        theme.border_default(),
-    );
+    if r.height >= 4 {
+        label(
+            frame,
+            0,
+            1,
+            r.width,
+            &"─".repeat(usize::from(r.width)),
+            theme.border_default(),
+        );
+    }
 
     let layout = NodeDashboardLayout::from_area(r);
     if let Some(node_area) = layout.node {
@@ -956,16 +965,18 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
     }
     render_aggregate_panel(frame, layout.aggregate, snapshot, &theme);
 
-    let footer_rule_y = r.height - 2;
+    let footer_rule_y = r.height.saturating_sub(2);
     let footer_y = r.height - 1;
-    label(
-        frame,
-        0,
-        footer_rule_y,
-        r.width,
-        &"─".repeat(usize::from(r.width)),
-        theme.border_default(),
-    );
+    if r.height >= 4 {
+        label(
+            frame,
+            0,
+            footer_rule_y,
+            r.width,
+            &"─".repeat(usize::from(r.width)),
+            theme.border_default(),
+        );
+    }
 
     let rates_str = format!(
         "↓{}  ↑{}",
@@ -1596,8 +1607,8 @@ mod tests {
     }
 
     #[test]
-    fn test_render_node_dashboard_unsupported_guard() {
-        for (w, h) in [(70, 20), (79, 24), (80, 23)] {
+    fn test_render_node_dashboard_compact_viewports() {
+        for (w, h) in [(70, 20), (79, 24), (80, 23), (40, 12), (20, 8)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1622,8 +1633,9 @@ mod tests {
             assert_eq!(buffer.area.height, h);
 
             let t = buffer_to_text(buffer);
-            assert!(t.contains("Resize terminal to at least 80x24"));
-            assert!(t.contains("q to quit") && t.contains("? for help"));
+            assert!(t.contains("NODE DASHBOARD"), "{w}x{h}");
+            assert!(t.contains("JP-Edge-03"), "{w}x{h}");
+            assert!(!t.contains("Resize terminal"), "{w}x{h}");
         }
     }
 }

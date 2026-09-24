@@ -38,7 +38,6 @@ and current route history semantics.
 | First launch workspace choice | `953:3` | Design reference; no matching shipped page |
 | Returning launch notice | `953:25` | Design reference; runtime restores the saved workspace directly |
 | Subscription URL first-run setup | No current frame | `src/tui/view/onboarding.rs` |
-| Unsupported terminal resize notice | Terminal contract `874:2` | `src/tui/ds/widgets.rs` |
 
 ## Viewport and terminal checks
 
