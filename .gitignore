@@ -14,6 +14,15 @@ __pycache__/
 /sing-box-tui-bypass.json
 /sing-box-tui.json
 /singbox.sqlite3
+/singbox.sqlite3-*
+/singbox.sqlite3.node-quality-*
+/sing-box-tui-metrics.sqlite3*
+/sing-box-tui-background.json
+/sing-box-tui-background.log
+/sing-box-tui-ui-watchdog.log
+/sing-box-tui-hang-*.dmp
+/sing-box.log
+/*.sing-box-tui-config-mutation.lock
 /.suburl
 /.suburl.*
 /*.sing-box-tui-subscription-backup
