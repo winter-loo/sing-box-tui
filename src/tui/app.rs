@@ -1991,7 +1991,7 @@ mod navigation_tests {
         assert!(!text.contains("TUN:"));
         assert!(!text.contains("SYS PROXY:"));
         assert!(!text.contains("CLASH:"));
-        assert!(text.contains("GLOBAL NET"));
+        assert!(text.contains("SYSTEM PROXY"));
         assert!(text.contains("↓8.4M/s"));
         assert!(text.contains("↑612K/s"));
     }
@@ -2020,6 +2020,21 @@ mod navigation_tests {
             assert!(text.contains("node-a"), "{width}x{height}");
             assert!(!text.contains("Resize terminal"), "{width}x{height}");
         }
+    }
+
+    #[test]
+    fn provider_shortcut_and_system_proxy_help_match_their_actions() {
+        let mut app = test_support::test_app();
+
+        app.handle_key(KeyCode::Char('p')).unwrap();
+        assert!(app.provider_modal.is_some());
+        assert!(!app.system_proxy.is_updating());
+        app.handle_key(KeyCode::Esc).unwrap();
+        app.handle_key(KeyCode::Char('x')).unwrap();
+        assert!(app.system_proxy.is_updating());
+        assert!(view::has_help_binding("p", "Choose provider or profile"));
+        assert!(view::has_help_binding("x", "Toggle system proxy"));
+        assert!(!view::has_help_binding("p", "Toggle system proxy"));
     }
 
     #[test]
@@ -2081,9 +2096,9 @@ mod navigation_tests {
             let footer = row(height - 1);
             assert!(footer.contains("Ctrl+K"));
             assert!(!footer.contains("[Tab]"));
-            assert!(footer.contains("GLOBAL NET"));
+            assert!(footer.contains("SYSTEM PROXY"));
             assert!(footer.trim_end().ends_with("↑0.0M/s"));
-            assert!(!row(0).contains("GLOBAL NET"));
+            assert!(!row(0).contains("SYSTEM PROXY"));
             assert!(!footer.contains("node-a"));
         }
     }

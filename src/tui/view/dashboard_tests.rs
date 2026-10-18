@@ -164,7 +164,6 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             sing_box: "sing-box: managed".to_string(),
             footer: StatusFooter::Status("ready".to_string()),
         },
-        network_status: "STABLE",
         current_down_rate: "0.0M/s",
         current_up_rate: "0.0M/s",
         flash: None,
@@ -304,8 +303,8 @@ fn render_consumes_a_dashboard_snapshot_without_app_state() {
     assert!(text.contains("quality"));
     assert!(text.contains("help"));
     assert!(!text.contains("[Tab] Intranet"));
-    assert!(text.contains("GLOBAL NET"));
-    assert!(text.contains("STABLE"));
+    assert!(text.contains("SYSTEM PROXY"));
+    assert!(text.contains("SYSTEM PROXY  TUN"));
     assert!(text.contains("↓0.0M/s"));
     assert!(text.contains("↑0.0M/s"));
     assert!(!text.contains("Intranet Proxy"));
@@ -343,19 +342,19 @@ fn status_footer_is_rendered_below_its_box() {
     let lines = rendered_lines(&dashboard_snapshot());
     let message_row = lines
         .iter()
-        .position(|line| line.contains("GLOBAL NET"))
+        .position(|line| line.contains("SYSTEM PROXY"))
         .expect("status footer row");
 
     assert_eq!(message_row, 29);
     assert!(!lines[message_row].contains('─'));
     assert!(!lines[message_row - 1].contains('└'));
     assert!(!lines[message_row - 1].contains('┘'));
-    assert!(lines[message_row].contains("GLOBAL NET"));
-    assert!(lines[message_row].contains("STABLE"));
+    assert!(lines[message_row].contains("SYSTEM PROXY"));
+    assert!(lines[message_row].contains("SYSTEM PROXY  TUN"));
 }
 
 #[test]
-fn filter_footer_keeps_network_status_and_live_rates_visible() {
+fn filter_footer_keeps_network_modes_and_live_rates_visible() {
     let mut snapshot = dashboard_snapshot();
     snapshot.status.footer = StatusFooter::Filter("edge".to_string());
     snapshot.current_down_rate = "8.4M/s";
@@ -365,7 +364,7 @@ fn filter_footer_keeps_network_status_and_live_rates_visible() {
         let lines = rendered_lines_at(&snapshot, width, 24);
         let footer = lines.last().expect("footer row");
         assert!(footer.contains("Filter: edge"));
-        assert!(footer.contains("GLOBAL NET"));
+        assert!(footer.contains("SYSTEM PROXY"));
         assert!(footer.contains("↓8.4M/s"));
         assert!(footer.contains("↑612K/s"));
     }
@@ -524,7 +523,7 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
     assert!(text_120.contains("p profile"));
     assert!(!text_120.contains("↑↓ profile"));
     assert!(text_120.contains("V disconnect"));
-    assert!(text_120.contains("GLOBAL NET"));
+    assert!(text_120.contains("SYSTEM PROXY"));
 
     // 80x24 compact workspace
     let lines_80 = rendered_lines_at(&snapshot, 80, 24);
@@ -532,7 +531,7 @@ fn intranet_workspace_renders_responsive_layout_at_120x30_and_80x24() {
     assert!(text_80.contains("INTRANET / HILLSTONE / CONNECTED"));
     assert!(text_80.contains("hillstone"));
     assert!(text_80.contains("Gateway"));
-    assert!(text_80.contains("GLOBAL NET"));
+    assert!(text_80.contains("SYSTEM PROXY"));
 }
 
 #[test]
@@ -610,7 +609,7 @@ fn intranet_expansion_reserves_a_detail_pane_and_collapse_restores_full_width() 
         assert!(text.contains("▼ Routes (20)"), "{width}x{height}\n{text}");
         assert!(!text.contains("▼ DNS servers (12)"));
         let footer = text.lines().last().expect("footer");
-        assert!(footer.contains("GLOBAL NET"));
+        assert!(footer.contains("SYSTEM PROXY"));
         assert!(footer.contains("↓0.0M/s"));
         assert!(footer.contains("↑0.0M/s"));
     }
@@ -1111,8 +1110,8 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
     assert!(footer_row.contains("quality"));
     assert!(footer_row.contains("help"));
     assert!(!footer_row.contains("[Tab] Intranet"));
-    assert!(footer_row.contains("GLOBAL NET"));
-    assert!(footer_row.contains("STABLE"));
+    assert!(footer_row.contains("SYSTEM PROXY"));
+    assert!(footer_row.contains("SYSTEM PROXY  TUN"));
     assert!(footer_row.contains("↓0.0M/s"));
     assert!(footer_row.contains("↑0.0M/s"));
 

@@ -121,6 +121,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Apply an Internet Proxy selection, or open the selected Intranet Proxy profile details.",
     },
     HelpBinding {
+        key: "p",
+        category: "Actions",
+        section: HelpSection::Navigation,
+        summary: "Choose provider or profile",
+        detail: "Open the Internet Proxy provider chooser or the Private Access profile chooser.",
+    },
+    HelpBinding {
         key: "m",
         category: "Actions",
         section: HelpSection::NetworkApp,
@@ -198,7 +205,7 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Exit the TUI while leaving sing-box, auto-pick, and active Private Access sessions running in the background.",
     },
     HelpBinding {
-        key: "p",
+        key: "x",
         category: "Actions",
         section: HelpSection::NetworkApp,
         summary: "Toggle system proxy",

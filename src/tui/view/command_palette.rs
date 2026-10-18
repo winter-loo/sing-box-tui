@@ -353,8 +353,8 @@ mod tests {
                     Rect::new(0, 29, 60, 1),
                 );
                 frame.render_widget(
-                    Paragraph::new("GLOBAL NET STABLE  ↓0.0M/s  ↑0.0M/s"),
-                    Rect::new(80, 29, 40, 1),
+                    Paragraph::new("SYSTEM PROXY  TUN  ↓0.0M/s  ↑0.0M/s"),
+                    Rect::new(70, 29, 50, 1),
                 );
                 render_command_palette(frame, frame.area(), &theme, "", 0, &builtin_commands());
             })
@@ -364,7 +364,7 @@ mod tests {
             .collect::<String>();
         assert!(footer.contains("Ctrl+K close"));
         assert!(!footer.contains("c connections"));
-        assert!(footer.contains("GLOBAL NET STABLE"));
+        assert!(footer.contains("SYSTEM PROXY  TUN"));
     }
 
     fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {

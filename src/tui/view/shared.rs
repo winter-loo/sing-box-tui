@@ -1,21 +1,25 @@
 use super::*;
 
-pub(crate) fn global_network_footer_spans(
-    status: &str,
+pub(crate) fn network_mode_footer_spans(
+    system_proxy_enabled: bool,
+    tun_enabled: bool,
     down_rate: &str,
     up_rate: &str,
     theme: &crate::tui::ds::Theme,
 ) -> Vec<Span<'static>> {
+    let mode_style = |enabled| {
+        if enabled {
+            Style::default()
+                .fg(theme.text_status_active())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme.style_muted()
+        }
+    };
     vec![
-        Span::styled("GLOBAL NET  ", theme.style_muted()),
-        Span::styled(
-            status.to_owned(),
-            if status == "STABLE" {
-                Style::default().fg(theme.text_status_active())
-            } else {
-                theme.style_muted()
-            },
-        ),
+        Span::styled("SYSTEM PROXY", mode_style(system_proxy_enabled)),
+        Span::raw("  "),
+        Span::styled("TUN", mode_style(tun_enabled)),
         Span::raw("  "),
         Span::styled(
             format!("↓{down_rate}"),
@@ -27,6 +31,35 @@ pub(crate) fn global_network_footer_spans(
             Style::default().fg(theme.text_transfer()),
         ),
     ]
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+
+    #[test]
+    fn footer_labels_each_network_mode_and_highlights_only_enabled_modes() {
+        let theme = crate::tui::ds::Theme::detect();
+        for (proxy, tun) in [(false, false), (true, false), (false, true), (true, true)] {
+            let spans = network_mode_footer_spans(proxy, tun, "8.4M/s", "612K/s", &theme);
+            let text = spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(text, "SYSTEM PROXY  TUN  ↓8.4M/s  ↑612K/s");
+            for (span, enabled) in [(&spans[0], proxy), (&spans[2], tun)] {
+                assert_eq!(
+                    span.style.fg,
+                    Some(if enabled {
+                        theme.text_status_active()
+                    } else {
+                        theme.text_muted()
+                    })
+                );
+                assert_eq!(span.style.add_modifier.contains(Modifier::BOLD), enabled);
+            }
+        }
+    }
 }
 
 /// Full-width workbench overlay used by the Settings and Help reference frames.
@@ -106,8 +139,8 @@ pub(crate) fn render_context_footer_hint(
     }
     let status_start = {
         let buffer = frame.buffer_mut();
-        let marker = ["G", "L", "O", "B", "A", "L", " ", "N", "E", "T"];
-        (area.x..area.right().saturating_sub(9))
+        let marker = ["S", "Y", "S", "T", "E", "M", " ", "P", "R", "O", "X", "Y"];
+        (area.x..area.right().saturating_sub(11))
             .find(|&x| {
                 marker.iter().enumerate().all(|(offset, symbol)| {
                     buffer[(x + offset as u16, area.bottom() - 1)].symbol() == *symbol

@@ -91,7 +91,7 @@ fn shipped_workspaces_keep_navigation_and_status_at_viewport_edges() {
             "{width}x{height}"
         );
         assert!(
-            internet[height as usize - 1].contains("GLOBAL NET"),
+            internet[height as usize - 1].contains("SYSTEM PROXY"),
             "{width}x{height}"
         );
         assert!(
@@ -101,7 +101,7 @@ fn shipped_workspaces_keep_navigation_and_status_at_viewport_edges() {
         assert!(
             internet[1..height as usize - 1]
                 .iter()
-                .all(|row| !row.contains("GLOBAL NET"))
+                .all(|row| !row.contains("SYSTEM PROXY"))
         );
         assert!(
             internet[height as usize - 1]
@@ -114,7 +114,7 @@ fn shipped_workspaces_keep_navigation_and_status_at_viewport_edges() {
         let intranet = rows(&mut app, width, height);
         assert!(intranet[0].contains("INTRANET"), "{width}x{height}");
         assert!(
-            intranet[height as usize - 1].contains("GLOBAL NET"),
+            intranet[height as usize - 1].contains("SYSTEM PROXY"),
             "{width}x{height}"
         );
         assert!(
@@ -124,7 +124,7 @@ fn shipped_workspaces_keep_navigation_and_status_at_viewport_edges() {
         assert!(
             intranet[1..height as usize - 1]
                 .iter()
-                .all(|row| !row.contains("GLOBAL NET"))
+                .all(|row| !row.contains("SYSTEM PROXY"))
         );
         assert!(
             intranet[height as usize - 1]
@@ -136,13 +136,13 @@ fn shipped_workspaces_keep_navigation_and_status_at_viewport_edges() {
         let dashboard = rows(&mut app, width, height);
         assert!(dashboard[0].contains("NODE DASHBOARD"), "{width}x{height}");
         assert!(
-            dashboard[height as usize - 1].contains("GLOBAL NET"),
+            dashboard[height as usize - 1].contains("SYSTEM PROXY"),
             "{width}x{height}"
         );
         assert!(
             dashboard[1..height as usize - 1]
                 .iter()
-                .all(|row| !row.contains("GLOBAL NET"))
+                .all(|row| !row.contains("SYSTEM PROXY"))
         );
         assert!(
             dashboard[height as usize - 1]
@@ -182,7 +182,7 @@ fn global_dialogs_keep_their_controls_and_status_visible_at_supported_sizes() {
                 "{title} has no close control at {width}x{height}"
             );
             assert!(
-                rendered[height as usize - 1].contains("GLOBAL NET"),
+                rendered[height as usize - 1].contains("SYSTEM PROXY"),
                 "{title} status at {width}x{height}"
             );
             assert!(
@@ -190,7 +190,7 @@ fn global_dialogs_keep_their_controls_and_status_visible_at_supported_sizes() {
                     .chars()
                     .skip(width as usize / 2)
                     .collect::<String>()
-                    .contains("GLOBAL NET"),
+                    .contains("SYSTEM PROXY"),
                 "{title} puts status outside the right half at {width}x{height}"
             );
             if title == "COMMANDS" {
@@ -256,7 +256,7 @@ fn private_access_states_and_entry_dialogs_fit_the_viewport_matrix() {
             let rendered = rows(&mut app, width, height);
             let text = rendered.join("\n");
             assert!(text.contains(expected), "{expected} at {width}x{height}");
-            assert!(rendered[height as usize - 1].contains("GLOBAL NET"));
+            assert!(rendered[height as usize - 1].contains("SYSTEM PROXY"));
         }
 
         app.private_access.focused_mut().state = PrivateAccessState::Connected;
@@ -269,7 +269,7 @@ fn private_access_states_and_entry_dialogs_fit_the_viewport_matrix() {
                 rendered.join("\n").contains("INTRANET:"),
                 "expanded {section:?} at {width}x{height}"
             );
-            assert!(rendered[height as usize - 1].contains("GLOBAL NET"));
+            assert!(rendered[height as usize - 1].contains("SYSTEM PROXY"));
         }
 
         app.private_access
@@ -365,7 +365,7 @@ fn cjk_route_and_candidate_do_not_displace_right_corner_status() {
         let rendered = rows(&mut app, width, height);
         assert!(rendered[0].contains("INTERNET"), "{width}x{height}");
         assert!(
-            rendered[height as usize - 1].contains("GLOBAL NET"),
+            rendered[height as usize - 1].contains("SYSTEM PROXY"),
             "{width}x{height}"
         );
         assert!(
@@ -393,22 +393,22 @@ fn global_footer_uses_the_same_semantic_colors_in_every_workspace() {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
             let label_x = (0..120)
-                .find(|&x| buffer[(x, 29)].symbol() == "G")
-                .expect("global label in footer");
+                .find(|&x| buffer[(x, 29)].symbol() == "S")
+                .expect("network mode label in footer");
             let down_x = (label_x..120)
                 .find(|&x| buffer[(x, 29)].symbol() == "↓")
                 .expect("download rate in footer");
-            let status_x = (label_x..120)
-                .find(|&x| buffer[(x, 29)].symbol() == "S")
-                .expect("stable status in footer");
+            let tun_label_x = label_x + "SYSTEM PROXY  ".len() as u16;
             assert_eq!(
                 buffer[(label_x, 29)].fg,
-                theme.text_muted(),
+                theme.text_status_active(),
                 "{workspace:?} {view:?}"
             );
+            assert_eq!(buffer[(label_x, 29)].symbol(), "S");
+            assert_eq!(buffer[(tun_label_x, 29)].symbol(), "T");
             assert_eq!(
-                buffer[(status_x, 29)].fg,
-                theme.text_status_active(),
+                buffer[(tun_label_x, 29)].fg,
+                theme.text_muted(),
                 "{workspace:?} {view:?}"
             );
             assert_eq!(

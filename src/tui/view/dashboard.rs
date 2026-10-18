@@ -213,7 +213,6 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) pending_animation_bright: bool,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
     pub(crate) status: StatusSnapshot,
-    pub(crate) network_status: &'static str,
     pub(crate) current_down_rate: &'a str,
     pub(crate) current_up_rate: &'a str,
     pub(crate) flash: Option<String>,
@@ -647,8 +646,9 @@ fn render_internet_footer(
         return;
     }
 
-    let right_spans = global_network_footer_spans(
-        snapshot.network_status,
+    let right_spans = network_mode_footer_spans(
+        snapshot.status.system_proxy_enabled,
+        snapshot.status.tun_enabled,
         snapshot.current_down_rate,
         snapshot.current_up_rate,
         theme,
@@ -1110,11 +1110,17 @@ fn render_intranet_footer(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let right = format!(
-        "GLOBAL NET  {}  ↓{}  ↑{}",
-        snapshot.network_status, snapshot.current_down_rate, snapshot.current_up_rate
+    let right_spans = network_mode_footer_spans(
+        snapshot.status.system_proxy_enabled,
+        snapshot.status.tun_enabled,
+        snapshot.current_down_rate,
+        snapshot.current_up_rate,
+        theme,
     );
-    let right_width = unicode_width::UnicodeWidthStr::width(right.as_str()) as u16;
+    let right_width = right_spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>() as u16;
     let gap = u16::from(area.width > right_width);
     let left_width = area.width.saturating_sub(right_width.saturating_add(gap));
     let action = match state {
@@ -1153,12 +1159,7 @@ fn render_intranet_footer(
         left_area,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(global_network_footer_spans(
-            snapshot.network_status,
-            snapshot.current_down_rate,
-            snapshot.current_up_rate,
-            theme,
-        )))
+        Paragraph::new(Line::from(right_spans))
         .alignment(ratatui::layout::Alignment::Right),
         right_area,
     );

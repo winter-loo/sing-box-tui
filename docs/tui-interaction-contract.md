@@ -75,7 +75,7 @@
 任意普通页面都必须这样显示：
 
 - 当前页面可以使用的快捷键显示在左下角。
-- system status、GLOBAL NET、实时上传和下载显示在右下角。
+- `SYSTEM PROXY`、`TUN`、实时上传和下载显示在右下角；开启的模式标签高亮，关闭时弱化。
 - `Switch Workspace`、`Actions`、`Ctrl+K` 和 system status 不显示在顶部。
 - 左右两组内容在窄窗口中可以减少次要文字，但不能重叠。
 
@@ -769,14 +769,13 @@ TUN/System Proxy transition 期间按 `q`、`Esc` 或 `B`：不退出，status �
 这些是后续实现任务，不是允许存在的另一套行为：
 
 1. 当前代码中 `Tab` 循环 workspace；本规格要求 workspace 只通过 `Ctrl+K` 切换。Node List 的 `Tab` 无操作，Private Access Connected 的 `Tab` 在 DNS/Routes 之间切换焦点。
-2. 当前 Help/README 把 `p` 写成 System Proxy；实际和本规格为 `p = Provider/Profile Select`、`x = System Proxy`。
-3. 当前 Command Palette 把 usability probe 标成 `[u]`、subscription refresh 标成 `[U]`，两者写反。
-4. 当前 Settings 和 Authentication 会显示 password 原文；本规格要求始终掩码。
-5. 当前 first-run 只有 Subscription Setup，没有按 workspace 配置数量执行 Workspace Chooser。
-6. 当前 Private Access 用滚动位置和“超过 10 项”决定 DNS/Routes 折叠；本规格要求 `Tab` 选择 section、`Enter` 展开 details pane。
-7. 当前从 Node Dashboard 按 `i` 可能沿用 Node List 的 browsed node；本规格要求查看 current route node。
-8. 当前 Dashboard 只处理一部分全局快捷键；必须让实际 handler 与 Dashboard footer 完全一致。
-9. 当前 Help、footer、Command Palette 和 README 分别维护快捷键文本，已经发生漂移；必须改为同源定义。
+2. 当前 Command Palette 把 usability probe 标成 `[u]`、subscription refresh 标成 `[U]`，两者写反。
+3. 当前 Settings 和 Authentication 会显示 password 原文；本规格要求始终掩码。
+4. 当前 first-run 只有 Subscription Setup，没有按 workspace 配置数量执行 Workspace Chooser。
+5. 当前 Private Access 用滚动位置和“超过 10 项”决定 DNS/Routes 折叠；本规格要求 `Tab` 选择 section、`Enter` 展开 details pane。
+6. 当前从 Node Dashboard 按 `i` 可能沿用 Node List 的 browsed node；本规格要求查看 current route node。
+7. 当前 Dashboard 只处理一部分全局快捷键；必须让实际 handler 与 Dashboard footer 完全一致。
+8. 当前 Help、footer、Command Palette 和 README 分别维护快捷键文本，已经发生漂移；必须改为同源定义。
 
 ## 18. Figma 对照
 

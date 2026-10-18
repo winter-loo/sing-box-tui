@@ -7,7 +7,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::shared::global_network_footer_spans;
+use super::shared::network_mode_footer_spans;
 use crate::tui::ds::{Theme, render_breadcrumb};
 use crate::tui::metrics::{
     LatencySample, METRIC_RETENTION_WINDOW_MS, MetricStore, RouteInterval, TrafficSample,
@@ -45,25 +45,11 @@ pub(crate) struct ActiveConnectionSummary<'a> {
     pub(crate) rule: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GlobalNetworkStatus {
-    Stable,
-    Idle,
-}
-
-impl GlobalNetworkStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stable => "STABLE",
-            Self::Idle => "IDLE",
-        }
-    }
-}
-
 pub(crate) struct NodeDashboardSnapshot<'a> {
     pub(crate) active_provider: &'a str,
     pub(crate) active_node: &'a str,
-    pub(crate) network_status: GlobalNetworkStatus,
+    pub(crate) system_proxy_enabled: bool,
+    pub(crate) tun_enabled: bool,
     pub(crate) current_down_rate: &'a str,
     pub(crate) current_up_rate: &'a str,
     pub(crate) traffic_samples: &'a [TrafficSample],
@@ -978,12 +964,17 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
         );
     }
 
-    let rates_str = format!(
-        "↓{}  ↑{}",
-        snapshot.current_down_rate, snapshot.current_up_rate
+    let status_spans = network_mode_footer_spans(
+        snapshot.system_proxy_enabled,
+        snapshot.tun_enabled,
+        snapshot.current_down_rate,
+        snapshot.current_up_rate,
+        &theme,
     );
-    let status_str = format!("GLOBAL NET  {}  {}", snapshot.network_status.label(), rates_str);
-    let status_width = status_str.width() as u16;
+    let status_width = status_spans
+        .iter()
+        .map(|span| span.content.width())
+        .sum::<usize>() as u16;
     let shortcut_candidates = [
         "Ctrl+K 导航   c 连接   i 节点   o 设置   ? 帮助   q 退出",
         "Ctrl+K  c 连接  i 节点  o 设置  ?  q",
@@ -1005,12 +996,7 @@ pub(crate) fn render_node_dashboard(frame: &mut Frame, snapshot: &NodeDashboardS
     );
     if r.width >= shortcuts_width + status_width + 3 {
         frame.render_widget(
-            Paragraph::new(Line::from(global_network_footer_spans(
-                snapshot.network_status.label(),
-                snapshot.current_down_rate,
-                snapshot.current_up_rate,
-                &theme,
-            ))),
+            Paragraph::new(Line::from(status_spans)),
             Rect::new(
                 r.width.saturating_sub(status_width + 1),
                 footer_y,
@@ -1159,7 +1145,8 @@ mod tests {
         let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            network_status: GlobalNetworkStatus::Stable,
+            system_proxy_enabled: true,
+            tun_enabled: false,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &traffic,
@@ -1245,7 +1232,7 @@ mod tests {
         assert!(t.contains("q 退出"));
         assert!(!t.contains("历史有缺测"));
         assert!(!t.contains("探测流量"));
-        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
+        assert!(t.contains("SYSTEM PROXY  TUN  ↓3.9M/s  ↑2.1M/s"));
 
         // The body keeps one-cell outer gutters, a 37-cell left rail, a one-cell
         // panel gap, and an 80-cell global-history surface. Each visible group
@@ -1310,7 +1297,8 @@ mod tests {
         let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            network_status: GlobalNetworkStatus::Stable,
+            system_proxy_enabled: true,
+            tun_enabled: false,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &[],
@@ -1361,7 +1349,7 @@ mod tests {
         // Active connections table is omitted at width 96
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
-        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
+        assert!(t.contains("SYSTEM PROXY  TUN  ↓3.9M/s  ↑2.1M/s"));
 
         // One-cell gutters and one-cell inter-panel gap remain at the
         // intermediate breakpoint; connections are hidden before quality.
@@ -1410,7 +1398,8 @@ mod tests {
         let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            network_status: GlobalNetworkStatus::Stable,
+            system_proxy_enabled: true,
+            tun_enabled: false,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &[],
@@ -1454,7 +1443,7 @@ mod tests {
         assert!(!t.contains("活动连接"));
         assert!(!t.contains("chat.openai.com"));
         assert!(!t.contains("8.0 MiB/s"));
-        assert!(t.contains("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s"));
+        assert!(t.contains("SYSTEM PROXY  TUN  ↓3.9M/s  ↑2.1M/s"));
         assert!(t.contains("延迟 · ms"));
         assert!(t.contains("总吞吐量 · MiB/s"));
         assert!(t.contains("-30m") && t.contains("-15m") && t.contains("现在"));
@@ -1471,7 +1460,7 @@ mod tests {
                 .lines()
                 .nth(23)
                 .unwrap()
-                .contains("GLOBAL NET  STABLE")
+                .contains("SYSTEM PROXY  TUN")
         );
     }
 
@@ -1480,7 +1469,8 @@ mod tests {
         let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            network_status: GlobalNetworkStatus::Stable,
+            system_proxy_enabled: true,
+            tun_enabled: false,
             current_down_rate: "3.9M/s",
             current_up_rate: "2.1M/s",
             traffic_samples: &[],
@@ -1521,7 +1511,7 @@ mod tests {
             let footer = footer.lines().nth(usize::from(height - 1)).unwrap();
             assert!(footer.starts_with(' '));
             assert!(footer.contains("Ctrl+K"));
-            assert!(footer.ends_with("GLOBAL NET  STABLE  ↓3.9M/s  ↑2.1M/s "));
+            assert!(footer.ends_with("SYSTEM PROXY  TUN  ↓3.9M/s  ↑2.1M/s "));
         }
 
         let backend = TestBackend::new(150, 24);
@@ -1534,7 +1524,7 @@ mod tests {
         assert_eq!(buffer[(3, 2)].symbol(), "节");
         assert!(text.contains("节点质量"));
         assert!(!text.contains("活动连接"));
-        assert!(text.lines().nth(23).unwrap().contains("GLOBAL NET  STABLE"));
+        assert!(text.lines().nth(23).unwrap().contains("SYSTEM PROXY  TUN"));
 
         let backend = TestBackend::new(120, 29);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1554,7 +1544,8 @@ mod tests {
         let snapshot = NodeDashboardSnapshot {
             active_provider: "AirTCP",
             active_node: "JP-Edge-03",
-            network_status: GlobalNetworkStatus::Idle,
+            system_proxy_enabled: false,
+            tun_enabled: false,
             current_down_rate: "0B/s",
             current_up_rate: "0B/s",
             traffic_samples: &[],
@@ -1594,12 +1585,12 @@ mod tests {
         assert_eq!(buffer[(10, 12)].bg, Color::Black);
 
         let footer = text.lines().nth(29).unwrap();
-        let idle_offset = footer.find("IDLE").unwrap();
+        let tun_offset = footer.find("TUN").unwrap();
         let transfer_offset = footer.find('↓').unwrap();
-        let idle_x = unicode_width::UnicodeWidthStr::width(&footer[..idle_offset]) as u16;
+        let tun_x = unicode_width::UnicodeWidthStr::width(&footer[..tun_offset]) as u16;
         let transfer_x = unicode_width::UnicodeWidthStr::width(&footer[..transfer_offset]) as u16;
         let theme = Theme::detect();
-        assert_eq!(terminal.backend().buffer()[(idle_x, 29)].fg, theme.text_muted());
+        assert_eq!(terminal.backend().buffer()[(tun_x, 29)].fg, theme.text_muted());
         assert_eq!(
             terminal.backend().buffer()[(transfer_x, 29)].fg,
             theme.text_transfer()
@@ -1615,7 +1606,8 @@ mod tests {
             let snapshot = NodeDashboardSnapshot {
                 active_provider: "AirTCP",
                 active_node: "JP-Edge-03",
-                network_status: GlobalNetworkStatus::Stable,
+                system_proxy_enabled: true,
+                tun_enabled: false,
                 current_down_rate: "0.0M/s",
                 current_up_rate: "0.0M/s",
                 traffic_samples: &[],

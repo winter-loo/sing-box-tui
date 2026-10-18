@@ -4,11 +4,10 @@ use super::App;
 use super::settings::{settings_field_display_value, visible_settings_fields};
 use super::view::{
     ActiveConnectionSummary, ActiveNodeQualitySnapshot, CandidateNotice, CandidateRow,
-    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, GlobalNetworkStatus,
-    InternetRow, IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar,
-    LatencySignalState, NodeDashboardSnapshot, NodeViewPanel, NodeViewTab, SettingRow,
-    SettingsPanelSnapshot, StatusFooter, StatusSnapshot, format_connection_target, pick_mode_badge,
-    settings_field_label,
+    CandidateTone, ConnectionsPanelSnapshot, DashboardSnapshot, Focus, InternetRow,
+    IntranetDetailSnapshot, IntranetRow, LatencySignal, LatencySignalBar, LatencySignalState,
+    NodeDashboardSnapshot, NodeViewPanel, NodeViewTab, SettingRow, SettingsPanelSnapshot,
+    StatusFooter, StatusSnapshot, format_connection_target, pick_mode_badge, settings_field_label,
 };
 use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::ActiveQuickProbe;
@@ -588,11 +587,6 @@ impl App {
             pending_animation_bright: (self.animation_started.elapsed().as_millis() / 500) % 2 == 0,
             intranet_detail,
             status,
-            network_status: if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
-                "STABLE"
-            } else {
-                "IDLE"
-            },
             current_down_rate: &self.last_active_traffic_rate.0,
             current_up_rate: &self.last_active_traffic_rate.1,
             flash,
@@ -777,16 +771,11 @@ impl App {
             })
             .collect();
 
-        let network_status = if self.system_proxy.enabled() || self.internet_tun.is_enabled() {
-            GlobalNetworkStatus::Stable
-        } else {
-            GlobalNetworkStatus::Idle
-        };
-
         NodeDashboardSnapshot {
             active_provider,
             active_node,
-            network_status,
+            system_proxy_enabled: self.system_proxy.enabled(),
+            tun_enabled: self.internet_tun.is_enabled(),
             current_down_rate: &self.last_active_traffic_rate.0,
             current_up_rate: &self.last_active_traffic_rate.1,
             traffic_samples,

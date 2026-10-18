@@ -535,7 +535,8 @@ Detached auto-pick worker commands are available separately:
 - `Space`: apply/switch to the currently highlighted proxy in the current selector group
 - `b`: edit direct-bypass domains, IPs, and CIDRs; values are comma-separated and are written to the local sing-box rule-set
 - `B`: exit the TUI while keeping the managed sing-box process, auto-pick background worker, and active Private Access sessions running
-- `p`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
+- `p`: choose an Internet Proxy provider or Private Access profile
+- `x`: on Windows/macOS/Linux, toggle the system proxy for the sing-box mixed inbound
 - `\`: toggle the Internet Proxy TUN mode; adds or removes the sing-box `tun` inbound in the configured `config.json` and restarts the managed sing-box process. On macOS/Linux this needs `sudo` (the TUI prompts with `sudo -v`); on Windows it needs an Administrator session.
 - `Enter`: unused for selection
 - `Left` / `Right` while the candidate pane is focused: move between Current selector, Streaming, and custom usability-criterion panels
@@ -559,7 +560,7 @@ During a quick assessment, each current-selector row shows three thin Braille la
 
 ## System Proxy
 
-The TUI can set the OS system proxy with `p`. On Windows, it updates the current
+The TUI can set the OS system proxy with `x`. On Windows, it updates the current
 user's WinINET proxy:
 
 ```powershell

@@ -208,7 +208,7 @@ pub(crate) fn render_breadcrumb(frame: &mut Frame, area: Rect, theme: &Theme, se
 
 /// Renders the one-line footer: shortcuts left-aligned, status right-aligned
 /// e.g. "Ctrl+K menu   c connections   i quality   o settings   ? help" (left)
-///      "GLOBAL NET STABLE  ↓3.9M/s  ↑2.1M/s" (right)
+///      "SYSTEM PROXY  TUN  ↓3.9M/s  ↑2.1M/s" (right)
 #[allow(dead_code)]
 pub(crate) fn render_footer(
     frame: &mut Frame,

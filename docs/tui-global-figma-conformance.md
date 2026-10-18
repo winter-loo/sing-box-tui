@@ -83,8 +83,8 @@ covered by `TestBackend` rather than live terminal captures.
   At 80×24, Node Quality shortens evidence labels so the newest failure value
   stays readable within its one-row evidence viewport. Short labels also keep
   the initial evidence value visible without scrolling.
-- Internet, Private Access, and the node dashboard share muted `GLOBAL NET`,
-  state-colored network status, and transfer-colored rates. Focus uses the
+- Internet, Private Access, and the node dashboard show separate System Proxy
+  and TUN states, highlighting enabled modes, alongside transfer-colored rates. Focus uses the
   shared cyan token; ordinary boundaries stay subdued, while dialog borders
   use the focus token.
 - Workspace switching is an explicit Command Palette action. Tab changes
