@@ -1,9 +1,8 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(windows)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -206,6 +205,7 @@ fn find_procdump() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn request_windows_process_dump(_log_path: &Path) {}
 
+#[cfg(windows)]
 fn append_watchdog_note(path: &Path, message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "watchdog_note {message}");

@@ -310,13 +310,15 @@ impl App {
                 self.settings_error = None;
                 self.settings_pane = SettingsPane::Fields;
             }
-            KeyCode::Enter if let Some(&field) = fields.get(self.settings_index) => {
-                self.settings_error = None;
-                self.settings_edit = Some(SettingsEditState {
-                    field,
-                    input: settings_field_value(self, field),
-                    error: None,
-                });
+            KeyCode::Enter => {
+                if let Some(&field) = fields.get(self.settings_index) {
+                    self.settings_error = None;
+                    self.settings_edit = Some(SettingsEditState {
+                        field,
+                        input: settings_field_value(self, field),
+                        error: None,
+                    });
+                }
             }
             KeyCode::Char('q') => return Ok(false),
             _ => {}
