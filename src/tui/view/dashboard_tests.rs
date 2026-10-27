@@ -876,7 +876,7 @@ fn candidate_row_renders_cold_start_ms_and_sustained_throughput_speed() {
 }
 
 #[test]
-fn current_node_stays_visible_while_candidate_focus_scrolls_to_the_end() {
+fn current_node_scrolls_out_when_candidate_focus_moves_to_the_end() {
     let mut snapshot = dashboard_snapshot();
     snapshot.candidate_rows = (0..12)
         .map(|index| CandidateRow {
@@ -897,21 +897,50 @@ fn current_node_stays_visible_while_candidate_focus_scrolls_to_the_end() {
 
     let rendered = rendered_lines_at(&snapshot, 80, 24).join("\n");
 
-    assert!(rendered.contains("sticky-current"));
+    assert!(!rendered.contains("sticky-current"));
     assert!(rendered.contains("candidate-11"));
 }
 
 #[test]
-fn candidate_row_selected_focus_styling_matches_figma_accent() {
-    let theme = Theme::new(crate::tui::ds::ColorCapability::TrueColor);
-    let focused = theme.style_focused_row();
-    let breadcrumb = theme.style_breadcrumb();
+fn current_marker_and_focus_underline_preserve_content_colors() {
+    let mut snapshot = dashboard_snapshot();
+    snapshot.candidate_rows[0].reachability = "Stable".to_string();
+    let theme = Theme::default();
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &snapshot))
+        .expect("dashboard renders");
+    let buffer = terminal.backend().buffer();
+    let (y, line) = buffer
+        .content
+        .chunks(110)
+        .enumerate()
+        .map(|(y, cells)| {
+            (y, cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        })
+        .find(|(_, line)| line.contains("node-a"))
+        .expect("candidate row");
+    let column = |needle: &str| {
+        let byte_offset = line.find(needle).expect("candidate content");
+        unicode_width::UnicodeWidthStr::width(&line[..byte_offset]) as u16
+    };
+    let y = y as u16;
 
-    assert_eq!(focused.bg, Some(theme.bg_selected()));
-    assert_eq!(focused.fg, Some(theme.text_accent()));
-    assert_eq!(breadcrumb.fg, Some(theme.text_accent()));
-    assert!(focused.add_modifier.contains(Modifier::BOLD));
-    assert!(breadcrumb.add_modifier.contains(Modifier::BOLD));
+    let name_start = column("node-a");
+    let last_text_end = column("233ms") + "233ms".len() as u16;
+    assert_eq!(buffer[(column("▌"), y)].fg, theme.text_secondary());
+    assert!(!line.contains('>'));
+    assert_eq!(buffer[(column("node-a"), y)].fg, theme.text_primary());
+    assert_eq!(buffer[(column("Stable"), y)].fg, theme.text_success());
+    assert_eq!(buffer[(column("233ms"), y)].fg, theme.text_secondary());
+    assert_eq!(buffer[(column("node-a"), y)].bg, theme.bg_canvas());
+    for x in name_start..last_text_end {
+        assert_eq!(buffer[(x, y + 1)].symbol(), "━", "underline gap at column {x}");
+        assert_eq!(buffer[(x, y + 1)].fg, theme.text_accent());
+    }
+    assert_eq!(buffer[(name_start - 1, y + 1)].symbol(), " ");
+    assert_eq!(buffer[(last_text_end, y + 1)].symbol(), " ");
 }
 
 #[test]
@@ -1073,13 +1102,15 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
     // preserve a true middle line for the node name and trailing metrics.
     assert!(lines[2].trim().is_empty());
     let first_node_row = &lines[3];
-    assert!(first_node_row.contains("* JP-Edge-03"));
+    assert!(first_node_row.contains("▌ JP-Edge-03"));
+    assert!(!first_node_row.contains('>'));
+    assert!(!first_node_row.contains("* JP-Edge-03"));
     assert!(first_node_row.contains("8.0 MiB/s"));
     assert!(first_node_row.contains("Stable"));
     assert!(first_node_row.contains("⡆⡄⡀"));
     assert!(first_node_row.contains("42ms"));
     assert!(!first_node_row.contains("│"));
-    assert_eq!(first_node_row.find("* JP-Edge-03"), Some(2));
+    assert_eq!(first_node_row.find("▌ JP-Edge-03"), Some(2));
     let latency_start = first_node_row.find("42ms").expect("latency");
     let latency_end = unicode_width::UnicodeWidthStr::width(&first_node_row[..latency_start])
         + unicode_width::UnicodeWidthStr::width("42ms");
@@ -1087,7 +1118,11 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
         latency_end <= 80,
         "Figma keeps node metrics inside the left two-thirds column"
     );
-    assert!(lines[4].trim().is_empty());
+    let name_start = unicode_width::UnicodeWidthStr::width(
+        &first_node_row[..first_node_row.find("JP-Edge-03").unwrap()],
+    );
+    assert_eq!(lines[4].chars().filter(|ch| *ch == '━').count(), latency_end - name_start);
+    assert_eq!(lines[4].chars().position(|ch| ch == '━'), Some(name_start));
 
     assert!(lines[5].trim().is_empty());
     let second_node_row = &lines[6];

@@ -384,18 +384,18 @@ fn default_panel_keeps_every_selector_member_when_probe_filter_changes() {
 }
 
 #[test]
-fn displayed_members_pin_the_selector_current_node_first() {
+fn displayed_members_keep_selector_order_when_current_node_is_later() {
     let mut app = test_app();
     app.groups[0].members = ["node-a", "node-b", "node-c"].map(str::to_string).to_vec();
     app.groups[0].current = Some("node-c".to_string());
     app.member_index = 2;
 
-    assert_eq!(app.displayed_members(), ["node-c", "node-a", "node-b"]);
-    assert_eq!(app.displayed_member_index(), Some(0));
+    assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
+    assert_eq!(app.displayed_member_index(), Some(2));
 
-    app.move_next();
+    app.move_previous();
 
-    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-b"));
     assert_eq!(app.groups[0].current.as_deref(), Some("node-c"));
 }
 
@@ -458,7 +458,7 @@ fn implicit_root_members_follow_selected_choice() {
     assert_eq!(app.selected_root_choice_name().as_deref(), Some("宝贝云"));
     assert_eq!(
         app.displayed_members(),
-        vec!["bby-2".to_string(), "bby-1".to_string()]
+        vec!["bby-1".to_string(), "bby-2".to_string()]
     );
 
     app.internet_route_index = 0;
@@ -560,7 +560,7 @@ fn streaming_panel_filters_ranks_and_preserves_selector_members() {
     assert_eq!(app.node_view_counts(), (3, 2));
     assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
     app.move_node_view_next();
-    assert_eq!(app.displayed_members(), ["node-a", "node-b"]);
+    assert_eq!(app.displayed_members(), ["node-b", "node-a"]);
     app.move_node_view_previous();
     assert_eq!(app.displayed_members(), ["node-a", "node-b", "node-c"]);
 }
@@ -772,6 +772,7 @@ fn custom_snapshot_and_keyboard_navigation_share_selector_order() {
     let mut app = test_app();
     app.benchmark_filter.clear();
     app.groups[0].members = vec!["z-node".into(), "a-node".into(), "m-node".into()];
+    app.groups[0].current = Some("m-node".into());
     app.usability_probe_manifests.push(UsabilityProbeManifest {
         id: NodeViewId::new("ordered").unwrap(),
         label: "Ordered".to_string(),

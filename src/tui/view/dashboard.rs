@@ -492,29 +492,13 @@ fn render_candidate_table(
         .enumerate()
         .map(|(idx, row)| {
             let is_focused = snapshot.candidate_selected == Some(idx);
-            let prefix = if row.is_current {
-                "* "
-            } else if is_focused {
-                "> "
-            } else {
-                "  "
-            };
-
-            let prefix_style = if row.is_current {
-                theme.style_success().add_modifier(Modifier::BOLD)
-            } else if is_focused {
-                theme.style_focused_row()
-            } else {
-                theme.style_muted()
-            };
-
-            let name_style = if row.is_current {
-                theme.style_success().add_modifier(Modifier::BOLD)
-            } else if is_focused {
-                theme.style_focused_row()
-            } else {
-                Style::default().fg(theme.text_primary())
-            };
+            let name_style = Style::default()
+                .fg(theme.text_primary())
+                .add_modifier(if row.is_current {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
 
             let mut right_spans = Vec::new();
 
@@ -572,8 +556,14 @@ fn render_candidate_table(
                 .iter()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
+            let trailing_right_spaces = right_spans
+                .iter()
+                .rev()
+                .take_while(|span| span.content.chars().all(|ch| ch == ' '))
+                .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
 
-            let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+            let prefix_width = 2;
             let name_budget = content_width.saturating_sub(
                 horizontal_padding * 2 + prefix_width + right_width + minimum_middle_gap,
             );
@@ -586,7 +576,11 @@ fn render_candidate_table(
 
             let mut spans = Vec::new();
             spans.push(Span::raw(" ".repeat(horizontal_padding)));
-            spans.push(Span::styled(prefix, prefix_style));
+            spans.push(Span::styled(
+                if row.is_current { "▌" } else { " " },
+                Style::default().fg(theme.text_secondary()),
+            ));
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(name_str, name_style));
             if padding_spaces > 0 {
                 spans.push(Span::raw(" ".repeat(padding_spaces)));
@@ -597,43 +591,38 @@ fn render_candidate_table(
                 spans.push(Span::raw(" ".repeat(total_width - rendered_width)));
             }
 
+            // The focus line sits below the content and spans from the name to the last metric.
+            // It leaves every name, probe badge, and latency glyph's original color intact.
+            let underline = if is_focused {
+                let start = horizontal_padding + prefix_width;
+                let end = if right_width == 0 {
+                    left_width
+                } else {
+                    content_width
+                        .saturating_sub(horizontal_padding)
+                        .saturating_sub(trailing_right_spaces)
+                };
+                Line::from(vec![
+                    Span::raw(" ".repeat(start)),
+                    Span::styled(
+                        "━".repeat(end.saturating_sub(start)),
+                        Style::default().fg(theme.text_accent()),
+                    ),
+                ])
+            } else {
+                Line::default()
+            };
+
             // Terminal cells cannot express Figma's half-row padding, so an odd-height item keeps
             // the node name and its trailing measurements on the true middle row.
-            ListItem::new(vec![Line::default(), Line::from(spans), Line::default()])
+            ListItem::new(vec![Line::default(), Line::from(spans), underline])
         })
         .collect::<Vec<_>>();
 
-    if snapshot
-        .candidate_rows
-        .first()
-        .is_some_and(|row| row.is_current)
-    {
-        let mut members = members;
-        let scrolling_members = members.split_off(1);
-        let sticky_height = 3.min(candidate_list_area.height);
-        let [sticky_area, scrolling_area] =
-            Layout::vertical([Constraint::Length(sticky_height), Constraint::Min(0)])
-                .areas(candidate_list_area);
-
-        let sticky_widget = List::new(members).highlight_style(theme.style_focused_row());
-        let sticky_selected = (snapshot.candidate_selected == Some(0)).then_some(0);
-        let mut sticky_state = ListState::default().with_selected(sticky_selected);
-        frame.render_stateful_widget(sticky_widget, sticky_area, &mut sticky_state);
-
-        if scrolling_area.height > 0 {
-            let scrolling_widget =
-                List::new(scrolling_members).highlight_style(theme.style_focused_row());
-            let scrolling_selected = snapshot
-                .candidate_selected
-                .and_then(|index| index.checked_sub(1));
-            let mut scrolling_state = ListState::default().with_selected(scrolling_selected);
-            frame.render_stateful_widget(scrolling_widget, scrolling_area, &mut scrolling_state);
-        }
-    } else {
-        let members_widget = List::new(members).highlight_style(theme.style_focused_row());
-        let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
-        frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
-    }
+    // Keep the selected index for scrolling; the underline marks focus without recoloring content.
+    let members_widget = List::new(members);
+    let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
+    frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
 }
 
 fn render_internet_footer(
