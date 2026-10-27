@@ -160,6 +160,7 @@ pub(crate) enum CandidateTone {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LatencySignalState {
     Untested,
+    Measuring,
     Reachable { delay_ms: u64 },
     Unreachable,
 }
@@ -173,7 +174,7 @@ pub(crate) struct LatencySignalBar {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LatencySignal {
     pub(crate) bars: [LatencySignalBar; 3],
-    pub(crate) average_ms: Option<u64>,
+    pub(crate) value_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,17 +244,18 @@ fn latency_signal_glyph(height: u8) -> char {
 fn latency_signal_style(state: LatencySignalState, theme: &Theme) -> Style {
     match state {
         LatencySignalState::Untested => theme.style_muted(),
+        LatencySignalState::Measuring => Style::default().fg(theme.text_secondary()),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 200 => theme.style_success(),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 400 => theme.style_warning(),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 600 => theme.style_warning(),
         LatencySignalState::Reachable { .. } => theme.style_error(),
-        LatencySignalState::Unreachable => theme.style_error().add_modifier(Modifier::BOLD),
+        LatencySignalState::Unreachable => theme.style_muted(),
     }
 }
 
-fn latency_average_label(signal: &LatencySignal) -> String {
+fn latency_value_label(signal: &LatencySignal) -> String {
     signal
-        .average_ms
+        .value_ms
         .map_or_else(|| "--".to_string(), |average| format!("{average}ms"))
 }
 
@@ -543,8 +545,8 @@ fn render_candidate_table(
                 right_spans.extend(render_latency_signal(signal, theme));
                 right_spans.push(Span::raw(" "));
                 right_spans.push(Span::styled(
-                    latency_average_label(signal),
-                    Style::default().fg(if signal.average_ms.is_some() {
+                    latency_value_label(signal),
+                    Style::default().fg(if signal.value_ms.is_some() {
                         theme.text_secondary()
                     } else {
                         theme.text_muted()

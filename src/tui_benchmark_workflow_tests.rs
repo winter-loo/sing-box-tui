@@ -1,6 +1,7 @@
 use super::super::test_support::{
     install_streaming_probe_run, internet_routes_app, test_app, test_db_path,
 };
+use super::super::view::LatencySignalState;
 use crate::automatic_selection::{NodeViewId, RankingPolicy, SelectionScope};
 use crate::benchmark_workflow::{
     BenchmarkCompletion, BenchmarkUpdate, BenchmarkWorkflow, ManagedRuntimeObservation,
@@ -148,6 +149,26 @@ fn reachability(name: &str, delays: [u64; 3]) -> NodeReachabilityAssessment {
             .map(|delay_ms| ProbeOutcome::Reachable { delay_ms })
             .collect(),
     )
+}
+
+#[test]
+fn quick_probe_keys_show_a_measuring_bar_before_the_first_result() {
+    for key in [KeyCode::Char('t'), KeyCode::Char('T')] {
+        let mut app = test_app();
+        app.benchmark_filter.clear();
+        app.handle_key(key).expect("start quick probe");
+
+        let snapshot = app.view_snapshot();
+        let node = snapshot
+            .candidate_rows
+            .iter()
+            .find(|row| row.name == "node-a")
+            .expect("selected node remains visible");
+        let signal = node.latency_signal.as_ref().expect("latency signal");
+        assert_eq!(signal.bars[0].state, LatencySignalState::Measuring);
+        assert_eq!(signal.value_ms, None);
+        app.benchmark_workflow.cancel_running_probes();
+    }
 }
 
 fn auto_selection_scope() -> SelectionScope {

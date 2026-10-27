@@ -794,7 +794,7 @@ mod tests {
             "/redirect/2" => write_redirect(&mut stream, "/redirect/1"),
             "/redirect/3" => write_redirect(&mut stream, "/redirect/2"),
             "/stall" => {
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_secs(1));
                 write_body_response(
                     &mut stream,
                     "200 OK",
@@ -974,7 +974,7 @@ mod tests {
             .probe_with_timeout("/stall", Duration::from_millis(50))
             .expect_err("stalled response must hit the total request timeout");
 
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_millis(750));
     }
 
     #[test]

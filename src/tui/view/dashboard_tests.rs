@@ -74,9 +74,14 @@ fn latency_signal_uses_the_requested_color_thresholds() {
         latency_signal_style(LatencySignalState::Reachable { delay_ms: 600 }, &theme).fg,
         Some(theme.text_error())
     );
-    let unreachable = latency_signal_style(LatencySignalState::Unreachable, &theme);
-    assert_eq!(unreachable.fg, Some(theme.text_error()));
-    assert!(unreachable.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Measuring, &theme).fg,
+        Some(theme.text_secondary())
+    );
+    assert_eq!(
+        latency_signal_style(LatencySignalState::Unreachable, &theme).fg,
+        Some(theme.text_muted())
+    );
 }
 
 #[test]
@@ -144,7 +149,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
                         state: LatencySignalState::Reachable { delay_ms: 400 },
                     },
                 ],
-                average_ms: Some(233),
+                value_ms: Some(233),
             }),
             reachability: String::new(),
             marker: String::new(),
@@ -830,7 +835,7 @@ fn candidate_row_cjk_grapheme_truncation_preserves_multibyte_safety() {
                     state: LatencySignalState::Reachable { delay_ms: 50 },
                 },
             ],
-            average_ms: Some(50),
+            value_ms: Some(50),
         }),
         reachability: "Stable".to_string(),
         marker: String::new(),
@@ -1021,7 +1026,7 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
                         state: LatencySignalState::Reachable { delay_ms: 42 },
                     },
                 ],
-                average_ms: Some(42),
+                value_ms: Some(42),
             }),
             reachability: "Stable".to_string(),
             marker: "8.0 MiB/s".to_string(),
@@ -1046,7 +1051,7 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
                         state: LatencySignalState::Reachable { delay_ms: 68 },
                     },
                 ],
-                average_ms: Some(68),
+                value_ms: Some(68),
             }),
             reachability: "Stable".to_string(),
             marker: String::new(),
@@ -1071,7 +1076,7 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
                         state: LatencySignalState::Reachable { delay_ms: 63 },
                     },
                 ],
-                average_ms: Some(63),
+                value_ms: Some(63),
             }),
             reachability: "Stable".to_string(),
             marker: String::new(),

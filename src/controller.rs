@@ -574,6 +574,9 @@ async fn measure_probe_outcome_with_deadlines(
             };
         }
     };
+    if !controller_timeout_is_infrastructure && matches!(response.status().as_u16(), 503 | 504) {
+        return ProbeOutcome::Timeout;
+    }
     if !response.status().is_success() {
         return ProbeOutcome::ControllerFailure {
             status: response.status().as_u16(),
@@ -1228,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_delay_endpoint_returns_structured_outcomes() {
-        use super::{ProbeOutcome, measure_probe_outcome};
+        use super::{ProbeOutcome, measure_probe_outcome, measure_usability_probe_outcome};
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
         let (reachable, request_rx) =
@@ -1261,7 +1264,36 @@ mod tests {
                 Duration::from_secs(1)
             )
             .await,
+            ProbeOutcome::Timeout
+        );
+
+        let usability_controller =
+            one_response_server("503 Service Unavailable", "{}", Duration::ZERO);
+        assert_eq!(
+            measure_usability_probe_outcome(
+                client.clone(),
+                &usability_controller,
+                "node-a",
+                "https://example.com",
+                Duration::from_secs(1),
+                Duration::from_secs(2)
+            )
+            .await,
             ProbeOutcome::ControllerFailure { status: 503 }
+        );
+
+        let timed_out = one_response_server("504 Gateway Timeout", "{}", Duration::ZERO);
+        assert_eq!(
+            measure_probe_outcome(
+                client.clone(),
+                &timed_out,
+                "node-a",
+                "https://example.com",
+                1_000,
+                Duration::from_secs(1)
+            )
+            .await,
+            ProbeOutcome::Timeout
         );
 
         let invalid = one_response_server("200 OK", r#"{"delay":0}"#, Duration::ZERO);

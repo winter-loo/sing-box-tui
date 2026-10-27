@@ -1747,11 +1747,11 @@ mod persistent_path_tests {
 
     #[test]
     fn metric_history_uses_a_dedicated_database_name() {
-        let config = PathBuf::from(r"C:\proxy\config.json");
+        let config = PathBuf::from("proxy").join("config.json");
 
         assert_eq!(
             metric_history_database_path(&config),
-            PathBuf::from(r"C:\proxy\sing-box-tui-metrics.sqlite3")
+            PathBuf::from("proxy").join("sing-box-tui-metrics.sqlite3")
         );
     }
 
@@ -2124,7 +2124,7 @@ mod navigation_tests {
             assert!(row(tabs_y + 1).trim().is_empty());
             assert!(row(tabs_y + 2).trim().is_empty());
             assert!(row(tabs_y + 3).contains("node-a"));
-            assert!(row(tabs_y + 4).trim().is_empty());
+            assert!(row(tabs_y + 4).contains('─'));
             if height >= 30 {
                 assert!(row(1).trim().is_empty());
             }

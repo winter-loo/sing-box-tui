@@ -58,11 +58,18 @@ fn extract_candidate_brief_marker(
     ("usable".to_string(), "usable".to_string())
 }
 
-fn latency_signal_for_attempts(attempts: &[ProbeOutcome]) -> LatencySignal {
+fn latency_signal_for_attempts(
+    attempts: &[ProbeOutcome],
+    timeout_ms: u64,
+    active_attempt: Option<usize>,
+    animation_tick: usize,
+) -> LatencySignal {
     const UNTESTED_HEIGHT: u8 = 2;
     const SINGLE_SAMPLE_HEIGHT: u8 = 5;
     const MIN_MEASURED_HEIGHT: u8 = 2;
     const MAX_MEASURED_HEIGHT: u8 = 8;
+    const FAILED_HEIGHT: u8 = 6;
+    const MEASURING_HEIGHTS: [u8; 4] = [2, 4, 6, 4];
 
     let reachable_delays = attempts
         .iter()
@@ -73,14 +80,27 @@ fn latency_signal_for_attempts(attempts: &[ProbeOutcome]) -> LatencySignal {
         .collect::<Vec<_>>();
     let minimum_delay = reachable_delays.iter().copied().min();
     let compare_relative_heights = reachable_delays.len() >= 2;
-    let average_ms = (!reachable_delays.is_empty()).then(|| {
-        let count = reachable_delays.len() as u128;
-        let sum = reachable_delays
+    let measured_values = attempts
+        .iter()
+        .filter_map(|attempt| match attempt {
+            ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+            ProbeOutcome::Timeout | ProbeOutcome::TransportFailure { .. } => Some(timeout_ms),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mean_ms = (!measured_values.is_empty()).then(|| {
+        let count = measured_values.len() as u128;
+        let sum = measured_values
             .iter()
             .map(|delay| u128::from(*delay))
             .sum::<u128>();
         ((sum + count / 2) / count).min(u128::from(u64::MAX)) as u64
     });
+    let value_ms = if active_attempt.is_some() {
+        measured_values.last().copied()
+    } else {
+        mean_ms
+    };
 
     let bars = std::array::from_fn(|index| match attempts.get(index) {
         Some(ProbeOutcome::Reachable { delay_ms }) => {
@@ -102,26 +122,36 @@ fn latency_signal_for_attempts(attempts: &[ProbeOutcome]) -> LatencySignal {
             }
         }
         Some(ProbeOutcome::Timeout | ProbeOutcome::TransportFailure { .. }) => LatencySignalBar {
-            height: MAX_MEASURED_HEIGHT,
+            height: FAILED_HEIGHT,
             state: LatencySignalState::Unreachable,
         },
         Some(
             ProbeOutcome::ControllerFailure { .. }
             | ProbeOutcome::InvalidMeasurement
             | ProbeOutcome::Cancelled,
-        )
-        | None => LatencySignalBar {
+        ) => LatencySignalBar {
+            height: UNTESTED_HEIGHT,
+            state: LatencySignalState::Untested,
+        },
+        None if active_attempt == Some(index) => LatencySignalBar {
+            height: MEASURING_HEIGHTS[(animation_tick / 5) % MEASURING_HEIGHTS.len()],
+            state: LatencySignalState::Measuring,
+        },
+        None => LatencySignalBar {
             height: UNTESTED_HEIGHT,
             state: LatencySignalState::Untested,
         },
     });
 
-    LatencySignal { bars, average_ms }
+    LatencySignal { bars, value_ms }
 }
 
 impl App {
     pub(super) fn view_snapshot(&mut self) -> DashboardSnapshot<'_> {
         let flash = self.flash_message();
+        let animation_elapsed = self.animation_started.elapsed();
+        let pending_animation_tick = (animation_elapsed.as_millis() / 80) as usize;
+        let pending_animation_bright = (animation_elapsed.as_millis() / 500) % 2 == 0;
         let implicit_root_mode = self.implicit_root_mode();
         let implicit_current = self
             .implicit_root_group()
@@ -278,10 +308,23 @@ impl App {
                             .active_quick_probe(&group.name, member)
                         {
                             Some(ActiveQuickProbe::Pending) => {
-                                (latency_signal_for_attempts(&[]), CandidateTone::Pending)
+                                (
+                                    latency_signal_for_attempts(
+                                        &[],
+                                        self.benchmark_timeout_ms,
+                                        Some(0),
+                                        pending_animation_tick,
+                                    ),
+                                    CandidateTone::Pending,
+                                )
                             }
                             Some(ActiveQuickProbe::IncompleteAssessment(assessment)) => (
-                                latency_signal_for_attempts(&assessment.attempts),
+                                latency_signal_for_attempts(
+                                    &assessment.attempts,
+                                    self.benchmark_timeout_ms,
+                                    (assessment.attempts.len() < 3).then_some(assessment.attempts.len()),
+                                    pending_animation_tick,
+                                ),
                                 CandidateTone::Pending,
                             ),
                             Some(ActiveQuickProbe::CompleteAssessment(assessment)) => {
@@ -298,7 +341,15 @@ impl App {
                                     ) => CandidateTone::Error,
                                     None => CandidateTone::Missing,
                                 };
-                                (latency_signal_for_attempts(&assessment.attempts), tone)
+                                (
+                                    latency_signal_for_attempts(
+                                        &assessment.attempts,
+                                        self.benchmark_timeout_ms,
+                                        None,
+                                        0,
+                                    ),
+                                    tone,
+                                )
                             }
                             None => {
                                 let stored_assessment = self
@@ -322,6 +373,9 @@ impl App {
                                         stored_assessment
                                             .map(|assessment| assessment.attempts.as_slice())
                                             .unwrap_or(&[]),
+                                        self.benchmark_timeout_ms,
+                                        None,
+                                        0,
                                     ),
                                     tone,
                                 )
@@ -583,8 +637,8 @@ impl App {
             active_node_view_tab,
             candidate_rows,
             candidate_selected,
-            pending_animation_tick: (self.animation_started.elapsed().as_millis() / 80) as usize,
-            pending_animation_bright: (self.animation_started.elapsed().as_millis() / 500) % 2 == 0,
+            pending_animation_tick,
+            pending_animation_bright,
             intranet_detail,
             status,
             current_down_rate: &self.last_active_traffic_rate.0,
@@ -820,7 +874,9 @@ fn pending_candidate_marker(stage: &str, elapsed_seconds: u64) -> String {
 mod tests {
     use super::super::test_support::{internet_routes_app, test_app};
     use super::super::view::{CandidateTone, LatencySignalState, render_node_dashboard};
-    use super::{format_custom_probe_progress, pending_candidate_marker};
+    use super::{
+        format_custom_probe_progress, latency_signal_for_attempts, pending_candidate_marker,
+    };
     use crate::controller::{
         ConnectionInfo, ConnectionMetadata, NodeReachabilityAssessment, ProbeOutcome,
         ReachabilityAssessment,
@@ -1003,15 +1059,74 @@ mod tests {
             .latency_signal
             .as_ref()
             .expect("current-selector row has a latency signal");
-        assert_eq!(signal.average_ms, Some(45));
+        assert_eq!(signal.value_ms, Some(1697));
         assert_eq!(signal.bars[0].height, 8);
         assert_eq!(signal.bars[1].height, 6);
-        assert_eq!(signal.bars[2].height, 8);
+        assert_eq!(signal.bars[2].height, 6);
         assert_eq!(signal.bars[2].state, LatencySignalState::Unreachable);
         assert!(snapshot.candidate_rows[0].reachability.is_empty());
         assert!(snapshot.candidate_rows[0].marker.is_empty());
         assert_eq!(snapshot.candidate_rows[0].tone, CandidateTone::Success);
         assert_eq!(snapshot.candidate_rows.len(), app.groups[0].members.len());
+    }
+
+    #[test]
+    fn active_latency_bar_cycles_through_three_gray_heights() {
+        let heights = [0, 5, 10, 15, 20]
+            .map(|tick| latency_signal_for_attempts(&[], 5_000, Some(0), tick).bars[0]);
+        assert_eq!(heights.map(|bar| bar.height), [2, 4, 6, 4, 2]);
+        assert!(
+            heights
+                .iter()
+                .all(|bar| bar.state == LatencySignalState::Measuring)
+        );
+
+        let after_first = latency_signal_for_attempts(
+            &[ProbeOutcome::Reachable { delay_ms: 100 }],
+            5_000,
+            Some(1),
+            10,
+        );
+        assert_eq!(
+            after_first.bars[0].state,
+            LatencySignalState::Reachable { delay_ms: 100 }
+        );
+        assert_eq!(after_first.bars[1].state, LatencySignalState::Measuring);
+        assert_eq!(after_first.bars[1].height, 6);
+        assert_eq!(after_first.bars[2].state, LatencySignalState::Untested);
+
+        let after_timeout = latency_signal_for_attempts(
+            &[
+                ProbeOutcome::Reachable { delay_ms: 100 },
+                ProbeOutcome::Timeout,
+            ],
+            5_000,
+            Some(2),
+            0,
+        );
+        assert_eq!(after_timeout.value_ms, Some(5_000));
+        assert_eq!(after_timeout.bars[1].height, 6);
+        assert_eq!(after_timeout.bars[2].state, LatencySignalState::Measuring);
+    }
+
+    #[test]
+    fn failed_attempts_use_timeout_value_in_three_attempt_average() {
+        let signal = latency_signal_for_attempts(
+            &[
+                ProbeOutcome::Reachable { delay_ms: 100 },
+                ProbeOutcome::Timeout,
+                ProbeOutcome::TransportFailure {
+                    detail: "reset".into(),
+                },
+            ],
+            5_000,
+            None,
+            0,
+        );
+        assert_eq!(signal.value_ms, Some(3367));
+        assert_eq!(signal.bars.map(|bar| bar.height), [5, 6, 6]);
+        assert_eq!(signal.bars[1].state, LatencySignalState::Unreachable);
+        assert_eq!(signal.bars[2].state, LatencySignalState::Unreachable);
     }
 
     #[test]
@@ -1031,8 +1146,10 @@ mod tests {
         {
             let snapshot = app.view_snapshot();
             let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
-            assert_eq!(signal.bars.map(|bar| bar.height), [5, 2, 2]);
-            assert_eq!(signal.average_ms, Some(100));
+            assert_eq!(signal.bars[0].height, 5);
+            assert_eq!(signal.bars[1].state, LatencySignalState::Measuring);
+            assert_eq!(signal.bars[2].state, LatencySignalState::Untested);
+            assert_eq!(signal.value_ms, Some(100));
         }
 
         app.benchmark_workflow
@@ -1049,8 +1166,10 @@ mod tests {
         {
             let snapshot = app.view_snapshot();
             let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
-            assert_eq!(signal.bars.map(|bar| bar.height), [8, 4, 2]);
-            assert_eq!(signal.average_ms, Some(150));
+            assert_eq!(signal.bars[0].height, 8);
+            assert_eq!(signal.bars[1].height, 4);
+            assert_eq!(signal.bars[2].state, LatencySignalState::Measuring);
+            assert_eq!(signal.value_ms, Some(200));
         }
 
         app.benchmark_workflow
@@ -1068,7 +1187,7 @@ mod tests {
         let snapshot = app.view_snapshot();
         let signal = snapshot.candidate_rows[0].latency_signal.as_ref().unwrap();
         assert_eq!(signal.bars.map(|bar| bar.height), [8, 4, 2]);
-        assert_eq!(signal.average_ms, Some(233));
+        assert_eq!(signal.value_ms, Some(233));
     }
 
     #[test]
@@ -1107,8 +1226,9 @@ mod tests {
 
         let signal = row.latency_signal.as_ref().unwrap();
         assert_eq!(signal.bars[0].state, LatencySignalState::Unreachable);
-        assert_eq!(signal.bars[1].state, LatencySignalState::Untested);
-        assert_eq!(signal.average_ms, None);
+        assert_eq!(signal.bars[0].height, 6);
+        assert_eq!(signal.bars[1].state, LatencySignalState::Measuring);
+        assert_eq!(signal.value_ms, Some(5000));
         assert_eq!(row.tone, CandidateTone::Pending);
     }
 
@@ -1139,7 +1259,7 @@ mod tests {
 
         let signal = row.latency_signal.as_ref().unwrap();
         assert_eq!(signal.bars.map(|bar| bar.height), [8, 8, 7]);
-        assert_eq!(signal.average_ms, Some(21));
+        assert_eq!(signal.value_ms, Some(21));
         assert_eq!(row.tone, CandidateTone::Success);
     }
 
@@ -1169,14 +1289,10 @@ mod tests {
             .expect("pending node row");
 
         let signal = row.latency_signal.as_ref().unwrap();
-        assert_eq!(signal.bars.map(|bar| bar.height), [2, 2, 2]);
-        assert!(
-            signal
-                .bars
-                .iter()
-                .all(|bar| bar.state == LatencySignalState::Untested)
-        );
-        assert_eq!(signal.average_ms, None);
+        assert_eq!(signal.bars[0].state, LatencySignalState::Measuring);
+        assert_eq!(signal.bars[1].state, LatencySignalState::Untested);
+        assert_eq!(signal.bars[2].state, LatencySignalState::Untested);
+        assert_eq!(signal.value_ms, None);
         assert_eq!(row.tone, CandidateTone::Pending);
     }
 
