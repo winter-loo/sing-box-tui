@@ -1,12 +1,14 @@
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use super::view::{format_duration_badge, subscription_report_badge, truncate_for_width};
 use super::{App, SUBSCRIPTION_REFRESH_RETRY_INTERVAL, TuiSubscriptionRefreshOptions};
+use crate::managed_sing_box::AuthorizationRequirement;
 use crate::subscriptions::{
     SubscriptionRefreshOutput, SubscriptionRefreshRequest, refresh_subscriptions,
     validate_subscription_refresh_paths,
@@ -19,6 +21,9 @@ pub(super) struct SubscriptionRefreshState {
     job: Option<SubscriptionRefreshJob>,
     last_report: Option<SubscriptionRefreshOutput>,
     last_error: Option<String>,
+    pending_reload: bool,
+    next_reload: Option<Instant>,
+    last_reload_error: Option<String>,
 }
 
 struct SubscriptionRefreshJob {
@@ -62,6 +67,9 @@ impl SubscriptionRefreshState {
             job: None,
             last_report: None,
             last_error: None,
+            pending_reload: false,
+            next_reload: None,
+            last_reload_error: None,
         }))
     }
 
@@ -84,6 +92,23 @@ impl App {
                 state.request.merged_path.display()
             );
         }
+        if state.pending_reload {
+            let retry = state
+                .next_reload
+                .map(|at| {
+                    format!(
+                        "  retry in {}",
+                        format_duration_badge(at.saturating_duration_since(Instant::now()))
+                    )
+                })
+                .unwrap_or_default();
+            let error = state
+                .last_reload_error
+                .as_deref()
+                .map(|error| format!("{}", truncate_for_width(error, 72)))
+                .unwrap_or_else(|| "applying updated config".to_string());
+            return format!("subscriptions: sing-box reload pending: {error}{retry}");
+        }
         if let Some(error) = &state.last_error {
             return format!(
                 "subscriptions: error: {}  retry in {}",
@@ -92,18 +117,10 @@ impl App {
             );
         }
         if let Some(report) = &state.last_report {
-            let reload_note = if report.node_history_changed {
-                "  node-quality persistence paused until a managed sing-box reload is confirmed"
-            } else if report.config_updated {
-                "  reload sing-box to apply"
-            } else {
-                ""
-            };
             return format!(
-                "subscriptions: {}  next in {}{}",
+                "subscriptions: {}  next in {}",
                 subscription_report_badge(report),
                 format_duration_badge(state.next_run.saturating_duration_since(Instant::now())),
-                reload_note
             );
         }
         format!(
@@ -113,6 +130,17 @@ impl App {
     }
 
     pub(super) fn maybe_start_subscription_refresh(&mut self) {
+        if self
+            .subscription_refresh
+            .as_ref()
+            .is_some_and(|state| state.pending_reload)
+        {
+            self.try_pending_subscription_reload_with(
+                |app| app.reload_subscription_managed_runtime(),
+                |app| app.refresh(),
+            );
+            return;
+        }
         let Some(state) = self.subscription_refresh.as_mut() else {
             return;
         };
@@ -161,6 +189,67 @@ impl App {
     }
 
     pub(super) fn poll_subscription_refresh_updates(&mut self) -> Result<()> {
+        self.poll_subscription_refresh_updates_with_reload(|app| {
+            app.reload_subscription_managed_runtime()
+        })
+    }
+
+    pub(super) fn subscription_reload_needs_terminal_prompt(&self) -> bool {
+        self.subscription_refresh
+            .as_ref()
+            .is_some_and(|state| state.pending_reload)
+            && self
+                .subscription_reload_authorization_requirement()
+                .is_ok_and(|requirement| requirement == AuthorizationRequirement::InteractiveSudo)
+    }
+
+    fn subscription_reload_authorization_requirement(&self) -> Result<AuthorizationRequirement> {
+        let next_run_needs_elevation = self.sing_box.startup_authorization_requirement()?
+            == AuthorizationRequirement::InteractiveSudo;
+        Ok(self
+            .sing_box
+            .restart_authorization_requirement(next_run_needs_elevation))
+    }
+
+    fn reload_subscription_managed_runtime(&mut self) -> Result<()> {
+        self.sing_box.validate_config_for_restart()?;
+        if self.subscription_reload_authorization_requirement()?
+            == AuthorizationRequirement::InteractiveSudo
+        {
+            let status = Command::new("sudo")
+                .args(["-n", "-v"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("failed to check sudo authorization before sing-box reload")?;
+            ensure!(
+                status.success(),
+                "sudo authorization expired; press R in the node list to authorize and retry"
+            );
+        }
+        self.restart_managed_sing_box()
+    }
+
+    pub(super) fn retry_subscription_reload_now(&mut self) {
+        let Some(state) = self.subscription_refresh.as_mut() else {
+            self.set_status_only("Subscription refresh is disabled");
+            return;
+        };
+        if !state.pending_reload {
+            self.set_status_only("No subscription config reload is pending");
+            return;
+        }
+        state.next_reload = Some(Instant::now());
+        self.try_pending_subscription_reload_with(
+            |app| app.reload_subscription_managed_runtime(),
+            |app| app.refresh(),
+        );
+    }
+
+    fn poll_subscription_refresh_updates_with_reload<F>(&mut self, reload: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
         let Some(state) = self.subscription_refresh.as_mut() else {
             return Ok(());
         };
@@ -188,23 +277,17 @@ impl App {
                 state.schedule_after(state.interval);
                 state.last_error = None;
                 state.last_report = Some(report.clone());
-                let status = if report.node_history_changed {
-                    format!(
-                        "Subscription refresh updated config: {}; node-quality persistence paused until a managed sing-box reload is confirmed",
-                        subscription_report_badge(&report)
-                    )
-                } else if report.config_updated {
-                    format!(
-                        "Subscription refresh updated config: {}; reload/restart sing-box to apply",
-                        subscription_report_badge(&report)
-                    )
+                if report.config_updated || report.node_history_changed {
+                    state.pending_reload = true;
+                    state.next_reload = Some(Instant::now());
+                    state.last_reload_error = None;
+                    self.try_pending_subscription_reload_with(reload, |app| app.refresh());
                 } else {
-                    format!(
+                    self.set_status_only(format!(
                         "Subscription refresh kept the active config unchanged: {}",
                         subscription_report_badge(&report)
-                    )
-                };
-                self.set_status_only(status);
+                    ));
+                }
             }
             SubscriptionRefreshEvent::Finished(Err(error)) => {
                 state.schedule_after(SUBSCRIPTION_REFRESH_RETRY_INTERVAL);
@@ -217,6 +300,56 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn try_pending_subscription_reload_with<F, Refresh>(&mut self, reload: F, refresh: Refresh)
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+        Refresh: FnOnce(&mut Self) -> Result<()>,
+    {
+        let Some(state) = self.subscription_refresh.as_ref() else {
+            return;
+        };
+        if !state.pending_reload
+            || state.job.is_some()
+            || state.next_reload.is_some_and(|at| Instant::now() < at)
+            || self.network_transition_is_running()
+        {
+            return;
+        }
+        let result = reload(self);
+        let state = self
+            .subscription_refresh
+            .as_mut()
+            .expect("subscription refresh exists");
+        let report = state.last_report.as_ref().map(subscription_report_badge);
+        match result {
+            Ok(()) => {
+                state.pending_reload = false;
+                state.next_reload = None;
+                state.last_reload_error = None;
+                let refresh_error = refresh(self).err();
+                let status = format!(
+                    "Subscription refresh applied and sing-box restarted: {}",
+                    report.unwrap_or_else(|| "updated config".to_string())
+                );
+                if let Some(error) = refresh_error {
+                    self.set_status_only(format!("{status}; node list refresh failed: {error:#}"));
+                } else {
+                    self.set_status_only(status);
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                state.last_reload_error = Some(error.clone());
+                state.next_reload = Instant::now().checked_add(SUBSCRIPTION_REFRESH_RETRY_INTERVAL);
+                self.set_status_only(format!(
+                    "Subscription refresh needs sing-box reload; failed: {}; retry in {}",
+                    truncate_for_width(&error, 90),
+                    format_duration_badge(SUBSCRIPTION_REFRESH_RETRY_INTERVAL)
+                ));
+            }
+        }
     }
 }
 
@@ -236,6 +369,7 @@ mod tests {
     fn install_completed_refresh(
         app: &mut super::super::App,
         database_path: &std::path::Path,
+        config_updated: bool,
         node_history_changed: bool,
     ) {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -247,7 +381,7 @@ mod tests {
                     interval_days: 7,
                     merged_config_path: "config.json".to_string(),
                     backup_config_path: None,
-                    config_updated: true,
+                    config_updated,
                     node_history_reconciled: true,
                     node_history_changed,
                     node_quality_generation: Some(u64::from(node_history_changed)),
@@ -276,6 +410,9 @@ mod tests {
             }),
             last_report: None,
             last_error: None,
+            pending_reload: false,
+            next_reload: None,
+            last_reload_error: None,
         });
     }
 
@@ -336,9 +473,9 @@ mod tests {
             usability_details: Vec::new(),
             evidence_scroll: 0,
         });
-        install_completed_refresh(&mut app, &path, true);
+        install_completed_refresh(&mut app, &path, true, true);
 
-        app.poll_subscription_refresh_updates()
+        app.poll_subscription_refresh_updates_with_reload(|_| anyhow::bail!("restart unavailable"))
             .expect("apply completed changed refresh");
 
         assert!(!app.benchmark_workflow.quality_persistence_enabled());
@@ -363,7 +500,24 @@ mod tests {
                 .expect("new result is ignored until runtime reload"),
             None
         );
-        assert!(app.status.contains("node-quality persistence paused"));
+        assert!(app.status.contains("sing-box reload"));
+        assert!(app.status.contains("restart unavailable"));
+        assert!(app.subscription_refresh.as_ref().unwrap().pending_reload);
+        let next_reload = app.subscription_refresh.as_ref().unwrap().next_reload;
+        app.try_pending_subscription_reload_with(
+            |_| panic!("reload must wait for retry deadline"),
+            |_| panic!("refresh must wait for retry deadline"),
+        );
+        assert_eq!(
+            app.subscription_refresh.as_ref().unwrap().next_reload,
+            next_reload
+        );
+
+        app.subscription_refresh.as_mut().unwrap().next_reload =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.try_pending_subscription_reload_with(|_| Ok(()), |_| Ok(()));
+        assert!(!app.subscription_refresh.as_ref().unwrap().pending_reload);
+        assert!(app.status.contains("sing-box restarted"));
         assert!(
             BenchmarkStore::open(&path)
                 .expect("reopen node-quality store")
@@ -388,10 +542,12 @@ mod tests {
             .expect("bind unchanged test identities");
         let mut app = test_app();
         app.benchmark_workflow.replace_store(Some(store));
-        install_completed_refresh(&mut app, &path, false);
+        install_completed_refresh(&mut app, &path, false, false);
 
-        app.poll_subscription_refresh_updates()
-            .expect("apply completed unchanged refresh");
+        app.poll_subscription_refresh_updates_with_reload(|_| {
+            panic!("unchanged config must not restart sing-box")
+        })
+        .expect("apply completed unchanged refresh");
 
         assert!(app.benchmark_workflow.quality_persistence_enabled());
         assert_eq!(
@@ -410,5 +566,23 @@ mod tests {
         );
         assert!(!app.status.contains("persistence paused"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_only_refresh_restarts_managed_runtime() {
+        let path = test_db_path();
+        let mut app = test_app();
+        install_completed_refresh(&mut app, &path, true, false);
+
+        let mut restarted = false;
+        app.poll_subscription_refresh_updates_with_reload(|_| {
+            restarted = true;
+            anyhow::bail!("restart deferred")
+        })
+        .expect("config-only refresh remains recoverable");
+
+        assert!(restarted);
+        assert!(app.subscription_refresh.as_ref().unwrap().pending_reload);
+        assert!(app.status.contains("restart deferred"));
     }
 }

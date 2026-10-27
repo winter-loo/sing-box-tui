@@ -154,6 +154,7 @@ pub(super) fn test_app() -> App {
         settings_edit: None,
         settings_error: None,
         subscription_refresh: None,
+        last_background_auto_pick_poll_error: None,
         system_proxy_config_path: config_path.clone(),
         node_quality_db_path: default_benchmark_db_path_for_config(&config_path)
             .expect("derive test node-quality path"),

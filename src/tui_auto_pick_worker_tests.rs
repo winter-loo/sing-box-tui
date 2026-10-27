@@ -578,6 +578,19 @@ fn background_poll_without_runtime_receipt_keeps_tui_alive() {
 }
 
 #[test]
+fn repeated_background_error_does_not_hide_foreground_feedback() {
+    let mut app = test_app();
+    app.poll_background_auto_pick_status_with_management(true)
+        .expect("report missing receipt");
+    assert!(app.status.contains("worker deferred"));
+
+    app.set_status_only("Assessing reachability for selected node...");
+    app.poll_background_auto_pick_status_with_management(true)
+        .expect("same error remains recoverable");
+    assert_eq!(app.status, "Assessing reachability for selected node...");
+}
+
+#[test]
 fn background_start_without_runtime_receipt_preserves_foreground_and_intent() {
     let mut app = test_app();
     app.auto_select_enabled = true;

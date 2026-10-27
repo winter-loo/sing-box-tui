@@ -226,6 +226,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Force a background subscription refresh when subscription refresh is configured.",
     },
     HelpBinding {
+        key: "R",
+        category: "Actions",
+        section: HelpSection::NetworkApp,
+        summary: "Retry subscription reload",
+        detail: "Apply an updated subscription config after a failed sing-box restart. Prompts for administrator authorization when needed.",
+    },
+    HelpBinding {
         key: "v",
         category: "Actions",
         section: HelpSection::NetworkApp,

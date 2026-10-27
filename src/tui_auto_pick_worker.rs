@@ -213,10 +213,15 @@ impl App {
         }
         // Background maintenance is recoverable. In particular, subscription reconciliation
         // can revoke the runtime receipt while the foreground must remain available for recovery.
-        if let Err(error) = self.try_poll_background_auto_pick_status() {
-            self.set_status_only(format!(
-                "Automatic selection worker deferred; will retry: {error:#}"
-            ));
+        match self.try_poll_background_auto_pick_status() {
+            Ok(()) => self.last_background_auto_pick_poll_error = None,
+            Err(error) => {
+                let message = format!("Automatic selection worker deferred; will retry: {error:#}");
+                if self.last_background_auto_pick_poll_error.as_deref() != Some(&message) {
+                    self.set_status_only(message.clone());
+                    self.last_background_auto_pick_poll_error = Some(message);
+                }
+            }
         }
         Ok(())
     }

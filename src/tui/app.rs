@@ -391,6 +391,12 @@ fn run_app(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     && app.tun_toggle_needs_terminal_prompt()
                 {
                     toggle_tun_with_terminal_prompt(&mut terminal, app)?;
+                } else if matches!(key.code, KeyCode::Char('R'))
+                    && app.active_view == ActiveView::NodeList
+                    && !app.has_active_modal()
+                    && app.subscription_reload_needs_terminal_prompt()
+                {
+                    reload_subscriptions_with_terminal_prompt(&mut terminal, app)?;
                 } else if !app.handle_key(key.code)? {
                     return Ok(());
                 }
@@ -444,6 +450,32 @@ fn toggle_tun_with_terminal_prompt(terminal: &mut DefaultTerminal, app: &mut App
         return Ok(());
     }
     app.toggle_tun_mode();
+    Ok(())
+}
+
+fn reload_subscriptions_with_terminal_prompt(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+) -> Result<()> {
+    app.set_status_only("Authorizing sing-box reload for updated subscriptions...");
+    terminal.draw(|frame| draw(frame, app))?;
+    suspend_terminal_for_prompt(
+        terminal,
+        "Updated subscriptions need administrator authorization to restart sing-box.",
+    )?;
+    let authorization = Command::new("sudo")
+        .arg("-v")
+        .status()
+        .context("failed to start sudo authorization for subscription reload");
+    resume_terminal_after_prompt(terminal)?;
+    let status = authorization?;
+    if status.success() {
+        app.retry_subscription_reload_now();
+    } else {
+        app.set_status_with_flash(format!(
+            "Subscription reload sudo authorization failed: {status}"
+        ));
+    }
     Ok(())
 }
 
@@ -626,6 +658,7 @@ struct App {
     settings_edit: Option<SettingsEditState>,
     settings_error: Option<String>,
     subscription_refresh: Option<SubscriptionRefreshState>,
+    last_background_auto_pick_poll_error: Option<String>,
     system_proxy_config_path: PathBuf,
     node_quality_db_path: PathBuf,
     system_proxy: SystemProxy,
@@ -871,6 +904,7 @@ impl App {
             settings_edit: None,
             settings_error: None,
             subscription_refresh,
+            last_background_auto_pick_poll_error: None,
             system_proxy_config_path: system_proxy_config_path.clone(),
             node_quality_db_path,
             system_proxy,
@@ -1267,6 +1301,7 @@ impl App {
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('r') => self.refresh()?,
             KeyCode::Char('u') => self.start_manual_subscription_refresh(),
+            KeyCode::Char('R') => self.retry_subscription_reload_now(),
             KeyCode::Char('U') => self.start_manual_usability_probe(),
             KeyCode::Char('P') => self.toggle_background_usability_probe()?,
             KeyCode::Char('T') => self.start_group_benchmark()?,

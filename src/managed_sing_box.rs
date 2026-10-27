@@ -1408,6 +1408,29 @@ impl ManagedSingBox {
         self.core.restart()
     }
 
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    pub(crate) fn validate_config_for_restart(&self) -> Result<()> {
+        let executable = resolve_sing_box_executable(&self.core.executable)?;
+        let status = Command::new(executable)
+            .arg("check")
+            .arg("--config")
+            .arg(&self.core.config_path)
+            .current_dir(sing_box_config_directory(&self.core.config_path))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("failed to validate updated sing-box config before restart")?;
+        if !status.success() {
+            bail!("updated sing-box config failed validation ({status}); old runtime kept running");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    pub(crate) fn validate_config_for_restart(&self) -> Result<()> {
+        bail!("automatic sing-box config validation is unavailable on this platform")
+    }
+
     pub(crate) fn startup_authorization_requirement(&self) -> Result<AuthorizationRequirement> {
         self.core.startup_authorization_requirement()
     }
