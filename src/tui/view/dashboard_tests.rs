@@ -929,14 +929,14 @@ fn current_marker_and_focus_underline_preserve_content_colors() {
 
     let name_start = column("node-a");
     let last_text_end = column("233ms") + "233ms".len() as u16;
-    assert_eq!(buffer[(column("▌"), y)].fg, theme.text_secondary());
+    assert_eq!(buffer[(column("▌"), y)].fg, theme.text_accent());
     assert!(!line.contains('>'));
     assert_eq!(buffer[(column("node-a"), y)].fg, theme.text_primary());
     assert_eq!(buffer[(column("Stable"), y)].fg, theme.text_success());
     assert_eq!(buffer[(column("233ms"), y)].fg, theme.text_secondary());
     assert_eq!(buffer[(column("node-a"), y)].bg, theme.bg_canvas());
     for x in name_start..last_text_end {
-        assert_eq!(buffer[(x, y + 1)].symbol(), "━", "underline gap at column {x}");
+        assert_eq!(buffer[(x, y + 1)].symbol(), "─", "underline gap at column {x}");
         assert_eq!(buffer[(x, y + 1)].fg, theme.text_accent());
     }
     assert_eq!(buffer[(name_start - 1, y + 1)].symbol(), " ");
@@ -1121,8 +1121,8 @@ fn internet_workspace_120x30_matches_figma_8_2_borderless_specification() {
     let name_start = unicode_width::UnicodeWidthStr::width(
         &first_node_row[..first_node_row.find("JP-Edge-03").unwrap()],
     );
-    assert_eq!(lines[4].chars().filter(|ch| *ch == '━').count(), latency_end - name_start);
-    assert_eq!(lines[4].chars().position(|ch| ch == '━'), Some(name_start));
+    assert_eq!(lines[4].chars().filter(|ch| *ch == '─').count(), latency_end - name_start);
+    assert_eq!(lines[4].chars().position(|ch| ch == '─'), Some(name_start));
 
     assert!(lines[5].trim().is_empty());
     let second_node_row = &lines[6];

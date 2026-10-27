@@ -578,7 +578,7 @@ fn render_candidate_table(
             spans.push(Span::raw(" ".repeat(horizontal_padding)));
             spans.push(Span::styled(
                 if row.is_current { "▌" } else { " " },
-                Style::default().fg(theme.text_secondary()),
+                Style::default().fg(theme.text_accent()),
             ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(name_str, name_style));
@@ -605,7 +605,7 @@ fn render_candidate_table(
                 Line::from(vec![
                     Span::raw(" ".repeat(start)),
                     Span::styled(
-                        "━".repeat(end.saturating_sub(start)),
+                        "─".repeat(end.saturating_sub(start)),
                         Style::default().fg(theme.text_accent()),
                     ),
                 ])
