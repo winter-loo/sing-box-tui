@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::view::{
-    IntranetDetailSection, IntranetDetailView, NodeViewPanel,
-    private_access_detail_view,
+    IntranetDetailSection, IntranetDetailView, NodeViewPanel, private_access_detail_view,
 };
 use super::{App, Focus};
-use crate::controller::{ProxyGroup, matches_filter};
+use crate::benchmark_workflow::ActiveQuickProbe;
+use crate::controller::{ProxyGroup, matches_filter, probe_average_latency_ms};
 use crate::defaults::DEFAULT_SELECTOR_TAG;
 use crate::private_access_session::PrivateAccessProfileRuntime;
 
@@ -284,11 +284,13 @@ impl App {
             if let Some((pending, results)) =
                 self.custom_usability_live_projection(&manifest_id, &group.name)
             {
-                return live_usability_members(
+                let mut displayed = live_usability_members(
                     &group.members,
                     pending.as_ref().map(|(node, _, _)| node.as_str()),
                     &results,
                 );
+                self.sort_members_by_average_latency(&group.name, &mut displayed);
+                return displayed;
             }
             let projection =
                 self.cached_custom_node_view_projection(&manifest_id, &group.name, &group.members);
@@ -321,9 +323,39 @@ impl App {
                     (None, None) => Ordering::Equal,
                 }
             });
+            self.sort_members_by_average_latency(&group.name, &mut displayed);
             return displayed;
         }
-        group.members.clone()
+        let mut displayed = group.members.clone();
+        self.sort_members_by_average_latency(&group.name, &mut displayed);
+        displayed
+    }
+
+    fn sort_members_by_average_latency(&self, group: &str, members: &mut [String]) {
+        if !self.sort_candidates_by_average_latency {
+            return;
+        }
+        members.sort_by_key(|member| {
+            let assessment = match self.benchmark_workflow.active_quick_probe(group, member) {
+                Some(
+                    ActiveQuickProbe::CompleteAssessment(assessment)
+                    | ActiveQuickProbe::IncompleteAssessment(assessment),
+                ) => Some(assessment),
+                Some(ActiveQuickProbe::Pending) => None,
+                None => self
+                    .benchmark_workflow
+                    .reachability_assessment(group, member),
+            };
+            let mean = assessment.and_then(|assessment| {
+                probe_average_latency_ms(&assessment.attempts, self.benchmark_timeout_ms)
+            });
+            (mean.is_none(), mean.unwrap_or(u64::MAX))
+        });
+    }
+
+    pub(super) fn enable_average_latency_sort(&mut self) {
+        self.sort_candidates_by_average_latency = true;
+        self.set_status_only("Candidates sorted by average latency (ascending)");
     }
 
     pub(super) fn active_usability_manifest_id(

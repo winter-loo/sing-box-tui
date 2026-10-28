@@ -688,6 +688,18 @@ impl ProbeOutcome {
     }
 }
 
+pub(crate) fn probe_average_latency_ms(attempts: &[ProbeOutcome], timeout_ms: u64) -> Option<u64> {
+    let values = attempts.iter().filter_map(|attempt| match attempt {
+        ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
+        ProbeOutcome::Timeout | ProbeOutcome::TransportFailure { .. } => Some(timeout_ms),
+        _ => None,
+    });
+    let (sum, count) = values.fold((0_u128, 0_u128), |(sum, count), value| {
+        (sum + u128::from(value), count + 1)
+    });
+    (count > 0).then(|| ((sum + count / 2) / count).min(u128::from(u64::MAX)) as u64)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReachabilityAssessment {

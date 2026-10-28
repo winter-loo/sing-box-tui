@@ -149,6 +149,13 @@ const HELP_BINDINGS: &[HelpBinding] = &[
         detail: "Run quick eligibility and then one bounded sustained transfer through an isolated node runtime.",
     },
     HelpBinding {
+        key: "S",
+        category: "Actions",
+        section: HelpSection::Probes,
+        summary: "Sort by average latency",
+        detail: "Keep the Internet node list in ascending average latency order. Active probes use completed attempts so far; nodes without a sample remain last in view order.",
+    },
+    HelpBinding {
         key: "U",
         category: "Actions",
         section: HelpSection::Probes,

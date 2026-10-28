@@ -210,6 +210,7 @@ pub(crate) struct DashboardSnapshot<'a> {
     pub(crate) active_node_view_tab: usize,
     pub(crate) candidate_rows: Vec<CandidateRow>,
     pub(crate) candidate_selected: Option<usize>,
+    pub(crate) candidate_scroll_offset: usize,
     pub(crate) pending_animation_tick: usize,
     pub(crate) pending_animation_bright: bool,
     pub(crate) intranet_detail: Option<IntranetDetailSnapshot<'a>>,
@@ -246,7 +247,6 @@ fn latency_signal_style(state: LatencySignalState, theme: &Theme) -> Style {
         LatencySignalState::Untested => theme.style_muted(),
         LatencySignalState::Measuring => Style::default().fg(theme.text_secondary()),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 200 => theme.style_success(),
-        LatencySignalState::Reachable { delay_ms } if delay_ms < 400 => theme.style_warning(),
         LatencySignalState::Reachable { delay_ms } if delay_ms < 600 => theme.style_warning(),
         LatencySignalState::Reachable { .. } => theme.style_error(),
         LatencySignalState::Unreachable => theme.style_muted(),
@@ -281,18 +281,23 @@ pub(crate) fn render(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
     render_in_area(frame, frame.area(), snapshot);
 }
 
-pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &DashboardSnapshot<'_>) {
+pub(crate) fn render_in_area(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &DashboardSnapshot<'_>,
+) -> usize {
     let theme = Theme::detect();
     frame.render_widget(Block::default().style(theme.style_base()), area);
 
     let is_private_access = snapshot.operational_workspace
         == crate::tui_state::OperationalWorkspace::PrivateAccess;
 
-    if !is_private_access {
-        render_internet_workspace(frame, area, snapshot, &theme);
+    let candidate_scroll_offset = if !is_private_access {
+        render_internet_workspace(frame, area, snapshot, &theme)
     } else {
         render_intranet_workspace(frame, area, snapshot, &theme);
-    }
+        snapshot.candidate_scroll_offset
+    };
 
     if let Some(message) = snapshot.flash.as_deref() {
         let estimated_width = area.width.saturating_mul(80).saturating_div(100).max(1);
@@ -324,6 +329,7 @@ pub(crate) fn render_in_area(frame: &mut Frame, area: Rect, snapshot: &Dashboard
     if let Some(auth) = snapshot.private_access_auth {
         draw_private_access_auth_panel(frame, auth);
     }
+    candidate_scroll_offset
 }
 
 pub(crate) fn render_active_modals(frame: &mut Frame, snapshot: &DashboardSnapshot<'_>) {
@@ -346,9 +352,9 @@ fn render_internet_workspace(
     area: Rect,
     snapshot: &DashboardSnapshot<'_>,
     theme: &Theme,
-) {
+) -> usize {
     if area.height == 0 || area.width == 0 {
-        return;
+        return snapshot.candidate_scroll_offset;
     }
 
     // Figma 8:2 uses a 30 px tab container around 16 px text, which maps most closely to two
@@ -378,13 +384,16 @@ fn render_internet_workspace(
         render_filter_tabs(frame, tabs_area, snapshot, theme);
     }
 
-    if candidate_area.height > 0 {
-        render_candidate_table(frame, candidate_area, snapshot, theme);
-    }
+    let candidate_scroll_offset = if candidate_area.height > 0 {
+        render_candidate_table(frame, candidate_area, snapshot, theme)
+    } else {
+        snapshot.candidate_scroll_offset
+    };
 
     if footer_area.height > 0 {
         render_internet_footer(frame, footer_area, snapshot, theme);
     }
+    candidate_scroll_offset
 }
 
 fn render_filter_tabs(
@@ -418,9 +427,9 @@ fn render_candidate_table(
     area: Rect,
     snapshot: &DashboardSnapshot<'_>,
     theme: &Theme,
-) {
+) -> usize {
     if area.height == 0 || area.width == 0 {
-        return;
+        return snapshot.candidate_scroll_offset;
     }
 
     let (candidate_notice_area, candidate_list_area) = if let Some(notice) =
@@ -474,7 +483,7 @@ fn render_candidate_table(
                 candidate_list_area,
             );
         }
-        return;
+        return 0;
     }
 
     let total_width = candidate_list_area.width as usize;
@@ -621,10 +630,13 @@ fn render_candidate_table(
         })
         .collect::<Vec<_>>();
 
-    // Keep the selected index for scrolling; the underline marks focus without recoloring content.
+    // Preserve the viewport across draws while the selected index moves after sorting.
     let members_widget = List::new(members);
-    let mut members_state = ListState::default().with_selected(snapshot.candidate_selected);
+    let mut members_state = ListState::default()
+        .with_selected(snapshot.candidate_selected)
+        .with_offset(snapshot.candidate_scroll_offset);
     frame.render_stateful_widget(members_widget, candidate_list_area, &mut members_state);
+    members_state.offset()
 }
 
 fn render_internet_footer(

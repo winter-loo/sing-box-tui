@@ -509,7 +509,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 &["INTERNET", provider.as_str(), route_node.as_str()],
             );
             let snapshot = app.view_snapshot();
-            view::render_in_area(frame, body_area, &snapshot);
+            app.candidate_scroll_offset = view::render_in_area(frame, body_area, &snapshot);
         } else {
             let snapshot = app.view_snapshot();
             view::render_in_area(frame, area, &snapshot);
@@ -592,6 +592,8 @@ struct App {
     applied_group_index: usize,
     internet_route_index: usize,
     member_index: usize,
+    candidate_scroll_offset: usize,
+    last_candidate_focus: Option<(String, usize)>,
     node_view_panel: NodeViewPanel,
     focus: Focus,
     left_pane_section: LeftPaneSection,
@@ -602,6 +604,7 @@ struct App {
     flash: Option<(String, Instant)>,
     animation_started: Instant,
     benchmark_filter: String,
+    sort_candidates_by_average_latency: bool,
     benchmark_url: String,
     sustained_target_url: String,
     sustained_runtime_environment: Option<(PathBuf, PathBuf)>,
@@ -837,6 +840,8 @@ impl App {
             applied_group_index: 0,
             internet_route_index: 0,
             member_index: 0,
+            candidate_scroll_offset: 0,
+            last_candidate_focus: None,
             node_view_panel: NodeViewPanel::CurrentSelector,
             focus: Focus::Members,
             left_pane_section: LeftPaneSection::Internet,
@@ -847,6 +852,7 @@ impl App {
             flash: None,
             animation_started: Instant::now(),
             benchmark_filter: String::new(),
+            sort_candidates_by_average_latency: false,
             benchmark_url: String::from(DEFAULT_DELAY_TEST_URL),
             sustained_target_url: String::from(DEFAULT_SUSTAINED_TARGET_URL),
             sustained_runtime_environment,
@@ -1306,6 +1312,9 @@ impl App {
             KeyCode::Char('P') => self.toggle_background_usability_probe()?,
             KeyCode::Char('T') => self.start_group_benchmark()?,
             KeyCode::Char('t') => self.start_member_benchmark()?,
+            KeyCode::Char('S') if self.operational_workspace == OperationalWorkspace::Internet => {
+                self.enable_average_latency_sort();
+            }
             KeyCode::Char('a') => self.toggle_auto_select()?,
             KeyCode::Char('m') => self.cycle_clash_mode()?,
             KeyCode::Char('b') => self.open_bypass_modal(),

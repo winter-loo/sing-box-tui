@@ -32,6 +32,196 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPACE_SELECTION_CHILD_ENV: &str = "SING_BOX_TUI_SPACE_SELECTION_CHILD";
 
+#[test]
+fn average_latency_shortcut_sorts_completed_results_and_stays_enabled() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = vec![
+        "node-a".into(),
+        "node-b".into(),
+        "node-c".into(),
+        "node-d".into(),
+    ];
+    for (name, attempts) in [
+        ("node-a", vec![200, 250, 300]),
+        ("node-b", vec![90, 100, 110]),
+    ] {
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                name.into(),
+                attempts
+                    .into_iter()
+                    .map(|delay_ms| ProbeOutcome::Reachable { delay_ms })
+                    .collect(),
+            ),
+        );
+    }
+    app.benchmark_workflow.set_reachability_assessment(
+        "select",
+        NodeReachabilityAssessment::from_attempts(
+            "node-c".into(),
+            vec![
+                ProbeOutcome::Reachable { delay_ms: 100 },
+                ProbeOutcome::Timeout,
+                ProbeOutcome::Reachable { delay_ms: 100 },
+            ],
+        ),
+    );
+
+    assert_eq!(
+        app.displayed_members(),
+        ["node-a", "node-b", "node-c", "node-d"]
+    );
+    app.handle_key(KeyCode::Char('S')).unwrap();
+    assert_eq!(
+        app.displayed_members(),
+        ["node-b", "node-a", "node-c", "node-d"]
+    );
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+    let snapshot = app.view_snapshot();
+    assert!(snapshot.candidate_title.contains("AVG LATENCY ASC"));
+    assert_eq!(
+        snapshot.candidate_rows[2]
+            .latency_signal
+            .as_ref()
+            .unwrap()
+            .value_ms,
+        Some(1733)
+    );
+    app.handle_key(KeyCode::Char('j')).unwrap();
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-c"));
+
+    app.handle_key(KeyCode::Char('S')).unwrap();
+    assert_eq!(
+        app.displayed_members(),
+        ["node-b", "node-a", "node-c", "node-d"]
+    );
+    assert!(
+        app.view_snapshot()
+            .candidate_title
+            .contains("AVG LATENCY ASC")
+    );
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-c"));
+}
+
+#[test]
+fn average_latency_sort_updates_as_active_attempts_arrive() {
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = vec!["node-a".into(), "node-b".into(), "node-c".into()];
+    for (name, delay) in [("node-a", 20), ("node-b", 100)] {
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                name.into(),
+                vec![ProbeOutcome::Reachable { delay_ms: delay }; 3],
+            ),
+        );
+    }
+    for name in ["node-a", "node-c"] {
+        app.benchmark_workflow
+            .add_pending_job_for_test("select", name);
+    }
+
+    app.handle_key(KeyCode::Char('S')).unwrap();
+    assert_eq!(app.displayed_members(), ["node-b", "node-a", "node-c"]);
+
+    app.benchmark_workflow
+        .set_active_reachability_assessment_for_test(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                "node-a".into(),
+                vec![ProbeOutcome::Reachable { delay_ms: 300 }],
+            ),
+        );
+    assert_eq!(app.displayed_members(), ["node-b", "node-a", "node-c"]);
+
+    app.benchmark_workflow
+        .set_active_reachability_assessment_for_test(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                "node-c".into(),
+                vec![ProbeOutcome::Reachable { delay_ms: 50 }],
+            ),
+        );
+    assert_eq!(app.displayed_members(), ["node-c", "node-b", "node-a"]);
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+
+    app.benchmark_workflow
+        .set_active_reachability_assessment_for_test(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                "node-c".into(),
+                vec![
+                    ProbeOutcome::Reachable { delay_ms: 50 },
+                    ProbeOutcome::Reachable { delay_ms: 250 },
+                ],
+            ),
+        );
+    assert_eq!(app.displayed_members(), ["node-b", "node-c", "node-a"]);
+}
+
+#[test]
+fn sorting_keeps_the_focused_node_on_the_same_terminal_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = test_app();
+    app.benchmark_filter.clear();
+    app.groups[0].members = std::iter::once("node-a".to_string())
+        .chain((1..12).map(|index| format!("node-{index:02}")))
+        .collect();
+    for (index, name) in app.groups[0].members.iter().enumerate() {
+        let delay_ms = if index == 0 { 1_000 } else { index as u64 * 10 };
+        app.benchmark_workflow.set_reachability_assessment(
+            "select",
+            NodeReachabilityAssessment::from_attempts(
+                name.clone(),
+                vec![ProbeOutcome::Reachable { delay_ms }; 3],
+            ),
+        );
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let focused_y = |terminal: &Terminal<TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .enumerate()
+            .skip(3)
+            .find(|(_, cells)| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("node-a")
+            })
+            .map(|(y, _)| y)
+            .expect("focused node visible")
+    };
+    terminal
+        .draw(|frame| super::super::draw(frame, &mut app))
+        .unwrap();
+    let before = focused_y(&terminal);
+    app.handle_key(KeyCode::Char('S')).unwrap();
+    terminal
+        .draw(|frame| super::super::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(focused_y(&terminal), before);
+    app.handle_key(KeyCode::Char('S')).unwrap();
+    terminal
+        .draw(|frame| super::super::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(focused_y(&terminal), before);
+    assert_eq!(app.selected_member_name().as_deref(), Some("node-a"));
+    terminal
+        .draw(|frame| super::super::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(focused_y(&terminal), before);
+}
+
 fn space_selection_test_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

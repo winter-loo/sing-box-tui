@@ -157,6 +157,7 @@ fn dashboard_snapshot<'a>() -> DashboardSnapshot<'a> {
             tone: CandidateTone::Success,
         }],
         candidate_selected: Some(0),
+        candidate_scroll_offset: 0,
         pending_animation_tick: 0,
         pending_animation_bright: true,
         intranet_detail: None,

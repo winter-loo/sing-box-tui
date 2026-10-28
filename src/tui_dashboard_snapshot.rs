@@ -11,7 +11,7 @@ use super::view::{
 };
 use crate::automatic_selection::NodeViewId;
 use crate::benchmark_workflow::ActiveQuickProbe;
-use crate::controller::ProbeOutcome;
+use crate::controller::{ProbeOutcome, probe_average_latency_ms};
 use crate::sustained_quality::{NodeSustainedQuality, SustainedProbeOutcome};
 
 fn extract_candidate_brief_marker(
@@ -80,24 +80,13 @@ fn latency_signal_for_attempts(
         .collect::<Vec<_>>();
     let minimum_delay = reachable_delays.iter().copied().min();
     let compare_relative_heights = reachable_delays.len() >= 2;
-    let measured_values = attempts
-        .iter()
-        .filter_map(|attempt| match attempt {
+    let mean_ms = probe_average_latency_ms(attempts, timeout_ms);
+    let value_ms = if active_attempt.is_some() {
+        attempts.iter().rev().find_map(|attempt| match attempt {
             ProbeOutcome::Reachable { delay_ms } => Some(*delay_ms),
             ProbeOutcome::Timeout | ProbeOutcome::TransportFailure { .. } => Some(timeout_ms),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    let mean_ms = (!measured_values.is_empty()).then(|| {
-        let count = measured_values.len() as u128;
-        let sum = measured_values
-            .iter()
-            .map(|delay| u128::from(*delay))
-            .sum::<u128>();
-        ((sum + count / 2) / count).min(u128::from(u64::MAX)) as u64
-    });
-    let value_ms = if active_attempt.is_some() {
-        measured_values.last().copied()
     } else {
         mean_ms
     };
@@ -190,7 +179,7 @@ impl App {
             selected_group.and_then(|group| self.custom_usability_live_projection(id, &group.name))
         });
         let displayed_members = self.displayed_members();
-        let candidate_rows = selected_group
+        let candidate_rows: Vec<CandidateRow> = selected_group
             .map(|group| {
                 if usability_manifest_id.is_some() {
                     if let Some((pending, live_results)) = custom_live.as_ref() {
@@ -396,17 +385,23 @@ impl App {
             .unwrap_or_default();
         let candidate_title = selected_group
             .map(|group| {
-                let order = match &self.node_view_panel {
-                    NodeViewPanel::CurrentSelector => "SELECTOR ORDER",
-                    NodeViewPanel::Streaming | NodeViewPanel::Custom(_) => usability_manifest_id
-                        .as_ref()
-                        .and_then(|id| {
-                            self.usability_probe_manifests
-                                .iter()
-                                .find(|manifest| &manifest.id == id)
-                                .map(|manifest| manifest.ranking_policy.badge())
-                        })
-                        .unwrap_or("CUSTOM"),
+                let order = if self.sort_candidates_by_average_latency {
+                    "AVG LATENCY ASC"
+                } else {
+                    match &self.node_view_panel {
+                        NodeViewPanel::CurrentSelector => "SELECTOR ORDER",
+                        NodeViewPanel::Streaming | NodeViewPanel::Custom(_) => {
+                            usability_manifest_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.usability_probe_manifests
+                                        .iter()
+                                        .find(|manifest| &manifest.id == id)
+                                        .map(|manifest| manifest.ranking_policy.badge())
+                                })
+                                .unwrap_or("CUSTOM")
+                        }
+                    }
                 };
                 let progress = match usability_manifest_id.as_ref() {
                     Some(id) => {
@@ -546,6 +541,21 @@ impl App {
         } else {
             self.displayed_member_index()
         };
+        let current_focus: Option<(String, usize)> = candidate_selected.and_then(|index| {
+            candidate_rows
+                .get(index)
+                .map(|row| (row.name.clone(), index))
+        });
+        if let (Some((previous_name, previous_index)), Some((current_name, current_index))) =
+            (&self.last_candidate_focus, &current_focus)
+            && self.sort_candidates_by_average_latency
+            && previous_name == current_name
+            && previous_index != current_index
+        {
+            let previous_screen_row = previous_index.saturating_sub(self.candidate_scroll_offset);
+            self.candidate_scroll_offset = current_index.saturating_sub(previous_screen_row);
+        }
+        self.last_candidate_focus = current_focus;
         let showing_intranet_details = self.showing_intranet_details();
         let intranet_detail = if showing_intranet_details {
             self.private_access
@@ -637,6 +647,7 @@ impl App {
             active_node_view_tab,
             candidate_rows,
             candidate_selected,
+            candidate_scroll_offset: self.candidate_scroll_offset,
             pending_animation_tick,
             pending_animation_bright,
             intranet_detail,
