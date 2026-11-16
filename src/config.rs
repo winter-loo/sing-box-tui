@@ -29,10 +29,16 @@ const TAILSCALE_ENDPOINT_TAG: &str = "ts-ep";
 const TAILSCALE_DNS_TAG: &str = "tailscale-dns";
 const TAILSCALE_STATE_DIRECTORY: &str = ".local/tailscale-embedded";
 const TAILSCALE_IPV6_CIDR: &str = "fd7a:115c:a1e0::/48";
-// AliDNS alternate address, used as the directly reachable remote DoT default.
-const DEFAULT_REMOTE_DNS_SERVER: &str = "223.6.6.6";
-const LEGACY_REMOTE_DNS_SERVER: &str = "8.8.8.8";
-const DEFAULT_REMOTE_DNS_PORT: u64 = 853;
+// Cloudflare DoH via proxy selector is the default remote DNS; legacy DoT defaults are migrated.
+const DEFAULT_REMOTE_DNS_SERVER: &str = "1.1.1.1";
+const DEFAULT_REMOTE_DNS_PORT: u64 = 443;
+const DEFAULT_REMOTE_DNS_PATH: &str = "/dns-query";
+const DEFAULT_REMOTE_DNS_SERVER_NAME: &str = "cloudflare-dns.com";
+const LEGACY_REMOTE_DOT_DNS_SERVERS: &[&str] = &["8.8.8.8", "223.6.6.6"];
+const LEGACY_REMOTE_DOT_DNS_PORT: u64 = 853;
+const DEFAULT_FAKEIP_DNS_TAG: &str = "fakeip";
+const DEFAULT_FAKEIP_INET4_RANGE: &str = "198.18.0.0/15";
+const DEFAULT_SNIFF_TIMEOUT: &str = "300ms";
 
 // China split-routing rule-set tags. These are the binary rule-sets the China IP routing
 // toggle adds or removes, distinct from the AdGuard ad-block rule-set.
@@ -1107,7 +1113,64 @@ fn reject_tailscale_dns_tag_collision(root: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+fn existing_selector_outbound_tag(outbounds: &[Value]) -> Option<String> {
+    outbounds
+        .iter()
+        .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+        .find(|tag| SELECTOR_TAG_ALIASES.iter().any(|alias| alias == tag))
+        .map(ToString::to_string)
+        .or_else(|| {
+            outbounds
+                .iter()
+                .find(|outbound| {
+                    matches!(
+                        outbound.get("type").and_then(Value::as_str),
+                        Some("selector" | "urltest")
+                    )
+                })
+                .and_then(|outbound| outbound.get("tag").and_then(Value::as_str))
+                .map(ToString::to_string)
+        })
+}
+
+fn default_remote_dns_server(selector_tag: Option<&str>) -> Value {
+    let mut server = json!({
+        "type": "https",
+        "tag": DEFAULT_REMOTE_DNS_TAG,
+        "server": DEFAULT_REMOTE_DNS_SERVER,
+        "server_port": DEFAULT_REMOTE_DNS_PORT,
+        "path": DEFAULT_REMOTE_DNS_PATH,
+        "tls": {
+            "enabled": true,
+            "server_name": DEFAULT_REMOTE_DNS_SERVER_NAME,
+        },
+    });
+    if let Some(selector_tag) = selector_tag {
+        server["detour"] = Value::String(selector_tag.to_string());
+    }
+    server
+}
+
+fn default_fakeip_dns_server() -> Value {
+    json!({
+        "type": "fakeip",
+        "tag": DEFAULT_FAKEIP_DNS_TAG,
+        "inet4_range": DEFAULT_FAKEIP_INET4_RANGE,
+    })
+}
+
+fn default_sniff_route_rule() -> Value {
+    json!({
+        "action": "sniff",
+        "timeout": DEFAULT_SNIFF_TIMEOUT,
+    })
+}
+
 fn ensure_tailscale_remote_dns_server(root: &mut Map<String, Value>) -> Result<()> {
+    let selector_tag = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
     let servers = root
         .get_mut("dns")
         .and_then(Value::as_object_mut)
@@ -1122,13 +1185,7 @@ fn ensure_tailscale_remote_dns_server(root: &mut Map<String, Value>) -> Result<(
     {
         return Ok(());
     }
-    let server = json!({
-        "type": "tls",
-        "tag": DEFAULT_REMOTE_DNS_TAG,
-        "server": DEFAULT_REMOTE_DNS_SERVER,
-        "server_port": DEFAULT_REMOTE_DNS_PORT,
-    });
-    servers.push(server);
+    servers.push(default_remote_dns_server(selector_tag.as_deref()));
     Ok(())
 }
 
@@ -1189,34 +1246,37 @@ fn existing_direct_outbound_tag(outbounds: &[Value]) -> Option<String> {
         })
 }
 
-fn find_remote_dns_and_migrate_if_managed(servers: &mut [Value]) -> bool {
+fn find_remote_dns_and_migrate_if_managed(
+    servers: &mut [Value],
+    selector_tag: Option<&str>,
+) -> bool {
     let Some(remote) = servers
         .iter_mut()
         .find(|server| server.get("tag").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG))
     else {
         return false;
     };
+    let server_type = remote.get("type").and_then(Value::as_str);
     let server = remote.get("server").and_then(Value::as_str);
-    let is_managed_remote = remote.get("type").and_then(Value::as_str) == Some("tls")
-        && matches!(
-            server,
-            Some(DEFAULT_REMOTE_DNS_SERVER | LEGACY_REMOTE_DNS_SERVER)
-        )
-        && remote.get("server_port").and_then(Value::as_u64) == Some(DEFAULT_REMOTE_DNS_PORT);
-    if is_managed_remote {
-        let remote = remote
-            .as_object_mut()
-            .expect("tagged DNS server is an object");
-        remote.insert(
-            "server".to_string(),
-            Value::String(DEFAULT_REMOTE_DNS_SERVER.to_string()),
-        );
-        remote.remove("detour");
+    let server_port = remote.get("server_port").and_then(Value::as_u64);
+    let is_legacy_managed_dot = server_type == Some("tls")
+        && server.is_some_and(|addr| LEGACY_REMOTE_DOT_DNS_SERVERS.contains(&addr))
+        && server_port == Some(LEGACY_REMOTE_DOT_DNS_PORT);
+    let is_managed_doh = server_type == Some("https")
+        && server == Some(DEFAULT_REMOTE_DNS_SERVER)
+        && server_port == Some(DEFAULT_REMOTE_DNS_PORT)
+        && remote.get("path").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_PATH);
+    if is_legacy_managed_dot || is_managed_doh {
+        *remote = default_remote_dns_server(selector_tag);
     }
     true
 }
 
 fn migrate_existing_managed_remote_dns(root: &mut serde_json::Map<String, Value>) {
+    let selector_tag = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
     let Some(servers) = root
         .get_mut("dns")
         .and_then(Value::as_object_mut)
@@ -1225,13 +1285,16 @@ fn migrate_existing_managed_remote_dns(root: &mut serde_json::Map<String, Value>
     else {
         return;
     };
-    find_remote_dns_and_migrate_if_managed(servers);
+    find_remote_dns_and_migrate_if_managed(servers, selector_tag.as_deref());
 }
 
 /// Ensures the `local` and `remote` DNS servers the China DNS rules reference actually exist,
-/// adding the canonical definitions when they are missing. Remote DNS dials directly, so any
-/// inherited detour is removed.
+/// adding the canonical definitions when they are missing or migrating managed legacy defaults.
 fn ensure_china_ip_routing_dns_servers(root: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let selector_tag = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .and_then(|outbounds| existing_selector_outbound_tag(outbounds));
     let dns = root
         .entry("dns")
         .or_insert_with(|| json!({}))
@@ -1253,13 +1316,8 @@ fn ensure_china_ip_routing_dns_servers(root: &mut serde_json::Map<String, Value>
             "server_port": 853,
         }));
     }
-    if !find_remote_dns_and_migrate_if_managed(servers) {
-        servers.push(json!({
-            "type": "tls",
-            "tag": DEFAULT_REMOTE_DNS_TAG,
-            "server": DEFAULT_REMOTE_DNS_SERVER,
-            "server_port": DEFAULT_REMOTE_DNS_PORT,
-        }));
+    if !find_remote_dns_and_migrate_if_managed(servers, selector_tag.as_deref()) {
+        servers.push(default_remote_dns_server(selector_tag.as_deref()));
     }
     Ok(())
 }
@@ -1715,6 +1773,25 @@ pub(crate) fn build_default_config_with_options(
 
     let mut dns_rules = vec![
         json!({
+            "domain_suffix": [
+                "airtcp.me",
+                "airtcp.com",
+                "airapp.link",
+                "mailrelay.us"
+            ],
+            "server": DEFAULT_LOCAL_DNS_TAG,
+        }),
+        json!({
+            "rule_set": DEFAULT_BYPASS_RULE_SET_TAG,
+            "server": DEFAULT_LOCAL_DNS_TAG,
+        }),
+        json!({
+            "query_type": ["A", "AAAA"],
+            "clash_mode": "全局",
+            "server": DEFAULT_FAKEIP_DNS_TAG,
+            "rewrite_ttl": 1,
+        }),
+        json!({
             "clash_mode": "全局",
             "server": DEFAULT_REMOTE_DNS_TAG,
         }),
@@ -1726,6 +1803,12 @@ pub(crate) fn build_default_config_with_options(
     if options.include_geosite_rules {
         dns_rules.extend(china_ip_routing_dns_rules());
     }
+    dns_rules.push(json!({
+        "query_type": ["A", "AAAA"],
+        "clash_mode": "规则",
+        "server": DEFAULT_FAKEIP_DNS_TAG,
+        "rewrite_ttl": 1,
+    }));
     dns_rules.push(json!({
         "clash_mode": "规则",
         "server": DEFAULT_REMOTE_DNS_TAG,
@@ -1745,6 +1828,7 @@ pub(crate) fn build_default_config_with_options(
             ],
             "action": "hijack-dns",
         }),
+        default_sniff_route_rule(),
         json!({
             "domain_suffix": [
                 "airtcp.me",
@@ -1813,22 +1897,18 @@ pub(crate) fn build_default_config_with_options(
         },
         "dns": {
             "servers": [
-                {
-                    "type": "tls",
-                    "tag": DEFAULT_REMOTE_DNS_TAG,
-                    "server": DEFAULT_REMOTE_DNS_SERVER,
-                    "server_port": DEFAULT_REMOTE_DNS_PORT,
-                },
+                default_remote_dns_server(Some(DEFAULT_SELECTOR_TAG)),
                 {
                     "type": "tls",
                     "tag": DEFAULT_LOCAL_DNS_TAG,
                     "server": "223.5.5.5",
                     "server_port": 853,
-                }
+                },
+                default_fakeip_dns_server(),
             ],
             "rules": dns_rules,
             "strategy": "ipv4_only",
-            "independent_cache": false,
+            "independent_cache": true,
         },
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -1844,6 +1924,7 @@ pub(crate) fn build_default_config_with_options(
         "experimental": {
             "cache_file": {
                 "enabled": true,
+                "store_fakeip": true,
                 "store_rdrc": true,
             },
             "clash_api": {
@@ -1863,7 +1944,6 @@ pub(crate) fn merge_into_existing_config(
         .as_object_mut()
         .context("existing sing-box config must be a JSON object")?;
     migrate_legacy_inbound_fields(root)?;
-    migrate_existing_managed_remote_dns(root);
     let outbounds_value = root
         .entry("outbounds")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -1974,6 +2054,8 @@ pub(crate) fn merge_into_existing_config(
         upsert_tagged_outbound(outbounds, node)?;
     }
 
+    migrate_existing_managed_remote_dns(root);
+
     let route_value = root.entry("route").or_insert_with(|| json!({}));
     let route = route_value
         .as_object_mut()
@@ -1984,6 +2066,8 @@ pub(crate) fn merge_into_existing_config(
     ensure_subscription_direct_route(route, &direct_tag)?;
     ensure_bypass_route(route, &direct_tag)?;
     ensure_cgnat_direct_route(route, &direct_tag)?;
+
+    ensure_existing_config_fakeip_and_sniff(root);
 
     let experimental_value = root.entry("experimental").or_insert_with(|| json!({}));
     let experimental = experimental_value
@@ -1997,6 +2081,9 @@ pub(crate) fn merge_into_existing_config(
         .context("existing config experimental.cache_file must be an object")?;
     cache_file
         .entry("enabled")
+        .or_insert_with(|| Value::Bool(true));
+    cache_file
+        .entry("store_fakeip")
         .or_insert_with(|| Value::Bool(true));
 
     let clash_api_value = experimental.entry("clash_api").or_insert_with(|| {
@@ -2016,6 +2103,73 @@ pub(crate) fn merge_into_existing_config(
         .or_insert_with(|| Value::String(String::new()));
 
     Ok(())
+}
+
+fn ensure_existing_config_fakeip_and_sniff(root: &mut serde_json::Map<String, Value>) {
+    if let Some(dns) = root.get_mut("dns").and_then(Value::as_object_mut)
+        && dns.get("servers").is_some_and(Value::is_array)
+        && dns.get("rules").is_some_and(Value::is_array)
+    {
+        let servers = dns
+            .get_mut("servers")
+            .and_then(Value::as_array_mut)
+            .expect("dns.servers validated as array");
+        let has_fakeip = servers.iter().any(|server| {
+            server.get("tag").and_then(Value::as_str) == Some(DEFAULT_FAKEIP_DNS_TAG)
+                || server.get("type").and_then(Value::as_str) == Some("fakeip")
+        });
+        if !has_fakeip {
+            servers.push(default_fakeip_dns_server());
+        }
+        dns.insert("independent_cache".to_string(), Value::Bool(true));
+
+        let rules = dns
+            .get_mut("rules")
+            .and_then(Value::as_array_mut)
+            .expect("dns.rules validated as array");
+        ensure_fakeip_dns_rule_before_mode(rules, "全局");
+        ensure_fakeip_dns_rule_before_mode(rules, "规则");
+    }
+
+    if let Some(rules) = root
+        .get_mut("route")
+        .and_then(Value::as_object_mut)
+        .and_then(|route| route.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+    {
+        let has_sniff = rules
+            .iter()
+            .any(|rule| rule.get("action").and_then(Value::as_str) == Some("sniff"));
+        if !has_sniff
+            && let Some(hijack_index) = rules.iter().position(is_dns_hijack_rule)
+        {
+            rules.insert(hijack_index + 1, default_sniff_route_rule());
+        }
+    }
+}
+
+fn ensure_fakeip_dns_rule_before_mode(rules: &mut Vec<Value>, mode: &str) {
+    let has_fakeip_rule = rules.iter().any(|rule| {
+        rule.get("clash_mode").and_then(Value::as_str) == Some(mode)
+            && rule.get("server").and_then(Value::as_str) == Some(DEFAULT_FAKEIP_DNS_TAG)
+    });
+    if has_fakeip_rule {
+        return;
+    }
+    if let Some(index) = rules.iter().position(|rule| {
+        rule.get("clash_mode").and_then(Value::as_str) == Some(mode)
+            && rule.get("server").and_then(Value::as_str) == Some(DEFAULT_REMOTE_DNS_TAG)
+    }) {
+        rules.insert(
+            index,
+            json!({
+                "query_type": ["A", "AAAA"],
+                "clash_mode": mode,
+                "server": DEFAULT_FAKEIP_DNS_TAG,
+                "rewrite_ttl": 1,
+            }),
+        );
+    }
 }
 
 fn add_provider_groups(
@@ -3207,9 +3361,14 @@ mod tests {
             .expect("manual selector");
         let members = select["outbounds"].as_array().expect("selector members");
         assert!(!members.contains(&Value::String("国内直连".to_string())));
-        assert_eq!(config["dns"]["servers"][0]["type"], "tls");
-        assert_eq!(config["dns"]["servers"][0]["server"], "223.6.6.6");
-        assert!(config["dns"]["servers"][0].get("detour").is_none());
+        assert_eq!(config["dns"]["servers"][0]["type"], "https");
+        assert_eq!(config["dns"]["servers"][0]["server"], "1.1.1.1");
+        assert_eq!(config["dns"]["servers"][0]["server_port"], 443);
+        assert_eq!(config["dns"]["servers"][0]["detour"], "手动选择");
+        assert_eq!(config["dns"]["servers"][2]["type"], "fakeip");
+        assert_eq!(config["dns"]["servers"][2]["inet4_range"], "198.18.0.0/15");
+        assert_eq!(config["dns"]["independent_cache"], true);
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], true);
         let mixed = inbounds
             .iter()
             .find(|value| value["type"] == "mixed")
@@ -3220,20 +3379,21 @@ mod tests {
             "local"
         );
         assert_eq!(config["route"]["rules"][0]["action"], "hijack-dns");
+        assert_eq!(config["route"]["rules"][1]["action"], "sniff");
         assert_eq!(
-            config["route"]["rules"].as_array().expect("route rules")[1]["domain_suffix"],
+            config["route"]["rules"].as_array().expect("route rules")[2]["domain_suffix"],
             json!(["airtcp.me", "airtcp.com", "airapp.link", "mailrelay.us"])
         );
         assert!(
-            config["route"]["rules"].as_array().expect("route rules")[2]["rule_set"]
+            config["route"]["rules"].as_array().expect("route rules")[3]["rule_set"]
                 == "sing-box-tui-bypass"
         );
         assert_eq!(
-            config["route"]["rules"].as_array().expect("route rules")[3]["ip_cidr"],
+            config["route"]["rules"].as_array().expect("route rules")[4]["ip_cidr"],
             json!(["100.64.0.0/10"])
         );
         assert_eq!(
-            config["route"]["rules"].as_array().expect("route rules")[3]["outbound"],
+            config["route"]["rules"].as_array().expect("route rules")[4]["outbound"],
             "国内直连"
         );
         assert!(
@@ -4346,8 +4506,82 @@ mod tests {
             .iter()
             .find(|server| server["tag"] == "remote")
             .expect("remote DNS server");
-        assert_eq!(remote["server"], "223.6.6.6");
-        assert!(remote.get("detour").is_none());
+        assert_eq!(remote["type"], "https");
+        assert_eq!(remote["server"], "1.1.1.1");
+        assert_eq!(remote["server_port"], 443);
+        assert_eq!(remote["detour"], "手动选择");
+    }
+
+    #[test]
+    fn merge_adds_fakeip_and_sniff_idempotently() {
+        let mut config = json!({
+            "dns": {
+                "servers": [
+                    { "type": "tls", "tag": "remote", "server": "8.8.8.8", "server_port": 853, "detour": "手动选择" },
+                    { "type": "tls", "tag": "local", "server": "223.5.5.5", "server_port": 853 }
+                ],
+                "rules": [
+                    { "clash_mode": "全局", "server": "remote" },
+                    { "clash_mode": "直连", "server": "local" },
+                    { "clash_mode": "规则", "server": "remote" }
+                ],
+                "independent_cache": false
+            },
+            "outbounds": [
+                { "type": "selector", "tag": "手动选择", "outbounds": ["国内直连"] },
+                { "type": "urltest", "tag": "自动选择", "outbounds": [] },
+                { "type": "direct", "tag": "国内直连" }
+            ],
+            "route": {
+                "rules": [
+                    { "action": "hijack-dns" },
+                    { "clash_mode": "规则", "outbound": "手动选择" }
+                ]
+            }
+        });
+
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("first merge succeeds");
+        let dns_after_first = config["dns"].clone();
+        let experimental_after_first = config["experimental"].clone();
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("second merge succeeds");
+        assert_eq!(config["dns"], dns_after_first, "dns merge must be idempotent");
+        assert_eq!(
+            config["experimental"], experimental_after_first,
+            "experimental merge must be idempotent"
+        );
+        let after_second = config.clone();
+        merge_into_existing_config(&mut config, Vec::new(), false).expect("third merge succeeds");
+        assert_eq!(config, after_second, "repeated merges must be idempotent");
+
+        let dns_servers = config["dns"]["servers"].as_array().expect("dns servers");
+        assert!(dns_servers.iter().any(|s| s["tag"] == "fakeip" && s["type"] == "fakeip"));
+        assert_eq!(config["dns"]["independent_cache"], true);
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], true);
+
+        let dns_rules = config["dns"]["rules"].as_array().expect("dns rules");
+        let global_fakeip = dns_rules
+            .iter()
+            .position(|r| r["clash_mode"] == "全局" && r["server"] == "fakeip")
+            .expect("global fakeip rule");
+        let global_remote = dns_rules
+            .iter()
+            .position(|r| r["clash_mode"] == "全局" && r["server"] == "remote")
+            .expect("global remote rule");
+        let rule_fakeip = dns_rules
+            .iter()
+            .position(|r| r["clash_mode"] == "规则" && r["server"] == "fakeip")
+            .expect("rule fakeip rule");
+        let rule_remote = dns_rules
+            .iter()
+            .position(|r| r["clash_mode"] == "规则" && r["server"] == "remote")
+            .expect("rule remote rule");
+        assert!(global_fakeip < global_remote);
+        assert!(rule_fakeip < rule_remote);
+
+        let route_rules = config["route"]["rules"].as_array().expect("route rules");
+        assert_eq!(route_rules[0]["action"], "hijack-dns");
+        assert_eq!(route_rules[1]["action"], "sniff");
+        assert_eq!(route_rules[1]["timeout"], "300ms");
     }
 
     #[test]
@@ -5265,8 +5499,10 @@ mod tests {
             .iter()
             .find(|server| server["tag"] == "remote")
             .expect("remote DNS server");
-        assert_eq!(remote["server"], "223.6.6.6");
-        assert!(remote.get("detour").is_none());
+        assert_eq!(remote["type"], "https");
+        assert_eq!(remote["server"], "1.1.1.1");
+        assert_eq!(remote["server_port"], 443);
+        assert_eq!(remote["detour"], "手动选择");
 
         let _ = fs::remove_file(path);
     }
@@ -5308,8 +5544,10 @@ mod tests {
             .iter()
             .find(|server| server["tag"] == "remote")
             .expect("remote DNS server");
-        assert_eq!(remote["server"], "223.6.6.6");
-        assert!(remote.get("detour").is_none());
+        assert_eq!(remote["type"], "https");
+        assert_eq!(remote["server"], "1.1.1.1");
+        assert_eq!(remote["server_port"], 443);
+        assert_eq!(remote["detour"], "手动选择");
 
         let _ = fs::remove_file(path);
     }
